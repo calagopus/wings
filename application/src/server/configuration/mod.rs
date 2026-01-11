@@ -465,6 +465,7 @@ impl ServerConfiguration {
                     "net_bind_service".to_string(),
                     "sys_chroot".to_string(),
                     "setfcap".to_string(),
+                    "sys_ptrace".to_string(),
                 ]),
                 userns_mode: string_to_option(&config.docker.userns_mode),
                 readonly_rootfs: Some(true),
