@@ -913,7 +913,8 @@ impl ServerInstaller {
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
 
-                privileged: Some(self.server.configuration.read().await.container.privileged),
+                privileged: Some(false),
+                publish_all_ports: Some(false),
                 mounts: Some(vec![
                     bollard::models::Mount {
                         typ: Some(bollard::secret::MountTypeEnum::BIND),
@@ -959,6 +960,7 @@ impl ServerInstaller {
                             .collect(),
                     ),
                 }),
+                cap_add: None,
                 userns_mode: string_to_option(&self.server.app_state.config.docker.userns_mode),
                 ..Default::default()
             }),
