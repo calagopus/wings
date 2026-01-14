@@ -81,8 +81,6 @@ async fn container_config(
             blkio_weight: resources.blkio_weight,
             oom_kill_disable: resources.oom_kill_disable,
 
-            privileged: Some(false),
-            publish_all_ports: Some(false),
             mounts: Some(vec![
                 bollard::models::Mount {
                     typ: Some(bollard::secret::MountTypeEnum::BIND),
@@ -120,7 +118,6 @@ async fn container_config(
                         .collect(),
                 ),
             }),
-            cap_add: None,
             userns_mode: string_to_option(&server.app_state.config.docker.userns_mode),
             auto_remove: Some(true),
             ..Default::default()
