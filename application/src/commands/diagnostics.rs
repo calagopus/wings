@@ -187,7 +187,7 @@ pub async fn diagnostics(
                     .trim_start_matches("http://"),
                 "{redacted}",
             )
-            .replace(&config.api.host.to_string(), "{redacted}")
+            .replace(&config.api.host, "{redacted}")
             .replace(&config.system.sftp.bind_address.to_string(), "{redacted}");
 
         if !config.api.ssl.cert.is_empty() {

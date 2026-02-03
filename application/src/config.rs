@@ -19,8 +19,8 @@ use utoipa::ToSchema;
 fn app_name() -> String {
     "Pterodactyl".to_string()
 }
-fn api_host() -> std::net::IpAddr {
-    std::net::IpAddr::from([0, 0, 0, 0])
+fn api_host() -> String {
+    "0.0.0.0".to_string()
 }
 fn api_port() -> u16 {
     8080
@@ -440,8 +440,7 @@ nestify::nest! {
         #[schema(inline)]
         pub api: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Api {
             #[serde(default = "api_host")]
-            #[schema(value_type = String)]
-            pub host: std::net::IpAddr,
+            pub host: String,
             #[serde(default = "api_port")]
             pub port: u16,
 

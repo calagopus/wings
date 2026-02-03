@@ -1,7 +1,7 @@
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::Next,
     response::IntoResponse,
@@ -590,74 +590,111 @@ async fn main() {
         }
     });
 
-    let address = SocketAddr::from((state.config.api.host, state.config.api.port));
+    if let Ok(host) = state.config.api.host.parse::<std::net::IpAddr>() {
+        let address = SocketAddr::from((host, state.config.api.port));
 
-    if config.api.ssl.enabled {
-        tracing::info!("loading ssl certs");
+        if config.api.ssl.enabled {
+            tracing::info!("loading ssl certs");
 
-        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            config.api.ssl.cert.as_str(),
-            config.api.ssl.key.as_str(),
-        )
-        .await
-        .context("failed to load SSL certificate and key")
-        .unwrap();
-
-        tracing::info!(
-            "{} listening on {}",
-            "https server".bright_red(),
-            address.to_string().cyan(),
-        );
-
-        match axum_server::bind_rustls(address, config)
-            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                config.api.ssl.cert.as_str(),
+                config.api.ssl.key.as_str(),
+            )
             .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::AddrInUse {
-                    tracing::error!("failed to start https server (address already in use)");
-                } else {
-                    tracing::error!("failed to start https server: {:?}", err,);
+            .context("failed to load SSL certificate and key")
+            .unwrap();
+
+            tracing::info!(
+                "{} listening on {}",
+                "https server".bright_red(),
+                address.to_string().cyan(),
+            );
+
+            match axum_server::bind_rustls(address, config)
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+            {
+                Ok(_) => {}
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        tracing::error!("failed to start https server (address already in use)");
+                    } else {
+                        tracing::error!("failed to start https server: {:?}", err,);
+                    }
+
+                    std::process::exit(1);
                 }
-
-                std::process::exit(1);
             }
-        }
-    } else {
-        tracing::info!(
-            "{} listening on {}",
-            "http server".bright_red(),
-            address.to_string().cyan(),
-        );
+        } else {
+            tracing::info!(
+                "{} listening on {}",
+                "http server".bright_red(),
+                address.to_string().cyan(),
+            );
 
-        match axum::serve(
-            match tokio::net::TcpListener::bind(address).await {
-                Ok(listener) => listener,
+            match axum::serve(
+                match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::AddrInUse {
+                            tracing::error!("failed to start http server (address already in use)");
+                            std::process::exit(1);
+                        } else {
+                            tracing::error!("failed to start http server: {:?}", err);
+                            std::process::exit(1);
+                        }
+                    }
+                },
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
                         tracing::error!("failed to start http server (address already in use)");
-                        std::process::exit(1);
                     } else {
                         tracing::error!("failed to start http server: {:?}", err);
-                        std::process::exit(1);
                     }
-                }
-            },
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::AddrInUse {
-                    tracing::error!("failed to start http server (address already in use)");
-                } else {
-                    tracing::error!("failed to start http server: {:?}", err);
-                }
 
-                std::process::exit(1);
+                    std::process::exit(1);
+                }
             }
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            let socket_path = &state.config.api.host;
+
+            tracing::info!(
+                "{} listening on {}",
+                "http server".bright_red(),
+                socket_path.cyan(),
+            );
+
+            let router = router.layer(axum::middleware::from_fn(
+                |mut req: Request, next: Next| async move {
+                    req.extensions_mut().insert(ConnectInfo(SocketAddr::from((
+                        std::net::IpAddr::from([127, 0, 0, 1]),
+                        0,
+                    ))));
+                    next.run(req).await
+                },
+            ));
+
+            let _ = tokio::fs::remove_file(socket_path).await;
+
+            let listener = tokio::net::UnixListener::bind(socket_path).unwrap();
+
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            tracing::error!("unix socket support is only available on unix systems");
+            std::process::exit(1);
         }
     }
 }

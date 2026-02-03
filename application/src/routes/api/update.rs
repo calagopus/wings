@@ -17,8 +17,7 @@ mod post {
 
             #[schema(inline)]
             api: Option<#[derive(ToSchema, Deserialize)] pub struct ApiPayload {
-                #[schema(value_type = Option<String>)]
-                host: Option<std::net::IpAddr>,
+                host: Option<String>,
                 port: Option<u16>,
 
                 #[schema(inline)]
