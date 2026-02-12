@@ -150,6 +150,39 @@ mod post {
             }
         };
 
+        {
+            let storage_pool = &state.config.system.transfers.storage_pool;
+            let source_pool = headers
+                .get("X-Storage-Pool")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+
+            if storage_pool.enabled
+                && !storage_pool.pool_name.is_empty()
+                && !source_pool.is_empty()
+                && storage_pool.pool_name.eq_ignore_ascii_case(source_pool)
+            {
+                server.filesystem.setup().await;
+                server
+                    .transferring
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .config
+                    .client
+                    .set_server_transfer(subject, true, vec![])
+                    .await?;
+                server
+                    .websocket
+                    .send(crate::server::websocket::WebsocketMessage::new(
+                        crate::server::websocket::WebsocketEvent::ServerTransferStatus,
+                        ["completed".into()].into(),
+                    ))
+                    .ok();
+
+                return ApiResponse::new_serialized(Response {}).ok();
+            }
+        }
+
         let handle = tokio::spawn({
             let runtime = tokio::runtime::Handle::current();
             let server = server.clone();

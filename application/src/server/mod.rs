@@ -1521,7 +1521,16 @@ impl Server {
         tokio::spawn({
             let server = self.clone();
 
-            async move { server.filesystem.destroy().await }
+            async move {
+                let pool = &server.app_state.config.system.transfers.storage_pool;
+                let skip_file_removal = pool.enabled
+                    && !pool.pool_name.is_empty()
+                    && server.transferring.load(Ordering::SeqCst);
+
+                if !skip_file_removal {
+                    server.filesystem.destroy().await;
+                }
+            }
         });
     }
 

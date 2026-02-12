@@ -531,12 +531,19 @@ impl OutgoingServerTransfer {
                 }
             });
 
-            let response = reqwest::Client::new()
+            let storage_pool = &server.app_state.config.system.transfers.storage_pool;
+            let include_storage_pool =
+                storage_pool.enabled && !storage_pool.pool_name.is_empty();
+
+            let mut response = reqwest::Client::new()
                 .post(&url)
                 .header("Authorization", &token)
                 .header("Multiplex-Stream-Count", multiplex_streams)
-                .multipart(form)
-                .send();
+                .multipart(form);
+            if include_storage_pool {
+                response = response.header("X-Storage-Pool", storage_pool.pool_name.as_str());
+            }
+            let response = response.send();
             let mut multiplex_responses = Vec::new();
             multiplex_responses.reserve_exact(multiplex_streams);
 
@@ -607,14 +614,15 @@ impl OutgoingServerTransfer {
                         .unwrap(),
                     );
 
-                multiplex_responses.push(
-                    reqwest::Client::new()
-                        .post(&url)
-                        .header("Authorization", &token)
-                        .header("Multiplex-Stream", i)
-                        .multipart(form)
-                        .send()
-                );
+                let mut request = reqwest::Client::new()
+                    .post(&url)
+                    .header("Authorization", &token)
+                    .header("Multiplex-Stream", i)
+                    .multipart(form);
+                if include_storage_pool {
+                    request = request.header("X-Storage-Pool", storage_pool.pool_name.as_str());
+                }
+                multiplex_responses.push(request.send());
                 multiplex_tasks.push(archive_task);
                 multiplex_tasks.push(checksum_task);
             }

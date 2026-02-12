@@ -729,6 +729,16 @@ nestify::nest! {
             pub transfers: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemTransfers {
                 #[serde(default)]
                 pub download_limit: MiB,
+
+                #[serde(default)]
+                #[schema(inline)]
+                pub storage_pool: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemTransfersStoragePool {
+                    #[serde(default)]
+                    pub enabled: bool,
+
+                    #[serde(default)]
+                    pub pool_name: String,
+                },
             },
         },
         #[serde(default)]
