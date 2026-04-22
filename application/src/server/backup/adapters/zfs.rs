@@ -74,6 +74,58 @@ impl ZfsBackup {
 
         Ok(ignore_builder.build()?)
     }
+
+    async fn destroy_snapshot(target: &str) -> Result<(), anyhow::Error> {
+        let backoffs_ms = [100u64, 200, 400, 800, 1600, 3200];
+
+        for backoff_ms in backoffs_ms {
+            let output = Command::new("zfs")
+                .arg("destroy")
+                .arg("-f")
+                .arg(target)
+                .env("LC_ALL", "C")
+                .output()
+                .await?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if stderr.contains("could not find any snapshots to destroy") {
+                return Ok(());
+            }
+
+            if !stderr.contains("dataset is busy") {
+                return Err(anyhow::anyhow!("failed to delete zfs snapshot: {}", stderr));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+
+        // Deferred destroy so the user-visible delete completes even if a kernel reference lingers.
+        let output = Command::new("zfs")
+            .arg("destroy")
+            .arg("-d")
+            .arg(target)
+            .env("LC_ALL", "C")
+            .output()
+            .await?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() && !stderr.contains("could not find any snapshots to destroy") {
+            return Err(anyhow::anyhow!("failed to delete zfs snapshot: {}", stderr));
+        }
+
+        tracing::warn!(
+            snapshot = %target,
+            "zfs snapshot still busy after retries; marked for deferred destroy"
+        );
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -433,21 +485,7 @@ impl BackupExt for ZfsBackup {
             .await;
 
         if let Ok(dataset_name) = tokio::fs::read_to_string(dataset_path).await {
-            let output = Command::new("zfs")
-                .arg("destroy")
-                .arg("-f")
-                .arg(format!("{}@{}", dataset_name.trim(), snapshot_name))
-                .env("LC_ALL", "C")
-                .output()
-                .await?;
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if !output.status.success()
-                && !stderr.contains("could not find any snapshots to destroy")
-            {
-                return Err(anyhow::anyhow!("failed to delete zfs snapshot: {}", stderr));
-            }
+            Self::destroy_snapshot(&format!("{}@{}", dataset_name.trim(), snapshot_name)).await?;
         }
 
         tokio::fs::remove_dir_all(backup_path).await?;
@@ -491,22 +529,14 @@ impl BackupCleanExt for ZfsBackup {
             return Ok(());
         }
 
+        server
+            .app_state
+            .backup_manager
+            .invalidate_cached_browse(uuid)
+            .await;
+
         if let Ok(dataset_name) = tokio::fs::read_to_string(dataset_path).await {
-            let output = Command::new("zfs")
-                .arg("destroy")
-                .arg("-f")
-                .arg(format!("{}@{}", dataset_name.trim(), snapshot_name))
-                .env("LC_ALL", "C")
-                .output()
-                .await?;
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if !output.status.success()
-                && !stderr.contains("could not find any snapshots to destroy")
-            {
-                return Err(anyhow::anyhow!("failed to delete zfs snapshot: {}", stderr));
-            }
+            Self::destroy_snapshot(&format!("{}@{}", dataset_name.trim(), snapshot_name)).await?;
         }
 
         tokio::fs::remove_dir_all(backup_path).await?;

@@ -498,5 +498,7 @@ impl BackupManager {
     pub async fn invalidate_cached_browse(&self, uuid: uuid::Uuid) {
         self.cached_browse_backups.invalidate(&uuid).await;
         self.cached_browse_backup_locks.invalidate(&uuid).await;
+        self.cached_browse_backups.run_pending_tasks().await;
+        self.cached_browse_backup_locks.run_pending_tasks().await;
     }
 }
