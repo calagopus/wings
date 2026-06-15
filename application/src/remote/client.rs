@@ -222,12 +222,12 @@ impl Client {
         &self,
         uuid: uuid::Uuid,
         successful: bool,
-        backups: Vec<uuid::Uuid>,
+        received_backups: &crate::server::backup::transfer::ReceivedBackups,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("setting server transfer status");
 
         self.retry(
-            || super::servers::set_server_transfer(self, uuid, successful, &backups),
+            || super::servers::set_server_transfer(self, uuid, successful, received_backups),
             Self::skip_client_errors,
         )
         .await

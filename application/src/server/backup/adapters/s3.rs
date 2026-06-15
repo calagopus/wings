@@ -17,7 +17,7 @@ use crate::{
     utils::PortablePermissions,
 };
 use futures::TryStreamExt;
-use sha1::Digest;
+use sha2::Digest;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -273,7 +273,7 @@ impl S3Backup {
             let scratch = &mut scratch;
 
             async move {
-                let mut sha1 = sha1::Sha1::new();
+                let mut hasher = sha2::Sha256::new();
                 let mut total_size: u64 = 0;
                 let mut parts = Vec::new();
 
@@ -297,7 +297,7 @@ impl S3Backup {
                             break;
                         }
 
-                        sha1.safe_update(&buffer, bytes_read)?;
+                        hasher.safe_update(&buffer, bytes_read)?;
                         scratch.safe_write_all(&buffer, bytes_read).await?;
 
                         valid_len += bytes_read as u64;
@@ -344,7 +344,7 @@ impl S3Backup {
                     }
                 }
 
-                Ok::<_, anyhow::Error>((hex::encode(sha1.finalize()), parts, total_size))
+                Ok::<_, anyhow::Error>((hex::encode(hasher.finalize()), parts, total_size))
             }
         };
 
@@ -362,7 +362,7 @@ impl S3Backup {
 
         Ok(RawServerBackup {
             checksum,
-            checksum_type: "sha1".into(),
+            checksum_type: "sha256".into(),
             size,
             files: total_files,
             successful: true,
@@ -391,7 +391,7 @@ impl S3Backup {
         let (mut checksum_reader, checksum_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let checksum_task = async {
-            let mut sha1 = sha1::Sha1::new();
+            let mut hasher = sha2::Sha256::new();
 
             let mut buffer = vec![0; crate::BUFFER_SIZE];
             loop {
@@ -400,12 +400,12 @@ impl S3Backup {
                     break;
                 }
 
-                sha1.safe_update(&buffer, bytes_read)?;
+                hasher.safe_update(&buffer, bytes_read)?;
                 file.safe_write_all(&buffer, bytes_read).await?;
                 total.fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
 
-            Ok::<_, anyhow::Error>(hex::encode(sha1.finalize()))
+            Ok::<_, anyhow::Error>(hex::encode(hasher.finalize()))
         };
 
         let total_task = {
@@ -595,7 +595,7 @@ impl S3Backup {
 
         Ok(RawServerBackup {
             checksum,
-            checksum_type: "sha1".into(),
+            checksum_type: "sha256".into(),
             size,
             files: total_files,
             successful: true,

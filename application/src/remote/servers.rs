@@ -94,7 +94,7 @@ pub async fn set_server_transfer(
     client: &Client,
     uuid: uuid::Uuid,
     successful: bool,
-    backups: &[uuid::Uuid],
+    backups: &crate::server::backup::transfer::ReceivedBackups,
 ) -> Result<(), anyhow::Error> {
     client
         .client
@@ -105,7 +105,8 @@ pub async fn set_server_transfer(
             if successful { "success" } else { "failure" }
         ))
         .json(&json!({
-            "backups": backups
+            "backups": backups.uuids,
+            "backup_migrations": backups.migrations,
         }))
         .send()
         .await?

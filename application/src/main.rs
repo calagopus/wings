@@ -401,6 +401,16 @@ async fn main_rt() {
         Err(err) => exit_error!("failed to reset remote state: {:?}", err),
     }
 
+    if config.load().system.disk_limiter_mode
+        == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
+    {
+        tracing::info!("cleaning up stale btrfs send snapshots from previous runs");
+        crate::server::backup::adapters::btrfs::BtrfsBackup::cleanup_stale_btrfs_send_snapshots(
+            &config,
+        )
+        .await;
+    }
+
     tracing::info!("creating server manager");
     let servers = match config.client.servers().await {
         Ok(servers) => servers,

@@ -28,7 +28,7 @@ pub trait DiskLimiterExt: Send + Sync {
     async fn update_disk_limit(&self, limit: u64) -> Result<(), std::io::Error>;
 }
 
-#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, Default)]
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskLimiterMode {
     #[default]

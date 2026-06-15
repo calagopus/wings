@@ -23,7 +23,7 @@ use crate::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use parking_lot::RwLock;
-use sha1::Digest;
+use sha2::Digest;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -36,9 +36,9 @@ use tokio::io::AsyncReadExt;
 
 pub struct WingsBackup {
     uuid: uuid::Uuid,
-    format: ArchiveFormat,
+    pub format: ArchiveFormat,
 
-    path: PathBuf,
+    pub path: PathBuf,
 }
 
 impl WingsBackup {
@@ -271,7 +271,7 @@ impl BackupCreateExt for WingsBackup {
 
         let (total_files, _) = tokio::try_join!(total_task, archive_task)?;
 
-        let mut checksum_writer = sha1::Sha1::new();
+        let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
         let mut buffer = vec![0; crate::BUFFER_SIZE];
 
@@ -292,7 +292,7 @@ impl BackupCreateExt for WingsBackup {
 
         Ok(RawServerBackup {
             checksum: hex::encode(checksum_writer.finalize()),
-            checksum_type: "sha1".into(),
+            checksum_type: "sha256".into(),
             size,
             files: total_files,
             successful: true,

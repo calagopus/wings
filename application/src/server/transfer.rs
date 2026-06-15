@@ -3,13 +3,12 @@ use crate::{
         SafeAsyncWriteExt, SafeDigestExt,
         compression::{CompressionLevel, CompressionType},
         counting_reader::AsyncCountingReader,
-        hash_reader::AsyncHashReader,
     },
     server::filesystem::archive::StreamableArchiveFormat,
 };
 use futures::FutureExt;
 use human_bytes::human_bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::{
     borrow::Cow,
@@ -24,7 +23,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
     task::{AbortHandle, JoinHandle},
 };
 use utoipa::ToSchema;
@@ -176,6 +174,23 @@ impl std::str::FromStr for TransferArchiveFormat {
     }
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy)]
+pub struct TransferCapabilities {
+    pub wings_archive_format: super::filesystem::archive::ArchiveFormat,
+    pub wings_archive_compression_level: CompressionLevel,
+    pub disk_limiter_mode: super::filesystem::limiter::DiskLimiterMode,
+}
+
+impl TransferCapabilities {
+    pub fn from_config(config: &crate::config::InnerConfig) -> Self {
+        Self {
+            wings_archive_format: config.system.backups.wings.archive_format,
+            wings_archive_compression_level: config.system.backups.compression_level,
+            disk_limiter_mode: config.system.disk_limiter_mode,
+        }
+    }
+}
+
 pub struct OutgoingServerTransfer {
     pub bytes_archived: Arc<AtomicU64>,
     pub bytes_sent: Arc<AtomicU64>,
@@ -227,7 +242,7 @@ impl OutgoingServerTransfer {
             .app_state
             .config
             .client
-            .set_server_transfer(server.uuid, false, Vec::new())
+            .set_server_transfer(server.uuid, false, &Default::default())
             .await
             .ok();
         server.outgoing_transfer.write().await.take();
@@ -243,6 +258,32 @@ impl OutgoingServerTransfer {
                 .build(),
             )
             .ok();
+    }
+
+    async fn query_destination_capabilities(
+        url: &str,
+        token: &str,
+    ) -> Result<TransferCapabilities, anyhow::Error> {
+        let mut query_url = reqwest::Url::parse(url)?;
+        query_url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("transfer url cannot be a base"))?
+            .pop_if_empty()
+            .push("query");
+
+        let capabilities = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?
+            .get(query_url)
+            .header("Authorization", token)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(capabilities)
     }
 
     pub fn start(
@@ -462,93 +503,37 @@ impl OutgoingServerTransfer {
                 );
             }
 
-            for backup in &backups {
-                if let Ok(Some(backup)) = backup_manager.find(&server.app_state, *backup).await {
-                    match backup.adapter() {
-                        super::backup::adapters::BackupAdapter::Wings => {
-                            let hasher = Arc::new(Mutex::new(sha2::Sha256::new()));
+            let destination_capabilities = if backups.is_empty() {
+                None
+            } else {
+                match Self::query_destination_capabilities(&url, &token).await {
+                    Ok(capabilities) => Some(capabilities),
+                    Err(err) => {
+                        tracing::warn!(
+                            server = %server.uuid,
+                            "failed to query destination transfer capabilities, falling back to local config: {err:#}"
+                        );
+                        Self::log(
+                            &server,
+                            "Could not query destination capabilities, using local backup format for conversions.",
+                        );
 
-                            let file_name = match super::backup::adapters::wings::WingsBackup::get_first_file_name(&server.app_state.config, backup.uuid()).await {
-                                Ok((_, file_name)) => file_name,
-                                Err(err) => {
-                                    tracing::error!(
-                                        server = %server.uuid,
-                                        "failed to get first file name for backup {}: {}",
-                                        backup.uuid(),
-                                        err
-                                    );
-                                    continue;
-                                }
-                            };
-                            let reader = AsyncCountingReader::new_with_bytes_read(
-                                match tokio::fs::File::open(&file_name).await {
-                                    Ok(file) => file,
-                                    Err(err) => {
-                                        tracing::error!(
-                                            server = %server.uuid,
-                                            "failed to open backup file {}: {}",
-                                            file_name.display(),
-                                            err
-                                        );
-                                        continue;
-                                    }
-                                },
-                                Arc::clone(&bytes_archived),
-                            );
-                            let reader = AsyncCountingReader::new_with_bytes_read(
-                                reader,
-                                Arc::clone(&bytes_sent),
-                            );
-                            let reader = AsyncHashReader::new_with_hasher(reader, Arc::clone(&hasher)).await;
-
-                            let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
-                            tokio::spawn(async move {
-                                checksum_sender.send(hex::encode(hasher.lock().await.finalize_reset())).ok();
-                            });
-
-                            bytes_total.fetch_add(
-                                tokio::fs::metadata(&file_name)
-                                    .await
-                                    .map(|m| m.len())
-                                    .unwrap_or(0),
-                                Ordering::Relaxed
-                            );
-
-                            form = form
-                                .part(
-                                    format!("backup-{}", backup.uuid()),
-                                    reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                                        tokio_util::io::ReaderStream::with_capacity(reader, crate::TRANSFER_BUFFER_SIZE),
-                                    ))
-                                    .file_name(file_name.file_name().unwrap_or_default().to_string_lossy().to_string())
-                                    .mime_str("backup/wings")
-                                    .expect("failed to set mime type for archive"),
-                                )
-                                .part(
-                                    format!("backup-checksum-{}", backup.uuid()),
-                                    reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                                        checksum_receiver.into_stream()
-                                    ))
-                                    .file_name(format!("backup-checksum-{}", backup.uuid()))
-                                    .mime_str("text/plain")
-                                    .expect("failed to set mime type for checksum"),
-                                );
-                        }
-                        _ => {
-                            tracing::warn!(
-                                server = %server.uuid,
-                                "backup {} is not a Wings backup and cannot be transferred, skipping",
-                                backup.uuid()
-                            );
-                        }
+                        Some(TransferCapabilities::from_config(
+                            &server.app_state.config.load(),
+                        ))
                     }
-                } else {
-                    tracing::warn!(
-                        server = %server.uuid,
-                        "requested backup {} does not exist",
-                        backup
-                    );
                 }
+            };
+
+            let mut backup_sender = crate::server::backup::transfer::BackupSender::new(
+                &server.app_state,
+                destination_capabilities.as_ref(),
+                &bytes_archived,
+                &bytes_sent,
+                &bytes_total,
+            );
+            for backup in &backups {
+                form = backup_sender.append_part(form, *backup).await;
             }
 
             let progress_task = Box::pin({
@@ -809,12 +794,15 @@ impl OutgoingServerTransfer {
                             err
                         );
 
+                        backup_sender.finish().await;
                         Self::transfer_failure(&server).await;
                         return;
                     }
                 }
                 _ = progress_task => {}
             };
+
+            backup_sender.finish().await;
 
             Self::log(&server, "Finished streaming archive to destination.");
 
@@ -863,19 +851,20 @@ impl OutgoingServerTransfer {
                 "finished outgoing server transfer"
             );
 
+            server
+                .websocket
+                .send(
+                    super::websocket::WebsocketMessage::builder(
+                        super::websocket::WebsocketEvent::ServerTransferStatus,
+                    )
+                    .arg("completed")
+                    .build(),
+                )
+                .ok();
+
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                server
-                    .websocket
-                    .send(
-                        super::websocket::WebsocketMessage::builder(
-                            super::websocket::WebsocketEvent::ServerTransferStatus,
-                        )
-                        .arg("completed")
-                        .build(),
-                    )
-                    .ok();
                 server.user_permissions.clear_permissions();
             });
         }));
@@ -908,8 +897,8 @@ pub struct IncomingServerTransfer {
 impl IncomingServerTransfer {
     pub async fn try_join_handles(
         &mut self,
-        main: JoinHandle<Result<Vec<uuid::Uuid>, anyhow::Error>>,
-    ) -> Result<Vec<uuid::Uuid>, anyhow::Error> {
+        main: JoinHandle<Result<super::backup::transfer::ReceivedBackups, anyhow::Error>>,
+    ) -> Result<super::backup::transfer::ReceivedBackups, anyhow::Error> {
         let (backups, _) = tokio::try_join!(async { main.await? }, async {
             Ok(futures::future::try_join_all(
                 self.multiplex_handles.drain(..).map(|h| h.1),

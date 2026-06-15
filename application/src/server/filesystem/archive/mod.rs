@@ -114,6 +114,34 @@ impl ArchiveFormat {
     }
 }
 
+impl std::str::FromStr for ArchiveFormat {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.ends_with(".tar") {
+            Ok(ArchiveFormat::Tar)
+        } else if s.ends_with(".tar.gz") {
+            Ok(ArchiveFormat::TarGz)
+        } else if s.ends_with(".tar.xz") {
+            Ok(ArchiveFormat::TarXz)
+        } else if s.ends_with(".tar.lz") {
+            Ok(ArchiveFormat::TarLzip)
+        } else if s.ends_with(".tar.bz2") {
+            Ok(ArchiveFormat::TarBz2)
+        } else if s.ends_with(".tar.lz4") {
+            Ok(ArchiveFormat::TarLz4)
+        } else if s.ends_with(".tar.zst") {
+            Ok(ArchiveFormat::TarZstd)
+        } else if s.ends_with(".zip") {
+            Ok(ArchiveFormat::Zip)
+        } else if s.ends_with(".7z") {
+            Ok(ArchiveFormat::SevenZip)
+        } else {
+            Err("Invalid archive format")
+        }
+    }
+}
+
 #[derive(ToSchema, Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 #[schema(rename_all = "snake_case")]
