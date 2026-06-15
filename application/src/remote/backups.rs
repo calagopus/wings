@@ -55,9 +55,9 @@ pub struct PbsBackupConfiguration {
     pub backup_id_prefix: Option<String>,
     #[serde(default)]
     pub server_uuid: Option<uuid::Uuid>,
-    /// The backup's creation time, used verbatim as the PBS snapshot
-    /// `backup-time` at create and at restore/delete.
-    pub backup_time: i64,
+    /// The backup's creation time; its Unix timestamp is used as the PBS
+    /// snapshot `backup-time` at create and at restore/delete.
+    pub backup_created: chrono::DateTime<chrono::Utc>,
 }
 
 pub async fn set_backup_status(

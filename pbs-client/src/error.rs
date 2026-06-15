@@ -1,10 +1,5 @@
 use compact_str::CompactString;
 
-/// Errors surfaced by the Proxmox Backup Server client.
-///
-/// These map PBS/transport failure modes onto actionable messages. Token
-/// secrets are never included in any variant. Implements [`std::error::Error`]
-/// so it composes with the crate's `anyhow`-based error handling via `?`.
 #[derive(Debug)]
 pub enum PbsError {
     Config(CompactString),

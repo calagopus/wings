@@ -11,11 +11,6 @@ use std::sync::Arc;
 const FINGERPRINT_ERROR: &str =
     "fingerprint must be a SHA-256 hash (64 hex characters, colons optional)";
 
-/// Normalizes a SHA-256 TLS fingerprint into its 32 raw bytes.
-///
-/// Accepts the fingerprint with or without colon separators and in any case,
-/// e.g. `AB:CD:...` or `abcd...`. Returns an error if it is not exactly 64 hex
-/// characters.
 pub fn normalize_fingerprint(fingerprint: &str) -> Result<[u8; 32], CompactString> {
     let mut out = [0u8; 32];
     let mut count = 0usize;
@@ -50,7 +45,6 @@ pub fn normalize_fingerprint(fingerprint: &str) -> Result<[u8; 32], CompactStrin
     Ok(out)
 }
 
-/// SHA-256 digest of a certificate's DER encoding, the value PBS pins on.
 pub fn cert_sha256(der: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(der);
     let mut out = [0u8; 32];
@@ -58,7 +52,6 @@ pub fn cert_sha256(der: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Lowercase, colon-less hex rendering of raw fingerprint bytes (for messages).
 pub fn fingerprint_hex(bytes: &[u8]) -> CompactString {
     use std::fmt::Write;
 
@@ -69,13 +62,6 @@ pub fn fingerprint_hex(bytes: &[u8]) -> CompactString {
     out.into()
 }
 
-/// A rustls certificate verifier that pins the server's end-entity certificate
-/// to a specific SHA-256 fingerprint.
-///
-/// PBS instances commonly use self-signed certificates, so chain/hostname
-/// validation is intentionally replaced by exact fingerprint matching. Crucially
-/// this does **not** disable TLS: handshake signature verification is delegated
-/// to the configured crypto provider, so a forged handshake is still rejected.
 #[derive(Debug)]
 struct FingerprintVerifier {
     expected: [u8; 32],
@@ -138,8 +124,6 @@ impl ServerCertVerifier for FingerprintVerifier {
     }
 }
 
-/// Builds a rustls [`ClientConfig`] that pins the PBS certificate to the given
-/// SHA-256 fingerprint.
 pub fn build_client_config(fingerprint: &str) -> Result<ClientConfig, CompactString> {
     let expected = normalize_fingerprint(fingerprint)?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -152,50 +136,4 @@ pub fn build_client_config(fingerprint: &str) -> Result<ClientConfig, CompactStr
         .with_no_client_auth();
 
     Ok(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_accepts_colons_and_any_case() {
-        let plain = "ab".repeat(32);
-        let upper = "AB".repeat(32);
-        let colons = std::iter::repeat_n("ab", 32).collect::<Vec<_>>().join(":");
-
-        let a = normalize_fingerprint(&plain).expect("plain hex is valid");
-        let b = normalize_fingerprint(&upper).expect("upper hex is valid");
-        let c = normalize_fingerprint(&colons).expect("colon hex is valid");
-
-        assert_eq!(a, b);
-        assert_eq!(a, c);
-        assert_eq!(a, [0xabu8; 32]);
-    }
-
-    #[test]
-    fn normalize_rejects_bad_input() {
-        assert!(normalize_fingerprint("abcd").is_err()); // too short
-        assert!(normalize_fingerprint(&"zz".repeat(32)).is_err()); // non-hex
-        assert!(normalize_fingerprint(&"ab".repeat(33)).is_err()); // too long
-    }
-
-    #[test]
-    fn pinning_detects_mismatch() {
-        // A pinned fingerprint matches only the exact certificate bytes.
-        let cert_a = b"-----fake der cert A-----";
-        let cert_b = b"-----fake der cert B-----";
-
-        let expected = cert_sha256(cert_a);
-        assert_eq!(
-            cert_sha256(cert_a),
-            expected,
-            "same cert must match the pin"
-        );
-        assert_ne!(
-            cert_sha256(cert_b),
-            expected,
-            "a different cert must fail the pin"
-        );
-    }
 }

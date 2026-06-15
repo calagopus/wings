@@ -3188,6 +3188,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbs-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "compact_str",
+ "crc32fast",
+ "fastcdc",
+ "h2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5873,17 +5897,12 @@ dependencies = [
  "cron",
  "ddup-bak",
  "dialoguer",
- "fastcdc",
  "flate2",
  "futures",
  "gzp",
- "h2",
  "hex",
  "hickory-resolver",
- "http-body-util",
  "human_bytes",
- "hyper",
- "hyper-util",
  "ignore",
  "infer",
  "ini-roundtrip",
@@ -5903,6 +5922,7 @@ dependencies = [
  "nu-ansi-term",
  "ouroboros",
  "parking_lot",
+ "pbs-client",
  "percent-encoding",
  "positioned-io",
  "rand 0.10.1",
@@ -5930,7 +5950,6 @@ dependencies = [
  "thin-vec",
  "tikv-jemallocator",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "toml_edit",
  "tower-http",

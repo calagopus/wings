@@ -1,0 +1,41 @@
+[package]
+name = "pbs-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = { workspace = true }
+description = "Proxmox Backup Server client (token auth, fingerprint pinning, DataBlob + dynamic-index writer/reader)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync", "rt", "net"] }
+uuid = { workspace = true }
+h2 = "0.4"
+hyper = { version = "1.10", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = "0.26.4"
+rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
+bytes = "1"
+sha2 = "0.11.0"
+crc32fast = "1.4.2"
+fastcdc = "3.2.1"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
+hex = "0.4.3"
+compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", version = "0.9.0", features = ["serde"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+indexing_slicing = "deny"
+string_slice = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+missing_panics_doc = "warn"

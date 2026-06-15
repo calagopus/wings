@@ -8,17 +8,7 @@ use crate::{
     remote::backups::{PbsBackupConfiguration, RawServerBackup},
     response::ApiResponse,
     server::{
-        backup::{
-            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt,
-            pbs::{
-                config::PbsConfig,
-                manifest::{BackupManifest, MANIFEST_BLOB_NAME},
-                naming,
-                reader::PbsBackupReader,
-                rest::PbsClient,
-                writer::{ARCHIVE_NAME, META_BLOB_NAME, PbsBackupWriter},
-            },
-        },
+        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
         filesystem::{
             archive::{
                 StreamableArchiveFormat,
@@ -31,6 +21,14 @@ use crate::{
     utils::PortablePermissions,
 };
 use compact_str::CompactString;
+use pbs_client::{
+    config::PbsConfig,
+    manifest::{BackupManifest, MANIFEST_BLOB_NAME},
+    naming,
+    reader::PbsBackupReader,
+    rest::PbsClient,
+    writer::{ARCHIVE_NAME, META_BLOB_NAME, PbsBackupWriter},
+};
 use std::{
     io::Write,
     path::Path,
@@ -42,10 +40,6 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
-/// Proxmox Backup Server backup adapter.
-///
-/// Constructed from the panel-provided locator (config + server uuid +
-/// backup-time) so delete/restore can address the exact PBS snapshot.
 pub struct PbsBackup {
     uuid: uuid::Uuid,
     config: PbsConfig,
@@ -53,7 +47,6 @@ pub struct PbsBackup {
     backup_time: i64,
 }
 
-/// Builds the connection config from the panel's remote configuration.
 fn build_config(remote: PbsBackupConfiguration) -> PbsConfig {
     PbsConfig {
         url: remote.url.into(),
@@ -82,16 +75,13 @@ impl BackupFindExt for PbsBackup {
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_pbs_configuration(uuid).await {
             Ok(remote) => remote,
-            // Not a PBS backup, or no configuration assigned.
             Err(_) => return Ok(None),
         };
 
-        // The server uuid identifies the PBS group; the backup-time is the
-        // backup's creation time, supplied by the panel.
         let Some(server_uuid) = remote.server_uuid else {
             return Ok(None);
         };
-        let backup_time = remote.backup_time;
+        let backup_time = remote.backup_created.timestamp();
 
         let config = build_config(remote);
         let backup_id = naming::backup_id(config.id_prefix(), server_uuid);
@@ -115,17 +105,13 @@ impl BackupCreateExt for PbsBackup {
         ignore: ignore::gitignore::Gitignore,
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
-        // The node fetches the (decrypted) PBS connection config from the panel
-        // by backup uuid, mirroring the restic adapter. The panel also supplies
-        // the snapshot backup-time (the backup's creation time) so it stays the
-        // single source of truth for addressing the snapshot on restore/delete.
         let remote = server
             .app_state
             .config
             .client
             .backup_pbs_configuration(uuid)
             .await?;
-        let backup_time = remote.backup_time;
+        let backup_time = remote.backup_created.timestamp();
         let config = build_config(remote);
         config.validate().map_err(|err| anyhow::anyhow!("{err}"))?;
 
@@ -133,7 +119,6 @@ impl BackupCreateExt for PbsBackup {
 
         let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
-        // Compute total bytes/files for progress reporting.
         let total_task = {
             let total = Arc::clone(&total);
             let server = server.clone();
@@ -160,7 +145,6 @@ impl BackupCreateExt for PbsBackup {
             }
         };
 
-        // Produce a plain (uncompressed) tar — PBS does its own per-chunk zstd.
         let archive_task = {
             let server = server.clone();
             let ignore = ignore.clone();
@@ -215,7 +199,6 @@ impl BackupCreateExt for PbsBackup {
             }
         };
 
-        // Stream the tar into PBS as a dynamic-index archive + metadata + manifest.
         let pbs_task = {
             let config = config.clone();
             let backup_id = backup_id.clone();
@@ -279,10 +262,6 @@ impl BackupExt for PbsBackup {
         archive_format: StreamableArchiveFormat,
         _range: Option<ByteRange>,
     ) -> Result<ApiResponse, anyhow::Error> {
-        // The snapshot is stored as a plain tar split into chunks. We can stream
-        // it back as any tar-based format by reassembling the tar and re-encoding
-        // the requested compression on the fly. Zip/itaf would require parsing the
-        // tar and re-emitting per entry, which is not supported.
         if !archive_format.is_tar() {
             return Err(anyhow::anyhow!(
                 "Proxmox Backup Server downloads currently support only tar-based formats, not {}",
@@ -290,15 +269,12 @@ impl BackupExt for PbsBackup {
             ));
         }
 
-        // Open the reader session up front so connection/auth failures surface as
-        // a clean error response rather than a truncated body.
         let reader =
             PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
 
         let (tar_reader, tar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
         let (out_reader, out_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
-        // Reassemble the tar stream into the pipe.
         tokio::spawn(async move {
             let mut tar_writer = tar_writer;
             if let Err(err) = reader.reassemble_archive(&mut tar_writer, None).await {
@@ -307,7 +283,6 @@ impl BackupExt for PbsBackup {
             let _ = tar_writer.shutdown().await;
         });
 
-        // Re-encode the reassembled tar into the requested compression.
         let compression_type = archive_format.compression_format();
         let compression_level = state.config.load().system.backups.compression_level;
         let threads = state.config.load().api.file_compression_threads;
@@ -352,9 +327,8 @@ impl BackupExt for PbsBackup {
         let mut reader =
             PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
 
-        // Best-effort total from the manifest's archive file size.
         if let Ok(manifest_raw) = reader.download_file(MANIFEST_BLOB_NAME).await
-            && let Ok(json) = crate::server::backup::pbs::datablob::decode_blob(&manifest_raw)
+            && let Ok(json) = pbs_client::datablob::decode_blob(&manifest_raw)
             && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&json)
             && let Some(files) = manifest.get("files").and_then(|files| files.as_array())
         {
@@ -369,7 +343,6 @@ impl BackupExt for PbsBackup {
 
         let (pipe_reader, pipe_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
-        // Reassemble the tar stream into the pipe.
         let fetch_task = {
             let progress = Arc::clone(&progress);
             async move {
@@ -382,7 +355,6 @@ impl BackupExt for PbsBackup {
             }
         };
 
-        // Extract the tar stream into the server filesystem.
         let extract_task = {
             let server = server.clone();
             async move {
@@ -496,8 +468,6 @@ impl BackupExt for PbsBackup {
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
-        // Never let a misconfigured prefix delete a snapshot Calagopus did not
-        // create; the backup-id must match our deterministic naming scheme.
         if !naming::is_calagopus_id(self.config.id_prefix(), &self.backup_id) {
             return Err(anyhow::anyhow!(
                 "refusing to delete PBS snapshot with non-Calagopus backup-id '{}'",

@@ -6,11 +6,6 @@ use reqwest::{
 };
 use std::time::Duration;
 
-/// A REST client for Proxmox Backup Server management endpoints.
-///
-/// Uses token authentication and TLS certificate fingerprint pinning. This
-/// covers exact-snapshot deletion; the streaming writer/reader protocols are
-/// handled separately.
 pub struct PbsClient {
     client: reqwest::Client,
     config: PbsConfig,
@@ -48,7 +43,6 @@ impl PbsClient {
         )
     }
 
-    /// Query parameters shared by datastore endpoints (namespace scoping).
     fn ns_query(&self) -> Vec<(&'static str, String)> {
         match &self.config.namespace {
             Some(ns) if !ns.is_empty() => vec![("ns", ns.to_string())],
@@ -56,10 +50,6 @@ impl PbsClient {
         }
     }
 
-    /// Deletes exactly one snapshot, identified by type/id/time.
-    ///
-    /// The caller is responsible for ensuring the snapshot belongs to a
-    /// Calagopus-created group; this method never deletes a group wholesale.
     pub async fn delete_snapshot(
         &self,
         backup_type: &str,
@@ -84,7 +74,6 @@ impl PbsClient {
         Ok(())
     }
 
-    /// Maps a non-success HTTP status onto an actionable [`PbsError`].
     async fn check_status(
         &self,
         response: reqwest::Response,
@@ -105,7 +94,6 @@ impl PbsClient {
                 datastore: self.config.datastore.clone(),
             },
             other => {
-                // Body may carry a PBS error message; it never contains the token.
                 let message = response
                     .text()
                     .await
@@ -120,7 +108,6 @@ impl PbsClient {
         })
     }
 
-    /// Maps a transport error, surfacing certificate fingerprint mismatches.
     fn map_transport(&self, err: reqwest::Error) -> PbsError {
         let chain = error_chain(&err);
         if chain.contains("fingerprint mismatch") {
@@ -148,7 +135,6 @@ impl PbsClient {
     }
 }
 
-/// Renders an error and its source chain into a single string.
 fn error_chain(err: &reqwest::Error) -> String {
     let mut out = err.to_string();
     let mut source = std::error::Error::source(err);

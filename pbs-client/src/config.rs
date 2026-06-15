@@ -1,27 +1,15 @@
 use super::error::PbsError;
 use compact_str::CompactString;
-use serde::Deserialize;
-use utoipa::ToSchema;
 
-/// Connection configuration for a Proxmox Backup Server datastore.
-///
-/// Mirrors the panel-side `BackupConfigsPbs`. The `token_secret` is sensitive
-/// and is intentionally redacted from the [`std::fmt::Debug`] output so it can
-/// never end up in logs.
-#[derive(Clone, Deserialize, ToSchema)]
+#[derive(Clone)]
 pub struct PbsConfig {
-    /// Base URL of the PBS API, e.g. `https://pbs.example.com:8007`.
     pub url: CompactString,
     pub datastore: CompactString,
-    #[serde(default)]
     pub namespace: Option<CompactString>,
-    /// PBS user including realm, e.g. `root@pam`.
     pub username: CompactString,
     pub token_name: CompactString,
     pub token_secret: CompactString,
-    /// SHA-256 fingerprint of the PBS TLS certificate (any case, colons optional).
     pub fingerprint: CompactString,
-    #[serde(default)]
     pub backup_id_prefix: Option<CompactString>,
 }
 
@@ -41,7 +29,6 @@ impl std::fmt::Debug for PbsConfig {
 }
 
 impl PbsConfig {
-    /// Validates the required fields and the fingerprint format.
     pub fn validate(&self) -> Result<(), PbsError> {
         for (name, value) in [
             ("url", &self.url),
@@ -69,12 +56,10 @@ impl PbsConfig {
         Ok(())
     }
 
-    /// The API root with any trailing slash trimmed, e.g. `https://host:8007`.
     pub fn base_url(&self) -> &str {
         self.url.trim_end_matches('/')
     }
 
-    /// The effective backup-id prefix, defaulting to `calagopus`.
     pub fn id_prefix(&self) -> &str {
         self.backup_id_prefix
             .as_deref()
