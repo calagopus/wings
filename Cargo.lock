@@ -1431,6 +1431,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fastcdc"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf51ceb43e96afbfe4dd5c6f6082af5dfd60e220820b8123792d61963f2ce6bc"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3719,6 +3725,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -5855,6 +5862,7 @@ dependencies = [
  "base64",
  "blake3",
  "bollard",
+ "bytes",
  "bzip2",
  "cap-std",
  "chrono",
@@ -5869,12 +5877,17 @@ dependencies = [
  "cron",
  "ddup-bak",
  "dialoguer",
+ "fastcdc",
  "flate2",
  "futures",
  "gzp",
+ "h2",
  "hex",
  "hickory-resolver",
+ "http-body-util",
  "human_bytes",
+ "hyper",
+ "hyper-util",
  "ignore",
  "infer",
  "ini-roundtrip",
@@ -5921,6 +5934,7 @@ dependencies = [
  "thin-vec",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml_edit",
  "tower-http",

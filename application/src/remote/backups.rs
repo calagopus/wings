@@ -43,6 +43,23 @@ impl ResticBackupConfiguration {
     }
 }
 
+#[derive(Debug, Clone, ToSchema, Deserialize)]
+pub struct PbsBackupConfiguration {
+    pub url: String,
+    pub datastore: String,
+    pub namespace: Option<String>,
+    pub username: String,
+    pub token_name: String,
+    pub token_secret: String,
+    pub fingerprint: String,
+    pub backup_id_prefix: Option<String>,
+    #[serde(default)]
+    pub server_uuid: Option<uuid::Uuid>,
+    /// The backup's creation time, used verbatim as the PBS snapshot
+    /// `backup-time` at create and at restore/delete.
+    pub backup_time: i64,
+}
+
 pub async fn set_backup_status(
     client: &Client,
     uuid: uuid::Uuid,
@@ -140,6 +157,24 @@ pub async fn backup_restic_configuration(
         client
             .client
             .get(format!("{}/backups/{}/restic", client.url, uuid))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+
+    Ok(response)
+}
+
+pub async fn backup_pbs_configuration(
+    client: &Client,
+    uuid: uuid::Uuid,
+) -> Result<PbsBackupConfiguration, anyhow::Error> {
+    let response: PbsBackupConfiguration = super::into_json(
+        client
+            .client
+            .get(format!("{}/backups/{}/pbs", client.url, uuid))
             .send()
             .await?
             .error_for_status()?

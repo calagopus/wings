@@ -10,6 +10,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 pub mod adapters;
 pub mod manager;
+pub mod pbs;
 
 pub enum Backup {
     Wings(adapters::wings::WingsBackup),
@@ -18,6 +19,7 @@ pub enum Backup {
     Btrfs(adapters::btrfs::BtrfsBackup),
     Zfs(adapters::zfs::ZfsBackup),
     Restic(adapters::restic::ResticBackup),
+    ProxmoxBackupServer(adapters::pbs::PbsBackup),
 }
 
 impl Backup {
@@ -29,6 +31,7 @@ impl Backup {
             Backup::Btrfs(backup) => backup.uuid(),
             Backup::Zfs(backup) => backup.uuid(),
             Backup::Restic(backup) => backup.uuid(),
+            Backup::ProxmoxBackupServer(backup) => backup.uuid(),
         }
     }
 
@@ -41,6 +44,7 @@ impl Backup {
             Backup::Btrfs(_) => adapters::BackupAdapter::Btrfs,
             Backup::Zfs(_) => adapters::BackupAdapter::Zfs,
             Backup::Restic(_) => adapters::BackupAdapter::Restic,
+            Backup::ProxmoxBackupServer(_) => adapters::BackupAdapter::ProxmoxBackupServer,
         }
     }
 
@@ -57,6 +61,9 @@ impl Backup {
             Backup::Btrfs(backup) => backup.download(state, archive_format, range).await,
             Backup::Zfs(backup) => backup.download(state, archive_format, range).await,
             Backup::Restic(backup) => backup.download(state, archive_format, range).await,
+            Backup::ProxmoxBackupServer(backup) => {
+                backup.download(state, archive_format, range).await
+            }
         }
     }
 
@@ -74,6 +81,9 @@ impl Backup {
             Backup::Btrfs(backup) => backup.restore(server, progress, total, download_url).await,
             Backup::Zfs(backup) => backup.restore(server, progress, total, download_url).await,
             Backup::Restic(backup) => backup.restore(server, progress, total, download_url).await,
+            Backup::ProxmoxBackupServer(backup) => {
+                backup.restore(server, progress, total, download_url).await
+            }
         }
     }
 
@@ -85,6 +95,7 @@ impl Backup {
             Backup::Btrfs(backup) => backup.delete(state).await,
             Backup::Zfs(backup) => backup.delete(state).await,
             Backup::Restic(backup) => backup.delete(state).await,
+            Backup::ProxmoxBackupServer(backup) => backup.delete(state).await,
         }
     }
 
@@ -99,6 +110,7 @@ impl Backup {
             Backup::Btrfs(backup) => backup.browse(server).await,
             Backup::Zfs(backup) => backup.browse(server).await,
             Backup::Restic(backup) => backup.browse(server).await,
+            Backup::ProxmoxBackupServer(backup) => backup.browse(server).await,
         }
     }
 }

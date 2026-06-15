@@ -15,7 +15,7 @@ serde = { version = "1.0.138", features = ["derive"] }
 serde_json = { version = "1.0.139", features = ["preserve_order"] }
 utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
 utoipa-axum = "0.2.0"
-reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", "stream"] }
+reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", "query", "stream"] }
 tokio = { version = "1.43.0", features = ["fs", "net", "signal", "process"] }
 tokio-util = { version = "0.7.15", features = ["io-util"] }
 chrono = { version = "0.4.40", features = ["serde"] }
