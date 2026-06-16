@@ -23,6 +23,8 @@ crc32fast = "1.4.2"
 fastcdc = "3.2.1"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 hex = "0.4.3"
+tar = "0.4.44"
+pxar = { git = "https://github.com/proxmox/pxar", rev = "091a8a382d0d6fc71025351fb35c51b1f3b0074d", default-features = false }
 compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", version = "0.9.0", features = ["serde"] }
 
 [lints.clippy]

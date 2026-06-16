@@ -5,6 +5,7 @@ use crate::{
         limited_reader::LimitedReader,
         limited_writer::LimitedWriter,
     },
+    models::DirectoryEntry,
     remote::backups::{PbsBackupConfiguration, RawServerBackup},
     response::ApiResponse,
     server::{
@@ -14,8 +15,13 @@ use crate::{
                 StreamableArchiveFormat,
                 create::{CreateTarOptions, create_tar},
             },
+            cap::CapFilesystem,
             file::ServerFile,
-            virtualfs::{ByteRange, VirtualReadableFilesystem},
+            virtualfs::{
+                AsyncFileRead, ByteRange, DirectoryListing, DirectoryStreamWalk, DirectoryWalk,
+                FileMetadata, FileRead, IsIgnoredFn, VirtualReadableFilesystem,
+                cap::VirtualCapFilesystem,
+            },
         },
     },
     utils::PortablePermissions,
@@ -117,6 +123,7 @@ impl BackupCreateExt for PbsBackup {
 
         let backup_id = naming::backup_id(config.id_prefix(), server.uuid);
 
+        let (tar_reader, tar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
         let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let total_task = {
@@ -152,22 +159,10 @@ impl BackupCreateExt for PbsBackup {
 
             async move {
                 let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-                let writer = SyncIoBridge::new(archive_writer);
-                let writer = LimitedWriter::new_with_bytes_per_second(
-                    writer,
-                    server
-                        .app_state
-                        .config
-                        .load()
-                        .system
-                        .backups
-                        .write_limit
-                        .as_bytes(),
-                );
 
                 let file = create_tar(
                     server.filesystem.clone(),
-                    writer,
+                    SyncIoBridge::new(tar_writer),
                     Path::new(""),
                     sources,
                     Some(Arc::clone(&progress)),
@@ -193,9 +188,36 @@ impl BackupCreateExt for PbsBackup {
                 )
                 .await?;
 
-                file.into_inner().into_inner().shutdown().await?;
+                file.into_inner().shutdown().await?;
 
                 Ok::<_, anyhow::Error>(())
+            }
+        };
+
+        let pxar_task = {
+            let server = server.clone();
+
+            async move {
+                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                    let mut writer = LimitedWriter::new_with_bytes_per_second(
+                        SyncIoBridge::new(archive_writer),
+                        server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .write_limit
+                            .as_bytes(),
+                    );
+
+                    pbs_client::pxar_archive::tar_to_pxar(SyncIoBridge::new(tar_reader), &mut writer)?;
+                    writer.flush()?;
+                    writer.into_inner().shutdown()?;
+
+                    Ok(())
+                })
+                .await?
             }
         };
 
@@ -233,8 +255,8 @@ impl BackupCreateExt for PbsBackup {
             }
         };
 
-        let (total_files, _, (size, checksum)) =
-            tokio::try_join!(total_task, archive_task, pbs_task)?;
+        let (total_files, _, _, (size, checksum)) =
+            tokio::try_join!(total_task, archive_task, pxar_task, pbs_task)?;
 
         Ok(RawServerBackup {
             checksum,
@@ -242,7 +264,7 @@ impl BackupCreateExt for PbsBackup {
             size,
             files: total_files,
             successful: true,
-            browsable: false,
+            browsable: true,
             streaming: false,
             parts: vec![],
         })
@@ -272,15 +294,24 @@ impl BackupExt for PbsBackup {
         let reader =
             PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
 
+        let (pxar_reader, pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
         let (tar_reader, tar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
         let (out_reader, out_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         tokio::spawn(async move {
-            let mut tar_writer = tar_writer;
-            if let Err(err) = reader.reassemble_archive(&mut tar_writer, None).await {
+            let mut pxar_writer = pxar_writer;
+            if let Err(err) = reader.reassemble_archive(&mut pxar_writer, None).await {
                 tracing::error!("failed to reassemble PBS archive for download: {:?}", err);
             }
-            let _ = tar_writer.shutdown().await;
+            let _ = pxar_writer.shutdown().await;
+        });
+
+        crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+            let mut tar_writer = SyncIoBridge::new(tar_writer);
+            pbs_client::pxar_archive::pxar_to_tar(SyncIoBridge::new(pxar_reader), &mut tar_writer)?;
+            tar_writer.shutdown()?;
+
+            Ok(())
         });
 
         let compression_type = archive_format.compression_format();
@@ -341,25 +372,36 @@ impl BackupExt for PbsBackup {
             }
         }
 
-        let (pipe_reader, pipe_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (pxar_reader, pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (tar_reader, tar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let fetch_task = {
             let progress = Arc::clone(&progress);
             async move {
-                let mut pipe_writer = pipe_writer;
+                let mut pxar_writer = pxar_writer;
                 reader
-                    .reassemble_archive(&mut pipe_writer, Some(progress))
+                    .reassemble_archive(&mut pxar_writer, Some(progress))
                     .await?;
-                pipe_writer.shutdown().await?;
+                pxar_writer.shutdown().await?;
                 Ok::<_, anyhow::Error>(())
             }
+        };
+
+        let pxar_task = async move {
+            tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                let mut tar_writer = SyncIoBridge::new(tar_writer);
+                pbs_client::pxar_archive::pxar_to_tar(SyncIoBridge::new(pxar_reader), &mut tar_writer)?;
+                tar_writer.shutdown()?;
+                Ok(())
+            })
+            .await?
         };
 
         let extract_task = {
             let server = server.clone();
             async move {
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader = SyncIoBridge::new(pipe_reader);
+                    let reader = SyncIoBridge::new(tar_reader);
                     let reader = LimitedReader::new_with_bytes_per_second(
                         reader,
                         server
@@ -460,7 +502,7 @@ impl BackupExt for PbsBackup {
             }
         };
 
-        tokio::try_join!(fetch_task, extract_task)?;
+        tokio::try_join!(fetch_task, pxar_task, extract_task)?;
 
         server.filesystem.rerun_disk_checker().await;
 
@@ -490,11 +532,208 @@ impl BackupExt for PbsBackup {
 
     async fn browse(
         &self,
-        _server: &crate::server::Server,
+        server: &crate::server::Server,
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
-        Err(anyhow::anyhow!(
-            "this backup adapter does not support browsing files"
-        ))
+        let reader =
+            PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
+
+        let temp_dir = std::env::temp_dir().join(format!("calagopus-pbs-browse-{}", self.uuid));
+        tokio::fs::remove_dir_all(&temp_dir).await.ok();
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        let guard = BrowseTempDir(temp_dir.clone());
+
+        let (pxar_reader, pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (tar_reader, tar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+
+        let fetch_task = async move {
+            let mut pxar_writer = pxar_writer;
+            reader.reassemble_archive(&mut pxar_writer, None).await?;
+            pxar_writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let pxar_task = async move {
+            tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                let mut tar_writer = SyncIoBridge::new(tar_writer);
+                pbs_client::pxar_archive::pxar_to_tar(SyncIoBridge::new(pxar_reader), &mut tar_writer)?;
+                tar_writer.shutdown()?;
+
+                Ok(())
+            })
+            .await?
+        };
+
+        let extract_task = {
+            let temp_dir = temp_dir.clone();
+
+            async move {
+                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                    tar::Archive::new(SyncIoBridge::new(tar_reader)).unpack(&temp_dir)?;
+
+                    Ok(())
+                })
+                .await?
+            }
+        };
+
+        tokio::try_join!(fetch_task, pxar_task, extract_task)?;
+
+        let inner = CapFilesystem::new(temp_dir).await?.get_virtual(server.clone());
+
+        Ok(Arc::new(ExtractedBackup {
+            inner,
+            _guard: guard,
+        }))
+    }
+}
+
+/// Removes the backup's extracted temp directory once the cached browse
+/// filesystem is dropped (covers both explicit invalidation and TTL eviction,
+/// the latter of which never calls `close`).
+struct BrowseTempDir(std::path::PathBuf);
+
+impl Drop for BrowseTempDir {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.0)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.0.display(), "failed to remove PBS browse temp dir: {:?}", err);
+        }
+    }
+}
+
+/// A PBS snapshot extracted to a temp directory and served through the standard
+/// directory-backed virtual filesystem.
+struct ExtractedBackup {
+    inner: VirtualCapFilesystem,
+    _guard: BrowseTempDir,
+}
+
+#[async_trait::async_trait]
+impl VirtualReadableFilesystem for ExtractedBackup {
+    fn is_fast(&self) -> bool {
+        self.inner.is_fast()
+    }
+
+    fn backing_server(&self) -> &crate::server::Server {
+        self.inner.backing_server()
+    }
+
+    fn metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<FileMetadata, anyhow::Error> {
+        self.inner.metadata(path)
+    }
+    async fn async_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<FileMetadata, anyhow::Error> {
+        self.inner.async_metadata(path).await
+    }
+
+    fn symlink_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<FileMetadata, anyhow::Error> {
+        self.inner.symlink_metadata(path)
+    }
+    async fn async_symlink_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<FileMetadata, anyhow::Error> {
+        self.inner.async_symlink_metadata(path).await
+    }
+
+    async fn async_directory_entry(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        self.inner.async_directory_entry(path).await
+    }
+    async fn async_directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        self.inner.async_directory_entry_buffer(path, buffer).await
+    }
+
+    async fn async_read_dir(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
+    ) -> Result<DirectoryListing, anyhow::Error> {
+        self.inner
+            .async_read_dir(path, per_page, page, is_ignored, sort)
+            .await
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        self.inner.async_walk_dir(path, is_ignored).await
+    }
+    async fn async_walk_dir_stream<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+        self.inner.async_walk_dir_stream(path, is_ignored).await
+    }
+
+    fn read_file(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        range: Option<ByteRange>,
+    ) -> Result<FileRead, anyhow::Error> {
+        self.inner.read_file(path, range)
+    }
+    async fn async_read_file(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        range: Option<ByteRange>,
+    ) -> Result<AsyncFileRead, anyhow::Error> {
+        self.inner.async_read_file(path, range).await
+    }
+    fn read_symlink(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<std::path::PathBuf, anyhow::Error> {
+        self.inner.read_symlink(path)
+    }
+    async fn async_read_symlink(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<std::path::PathBuf, anyhow::Error> {
+        self.inner.async_read_symlink(path).await
+    }
+
+    async fn async_read_dir_archive(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        archive_format: StreamableArchiveFormat,
+        compression_level: crate::io::compression::CompressionLevel,
+        bytes_archived: Option<Arc<AtomicU64>>,
+        is_ignored: IsIgnoredFn,
+    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+        self.inner
+            .async_read_dir_archive(
+                path,
+                archive_format,
+                compression_level,
+                bytes_archived,
+                is_ignored,
+            )
+            .await
+    }
+
+    async fn close(&self) -> Result<(), anyhow::Error> {
+        self.inner.close().await
     }
 }
 

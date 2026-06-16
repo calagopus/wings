@@ -6,6 +6,7 @@ pub mod error;
 pub mod h2;
 pub mod manifest;
 pub mod naming;
+pub mod pxar_archive;
 pub mod reader;
 pub mod rest;
 pub mod tls;

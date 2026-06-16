@@ -9,7 +9,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-pub const ARCHIVE_NAME: &str = "backup.tar.didx";
+pub const ARCHIVE_NAME: &str = "root.pxar.didx";
 pub const META_BLOB_NAME: &str = "calagopus.json.blob";
 
 pub struct UploadedArchive {
