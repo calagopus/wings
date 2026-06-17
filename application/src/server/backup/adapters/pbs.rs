@@ -205,7 +205,18 @@ impl BackupCreateExt for PbsBackup {
                 let reader = SyncIoBridge::new(archive_reader);
                 let mut writer = PbsBackupWriter::connect(&config, &backup_id, backup_time).await?;
 
-                let archive = writer.upload_archive(reader).await?;
+                let known_chunks = match writer.previous_archive_digests(ARCHIVE_NAME).await {
+                    Ok(digests) => digests,
+                    Err(err) => {
+                        tracing::debug!(
+                            "no reusable chunks from previous PBS snapshot, uploading full archive: {:?}",
+                            err
+                        );
+                        Default::default()
+                    }
+                };
+
+                let archive = writer.upload_archive(reader, known_chunks).await?;
 
                 let catalog = catalog_rx
                     .await
@@ -214,6 +225,7 @@ impl BackupCreateExt for PbsBackup {
                     .upload_archive_named(
                         pbs_client::catalog::CATALOG_NAME,
                         std::io::Cursor::new(catalog),
+                        Default::default(),
                     )
                     .await?;
 

@@ -7,7 +7,7 @@ use super::{
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::{collections::HashSet, io::Read};
 
 pub const ARCHIVE_NAME: &str = "root.pxar.didx";
 pub const ARCHIVE_PXAR_NAME: &str = "root.pxar";
@@ -24,6 +24,11 @@ fn stream_chunker<R: Read>(reader: R) -> fastcdc::v2020::StreamCDC<R> {
 pub struct UploadedArchive {
     pub file: FileInfo,
     pub size: u64,
+}
+
+enum ChunkMessage {
+    Known { digest: [u8; 32], size: u64 },
+    New(EncodedBlob),
 }
 
 pub fn index_csum(entries: &[(u64, [u8; 32])]) -> [u8; 32] {
@@ -58,17 +63,33 @@ impl PbsBackupWriter {
         Ok(Self { transport })
     }
 
+    pub async fn previous_archive_digests(
+        &self,
+        archive_name: &str,
+    ) -> Result<HashSet<[u8; 32]>, PbsError> {
+        let index = self
+            .transport
+            .download("previous", &[("archive-name", archive_name.to_string())])
+            .await?;
+        Ok(crate::reader::parse_dynamic_index(&index)?
+            .into_iter()
+            .collect())
+    }
+
     pub async fn upload_archive<R: Read + Send + 'static>(
         &mut self,
         reader: R,
+        known_chunks: HashSet<[u8; 32]>,
     ) -> Result<UploadedArchive, PbsError> {
-        self.upload_archive_named(ARCHIVE_NAME, reader).await
+        self.upload_archive_named(ARCHIVE_NAME, reader, known_chunks)
+            .await
     }
 
     pub async fn upload_archive_named<R: Read + Send + 'static>(
         &mut self,
         archive_name: &str,
         reader: R,
+        known_chunks: HashSet<[u8; 32]>,
     ) -> Result<UploadedArchive, PbsError> {
         let wid = self
             .transport
@@ -80,11 +101,23 @@ impl PbsBackupWriter {
             .as_u64()
             .ok_or_else(|| PbsError::Decode("dynamic_index did not return a wid".into()))?;
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<EncodedBlob, String>>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<ChunkMessage, String>>(4);
         let producer = tokio::task::spawn_blocking(move || {
+            let mut known = known_chunks;
             for chunk in stream_chunker(reader) {
                 let message = match chunk {
-                    Ok(chunk) => Ok(datablob::encode_blob(&chunk.data)),
+                    Ok(chunk) => {
+                        let digest = datablob::sha256(&chunk.data);
+                        if known.contains(&digest) {
+                            Ok(ChunkMessage::Known {
+                                digest,
+                                size: chunk.data.len() as u64,
+                            })
+                        } else {
+                            known.insert(digest);
+                            Ok(ChunkMessage::New(datablob::encode_blob(&chunk.data)))
+                        }
+                    }
                     Err(err) => Err(err.to_string()),
                 };
                 let failed = message.is_err();
@@ -100,28 +133,36 @@ impl PbsBackupWriter {
         let mut end_offset: u64 = 0;
 
         while let Some(message) = rx.recv().await {
-            let blob = message.map_err(|err| PbsError::Transport(err.into()))?;
+            let message = message.map_err(|err| PbsError::Transport(err.into()))?;
             let start_offset = end_offset;
-            end_offset += blob.plaintext_size;
 
-            let digest_hex = hex::encode(blob.digest);
-            self.transport
-                .upload(
-                    hyper::Method::POST,
-                    "dynamic_chunk",
-                    &[
-                        ("wid", wid.to_string()),
-                        ("digest", digest_hex.clone()),
-                        ("size", blob.plaintext_size.to_string()),
-                        ("encoded-size", blob.data.len().to_string()),
-                    ],
-                    "application/octet-stream",
-                    Bytes::from(blob.data),
-                )
-                .await?;
+            let digest = match message {
+                ChunkMessage::Known { digest, size } => {
+                    end_offset += size;
+                    digest
+                }
+                ChunkMessage::New(blob) => {
+                    end_offset += blob.plaintext_size;
+                    self.transport
+                        .upload(
+                            hyper::Method::POST,
+                            "dynamic_chunk",
+                            &[
+                                ("wid", wid.to_string()),
+                                ("digest", hex::encode(blob.digest)),
+                                ("size", blob.plaintext_size.to_string()),
+                                ("encoded-size", blob.data.len().to_string()),
+                            ],
+                            "application/octet-stream",
+                            Bytes::from(blob.data),
+                        )
+                        .await?;
+                    blob.digest
+                }
+            };
 
-            entries.push((end_offset, blob.digest));
-            digest_list.push(digest_hex);
+            entries.push((end_offset, digest));
+            digest_list.push(hex::encode(digest));
             offset_list.push(start_offset);
         }
 
