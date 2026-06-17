@@ -1,4 +1,4 @@
-use super::{auth::authorization_header, config::PbsConfig, error::PbsError, tls};
+use super::{config::PbsConfig, error::PbsError, tls};
 use compact_str::CompactString;
 use reqwest::{
     StatusCode,
@@ -18,7 +18,7 @@ impl PbsClient {
         let tls = tls::build_client_config(&config.fingerprint).map_err(PbsError::Config)?;
 
         let mut headers = HeaderMap::new();
-        let mut auth = HeaderValue::from_str(&authorization_header(&config))
+        let mut auth = HeaderValue::from_str(&config.authorization_header())
             .map_err(|_| PbsError::Config("token contains invalid header characters".into()))?;
         auth.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth);
@@ -85,7 +85,7 @@ impl PbsClient {
 
         Err(match status {
             StatusCode::UNAUTHORIZED => PbsError::Unauthorized {
-                user: self.config.username.clone(),
+                token_id: self.config.token_id.clone(),
             },
             StatusCode::FORBIDDEN => PbsError::Forbidden {
                 datastore: self.config.datastore.clone(),

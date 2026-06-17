@@ -1,6 +1,9 @@
-use super::{auth, config::PbsConfig, error::PbsError, naming, tls};
+use super::{config::PbsConfig, error::PbsError, naming, tls};
 use bytes::Bytes;
-use std::{future::poll_fn, sync::Arc};
+use std::{
+    future::poll_fn,
+    sync::{Arc, Mutex},
+};
 
 const WINDOW_SIZE: u32 = (1 << 31) - 2;
 const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
@@ -84,9 +87,15 @@ pub fn unwrap_data(body: &[u8]) -> Result<serde_json::Value, PbsError> {
         .unwrap_or(serde_json::Value::Null))
 }
 
+struct ConnectionTasks {
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
 pub struct H2Transport {
     send: h2::client::SendRequest<Bytes>,
     authority: String,
+    tasks: Arc<ConnectionTasks>,
 }
 
 impl H2Transport {
@@ -116,16 +125,15 @@ impl H2Transport {
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
                 .await
                 .map_err(transport)?;
-        tokio::spawn(connection.with_upgrades());
+        let upgrade_task = tokio::spawn(async move {
+            let _ = connection.with_upgrades().await;
+        });
 
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(format!("/api2/json/{endpoint}?{session_query}"))
             .header(hyper::header::HOST, &authority)
-            .header(
-                hyper::header::AUTHORIZATION,
-                auth::authorization_header(config),
-            )
+            .header(hyper::header::AUTHORIZATION, config.authorization_header())
             .header(hyper::header::CONNECTION, "upgrade")
             .header(hyper::header::UPGRADE, protocol)
             .body(http_body_util::Empty::<Bytes>::new())
@@ -136,15 +144,30 @@ impl H2Transport {
         if status != hyper::StatusCode::SWITCHING_PROTOCOLS {
             return Err(match status {
                 hyper::StatusCode::UNAUTHORIZED => PbsError::Unauthorized {
-                    user: config.username.clone(),
+                    token_id: config.token_id.clone(),
                 },
                 hyper::StatusCode::FORBIDDEN => PbsError::Forbidden {
                     datastore: config.datastore.clone(),
                 },
-                other => PbsError::Http {
-                    status: other.as_u16(),
-                    message: "PBS did not upgrade the backup protocol connection".into(),
-                },
+                other => {
+                    let body = http_body_util::BodyExt::collect(response.into_body())
+                        .await
+                        .map(|body| body.to_bytes())
+                        .unwrap_or_default();
+                    let detail = String::from_utf8_lossy(&body)
+                        .chars()
+                        .take(512)
+                        .collect::<String>();
+                    let message = if detail.trim().is_empty() {
+                        "PBS did not upgrade the backup protocol connection".to_string()
+                    } else {
+                        format!("PBS did not upgrade the backup protocol connection: {detail}")
+                    };
+                    PbsError::Http {
+                        status: other.as_u16(),
+                        message: message.into(),
+                    }
+                }
             });
         }
 
@@ -156,11 +179,34 @@ impl H2Transport {
             .handshake(hyper_util::rt::TokioIo::new(upgraded))
             .await
             .map_err(transport)?;
-        tokio::spawn(async move {
+        let driver_task = tokio::spawn(async move {
             let _ = h2_connection.await;
         });
 
-        Ok(Self { send, authority })
+        Ok(Self {
+            send,
+            authority,
+            tasks: Arc::new(ConnectionTasks {
+                handles: Mutex::new(vec![upgrade_task, driver_task]),
+            }),
+        })
+    }
+
+    pub async fn close(&self) {
+        let handles = {
+            let mut guard = self
+                .tasks
+                .handles
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     fn build_request(
@@ -217,12 +263,16 @@ impl H2Transport {
     }
 
     pub async fn download(
-        &mut self,
+        &self,
         path: &str,
         params: &[(&str, String)],
     ) -> Result<Vec<u8>, PbsError> {
         let request = self.build_request(hyper::Method::GET, path, &encode_query(params), None)?;
-        let (response, _send) = self.send.send_request(request, true).map_err(transport)?;
+        let (response, _send) = self
+            .send
+            .clone()
+            .send_request(request, true)
+            .map_err(transport)?;
         self.read_body(response).await
     }
 

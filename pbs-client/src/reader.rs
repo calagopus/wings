@@ -69,7 +69,7 @@ impl PbsBackupReader {
     }
 }
 
-pub fn parse_dynamic_index(data: &[u8]) -> Result<Vec<[u8; 32]>, PbsError> {
+pub fn parse_dynamic_index_entries(data: &[u8]) -> Result<Vec<(u64, [u8; 32])>, PbsError> {
     let entries = data
         .get(DYNAMIC_INDEX_HEADER_SIZE..)
         .ok_or_else(|| PbsError::Decode("dynamic index shorter than its header".into()))?;
@@ -80,15 +80,28 @@ pub fn parse_dynamic_index(data: &[u8]) -> Result<Vec<[u8; 32]>, PbsError> {
         ));
     }
 
-    let mut digests = Vec::with_capacity(entries.len() / DYNAMIC_INDEX_ENTRY_SIZE);
+    let mut out = Vec::with_capacity(entries.len() / DYNAMIC_INDEX_ENTRY_SIZE);
     for entry in entries.chunks_exact(DYNAMIC_INDEX_ENTRY_SIZE) {
+        let offset_bytes = entry
+            .get(0..8)
+            .ok_or_else(|| PbsError::Decode("dynamic index entry too short".into()))?;
         let digest_bytes = entry
             .get(8..DYNAMIC_INDEX_ENTRY_SIZE)
             .ok_or_else(|| PbsError::Decode("dynamic index entry too short".into()))?;
-        let mut digest = [0u8; 32];
+
+        let mut offset = [0; 8];
+        offset.copy_from_slice(offset_bytes);
+        let mut digest = [0; 32];
         digest.copy_from_slice(digest_bytes);
-        digests.push(digest);
+        out.push((u64::from_le_bytes(offset), digest));
     }
 
-    Ok(digests)
+    Ok(out)
+}
+
+pub fn parse_dynamic_index(data: &[u8]) -> Result<Vec<[u8; 32]>, PbsError> {
+    Ok(parse_dynamic_index_entries(data)?
+        .into_iter()
+        .map(|(_, digest)| digest)
+        .collect())
 }

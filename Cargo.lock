@@ -3205,6 +3205,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "siphasher",
+ "tar",
  "tokio",
  "tokio-rustls",
  "uuid",

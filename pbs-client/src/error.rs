@@ -4,7 +4,7 @@ use compact_str::CompactString;
 pub enum PbsError {
     Config(CompactString),
     Unauthorized {
-        user: CompactString,
+        token_id: CompactString,
     },
     Forbidden {
         datastore: CompactString,
@@ -28,9 +28,9 @@ impl std::fmt::Display for PbsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PbsError::Config(msg) => write!(f, "invalid PBS configuration: {msg}"),
-            PbsError::Unauthorized { user } => write!(
+            PbsError::Unauthorized { token_id } => write!(
                 f,
-                "PBS rejected the API token (HTTP 401); verify the token name and secret for user '{user}'"
+                "PBS rejected the API token (HTTP 401); verify the token id and secret for '{token_id}'"
             ),
             PbsError::Forbidden { datastore } => write!(
                 f,

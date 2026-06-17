@@ -6,8 +6,8 @@ pub struct PbsConfig {
     pub url: CompactString,
     pub datastore: CompactString,
     pub namespace: Option<CompactString>,
-    pub username: CompactString,
-    pub token_name: CompactString,
+    /// Full API token id, e.g. `user@realm!tokenname`.
+    pub token_id: CompactString,
     pub token_secret: CompactString,
     pub fingerprint: CompactString,
     pub backup_id_prefix: Option<CompactString>,
@@ -19,8 +19,7 @@ impl std::fmt::Debug for PbsConfig {
             .field("url", &self.url)
             .field("datastore", &self.datastore)
             .field("namespace", &self.namespace)
-            .field("username", &self.username)
-            .field("token_name", &self.token_name)
+            .field("token_id", &self.token_id)
             .field("token_secret", &"<redacted>")
             .field("fingerprint", &self.fingerprint)
             .field("backup_id_prefix", &self.backup_id_prefix)
@@ -33,8 +32,7 @@ impl PbsConfig {
         for (name, value) in [
             ("url", &self.url),
             ("datastore", &self.datastore),
-            ("username", &self.username),
-            ("token_name", &self.token_name),
+            ("token_id", &self.token_id),
             ("token_secret", &self.token_secret),
             ("fingerprint", &self.fingerprint),
         ] {
@@ -54,6 +52,10 @@ impl PbsConfig {
         super::tls::normalize_fingerprint(&self.fingerprint).map_err(PbsError::Config)?;
 
         Ok(())
+    }
+
+    pub fn authorization_header(&self) -> String {
+        format!("PBSAPIToken={}:{}", self.token_id, self.token_secret)
     }
 
     pub fn base_url(&self) -> &str {

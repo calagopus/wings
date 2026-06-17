@@ -1,12 +1,12 @@
-pub mod auth;
-pub mod chunker;
+pub mod accessor;
+pub mod catalog;
 pub mod config;
 pub mod datablob;
 pub mod error;
 pub mod h2;
 pub mod manifest;
 pub mod naming;
-pub mod pxar_archive;
+pub mod pxar;
 pub mod reader;
 pub mod rest;
 pub mod tls;

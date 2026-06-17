@@ -12,9 +12,9 @@ const FINGERPRINT_ERROR: &str =
     "fingerprint must be a SHA-256 hash (64 hex characters, colons optional)";
 
 pub fn normalize_fingerprint(fingerprint: &str) -> Result<[u8; 32], CompactString> {
-    let mut out = [0u8; 32];
-    let mut count = 0usize;
-    let mut high: Option<u8> = None;
+    let mut out = [0; 32];
+    let mut count = 0;
+    let mut high = None;
 
     for ch in fingerprint.chars() {
         if ch.is_whitespace() || ch == ':' {
@@ -47,7 +47,7 @@ pub fn normalize_fingerprint(fingerprint: &str) -> Result<[u8; 32], CompactStrin
 
 pub fn cert_sha256(der: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(der);
-    let mut out = [0u8; 32];
+    let mut out = [0; 32];
     out.copy_from_slice(&digest);
     out
 }

@@ -45,7 +45,7 @@ impl RevisionRow {
         let user_blob: Option<Vec<u8>> = r.get(5)?;
         let user = user_blob.and_then(|b| {
             if b.len() == 16 {
-                let mut bytes = [0u8; 16];
+                let mut bytes = [0; 16];
                 bytes.copy_from_slice(&b);
                 Some(uuid::Uuid::from_bytes(bytes))
             } else {
@@ -53,7 +53,7 @@ impl RevisionRow {
             }
         });
         let hash_blob: Vec<u8> = r.get(8)?;
-        let mut hash = [0u8; 32];
+        let mut hash = [0; 32];
         if hash_blob.len() == 32 {
             hash.copy_from_slice(&hash_blob);
         }
@@ -293,10 +293,11 @@ impl Storage {
                     params![rid],
                     |r| {
                         let hb: Vec<u8> = r.get(3)?;
-                        let mut hash = [0u8; 32];
+                        let mut hash = [0; 32];
                         if hb.len() == 32 {
                             hash.copy_from_slice(&hb);
                         }
+
                         Ok((
                             r.get::<_, i64>(0)?,
                             r.get::<_, Option<i64>>(1)?,

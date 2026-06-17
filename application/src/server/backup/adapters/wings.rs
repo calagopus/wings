@@ -264,7 +264,7 @@ impl BackupCreateExt for WingsBackup {
                 }
             }?;
 
-            file.into_inner().sync_all()?;
+            tokio::task::spawn_blocking(move || file.into_inner().sync_all()).await??;
 
             Ok(())
         };

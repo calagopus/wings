@@ -16,7 +16,7 @@ pub struct EncodedBlob {
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
-    let mut out = [0u8; 32];
+    let mut out = [0; 32];
     out.copy_from_slice(&digest);
     out
 }

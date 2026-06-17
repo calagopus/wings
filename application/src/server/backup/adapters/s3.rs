@@ -280,7 +280,7 @@ impl S3Backup {
                 let mut url_queue: std::collections::VecDeque<String> =
                     initial_urls.into_iter().collect();
                 let mut part_number = 1;
-                let mut buffer = vec![0u8; crate::BUFFER_SIZE];
+                let mut buffer = vec![0; crate::BUFFER_SIZE];
 
                 'parts: loop {
                     scratch.seek(std::io::SeekFrom::Start(0)).await?;

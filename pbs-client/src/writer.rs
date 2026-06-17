@@ -10,7 +10,16 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 pub const ARCHIVE_NAME: &str = "root.pxar.didx";
+pub const ARCHIVE_PXAR_NAME: &str = "root.pxar";
 pub const META_BLOB_NAME: &str = "calagopus.json.blob";
+
+const MIN_CHUNK_SIZE: u32 = 1024 * 1024;
+const AVG_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+const MAX_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
+
+fn stream_chunker<R: Read>(reader: R) -> fastcdc::v2020::StreamCDC<R> {
+    fastcdc::v2020::StreamCDC::new(reader, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE)
+}
 
 pub struct UploadedArchive {
     pub file: FileInfo,
@@ -23,7 +32,8 @@ pub fn index_csum(entries: &[(u64, [u8; 32])]) -> [u8; 32] {
         hasher.update(end_offset.to_le_bytes());
         hasher.update(digest);
     }
-    let mut out = [0u8; 32];
+
+    let mut out = [0; 32];
     out.copy_from_slice(&hasher.finalize());
     out
 }
@@ -52,11 +62,19 @@ impl PbsBackupWriter {
         &mut self,
         reader: R,
     ) -> Result<UploadedArchive, PbsError> {
+        self.upload_archive_named(ARCHIVE_NAME, reader).await
+    }
+
+    pub async fn upload_archive_named<R: Read + Send + 'static>(
+        &mut self,
+        archive_name: &str,
+        reader: R,
+    ) -> Result<UploadedArchive, PbsError> {
         let wid = self
             .transport
             .post(
                 "dynamic_index",
-                &[("archive-name", ARCHIVE_NAME.to_string())],
+                &[("archive-name", archive_name.to_string())],
             )
             .await?
             .as_u64()
@@ -64,7 +82,7 @@ impl PbsBackupWriter {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<EncodedBlob, String>>(4);
         let producer = tokio::task::spawn_blocking(move || {
-            for chunk in super::chunker::stream_chunker(reader) {
+            for chunk in stream_chunker(reader) {
                 let message = match chunk {
                     Ok(chunk) => Ok(datablob::encode_blob(&chunk.data)),
                     Err(err) => Err(err.to_string()),
@@ -140,7 +158,7 @@ impl PbsBackupWriter {
             .await?;
 
         Ok(UploadedArchive {
-            file: FileInfo::new(ARCHIVE_NAME, end_offset, &csum),
+            file: FileInfo::new(archive_name, end_offset, &csum),
             size: end_offset,
         })
     }
