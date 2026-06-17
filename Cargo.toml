@@ -5,23 +5,19 @@ default-members = ["application"]
 package.rust-version = "1.95.0"
 
 [workspace.dependencies]
-anyhow = "1.0.98"
-axum = { version = "0.8.1", features = ["http2", "ws", "multipart"] }
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-axum-extra = { version = "0.12.1", features = ["query"] }
-tower-http = { version = "0.6.2", features = ["catch-panic"] }
-bollard = "0.21.0"
 serde = { version = "1.0.138", features = ["derive"] }
 serde_json = { version = "1.0.139", features = ["preserve_order"] }
-utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
-utoipa-axum = "0.2.0"
 reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", "query", "stream"] }
 tokio = { version = "1.43.0", features = ["fs", "net", "signal", "process"] }
-tokio-util = { version = "0.7.15", features = ["io-util"] }
-chrono = { version = "0.4.40", features = ["serde"] }
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
-rand = "0.10.0"
-regex = "1.12.2"
+rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
+bytes = "1"
+sha2 = "0.11.0"
+crc32fast = "1.4.2"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
+hex = "0.4.3"
+tar = "0.4.44"
+compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", version = "0.9.0", features = ["serde"] }
 
 [profile.dev.package."*"]
 opt-level = 2

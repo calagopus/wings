@@ -16,17 +16,16 @@ hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26.4"
-rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
-bytes = "1"
-sha2 = "0.11.0"
-crc32fast = "1.4.2"
-fastcdc = "3.2.1"
-zstd = { version = "0.13.3", features = ["zstdmt"] }
-hex = "0.4.3"
-tar = "0.4.44"
-# Goodbye-table filename hashing for the in-tree `pxar` module (see src/pxar/).
+rustls = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+crc32fast = { workspace = true }
+fastcdc = "4.0.1"
+zstd = { workspace = true }
+hex = { workspace = true }
+tar = { workspace = true }
 siphasher = "1"
-compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", version = "0.9.0", features = ["serde"] }
+compact_str = { workspace = true }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

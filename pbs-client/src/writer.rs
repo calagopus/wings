@@ -13,9 +13,9 @@ pub const ARCHIVE_NAME: &str = "root.pxar.didx";
 pub const ARCHIVE_PXAR_NAME: &str = "root.pxar";
 pub const META_BLOB_NAME: &str = "calagopus.json.blob";
 
-const MIN_CHUNK_SIZE: u32 = 1024 * 1024;
-const AVG_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
-const MAX_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
+const MIN_CHUNK_SIZE: usize = 1024 * 1024;
+const AVG_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 fn stream_chunker<R: Read>(reader: R) -> fastcdc::v2020::StreamCDC<R> {
     fastcdc::v2020::StreamCDC::new(reader, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE)
