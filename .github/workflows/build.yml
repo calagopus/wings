@@ -97,6 +97,9 @@ jobs:
         with:
           path: dist
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
@@ -160,3 +163,9 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           sbom-path: sbom-source.cyclonedx.json
           push-to-registry: true
+
+      - name: Sign image (GHCR)
+        run: cosign sign --yes ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}
+
+      - name: Sign image (Docker Hub)
+        run: cosign sign --yes ${{ env.DOCKERHUB_IMAGE }}@${{ steps.build.outputs.digest }}
