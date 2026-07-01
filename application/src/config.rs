@@ -1481,15 +1481,9 @@ impl Config {
                     }
 
                     cfg.system.user.uid = **user;
-                    if cfg.system.user.rootless.container_uid == 0 {
-                        cfg.system.user.rootless.container_uid = cfg.system.user.uid;
-                    }
                 }
                 if let Some(group) = process.group_id() {
                     cfg.system.user.gid = *group;
-                    if cfg.system.user.rootless.container_gid == 0 {
-                        cfg.system.user.rootless.container_gid = cfg.system.user.gid;
-                    }
                 }
 
                 if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
