@@ -13,6 +13,9 @@ pub enum ActivityEvent {
     #[serde(rename = "server:power.kill")]
     PowerKill,
 
+    #[serde(rename = "server:crash.detected")]
+    CrashDetected,
+
     #[serde(rename = "server:console.command")]
     ConsoleCommand,
 
