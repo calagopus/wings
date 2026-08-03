@@ -465,8 +465,6 @@ impl Server {
                                     return;
                                 }
 
-                                // Log a crash activity so panels can surface crash
-                                // context (exit code, oom kill) to users.
                                 server.activity.log_activity(activity::Activity {
                                     event: activity::ActivityEvent::CrashDetected,
                                     user: None,
