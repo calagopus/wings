@@ -184,6 +184,8 @@ nestify::nest! {
             pub id: uuid::Uuid,
             #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
             pub file_denylist: Vec<compact_str::CompactString>,
+            #[serde(default)]
+            pub features: Vec<compact_str::CompactString>,
         },
 
         #[schema(inline)]
@@ -266,6 +268,7 @@ impl ServerConfiguration {
             egg: ServerConfigurationEgg {
                 id: uuid::Uuid::new_v4(),
                 file_denylist: Vec::new(),
+                features: Vec::new(),
             },
             container: ServerConfigurationContainer {
                 image: "example/image:latest".into(),

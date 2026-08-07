@@ -24,6 +24,7 @@ mod bins;
 mod commands;
 mod config;
 mod deserialize;
+mod gamedig;
 mod io;
 mod models;
 mod net;
@@ -471,6 +472,9 @@ async fn main_rt() {
                 .expect("failed to initialize inotify manager"),
         ),
         mime_cache: moka::future::Cache::new(20480),
+        gamedig_cache: moka::future::Cache::builder()
+            .time_to_live(crate::gamedig::CACHE_TTL)
+            .build(),
     });
 
     tokio::spawn({
