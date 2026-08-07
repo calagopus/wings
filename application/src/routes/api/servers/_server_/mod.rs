@@ -12,6 +12,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod backup;
 mod commands;
 mod files;
+mod gamedig;
 mod install;
 mod logs;
 mod power;
@@ -125,6 +126,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/files", files::router(state))
         .nest("/backup", backup::router(state))
         .nest("/schedules", schedules::router(state))
+        .nest("/gamedig", gamedig::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth))
