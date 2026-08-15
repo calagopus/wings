@@ -90,6 +90,9 @@ pub struct Filesystem {
 
     disk_checker_rescan: Arc<tokio::sync::Notify>,
     pub disk_checker_state_dirty: Arc<AtomicBool>,
+    /// Raised on every observed filesystem write; consumed by the boot
+    /// permission walk so unchanged trees are not re-statted on every start.
+    pub chown_state_dirty: Arc<AtomicBool>,
     pub disk_checker: tokio::task::JoinHandle<()>,
     config: Arc<crate::config::Config>,
 
@@ -127,6 +130,7 @@ impl Filesystem {
         let base_path = config.data_path(uuid);
 
         let disk_checker_state_dirty = Arc::new(AtomicBool::new(true));
+        let chown_state_dirty = Arc::new(AtomicBool::new(true));
 
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
         let disk_usage_cached_logical = Arc::new(AtomicU64::new(0));
@@ -135,7 +139,13 @@ impl Filesystem {
             .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
 
         let cap_filesystem = cap::CapFilesystem::new_uninitialized(&base_path);
-        let server_notifier = inotify::InotifyServerNotifier::new(base_path.clone());
+        let server_notifier = inotify::InotifyServerNotifier::new(
+            base_path.clone(),
+            [
+                Arc::clone(&disk_checker_state_dirty),
+                Arc::clone(&chown_state_dirty),
+            ],
+        );
         let use_server_notifier = Arc::new(AtomicBool::new(false));
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
         let disk_check_completed = Arc::new(tokio::sync::Notify::new());
@@ -146,6 +156,7 @@ impl Filesystem {
             app_state,
             disk_checker_rescan: Arc::clone(&disk_checker_rescan),
             disk_checker_state_dirty: Arc::clone(&disk_checker_state_dirty),
+            chown_state_dirty,
             disk_checker: tokio::spawn(disk_checker::run(disk_checker::DiskCheckerContext {
                 config: Arc::clone(&config),
                 disk_usage: Arc::clone(&disk_usage),
@@ -200,6 +211,11 @@ impl Filesystem {
     pub fn rerun_disk_checker(&self) {
         self.server_notifier.clear_modified_paths();
         self.disk_checker_rescan.notify_one();
+    }
+
+    #[inline]
+    pub fn write_tracking_active(&self) -> bool {
+        self.use_server_notifier.load(Ordering::Relaxed) && self.server_notifier.is_trusted()
     }
 
     pub async fn update_ignored(&self, deny_list: &[impl AsRef<str>]) {
@@ -1455,7 +1471,7 @@ impl Filesystem {
                             let server_uuid = self.uuid;
 
                             async move {
-                                if let Err(err) = state
+                                match state
                                     .inotify_manager
                                     .register_server_with_notifier(
                                         server_notifier.clone(),
@@ -1463,12 +1479,16 @@ impl Filesystem {
                                     )
                                     .await
                                 {
-                                    tracing::error!(
-                                        "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                        err
-                                    );
-                                } else {
-                                    server_use_server_notifier.store(true, Ordering::Relaxed);
+                                    Ok(watching) => {
+                                        server_use_server_notifier
+                                            .store(watching, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                                            err
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -1518,7 +1538,7 @@ impl Filesystem {
                             let server_uuid = self.uuid;
 
                             async move {
-                                if let Err(err) = state
+                                match state
                                     .inotify_manager
                                     .register_server_with_notifier(
                                         server_notifier.clone(),
@@ -1526,12 +1546,16 @@ impl Filesystem {
                                     )
                                     .await
                                 {
-                                    tracing::error!(
-                                        "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                        err
-                                    );
-                                } else {
-                                    server_use_server_notifier.store(true, Ordering::Relaxed);
+                                    Ok(watching) => {
+                                        server_use_server_notifier
+                                            .store(watching, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                                            err
+                                        );
+                                    }
                                 }
                             }
                         });

@@ -264,7 +264,25 @@ impl OutgoingServerTransfer {
             .ok();
     }
 
+    fn destination_client(proxy: Option<&crate::net::CongestionControlProxy>) -> reqwest::Client {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
+
+        if let Some(proxy) = proxy {
+            match reqwest::Proxy::all(proxy.url()) {
+                Ok(proxy) => builder = builder.proxy(proxy),
+                Err(err) => {
+                    tracing::debug!("failed to construct transfer proxy definition: {}", err);
+                }
+            }
+        }
+
+        builder.build().expect("failed to build HTTP client")
+    }
+
     async fn query_destination_capabilities(
+        client: reqwest::Client,
         url: &str,
         token: &str,
     ) -> Result<TransferCapabilities, anyhow::Error> {
@@ -275,9 +293,7 @@ impl OutgoingServerTransfer {
             .pop_if_empty()
             .push("query");
 
-        let capabilities = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()?
+        let capabilities = client
             .get(query_url)
             .header("Authorization", token)
             .header("Accept", "application/json")
@@ -541,10 +557,31 @@ impl OutgoingServerTransfer {
                 }
             }
 
+            let proxy = match reqwest::Url::parse(&url) {
+                Ok(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
+                    (Some(host), Some(port)) => {
+                        crate::net::CongestionControlProxy::start(
+                            &server.app_state.config,
+                            host.to_string(),
+                            port,
+                        )
+                        .await
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+
             let destination_capabilities = if backups.is_empty() {
                 None
             } else {
-                match Self::query_destination_capabilities(&url, &token).await {
+                match Self::query_destination_capabilities(
+                    Self::destination_client(proxy.as_ref()),
+                    &url,
+                    &token,
+                )
+                .await
+                {
                     Ok(capabilities) => Some(capabilities),
                     Err(err) => {
                         tracing::warn!(
@@ -744,11 +781,7 @@ impl OutgoingServerTransfer {
                 }
             });
 
-            let response = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-                .build()
-                .expect("failed to build HTTP client")
+            let response = Self::destination_client(proxy.as_ref())
                 .post(&url)
                 .header("Authorization", &token)
                 .header("Multiplex-Stream-Count", multiplex_streams)
@@ -815,11 +848,7 @@ impl OutgoingServerTransfer {
                     );
 
                 multiplex_responses.push(
-                    reqwest::Client::builder()
-                        .connect_timeout(std::time::Duration::from_secs(15))
-                        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-                        .build()
-                        .expect("failed to build HTTP client")
+                    Self::destination_client(proxy.as_ref())
                         .post(&url)
                         .header("Authorization", &token)
                         .header("Multiplex-Stream", i)

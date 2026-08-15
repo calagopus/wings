@@ -9,7 +9,10 @@ use std::{
     collections::HashMap,
     path::Path,
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll},
 };
 use tokio::io::{AsyncWriteExt, ReadBuf};
@@ -23,6 +26,116 @@ pub fn string_to_option(s: &str) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn nofile_ceiling(requested: u64) -> u64 {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let current = getrlimit(Resource::Nofile);
+    let current_hard = current.maximum.unwrap_or(u64::MAX);
+    if requested <= current_hard {
+        return requested;
+    }
+
+    let probe = Rlimit {
+        current: current.current,
+        maximum: Some(requested),
+    };
+
+    match setrlimit(Resource::Nofile, probe) {
+        Ok(()) => {
+            setrlimit(Resource::Nofile, current).ok();
+
+            requested
+        }
+        Err(_) => current_hard,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nofile_ceiling(requested: u64) -> u64 {
+    requested
+}
+
+fn convert_ulimits(
+    config: &crate::config::Config,
+) -> Option<Vec<bollard::models::ResourcesUlimits>> {
+    static WARNED_CLAMP: OnceLock<()> = OnceLock::new();
+
+    let config = config.load();
+    if config.docker.container_ulimits.is_empty() {
+        return None;
+    }
+
+    Some(
+        config
+            .docker
+            .container_ulimits
+            .iter()
+            .map(|ulimit| {
+                let (mut soft, mut hard) = (ulimit.soft, ulimit.hard);
+                if ulimit.name == "nofile" && hard > 0 {
+                    let ceiling = nofile_ceiling(hard as u64) as i64;
+                    if ceiling < hard {
+                        if WARNED_CLAMP.set(()).is_ok() {
+                            tracing::warn!(
+                                "configured nofile ulimit {} exceeds what this host can set, clamping to {}",
+                                hard,
+                                ceiling
+                            );
+                        }
+
+                        hard = ceiling;
+                        soft = soft.min(ceiling);
+                    }
+                }
+
+                bollard::models::ResourcesUlimits {
+                    name: Some(ulimit.name.clone()),
+                    soft: Some(soft),
+                    hard: Some(hard),
+                }
+            })
+            .collect(),
+    )
+}
+
+fn convert_sysctls(
+    config: &crate::config::Config,
+    network_mode: &str,
+) -> Option<HashMap<String, String>> {
+    let config = config.load();
+    if config.docker.container_sysctls.is_empty() {
+        return None;
+    }
+
+    let foreign_netns = network_mode == "host" || network_mode.starts_with("container:");
+    let sysctls: HashMap<String, String> = config
+        .docker
+        .container_sysctls
+        .iter()
+        .filter(|(key, _)| {
+            if key.starts_with("net.") && foreign_netns {
+                tracing::debug!(
+                    sysctl = %key,
+                    network_mode = %network_mode,
+                    "skipping net sysctl, container shares a foreign network namespace"
+                );
+
+                return false;
+            }
+
+            true
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    if sysctls.is_empty() {
+        None
+    } else {
+        Some(sysctls)
     }
 }
 
@@ -294,6 +407,18 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         };
 
         let resources = self.convert_container_resources(config);
+        let sysctls = convert_sysctls(config, &network_mode);
+
+        if resources.blkio_weight.is_some() && !cgroup::io_weight_effective() {
+            static WARNED_IO_WEIGHT: OnceLock<()> = OnceLock::new();
+
+            if WARNED_IO_WEIGHT.set(()).is_ok() {
+                tracing::warn!(
+                    server = %self.uuid,
+                    "io weights are configured, but no io scheduler on this host enforces them (needs bfq or an iocost model) - they will have no effect"
+                );
+            }
+        }
 
         let mut security_opt = vec!["no-new-privileges".to_string()];
         if config.load().docker.container_apply_seccomp {
@@ -305,6 +430,9 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                     )
                     .to_string()?,
             );
+        }
+        if let Some(profile) = string_to_option(&config.load().docker.container_apparmor_profile) {
+            security_opt.push(format!("apparmor={profile}"));
         }
 
         Ok(bollard::plugin::ContainerCreateBody {
@@ -353,6 +481,8 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                     ),
                 }),
                 security_opt: Some(security_opt),
+                ulimits: convert_ulimits(config),
+                sysctls,
                 cap_drop: Some(vec![
                     "setpcap".to_string(),
                     "mknod".to_string(),
@@ -444,72 +574,110 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
 }
 
 #[async_trait::async_trait]
-trait DockerCfsBurstExt {
-    async fn write_cfs_burst(&self, container_id: &str, quota_us: Option<i64>, multiple: f64);
-    async fn apply_cfs_burst(
+trait DockerRemoveExt {
+    async fn remove_container_forgiving(
         &self,
         container_id: &str,
-        quota_us: Option<i64>,
-        config: &crate::config::Config,
-    );
+    ) -> Result<(), bollard::errors::Error>;
+}
+
+#[async_trait::async_trait]
+impl DockerRemoveExt for bollard::Docker {
+    async fn remove_container_forgiving(
+        &self,
+        container_id: &str,
+    ) -> Result<(), bollard::errors::Error> {
+        let result = self
+            .remove_container(
+                container_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(err) => match self.inspect_container(container_id, None).await {
+                Err(DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        "container removal reported an error but the container is gone, treating as removed: {}",
+                        err
+                    );
+
+                    Ok(())
+                }
+                _ => Err(err),
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait DockerCfsBurstExt {
+    async fn write_cfs_burst(&self, container_id: &str, multiple: f64);
+    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config);
     async fn clear_cfs_burst(&self, container_id: &str);
 }
 
 #[async_trait::async_trait]
 impl DockerCfsBurstExt for bollard::Docker {
-    async fn write_cfs_burst(&self, container_id: &str, quota_us: Option<i64>, multiple: f64) {
-        let inspect = match self.inspect_container(container_id, None).await {
-            Ok(inspect) => inspect,
-            Err(err) => {
-                tracing::debug!(
-                    container = %container_id,
-                    "failed to inspect container for cfs burst: {}",
-                    err
-                );
+    async fn write_cfs_burst(&self, container_id: &str, multiple: f64) {
+        for attempt in 0..2 {
+            let inspect = match self.inspect_container(container_id, None).await {
+                Ok(inspect) => inspect,
+                Err(err) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        "failed to inspect container for cfs burst: {}",
+                        err
+                    );
 
+                    return;
+                }
+            };
+
+            let Some(pid) = inspect
+                .state
+                .and_then(|state| state.pid)
+                .filter(|pid| *pid > 0)
+            else {
                 return;
+            };
+
+            match cgroup::CpuCgroup::write_process_burst(pid, multiple) {
+                cgroup::BurstOutcome::CgroupGone if attempt == 0 => continue,
+                _ => return,
             }
-        };
-
-        let Some(pid) = inspect
-            .state
-            .and_then(|state| state.pid)
-            .filter(|pid| *pid > 0)
-        else {
-            return;
-        };
-
-        let quota_us = quota_us
-            .or_else(|| inspect.host_config.and_then(|config| config.cpu_quota))
-            .unwrap_or(0);
-
-        cgroup::write_burst(pid, cgroup::burst_us(quota_us, multiple)).await;
+        }
     }
 
-    async fn apply_cfs_burst(
-        &self,
-        container_id: &str,
-        quota_us: Option<i64>,
-        config: &crate::config::Config,
-    ) {
+    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config) {
         let burst = config.load().docker.cfs_burst;
 
         if burst.enabled {
-            self.write_cfs_burst(container_id, quota_us, burst.multiple)
-                .await;
+            self.write_cfs_burst(container_id, burst.multiple).await;
         }
     }
 
     async fn clear_cfs_burst(&self, container_id: &str) {
-        self.write_cfs_burst(container_id, Some(0), 0.0).await;
+        self.write_cfs_burst(container_id, 0.0).await;
     }
 }
 
 pub struct DockerExecutor {
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
-    host_mounts: std::sync::OnceLock<Option<host_mounts::HostMountTable>>,
-    host_gateway: std::sync::OnceLock<Option<std::net::IpAddr>>,
+    stats_sampler: Arc<cgroup::StatsSampler>,
+    host_mounts: OnceLock<Option<host_mounts::HostMountTable>>,
+    host_gateway: OnceLock<Option<std::net::IpAddr>>,
 }
 
 impl DockerExecutor {
@@ -517,8 +685,9 @@ impl DockerExecutor {
         Self {
             docker,
             app_config,
-            host_mounts: std::sync::OnceLock::new(),
-            host_gateway: std::sync::OnceLock::new(),
+            stats_sampler: Arc::new(cgroup::StatsSampler::default()),
+            host_mounts: OnceLock::new(),
+            host_gateway: OnceLock::new(),
         }
     }
 
@@ -611,8 +780,7 @@ impl DockerExecutor {
                 compact_str::CompactString,
                 Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
             >;
-            static IMAGE_PULL_CACHE: std::sync::OnceLock<Arc<parking_lot::Mutex<InnerMap>>> =
-                std::sync::OnceLock::new();
+            static IMAGE_PULL_CACHE: OnceLock<Arc<parking_lot::Mutex<InnerMap>>> = OnceLock::new();
 
             IMAGE_PULL_CACHE.get_or_init(|| {
                 let cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -649,6 +817,75 @@ impl DockerExecutor {
 
         let cache_config = self.app_config.load().docker.registry_image_fetch_cache;
 
+        let mut registry_auth = None;
+        for (registry, config) in self.app_config.load().docker.registries.iter() {
+            if image.starts_with(registry.as_str()) {
+                registry_auth = Some(bollard::auth::DockerCredentials {
+                    username: Some(config.username.clone()),
+                    password: Some(config.password.clone()),
+                    serveraddress: Some(registry.clone()),
+                    ..Default::default()
+                });
+                break;
+            }
+        }
+
+        if cache_config.background_refresh && self.image_exists(image_name).await {
+            let entry = {
+                let mut cache = pull_cache.lock();
+                Arc::clone(cache.entry(image.into()).or_default())
+            };
+
+            if let Ok(mut last_pull) = entry.try_lock_owned() {
+                let stale = !cache_config.enabled
+                    || last_pull.is_none_or(|pulled_at| {
+                        pulled_at.elapsed().as_secs() >= cache_config.duration
+                    });
+
+                if stale {
+                    let docker = Arc::clone(&self.docker);
+                    let image_name = image_name.to_string();
+                    let tag = tag.to_string();
+
+                    tokio::spawn(async move {
+                        let mut stream = docker.create_image(
+                            Some(bollard::query_parameters::CreateImageOptions {
+                                from_image: Some(image_name.clone()),
+                                tag: Some(tag),
+                                ..Default::default()
+                            }),
+                            None,
+                            registry_auth,
+                        );
+
+                        while let Some(status) = stream.next().await {
+                            if let Err(err) = status {
+                                tracing::debug!(
+                                    image = %image_name,
+                                    "background image refresh failed: {}",
+                                    err
+                                );
+
+                                return;
+                            }
+                        }
+
+                        *last_pull = Some(std::time::Instant::now());
+
+                        tracing::debug!(image = %image_name, "background image refresh finished");
+                    });
+                }
+            }
+
+            tracing::debug!(
+                server = %server.uuid,
+                image = %image_name,
+                "image exists locally, starting from it and refreshing in the background"
+            );
+
+            return Ok(());
+        }
+
         let mut last_pull = if cache_config.enabled {
             let entry = {
                 let mut cache = pull_cache.lock();
@@ -678,19 +915,6 @@ impl DockerExecutor {
             server.log_daemon_with_prelude(
                 "Pulling Docker container image, this could take a few minutes to complete...",
             );
-        }
-
-        let mut registry_auth = None;
-        for (registry, config) in self.app_config.load().docker.registries.iter() {
-            if image.starts_with(registry.as_str()) {
-                registry_auth = Some(bollard::auth::DockerCredentials {
-                    username: Some(config.username.clone()),
-                    password: Some(config.password.clone()),
-                    serveraddress: Some(registry.clone()),
-                    ..Default::default()
-                });
-                break;
-            }
         }
 
         let mut stream = self.docker.create_image(
@@ -866,6 +1090,8 @@ struct DockerProcessHandle {
 
     resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
     publish_resource_usage: bool,
+    cfs_lock: Arc<tokio::sync::Mutex<()>>,
+    boosted_limit_percent: Arc<AtomicU32>,
     stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     stdout_ratelimited_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
@@ -876,11 +1102,13 @@ struct DockerProcessHandle {
 }
 
 impl DockerProcessHandle {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         container_id: String,
         docker: Arc<bollard::Docker>,
         server: &super::super::Server,
         app_config: Arc<crate::config::Config>,
+        stats_sampler: Arc<cgroup::StatsSampler>,
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
         attach_stdin: bool,
@@ -1006,98 +1234,215 @@ impl DockerProcessHandle {
         let stats_usage = resource_usage.clone();
         let stats_server = server.clone();
 
+        let boosted_limit_percent = Arc::new(AtomicU32::new(0));
+
         let stats_task = tokio::spawn(async move {
             if !publish_resource_usage {
                 return;
             }
 
+            enum StatsSource {
+                Unresolved,
+                Cgroup(cgroup::SampleReceiver),
+                Api,
+            }
+
+            let mut source = StatsSource::Unresolved;
             let mut prev_cpu_total = 0;
-            let mut prev_instant = None;
+            let mut prev_at = None;
 
-            let get_stats = async || {
-                let mut stream = stats_docker.stats(
-                    &stats_id,
-                    Some(bollard::query_parameters::StatsOptions {
-                        stream: false,
-                        one_shot: true,
-                    }),
-                );
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                let (r1, _) = tokio::join!(
-                    stream.next(),
-                    tokio::time::sleep(std::time::Duration::from_secs(1))
-                );
+            loop {
+                let received = match &mut source {
+                    StatsSource::Cgroup(samples) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            samples.recv(),
+                        )
+                        .await
+                        {
+                            Ok(Some(result)) => Some(result),
+                            Ok(None) | Err(_) => {
+                                tracing::debug!(
+                                    server = %stats_server.uuid,
+                                    "cgroup stats sampler stopped delivering, using the stats api"
+                                );
+                                source = StatsSource::Api;
 
-                (r1, stats_server.filesystem.limiter_usage().await)
-            };
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        tick.tick().await;
 
-            while let (Some(stats), disk_bytes) = get_stats().await {
-                let stats = match stats {
-                    Ok(stats) => stats,
-                    Err(err) => {
-                        tracing::warn!(
+                        None
+                    }
+                };
+
+                let disk_bytes = stats_server.filesystem.limiter_usage().await;
+
+                if stats_server.state.get_state() == super::super::state::ServerState::Offline {
+                    stats_usage.send_modify(|usage| {
+                        usage.disk_bytes = disk_bytes;
+                        usage.state = stats_server.state.get_state();
+                    });
+                    source = StatsSource::Unresolved;
+                    prev_at = None;
+
+                    continue;
+                }
+
+                if matches!(source, StatsSource::Unresolved) {
+                    source = match stats_docker.inspect_container(&stats_id, None).await {
+                        Ok(inspect) => {
+                            match inspect
+                                .state
+                                .and_then(|state| state.pid)
+                                .filter(|pid| *pid > 0)
+                            {
+                                Some(pid) => match cgroup::StatFiles::resolve(pid) {
+                                    Some(files) => {
+                                        StatsSource::Cgroup(stats_sampler.register(files))
+                                    }
+                                    None => {
+                                        tracing::debug!(
+                                            server = %stats_server.uuid,
+                                            "container cgroup not resolvable from here, using the stats api"
+                                        );
+
+                                        StatsSource::Api
+                                    }
+                                },
+                                None => continue,
+                            }
+                        }
+                        Err(_) => continue,
+                    };
+
+                    if matches!(source, StatsSource::Cgroup(_)) {
+                        continue;
+                    }
+                }
+
+                let sample = match received {
+                    Some(Ok(sample)) => sample,
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                        source = StatsSource::Unresolved;
+
+                        continue;
+                    }
+                    Some(Err(err)) => {
+                        tracing::debug!(
                             server = %stats_server.uuid,
-                            "failed to get container stats: {:?}",
+                            "failed to read container cgroup stats, using the stats api: {}",
                             err
                         );
+                        source = StatsSource::Api;
+
                         continue;
+                    }
+                    None => {
+                        let mut stream = stats_docker.stats(
+                            &stats_id,
+                            Some(bollard::query_parameters::StatsOptions {
+                                stream: false,
+                                one_shot: true,
+                            }),
+                        );
+
+                        let stats = match stream.next().await {
+                            Some(Ok(stats)) => stats,
+                            Some(Err(err)) => {
+                                tracing::warn!(
+                                    server = %stats_server.uuid,
+                                    "failed to get container stats: {:?}",
+                                    err
+                                );
+                                continue;
+                            }
+                            None => break,
+                        };
+
+                        let mut memory_bytes = stats
+                            .memory_stats
+                            .as_ref()
+                            .and_then(|memory| memory.usage)
+                            .unwrap_or(0);
+                        if let Some(stats) = stats
+                            .memory_stats
+                            .as_ref()
+                            .and_then(|memory| memory.stats.as_ref())
+                            && let Some(&inactive_file) = stats
+                                .get("total_inactive_file")
+                                .or_else(|| stats.get("inactive_file"))
+                            && inactive_file < memory_bytes
+                        {
+                            memory_bytes -= inactive_file;
+                        }
+
+                        cgroup::StatSample {
+                            memory_bytes,
+                            memory_limit_bytes: stats
+                                .memory_stats
+                                .as_ref()
+                                .and_then(|memory| memory.limit)
+                                .unwrap_or(0),
+                            network: stats.networks.as_ref().and_then(|networks| {
+                                networks.values().next().map(|net| {
+                                    (
+                                        net.rx_bytes.unwrap_or(0),
+                                        net.rx_packets.unwrap_or(0),
+                                        net.tx_bytes.unwrap_or(0),
+                                        net.tx_packets.unwrap_or(0),
+                                    )
+                                })
+                            }),
+                            cpu_total_ns: stats
+                                .cpu_stats
+                                .as_ref()
+                                .and_then(|cpu| cpu.cpu_usage.as_ref())
+                                .and_then(|cpu| cpu.total_usage)
+                                .unwrap_or(0),
+                            at: std::time::Instant::now(),
+                        }
                     }
                 };
 
                 stats_usage.send_modify(|usage| {
-                    if let Some(memory_stats) = &stats.memory_stats {
-                        let mut memory_bytes = memory_stats.usage.unwrap_or(0);
-
-                        if let Some(stats) = &memory_stats.stats {
-                            if let Some(&inactive_file) = stats.get("total_inactive_file")
-                                && inactive_file < memory_bytes
-                            {
-                                memory_bytes -= inactive_file;
-                            } else if let Some(&inactive_file) = stats.get("inactive_file")
-                                && inactive_file < memory_bytes
-                            {
-                                memory_bytes -= inactive_file;
-                            }
-                        }
-
-                        usage.memory_bytes = memory_bytes;
-                        usage.memory_limit_bytes = memory_stats.limit.unwrap_or(0);
-                    }
-
+                    usage.memory_bytes = sample.memory_bytes;
+                    usage.memory_limit_bytes = sample.memory_limit_bytes;
                     usage.disk_bytes = disk_bytes;
                     usage.state = stats_server.state.get_state();
 
-                    if let Some(networks) = &stats.networks
-                        && let Some(net) = networks.values().next()
-                    {
-                        usage.network.rx_bytes = net.rx_bytes.unwrap_or(0);
-                        usage.network.rx_packets = net.rx_packets.unwrap_or(0);
-                        usage.network.tx_bytes = net.tx_bytes.unwrap_or(0);
-                        usage.network.tx_packets = net.tx_packets.unwrap_or(0);
+                    if let Some((rx_bytes, rx_packets, tx_bytes, tx_packets)) = sample.network {
+                        usage.network.rx_bytes = rx_bytes;
+                        usage.network.rx_packets = rx_packets;
+                        usage.network.tx_bytes = tx_bytes;
+                        usage.network.tx_packets = tx_packets;
                     }
 
-                    if let Some(cpu_stats) = &stats.cpu_stats
-                        && let Some(cpu_usage) = &cpu_stats.cpu_usage
-                    {
-                        let total_usage = cpu_usage.total_usage.unwrap_or(0);
-                        let now = std::time::Instant::now();
+                    usage.cpu_absolute = if let Some(prev) = prev_at {
+                        let cpu_delta_ns =
+                            sample.cpu_total_ns.saturating_sub(prev_cpu_total) as f64;
+                        let wall_delta_ns = sample.at.duration_since(prev).as_nanos() as f64;
 
-                        usage.cpu_absolute = if let Some(prev) = prev_instant {
-                            let cpu_delta_ns = total_usage.saturating_sub(prev_cpu_total) as f64;
-                            let wall_delta_ns = now.duration_since(prev).as_nanos() as f64;
-
-                            if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
-                                ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
-                            } else {
-                                0.0
-                            }
+                        if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
+                            ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
                         } else {
                             0.0
-                        };
+                        }
+                    } else {
+                        0.0
+                    };
 
-                        prev_cpu_total = total_usage;
-                        prev_instant = Some(now);
-                    }
+                    prev_cpu_total = sample.cpu_total_ns;
+                    prev_at = Some(sample.at);
                 });
             }
         });
@@ -1105,55 +1450,120 @@ impl DockerProcessHandle {
         let state_docker = Arc::clone(&docker);
         let state_id = container_id.clone();
         let state_usage = resource_usage.clone();
+        let state_boosted_limit = Arc::clone(&boosted_limit_percent);
 
         let state_task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-                let inspect = match state_docker.inspect_container(&state_id, None).await {
-                    Ok(inspect) => inspect,
-                    Err(DockerResponseServerError {
-                        status_code: 404, ..
-                    }) => Default::default(),
-                    Err(err) => {
-                        tracing::warn!(
-                            server = %state_id,
-                            "failed to inspect container for state: {:?}",
-                            err
-                        );
-                        continue;
+            struct CachedState {
+                status: Option<bollard::plugin::ContainerStateStatusEnum>,
+                started_at: Option<chrono::DateTime<chrono::Utc>>,
+                exit_code: i32,
+                oom_killed: bool,
+                cpu_limit: u32,
+            }
+
+            let arm_wait = || {
+                state_docker.wait_container(
+                    &state_id,
+                    Some(bollard::query_parameters::WaitContainerOptions {
+                        condition: "next-exit".to_string(),
+                    }),
+                )
+            };
+
+            let mut wait_stream = arm_wait();
+            let mut wait_armed = true;
+            let mut wait_exit_code = None;
+            let mut cached: Option<CachedState> = None;
+            let mut last_inspect: Option<std::time::Instant> = None;
+
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                let died = tokio::select! {
+                    exit = wait_stream.next(), if wait_armed => {
+                        wait_armed = false;
+                        if let Some(Ok(response)) = exit {
+                            wait_exit_code = Some(response.status_code);
+                        }
+
+                        true
                     }
+                    _ = tick.tick() => false,
                 };
-                let state = inspect.state.unwrap_or_default();
+
+                if died
+                    || cached.is_none()
+                    || last_inspect.is_none_or(|at| at.elapsed() >= RECONCILE_INTERVAL)
+                {
+                    let inspect = match state_docker.inspect_container(&state_id, None).await {
+                        Ok(inspect) => inspect,
+                        Err(DockerResponseServerError {
+                            status_code: 404, ..
+                        }) => Default::default(),
+                        Err(err) => {
+                            tracing::warn!(
+                                server = %state_id,
+                                "failed to inspect container for state: {:?}",
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    last_inspect = Some(std::time::Instant::now());
+
+                    let state = inspect.state.unwrap_or_default();
+                    let host_config = inspect.host_config.unwrap_or_default();
+
+                    cached = Some(CachedState {
+                        status: state.status,
+                        started_at: state.started_at.as_deref().and_then(|started_at| {
+                            chrono::DateTime::parse_from_rfc3339(started_at)
+                                .ok()
+                                .map(|started_at| started_at.with_timezone(&chrono::Utc))
+                        }),
+                        exit_code: state.exit_code.or(wait_exit_code).unwrap_or(-1) as i32,
+                        oom_killed: state.oom_killed.unwrap_or(false),
+                        cpu_limit: cgroup::CpuCgroup::limit_percent(
+                            host_config.cpu_quota.unwrap_or(0),
+                            host_config.cpu_period.unwrap_or(100000),
+                        ),
+                    });
+                }
+
+                let Some(state) = &cached else {
+                    continue;
+                };
 
                 let process_status = match state.status {
                     Some(bollard::plugin::ContainerStateStatusEnum::RUNNING) => {
-                        if let Some(ref started_at) = state.started_at
-                            && let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started_at)
-                        {
+                        if publish_resource_usage && let Some(started_at) = state.started_at {
                             let uptime = chrono::Utc::now()
-                                .signed_duration_since(started_at.with_timezone(&chrono::Utc))
+                                .signed_duration_since(started_at)
                                 .num_milliseconds()
                                 .max(0) as u64;
-                            if publish_resource_usage {
-                                state_usage.send_modify(|usage| {
-                                    usage.uptime = uptime;
-                                    let host_config = inspect.host_config.unwrap_or_default();
-                                    let limit = cgroup::limit_percent(
-                                        host_config.cpu_quota.unwrap_or(0),
-                                        host_config.cpu_period.unwrap_or(100000),
-                                    );
 
-                                    usage.cpu_limit_absolute = if limit > 0 {
-                                        limit
-                                    } else {
-                                        std::thread::available_parallelism()
-                                            .map_or(1, |threads| threads.get())
-                                            as u32
-                                            * 100
-                                    };
-                                });
-                            }
+                            let limit = match state_boosted_limit.load(Ordering::Relaxed) {
+                                0 => state.cpu_limit,
+                                boosted => boosted,
+                            };
+
+                            state_usage.send_modify(|usage| {
+                                usage.uptime = uptime;
+                                usage.cpu_limit_absolute = if limit > 0 {
+                                    limit
+                                } else {
+                                    std::thread::available_parallelism()
+                                        .map_or(1, |threads| threads.get())
+                                        as u32
+                                        * 100
+                                };
+                            });
                         }
                         super::ProcessStatus::Running
                     }
@@ -1165,11 +1575,17 @@ impl DockerProcessHandle {
                             state_usage.send_modify(|usage| usage.uptime = 0);
                         }
                         super::ProcessStatus::Stopped {
-                            exit_code: state.exit_code.unwrap_or(-1) as i32,
-                            oom_killed: state.oom_killed.unwrap_or(false),
+                            exit_code: state.exit_code,
+                            oom_killed: state.oom_killed,
                         }
                     }
                 };
+
+                if !wait_armed && matches!(process_status, super::ProcessStatus::Running) {
+                    wait_stream = arm_wait();
+                    wait_armed = true;
+                    wait_exit_code = None;
+                }
 
                 if status_tx.send(process_status).await.is_err() {
                     break;
@@ -1184,6 +1600,8 @@ impl DockerProcessHandle {
             app_config,
             resource_usage,
             publish_resource_usage,
+            cfs_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boosted_limit_percent,
             stdin_tx,
             stdout_ratelimited_rx,
             stdout_rx,
@@ -1198,6 +1616,143 @@ impl DockerProcessHandle {
         self.server
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("server has been dropped"))
+    }
+
+    async fn begin_startup_boost(&self) -> bool {
+        static ACTIVE_BOOSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let boost = self.app_config.load().docker.startup_boost;
+        if !boost.enabled {
+            return false;
+        }
+
+        let Ok(server) = self.get_server() else {
+            return false;
+        };
+
+        let update_config = server
+            .configuration
+            .read()
+            .await
+            .container_update_config(&self.app_config);
+        let quota = update_config.cpu_quota.unwrap_or(-1);
+        let period = update_config.cpu_period.unwrap_or(100000);
+        if quota <= 0 {
+            return false;
+        }
+
+        let mut active = ACTIVE_BOOSTS.load(Ordering::Relaxed);
+        loop {
+            if active >= boost.max_concurrent {
+                tracing::debug!(
+                    server = %server.uuid,
+                    "startup boost skipped, {} boosts already active",
+                    active
+                );
+
+                return false;
+            }
+
+            match ACTIVE_BOOSTS.compare_exchange(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+
+        {
+            let _cfs_guard = self.cfs_lock.lock().await;
+
+            self.docker.clear_cfs_burst(&self.container_id).await;
+            if let Err(err) = self
+                .docker
+                .update_container(
+                    &self.container_id,
+                    bollard::plugin::ContainerUpdateBody {
+                        cpu_quota: Some(-1),
+                        cpu_period: Some(period),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                tracing::debug!(
+                    container = %self.container_id,
+                    "failed to apply startup boost: {}",
+                    err
+                );
+                ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
+
+                return false;
+            }
+        }
+
+        self.boosted_limit_percent.store(
+            cgroup::CpuCgroup::limit_percent(quota, period),
+            Ordering::Relaxed,
+        );
+
+        tracing::debug!(
+            server = %server.uuid,
+            container = %self.container_id,
+            "startup boost active, cpu quota lifted until the server is running"
+        );
+
+        tokio::spawn({
+            let docker = Arc::clone(&self.docker);
+            let app_config = Arc::clone(&self.app_config);
+            let container_id = self.container_id.clone();
+            let cfs_lock = Arc::clone(&self.cfs_lock);
+            let boosted_limit_percent = Arc::clone(&self.boosted_limit_percent);
+            let server = Arc::downgrade(&server);
+
+            async move {
+                if let Some(server) = server.upgrade() {
+                    server
+                        .state
+                        .wait_while_state(
+                            super::super::state::ServerState::Starting,
+                            std::time::Duration::from_secs(boost.timeout),
+                        )
+                        .await;
+                }
+
+                if let Some(server) = server.upgrade() {
+                    let update_config = server
+                        .configuration
+                        .read()
+                        .await
+                        .container_update_config(&app_config);
+
+                    let _cfs_guard = cfs_lock.lock().await;
+
+                    docker.clear_cfs_burst(&container_id).await;
+                    if let Err(err) = docker.update_container(&container_id, update_config).await {
+                        tracing::debug!(
+                            container = %container_id,
+                            "failed to restore cpu quota after startup boost: {}",
+                            err
+                        );
+                    }
+                    docker.apply_cfs_burst(&container_id, &app_config).await;
+
+                    tracing::debug!(
+                        server = %server.uuid,
+                        container = %container_id,
+                        "startup boost ended, cpu quota restored"
+                    );
+                }
+
+                boosted_limit_percent.store(0, Ordering::Relaxed);
+                ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+
+        true
     }
 }
 
@@ -1275,14 +1830,15 @@ impl super::ProcessHandle for DockerProcessHandle {
             .read()
             .await
             .container_update_config(&self.app_config);
-        let cpu_quota = update_config.cpu_quota;
+
+        let _cfs_guard = self.cfs_lock.lock().await;
 
         self.docker.clear_cfs_burst(&self.container_id).await;
         self.docker
             .update_container(&self.container_id, update_config)
             .await?;
         self.docker
-            .apply_cfs_burst(&self.container_id, cpu_quota, &self.app_config)
+            .apply_cfs_burst(&self.container_id, &self.app_config)
             .await;
 
         Ok(())
@@ -1292,9 +1848,13 @@ impl super::ProcessHandle for DockerProcessHandle {
         self.docker
             .start_container(&self.container_id, None)
             .await?;
-        self.docker
-            .apply_cfs_burst(&self.container_id, None, &self.app_config)
-            .await;
+
+        if !self.begin_startup_boost().await {
+            let _cfs_guard = self.cfs_lock.lock().await;
+            self.docker
+                .apply_cfs_burst(&self.container_id, &self.app_config)
+                .await;
+        }
 
         Ok(())
     }
@@ -1501,6 +2061,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
                 true,
@@ -1524,7 +2085,7 @@ impl super::ServerExecutor for DockerExecutor {
         .ok_or_else(|| anyhow::anyhow!("no running server container found"))?;
 
         self.docker
-            .apply_cfs_burst(&container_id, None, &self.app_config)
+            .apply_cfs_burst(&container_id, &self.app_config)
             .await;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
@@ -1534,6 +2095,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
                 true,
@@ -1562,17 +2124,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         for c in containers {
             let Some(id) = c.id else { continue };
-            if let Err(err) = self
-                .docker
-                .remove_container(
-                    &id,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
+            if let Err(err) = self.docker.remove_container_forgiving(&id).await {
                 tracing::error!(
                     server = %server.uuid,
                     container = %id,
@@ -1720,6 +2272,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
                 true,
@@ -1743,7 +2296,7 @@ impl super::ServerExecutor for DockerExecutor {
         .ok_or_else(|| anyhow::anyhow!("no running installer container found"))?;
 
         self.docker
-            .apply_cfs_burst(&container_id, None, &self.app_config)
+            .apply_cfs_burst(&container_id, &self.app_config)
             .await;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
@@ -1753,6 +2306,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
                 true,
@@ -1781,17 +2335,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         for c in containers {
             let Some(id) = c.id else { continue };
-            if let Err(err) = self
-                .docker
-                .remove_container(
-                    &id,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
+            if let Err(err) = self.docker.remove_container_forgiving(&id).await {
                 tracing::error!(
                     server = %server.uuid,
                     container = %id,
@@ -1943,6 +2487,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.stats_sampler),
                 status_tx,
                 false,
                 false,
@@ -1973,16 +2518,7 @@ impl super::ServerExecutor for DockerExecutor {
                     );
                 }
 
-                if let Err(err) = docker
-                    .remove_container(
-                        &container.id,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                {
+                if let Err(err) = docker.remove_container_forgiving(&container.id).await {
                     tracing::error!(
                         server = %server,
                         container = %container.id,
@@ -2128,13 +2664,13 @@ mod tests {
         let resources = configuration.convert_container_resources(&config);
         assert_eq!(resources.cpu_period, Some(20000));
         assert_eq!(resources.cpu_quota, Some(50000));
-        assert_eq!(cgroup::limit_percent(50000, 20000), 250);
+        assert_eq!(cgroup::CpuCgroup::limit_percent(50000, 20000), 250);
 
         // below the installer floor, which is a percentage of the same period
         configuration.build.cpu_limit = 50;
         let installer = configuration.installer_resources(&config);
         assert_eq!(installer.cpu_quota, Some(20000));
-        assert_eq!(cgroup::limit_percent(20000, 20000), 100);
+        assert_eq!(cgroup::CpuCgroup::limit_percent(20000, 20000), 100);
 
         // above the floor, the server limit is kept
         configuration.build.cpu_limit = 400;

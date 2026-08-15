@@ -27,7 +27,7 @@ impl IsIgnoredFn {
     /// Pairs a blocking body with the async one it mirrors.
     ///
     /// Both must accept and reject exactly the same paths; only how they get
-    /// there may differ. For anything that does no I/O, prefer `from` — the
+    /// there may differ. For anything that does no I/O, prefer `from` - the
     /// single body is then reused for both.
     pub fn new<S, A, Fut>(sync: S, r#async: A) -> Self
     where

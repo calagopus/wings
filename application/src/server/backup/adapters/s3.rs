@@ -60,6 +60,67 @@ pub struct S3Backup {
 }
 
 impl S3Backup {
+    /// A client for uploads to the given presigned URL's host, routed through
+    /// the congestion control proxy when one could be started - backup uploads
+    /// are long-haul flows where loss-based congestion control collapses. The
+    /// returned proxy must stay alive for as long as the client is used;
+    /// without one the shared direct client is handed out instead.
+    async fn upload_client(
+        server: &crate::server::Server,
+        sample_url: Option<&str>,
+    ) -> (
+        Option<crate::net::CongestionControlProxy>,
+        Arc<reqwest::Client>,
+    ) {
+        let proxy = match sample_url.and_then(|url| reqwest::Url::parse(url).ok()) {
+            Some(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
+                (Some(host), Some(port)) => {
+                    crate::net::CongestionControlProxy::start(
+                        &server.app_state.config,
+                        host.to_string(),
+                        port,
+                    )
+                    .await
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let client = match &proxy {
+            Some(active_proxy) => {
+                let mut builder = reqwest::ClientBuilder::new()
+                    .timeout(std::time::Duration::from_secs(
+                        server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .s3
+                            .part_upload_timeout,
+                    ))
+                    .tls_danger_accept_invalid_certs(
+                        server.app_state.config.ignore_certificate_errors,
+                    );
+
+                match reqwest::Proxy::all(active_proxy.url()) {
+                    Ok(reqwest_proxy) => builder = builder.proxy(reqwest_proxy),
+                    Err(err) => {
+                        tracing::debug!("failed to construct s3 upload proxy definition: {}", err);
+                    }
+                }
+
+                match builder.build() {
+                    Ok(client) => Arc::new(client),
+                    Err(_) => get_client(server),
+                }
+            }
+            None => get_client(server),
+        };
+
+        (proxy, client)
+    }
     #[inline]
     fn get_file_name(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
         config
@@ -76,6 +137,7 @@ impl S3Backup {
 
     async fn upload_part(
         server: &crate::server::Server,
+        client: &reqwest::Client,
         scratch: &mut tokio::fs::File,
         valid_len: u64,
         url: &str,
@@ -123,7 +185,7 @@ impl S3Backup {
                 crate::BUFFER_SIZE,
             ));
 
-            match get_client(server)
+            match client
                 .put(url)
                 .header("Content-Length", valid_len)
                 .header("Content-Type", "application/gzip")
@@ -316,6 +378,9 @@ impl S3Backup {
                 let mut part_number = 1;
                 let mut buffer = vec![0; crate::BUFFER_SIZE];
 
+                let (_upload_proxy, upload_http) =
+                    Self::upload_client(&server, url_queue.front().map(String::as_str)).await;
+
                 'parts: loop {
                     scratch.seek(std::io::SeekFrom::Start(0)).await?;
 
@@ -364,9 +429,16 @@ impl S3Backup {
                         }
                     };
 
-                    let etag =
-                        Self::upload_part(&server, scratch, valid_len, &url, part_number, uuid)
-                            .await?;
+                    let etag = Self::upload_part(
+                        &server,
+                        &upload_http,
+                        scratch,
+                        valid_len,
+                        &url,
+                        part_number,
+                        uuid,
+                    )
+                    .await?;
 
                     parts.push(crate::remote::backups::RawServerBackupPart { etag, part_number });
                     total_size += valid_len;
@@ -545,6 +617,9 @@ impl S3Backup {
             ));
         }
 
+        let (_upload_proxy, upload_http) =
+            Self::upload_client(server, part_urls.first().map(String::as_str)).await;
+
         let mut remaining_size = size;
         let mut parts = Vec::with_capacity(part_urls.len());
         for (i, url) in part_urls.into_iter().enumerate() {
@@ -590,7 +665,7 @@ impl S3Backup {
                     crate::BUFFER_SIZE,
                 ));
 
-                match get_client(server)
+                match upload_http
                     .put(&url)
                     .header("Content-Length", this_part_size)
                     .header("Content-Type", "application/gzip")

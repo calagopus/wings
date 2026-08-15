@@ -70,9 +70,9 @@ impl InotifyManager {
         &self,
         notifier: InotifyServerNotifier,
         uuid: uuid::Uuid,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<bool, anyhow::Error> {
         if notify::RecommendedWatcher::kind() == notify::WatcherKind::PollWatcher {
-            return Ok(());
+            return Ok(false);
         }
 
         let base_path = notifier.path.clone();
@@ -89,7 +89,7 @@ impl InotifyManager {
         })
         .await??;
 
-        Ok(())
+        Ok(true)
     }
 
     pub async fn unregister_server(&self, uuid: uuid::Uuid) {
@@ -109,19 +109,25 @@ pub struct InotifyServerNotifier {
     path: PathBuf,
     modified_paths: Arc<Mutex<Vec<PathBuf>>>,
     is_trusted: Arc<AtomicBool>,
+    dirty_flags: [Arc<AtomicBool>; 2],
 }
 
 impl InotifyServerNotifier {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, dirty_flags: [Arc<AtomicBool>; 2]) -> Self {
         Self {
             path: path.clone(),
             modified_paths: Arc::new(Mutex::new(vec![path])),
             is_trusted: Arc::new(AtomicBool::new(true)),
+            dirty_flags,
         }
     }
 
     fn add_path(&self, path: PathBuf) {
         const MAX_PATHS_BEFORE_DEDUP: usize = 512;
+
+        for flag in &self.dirty_flags {
+            flag.store(true, Ordering::Relaxed);
+        }
 
         let mut paths = self.modified_paths.lock();
         if paths.first() == Some(&self.path) {

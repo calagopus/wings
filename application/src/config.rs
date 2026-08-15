@@ -220,6 +220,9 @@ fn system_activity_send_interval() -> u64 {
 fn system_activity_send_count() -> usize {
     100
 }
+fn system_tcp_congestion_control() -> String {
+    "bbr".to_string()
+}
 fn system_check_permissions_on_boot() -> bool {
     true
 }
@@ -496,6 +499,12 @@ fn docker_cfs_burst_enabled() -> bool {
 }
 fn docker_cfs_burst_multiple() -> f64 {
     1.0
+}
+fn docker_startup_boost_timeout() -> u64 {
+    120
+}
+fn docker_startup_boost_max_concurrent() -> u64 {
+    3
 }
 
 fn docker_installer_limits_timeout() -> u64 {
@@ -791,6 +800,8 @@ nestify::nest! {
             pub check_permissions_on_boot_threads: usize,
             #[serde(default = "system_websocket_log_count")]
             pub websocket_log_count: usize,
+            #[serde(default = "system_tcp_congestion_control")]
+            pub tcp_congestion_control: String,
 
             #[serde(default)]
             #[schema(inline)]
@@ -1096,6 +1107,8 @@ nestify::nest! {
                 pub enabled: bool,
                 #[serde(default = "docker_registry_image_fetch_cache_duration")]
                 pub duration: u64,
+                #[serde(default)]
+                pub background_refresh: bool,
             },
 
             #[serde(default = "docker_tmpfs_size")]
@@ -1106,6 +1119,17 @@ nestify::nest! {
             pub container_pid_limit: u64,
             #[serde(default = "docker_container_apply_seccomp")]
             pub container_apply_seccomp: bool,
+            #[serde(default)]
+            pub container_apparmor_profile: String,
+            #[serde(default)]
+            #[schema(inline)]
+            pub container_ulimits: Vec<#[derive(Clone, ToSchema, Deserialize, Serialize)] pub struct DockerUlimit {
+                pub name: String,
+                pub soft: i64,
+                pub hard: i64,
+            }>,
+            #[serde(default)]
+            pub container_sysctls: HashMap<String, String>,
             #[serde(default = "docker_numa_memory_binding")]
             pub numa_memory_binding: bool,
 
@@ -1119,6 +1143,17 @@ nestify::nest! {
                 pub enabled: bool,
                 #[serde(default = "docker_cfs_burst_multiple")]
                 pub multiple: f64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub startup_boost: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerStartupBoost {
+                #[serde(default)]
+                pub enabled: bool,
+                #[serde(default = "docker_startup_boost_timeout")]
+                pub timeout: u64,
+                #[serde(default = "docker_startup_boost_max_concurrent")]
+                pub max_concurrent: u64,
             },
 
             #[serde(default)]

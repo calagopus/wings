@@ -337,7 +337,9 @@ impl Server {
                         None => break,
                     };
 
-                    server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
+                    if !server.filesystem.write_tracking_active() {
+                        server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
+                    }
 
                     if server.filesystem.is_full().await
                         && server.state.get_state() != state::ServerState::Offline
@@ -1069,9 +1071,33 @@ impl Server {
                         server.filesystem.setup().await;
                         server.filesystem.get_disk_limiter().startup().await?;
 
-                        server.destroy_container().await;
+                        // The old container's removal and the panel round-trip
+                        // are independent; only applying the fetched
+                        // configuration has to wait for the container (and its
+                        // process handle) to be gone.
+                        let (_, configuration) = tokio::join!(
+                            server.destroy_container(),
+                            server.app_state.config.client.server(server.uuid),
+                        );
 
-                        server.sync_configuration(true).await;
+                        match configuration {
+                            Ok(configuration) => {
+                                server
+                                    .update_configuration(
+                                        configuration.settings,
+                                        configuration.process_configuration,
+                                        true,
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    server = %server.uuid,
+                                    "failed to sync server configuration: {}",
+                                    err
+                                );
+                            }
+                        }
 
                         if !server.filesystem.disk_checker_state_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                             let now = std::time::SystemTime::now()
@@ -1120,15 +1146,32 @@ impl Server {
                         }
 
                         if server.app_state.config.load().system.check_permissions_on_boot {
-                            tracing::debug!(
-                                server = %server.uuid,
-                                "checking permissions on boot"
-                            );
-                            server.log_daemon_with_prelude(
-                                "Ensuring file permissions are set correctly, this could take a few seconds...",
-                            );
+                            // The walk only pays off when something was written
+                            // since the last one; an untracked filesystem keeps
+                            // the walk-every-boot behavior.
+                            let walk_needed = !server.filesystem.write_tracking_active()
+                                || server.filesystem.chown_state_dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
 
-                            server.filesystem.async_chown_path_recursive(&server.filesystem.base_path).await?;
+                            if walk_needed {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    "checking permissions on boot"
+                                );
+                                server.log_daemon_with_prelude(
+                                    "Ensuring file permissions are set correctly, this could take a few seconds...",
+                                );
+
+                                if let Err(err) = server.filesystem.async_chown_path_recursive(&server.filesystem.base_path).await {
+                                    server.filesystem.chown_state_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                                    return Err(err);
+                                }
+                            } else {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    "skipping permission check on boot, no filesystem writes since the last one"
+                                );
+                            }
                         }
 
                         server.setup_container().await?;
