@@ -90,9 +90,8 @@ pub struct Filesystem {
 
     disk_checker_rescan: Arc<tokio::sync::Notify>,
     pub disk_checker_state_dirty: Arc<AtomicBool>,
-    /// Raised on every observed filesystem write; consumed by the boot
-    /// permission walk so unchanged trees are not re-statted on every start.
     pub chown_state_dirty: Arc<AtomicBool>,
+    chown_refused: Arc<AtomicBool>,
     pub disk_checker: tokio::task::JoinHandle<()>,
     config: Arc<crate::config::Config>,
 
@@ -157,6 +156,7 @@ impl Filesystem {
             disk_checker_rescan: Arc::clone(&disk_checker_rescan),
             disk_checker_state_dirty: Arc::clone(&disk_checker_state_dirty),
             chown_state_dirty,
+            chown_refused: Arc::new(AtomicBool::new(false)),
             disk_checker: tokio::spawn(disk_checker::run(disk_checker::DiskCheckerContext {
                 config: Arc::clone(&config),
                 disk_usage: Arc::clone(&disk_usage),
@@ -1203,15 +1203,38 @@ impl Filesystem {
         }
     }
 
+    fn absorb_chown_refusal(
+        &self,
+        result: Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
+        let Err(err) = result else {
+            return Ok(());
+        };
+
+        if !self.config.load().system.user.rootless.enabled {
+            return Err(err);
+        }
+
+        if !self.chown_refused.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                server = %self.uuid,
+                "chown refused under a rootless engine, leaving ownership as written: {}",
+                err
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        if self.config.load().system.user.rootless.enabled {
+        if self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        Self::chown_impl(&self.config, &self.cap_filesystem, path)
+        self.absorb_chown_refusal(Self::chown_impl(&self.config, &self.cap_filesystem, path))
     }
     pub async fn async_chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        if self.config.load().system.user.rootless.enabled {
+        if self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1246,7 +1269,8 @@ impl Filesystem {
                 }
             })
             .await
-            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)
+            .and_then(|result| self.absorb_chown_refusal(result))
         }
         #[cfg(not(unix))]
         {
@@ -1258,7 +1282,7 @@ impl Filesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), anyhow::Error> {
-        if self.config.load().system.user.rootless.enabled {
+        if self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1276,7 +1300,7 @@ impl Filesystem {
                 let base_path = self.base_path.clone();
                 let root_rel = root_rel.clone();
 
-                move || -> Result<(), anyhow::Error> {
+                move || -> Result<(), std::io::Error> {
                     if root_rel.as_os_str().is_empty()
                         || root_rel == Path::new(".")
                         || root_rel == Path::new("/")
@@ -1299,9 +1323,10 @@ impl Filesystem {
                     Ok(())
                 }
             })
-            .await??;
+            .await
+            .map(|result| self.absorb_chown_refusal(result))??;
 
-            if !metadata.is_dir() {
+            if !metadata.is_dir() || self.chown_refused.load(Ordering::Relaxed) {
                 return Ok(());
             }
 

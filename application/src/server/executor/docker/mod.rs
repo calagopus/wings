@@ -29,6 +29,53 @@ pub fn string_to_option(s: &str) -> Option<String> {
     }
 }
 
+fn selinux_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *ENABLED.get_or_init(|| Path::new("/sys/fs/selinux/enforce").exists())
+}
+
+fn is_relabelable(source: &str) -> bool {
+    let source = Path::new(source);
+
+    !source.starts_with("/dev") && !source.starts_with("/proc") && !source.starts_with("/sys")
+}
+
+fn split_selinux_binds(
+    mounts: Vec<bollard::models::Mount>,
+) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
+    split_binds_for_relabel(mounts, selinux_enabled())
+}
+
+fn split_binds_for_relabel(
+    mounts: Vec<bollard::models::Mount>,
+    relabel: bool,
+) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
+    if !relabel {
+        return (mounts, None);
+    }
+
+    let mut binds = Vec::new();
+    let mut structured = Vec::new();
+
+    for mount in mounts {
+        match (mount.source.as_deref(), mount.target.as_deref()) {
+            (Some(source), Some(target)) if is_relabelable(source) => {
+                let mode = if mount.read_only.unwrap_or(false) {
+                    "ro"
+                } else {
+                    "rw"
+                };
+
+                binds.push(format!("{source}:{target}:{mode},z"));
+            }
+            _ => structured.push(mount),
+        }
+    }
+
+    (structured, (!binds.is_empty()).then_some(binds))
+}
+
 #[cfg(target_os = "linux")]
 fn nofile_ceiling(requested: u64) -> u64 {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -435,6 +482,9 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             security_opt.push(format!("apparmor={profile}"));
         }
 
+        let (mounts, binds) =
+            split_selinux_binds(self.convert_mounts(config, filesystem, host_mounts).await);
+
         Ok(bollard::plugin::ContainerCreateBody {
             exposed_ports: Some(self.convert_allocations_exposed()),
             host_config: Some(bollard::plugin::HostConfig {
@@ -454,7 +504,8 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 },
 
                 port_bindings: Some(self.convert_allocations_docker_bindings(config)),
-                mounts: Some(self.convert_mounts(config, filesystem, host_mounts).await),
+                mounts: Some(mounts),
+                binds,
                 #[cfg(unix)]
                 devices: Some(self.convert_devices()),
                 network_mode: Some(network_mode),
@@ -573,6 +624,83 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
     }
 }
 
+const TRANSIENT_JSON_ATTEMPTS: u32 = 4;
+const TRANSIENT_JSON_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[inline]
+fn is_transient_json_error(err: &bollard::errors::Error) -> bool {
+    matches!(
+        err,
+        bollard::errors::Error::JsonDataError { .. }
+            | bollard::errors::Error::JsonSerdeError { .. }
+    )
+}
+
+#[async_trait::async_trait]
+trait DockerCompatJsonExt {
+    async fn list_containers_settled(
+        &self,
+        options: Option<bollard::query_parameters::ListContainersOptions>,
+    ) -> Result<Vec<bollard::models::ContainerSummary>, bollard::errors::Error>;
+
+    async fn inspect_container_settled(
+        &self,
+        container_id: &str,
+        options: Option<bollard::query_parameters::InspectContainerOptions>,
+    ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error>;
+}
+
+#[async_trait::async_trait]
+impl DockerCompatJsonExt for bollard::Docker {
+    async fn list_containers_settled(
+        &self,
+        options: Option<bollard::query_parameters::ListContainersOptions>,
+    ) -> Result<Vec<bollard::models::ContainerSummary>, bollard::errors::Error> {
+        for attempt in 1..TRANSIENT_JSON_ATTEMPTS {
+            match self.list_containers(options.clone()).await {
+                Err(err) if is_transient_json_error(&err) => {
+                    tracing::debug!(
+                        "container list returned an unparseable state, retrying ({}/{}): {}",
+                        attempt,
+                        TRANSIENT_JSON_ATTEMPTS,
+                        err
+                    );
+
+                    tokio::time::sleep(TRANSIENT_JSON_BACKOFF * attempt).await;
+                }
+                result => return result,
+            }
+        }
+
+        self.list_containers(options).await
+    }
+
+    async fn inspect_container_settled(
+        &self,
+        container_id: &str,
+        options: Option<bollard::query_parameters::InspectContainerOptions>,
+    ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error> {
+        for attempt in 1..TRANSIENT_JSON_ATTEMPTS {
+            match self.inspect_container(container_id, options.clone()).await {
+                Err(err) if is_transient_json_error(&err) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        "container inspect returned an unparseable state, retrying ({}/{}): {}",
+                        attempt,
+                        TRANSIENT_JSON_ATTEMPTS,
+                        err
+                    );
+
+                    tokio::time::sleep(TRANSIENT_JSON_BACKOFF * attempt).await;
+                }
+                result => return result,
+            }
+        }
+
+        self.inspect_container(container_id, options).await
+    }
+}
+
 #[async_trait::async_trait]
 trait DockerRemoveExt {
     async fn remove_container_forgiving(
@@ -602,7 +730,7 @@ impl DockerRemoveExt for bollard::Docker {
             Err(DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(()),
-            Err(err) => match self.inspect_container(container_id, None).await {
+            Err(err) => match self.inspect_container_settled(container_id, None).await {
                 Err(DockerResponseServerError {
                     status_code: 404, ..
                 }) => {
@@ -631,7 +759,7 @@ trait DockerCfsBurstExt {
 impl DockerCfsBurstExt for bollard::Docker {
     async fn write_cfs_burst(&self, container_id: &str, multiple: f64) {
         for attempt in 0..2 {
-            let inspect = match self.inspect_container(container_id, None).await {
+            let inspect = match self.inspect_container_settled(container_id, None).await {
                 Ok(inspect) => inspect,
                 Err(err) => {
                     tracing::debug!(
@@ -1299,7 +1427,10 @@ impl DockerProcessHandle {
                 }
 
                 if matches!(source, StatsSource::Unresolved) {
-                    source = match stats_docker.inspect_container(&stats_id, None).await {
+                    source = match stats_docker
+                        .inspect_container_settled(&stats_id, None)
+                        .await
+                    {
                         Ok(inspect) => {
                             match inspect
                                 .state
@@ -1501,7 +1632,10 @@ impl DockerProcessHandle {
                     || cached.is_none()
                     || last_inspect.is_none_or(|at| at.elapsed() >= RECONCILE_INTERVAL)
                 {
-                    let inspect = match state_docker.inspect_container(&state_id, None).await {
+                    let inspect = match state_docker
+                        .inspect_container_settled(&state_id, None)
+                        .await
+                    {
                         Ok(inspect) => inspect,
                         Err(DockerResponseServerError {
                             status_code: 404, ..
@@ -1930,7 +2064,10 @@ async fn find_running_container(
     name_filter: &str,
     container_type: Option<&str>,
 ) -> Option<String> {
-    let mut filters = HashMap::from([("name".to_string(), vec![name_filter.to_string()])]);
+    let mut filters = HashMap::from([
+        ("name".to_string(), vec![name_filter.to_string()]),
+        ("status".to_string(), vec!["running".to_string()]),
+    ]);
     if let Some(container_type) = container_type {
         filters.insert(
             "label".to_string(),
@@ -1939,7 +2076,7 @@ async fn find_running_container(
     }
 
     let containers = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+        .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
             all: true,
             filters: Some(filters),
             ..Default::default()
@@ -2112,7 +2249,7 @@ impl super::ServerExecutor for DockerExecutor {
     ) -> Result<(), anyhow::Error> {
         let containers = self
             .docker
-            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
@@ -2174,6 +2311,27 @@ impl super::ServerExecutor for DockerExecutor {
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
+        let (mounts, binds) = split_selinux_binds(vec![
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    &server.filesystem.base(),
+                )),
+                target: Some("/mnt/server".to_string()),
+                ..Default::default()
+            },
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    &tmp_dir.to_string_lossy(),
+                )),
+                target: Some("/mnt/install".to_string()),
+                ..Default::default()
+            },
+        ]);
+
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(bollard::plugin::HostConfig {
                 memory: resources.memory,
@@ -2186,26 +2344,8 @@ impl super::ServerExecutor for DockerExecutor {
                 pids_limit: resources.pids_limit,
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
-                mounts: Some(vec![
-                    bollard::plugin::Mount {
-                        typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(host_mounts::translate_source(
-                            self.host_mounts(),
-                            &server.filesystem.base(),
-                        )),
-                        target: Some("/mnt/server".to_string()),
-                        ..Default::default()
-                    },
-                    bollard::plugin::Mount {
-                        typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(host_mounts::translate_source(
-                            self.host_mounts(),
-                            &tmp_dir.to_string_lossy(),
-                        )),
-                        target: Some("/mnt/install".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                mounts: Some(mounts),
+                binds,
                 network_mode: Some(self.app_config.load().docker.network.mode.clone()),
                 dns: Some(self.app_config.load().docker.network.dns.clone()),
                 dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
@@ -2323,7 +2463,7 @@ impl super::ServerExecutor for DockerExecutor {
     ) -> Result<(), anyhow::Error> {
         let containers = self
             .docker
-            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
@@ -2385,6 +2525,27 @@ impl super::ServerExecutor for DockerExecutor {
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
+        let (mounts, binds) = split_selinux_binds(vec![
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    &server.filesystem.base(),
+                )),
+                target: Some("/mnt/server".to_string()),
+                ..Default::default()
+            },
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    &tmp_dir.to_string_lossy(),
+                )),
+                target: Some("/mnt/script".to_string()),
+                ..Default::default()
+            },
+        ]);
+
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(bollard::plugin::HostConfig {
                 memory: resources.memory,
@@ -2397,26 +2558,8 @@ impl super::ServerExecutor for DockerExecutor {
                 pids_limit: resources.pids_limit,
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
-                mounts: Some(vec![
-                    bollard::plugin::Mount {
-                        typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(host_mounts::translate_source(
-                            self.host_mounts(),
-                            &server.filesystem.base(),
-                        )),
-                        target: Some("/mnt/server".to_string()),
-                        ..Default::default()
-                    },
-                    bollard::plugin::Mount {
-                        typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(host_mounts::translate_source(
-                            self.host_mounts(),
-                            &tmp_dir.to_string_lossy(),
-                        )),
-                        target: Some("/mnt/script".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                mounts: Some(mounts),
+                binds,
                 network_mode: Some(self.app_config.load().docker.network.mode.clone()),
                 dns: Some(self.app_config.load().docker.network.dns.clone()),
                 dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
@@ -2570,7 +2713,10 @@ impl super::ServerExecutor for DockerExecutor {
             }
         }
 
-        let inspect = self.docker.inspect_container(&container_id, None).await?;
+        let inspect = self
+            .docker
+            .inspect_container_settled(&container_id, None)
+            .await?;
 
         let network_name = self.app_config.load().docker.network.name.clone();
         match inspect
@@ -2603,7 +2749,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         let containers = self
             .docker
-            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
                 all: false,
                 ..Default::default()
             }))
@@ -2676,5 +2822,70 @@ mod tests {
         configuration.build.cpu_limit = 400;
         let installer = configuration.installer_resources(&config);
         assert_eq!(installer.cpu_quota, Some(80000));
+    }
+
+    // selinux relabelling
+
+    fn bind(source: &str, target: &str, read_only: bool) -> bollard::models::Mount {
+        bollard::models::Mount {
+            typ: Some(bollard::plugin::MountType::BIND),
+            source: Some(source.to_string()),
+            target: Some(target.to_string()),
+            read_only: Some(read_only),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_selinux_mounts_stay_structured() {
+        let (mounts, binds) = split_binds_for_relabel(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
+            false,
+        );
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(binds, None);
+    }
+
+    #[test]
+    fn with_selinux_binds_carry_the_shared_relabel_option() {
+        let (mounts, binds) = split_binds_for_relabel(
+            vec![
+                bind("/var/lib/wings/volumes/a", "/home/container", false),
+                bind("/run/wings/etc/passwd", "/etc/passwd", true),
+            ],
+            true,
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,z".to_string(),
+                "/run/wings/etc/passwd:/etc/passwd:ro,z".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn kernel_filesystems_are_never_relabelled() {
+        let (mounts, binds) = split_binds_for_relabel(
+            vec![
+                bind("/dev/hugepages", "/dev/hugepages", false),
+                bind("/var/lib/wings/volumes/a", "/home/container", false),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            mounts.first().and_then(|mount| mount.source.as_deref()),
+            Some("/dev/hugepages")
+        );
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,z".to_string()
+            ])
+        );
     }
 }

@@ -1,3 +1,4 @@
+use super::DockerCompatJsonExt;
 use anyhow::Context;
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ impl HostMountTable {
         let container_id = container_id_from_mountinfo(&mountinfo)?;
 
         let inspect = docker
-            .inspect_container(&container_id, None)
+            .inspect_container_settled(&container_id, None)
             .await
             .with_context(|| format!("failed to inspect own container {container_id}"))?;
         if inspect.id.as_deref() != Some(container_id.as_str()) {

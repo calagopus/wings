@@ -1728,6 +1728,18 @@ impl Config {
     }
 
     #[cfg(unix)]
+    fn ensure_rootless_userns_mode(cfg: &mut InnerConfig) {
+        if !cfg.docker.userns_mode.is_empty() {
+            return;
+        }
+
+        cfg.docker.userns_mode = format!(
+            "keep-id:uid={},gid={}",
+            cfg.system.user.rootless.container_uid, cfg.system.user.rootless.container_gid
+        );
+    }
+
+    #[cfg(unix)]
     fn ensure_user(cfg: &mut InnerConfig) -> Result<(), anyhow::Error> {
         let release =
             std::fs::read_to_string("/etc/os-release").unwrap_or_else(|_| "unknown".to_string());
@@ -1741,6 +1753,10 @@ impl Config {
             cfg.system.user.gid = std::env::var("WINGS_GID")
                 .unwrap_or_else(|_| "988".to_string())
                 .parse()?;
+
+            if cfg.system.user.rootless.enabled {
+                Self::ensure_rootless_userns_mode(cfg);
+            }
 
             return Ok(());
         }
@@ -1775,10 +1791,7 @@ impl Config {
                     ));
                 }
 
-                cfg.docker.userns_mode = format!(
-                    "keep-id:uid={},gid={}",
-                    cfg.system.user.rootless.container_uid, cfg.system.user.rootless.container_gid
-                );
+                Self::ensure_rootless_userns_mode(cfg);
 
                 return Ok(());
             }
