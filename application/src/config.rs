@@ -427,7 +427,7 @@ fn docker_network_interface() -> String {
     "172.18.0.1".to_string()
 }
 fn docker_network_dns() -> Vec<String> {
-    vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+    vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]
 }
 fn docker_network_dns_options() -> Vec<String> {
     vec![
