@@ -1071,10 +1071,6 @@ impl Server {
                         server.filesystem.setup().await;
                         server.filesystem.get_disk_limiter().startup().await?;
 
-                        // The old container's removal and the panel round-trip
-                        // are independent; only applying the fetched
-                        // configuration has to wait for the container (and its
-                        // process handle) to be gone.
                         let (_, configuration) = tokio::join!(
                             server.destroy_container(),
                             server.app_state.config.client.server(server.uuid),
@@ -1146,9 +1142,6 @@ impl Server {
                         }
 
                         if server.app_state.config.load().system.check_permissions_on_boot {
-                            // The walk only pays off when something was written
-                            // since the last one; an untracked filesystem keeps
-                            // the walk-every-boot behavior.
                             let walk_needed = !server.filesystem.write_tracking_active()
                                 || server.filesystem.chown_state_dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
 
