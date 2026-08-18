@@ -8,12 +8,11 @@ mod post {
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
-    use std::collections::HashSet;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
     pub struct Payload {
-        servers: HashSet<uuid::Uuid>,
+        servers: crate::models::ServerSelector,
         action: crate::models::ServerPowerAction,
         wait_seconds: Option<u64>,
     }
@@ -96,20 +95,14 @@ mod post {
         };
 
         let mut affected = 0;
-        if data.servers.is_empty() {
-            for server in state.server_manager.get_servers().await.iter() {
-                affected += 1;
-
-                spawn_task(server.clone());
+        for server in state.server_manager.get_servers().await.iter() {
+            if !data.servers.matches(&server.uuid) {
+                continue;
             }
-        } else {
-            for server in state.server_manager.get_servers().await.iter() {
-                if data.servers.contains(&server.uuid) {
-                    affected += 1;
 
-                    spawn_task(server.clone());
-                }
-            }
+            affected += 1;
+
+            spawn_task(server.clone());
         }
 
         ApiResponse::new_serialized(Response { affected })

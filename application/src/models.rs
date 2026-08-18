@@ -3,6 +3,26 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use utoipa::ToSchema;
 
+#[derive(ToSchema, Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+#[non_exhaustive]
+pub enum ServerSelector {
+    Uuids {
+        uuids: std::collections::HashSet<uuid::Uuid>,
+    },
+    All,
+}
+
+impl ServerSelector {
+    #[inline]
+    pub fn matches(&self, uuid: &uuid::Uuid) -> bool {
+        match self {
+            Self::Uuids { uuids } => uuids.contains(uuid),
+            Self::All => true,
+        }
+    }
+}
+
 #[derive(ToSchema, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerPowerAction {
