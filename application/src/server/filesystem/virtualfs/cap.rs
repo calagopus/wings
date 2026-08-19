@@ -16,8 +16,37 @@ use crate::{
     },
     utils::{CmpExt, PortablePermissions},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Ordering,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 use tokio::io::AsyncWriteExt;
+
+fn group_window(start: usize, end: usize, len: usize) -> Option<Range<usize>> {
+    let start = start.min(len);
+    let end = end.min(len);
+
+    if start >= end { None } else { Some(start..end) }
+}
+
+fn sort_window<T>(items: &mut [T], window: Range<usize>, cmp: impl Fn(&T, &T) -> Ordering) {
+    if window.start >= window.end || window.end > items.len() {
+        return;
+    }
+
+    items.select_nth_unstable_by(window.end - 1, &cmp);
+    if window.start > 0
+        && window.start + 1 < window.end
+        && let Some(prefix) = items.get_mut(..window.end - 1)
+    {
+        prefix.select_nth_unstable_by(window.start, &cmp);
+    }
+
+    if let Some(window) = items.get_mut(window) {
+        window.sort_unstable_by(&cmp);
+    }
+}
 
 #[derive(Clone)]
 pub struct VirtualCapFilesystem {
@@ -269,26 +298,48 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             let total_entries = directory_entries.len() + other_entries.len();
 
             if matches!(sort, NameAsc | NameDesc) {
-                directory_entries.sort_unstable_by(|a, b| a.cmp_ascii_case_insensitive(b));
-                other_entries.sort_unstable_by(|a, b| a.cmp_ascii_case_insensitive(b));
+                let descending = matches!(sort, NameDesc);
+                let cmp = |a: &String, b: &String| {
+                    let ordering = a.cmp_ascii_case_insensitive(b).then_with(|| a.cmp(b));
 
-                if matches!(sort, NameDesc) {
-                    directory_entries.reverse();
-                    other_entries.reverse();
+                    if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    }
+                };
+
+                let start = per_page.map_or(0, |per_page| {
+                    page.saturating_sub(1).saturating_mul(per_page)
+                });
+                let end = per_page.map_or(usize::MAX, |per_page| start.saturating_add(per_page));
+
+                let directory_window = group_window(start, end, directory_entries.len());
+                if let Some(window) = directory_window.clone() {
+                    sort_window(&mut directory_entries, window, cmp);
                 }
 
-                let start = per_page.map_or(0, |per_page| (page - 1) * per_page);
-                let limit = per_page.unwrap_or(usize::MAX);
+                let other_window = group_window(
+                    start.saturating_sub(directory_entries.len()),
+                    end.saturating_sub(directory_entries.len()),
+                    other_entries.len(),
+                );
+                if let Some(window) = other_window.clone() {
+                    sort_window(&mut other_entries, window, cmp);
+                }
 
                 let mut entries = Vec::new();
-                for entry in directory_entries
+                for entry in directory_window
                     .into_iter()
-                    .chain(other_entries)
-                    .skip(start)
-                    .take(limit)
+                    .flat_map(|window| directory_entries.get(window).unwrap_or_default())
+                    .chain(
+                        other_window
+                            .into_iter()
+                            .flat_map(|window| other_entries.get(window).unwrap_or_default()),
+                    )
                 {
                     if let Ok(entry) =
-                        runtime.block_on(this.async_directory_entry(&path.join(&entry)))
+                        runtime.block_on(this.async_directory_entry(&path.join(entry)))
                     {
                         entries.push(entry);
                     }
@@ -354,7 +405,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
                 let merged = dir_keyed.into_iter().chain(file_keyed).map(|(_, p)| p);
                 let paged: Vec<_> = if let Some(per_page) = per_page {
-                    let start = (page - 1) * per_page;
+                    let start = page.saturating_sub(1).saturating_mul(per_page);
                     merged.skip(start).take(per_page).collect()
                 } else {
                     merged.collect()
