@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     sync::{Arc, atomic::Ordering},
 };
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
 use utoipa::ToSchema;
 
 #[derive(ToSchema, Deserialize, Serialize, Clone)]
@@ -19,6 +22,8 @@ pub struct InstallationScript {
     pub environment: HashMap<compact_str::CompactString, serde_json::Value>,
 }
 
+pub const INSTALL_STATUS_FILE_NAME: &str = "status";
+
 pub struct ServerInstaller {
     pub reinstall: bool,
     environment: Vec<String>,
@@ -28,6 +33,7 @@ pub struct ServerInstaller {
     process_handle: Arc<Mutex<Option<Arc<dyn super::executor::ProcessHandle>>>>,
 
     abort_notify: Arc<tokio::sync::Notify>,
+    failure_reason: Mutex<Option<compact_str::CompactString>>,
 }
 
 impl ServerInstaller {
@@ -47,6 +53,84 @@ impl ServerInstaller {
             installation_script: installation_script.map(Arc::new),
             process_handle: Arc::new(Mutex::new(None)),
             abort_notify: Arc::new(tokio::sync::Notify::new()),
+            failure_reason: Mutex::new(None),
+        }
+    }
+
+    pub fn get_install_status_path(server: &super::Server) -> std::path::PathBuf {
+        server
+            .app_state
+            .config
+            .tmp_data_path(server.uuid)
+            .join(INSTALL_STATUS_FILE_NAME)
+    }
+
+    async fn read_install_status(path: &std::path::Path) -> Option<compact_str::CompactString> {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            options.custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            );
+        }
+
+        let file = options.open(path).await.ok()?;
+        if !file.metadata().await.ok()?.is_file() {
+            return None;
+        }
+
+        let mut content = Vec::new();
+        file.take(4096).read_to_end(&mut content).await.ok()?;
+
+        let content = String::from_utf8_lossy(&content);
+        let line = content.lines().next()?.trim();
+        if line.is_empty() {
+            return None;
+        }
+
+        let reason: compact_str::CompactString =
+            line.chars().filter(|c| !c.is_control()).take(255).collect();
+
+        match reason.parse::<i64>() {
+            Ok(0) => return None,
+            Ok(code) => {
+                return Some(compact_str::format_compact!(
+                    "installation script reported exit code {code}"
+                ));
+            }
+            Err(_) => {}
+        }
+
+        if reason.is_empty() {
+            return Some(compact_str::CompactString::const_new(
+                "installation script reported a failure",
+            ));
+        }
+
+        Some(reason)
+    }
+
+    async fn evaluate_install_result(&self, oom_killed: bool) {
+        let reason = if oom_killed {
+            Some(compact_str::CompactString::const_new(
+                "installation container ran out of memory",
+            ))
+        } else {
+            Self::read_install_status(&Self::get_install_status_path(&self.server)).await
+        };
+
+        if let Some(reason) = reason {
+            tracing::warn!(
+                server = %self.server.uuid,
+                "installation process reported failure: {}",
+                reason
+            );
+
+            self.server.log_daemon_install(compact_str::format_compact!(
+                "Installation failed: {reason}"
+            ));
+            *self.failure_reason.lock().await = Some(reason);
         }
     }
 
@@ -337,8 +421,10 @@ impl ServerInstaller {
                                                     Some(super::executor::ProcessStatus::Running) => {
                                                         seen_running = true;
                                                     }
-                                                    Some(super::executor::ProcessStatus::Stopped { .. }) if seen_running => {
-                                                        tracing::info!(server = ?installer.server.uuid, "ending server installation process by container exit");
+                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running => {
+                                                        tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
+
+                                                        installer.evaluate_install_result(oom_killed).await;
                                                         break;
                                                     }
                                                     None => break,
@@ -376,7 +462,8 @@ impl ServerInstaller {
                         }
                     }
 
-                    installer.unset_installing(true).await?;
+                    let successful = installer.failure_reason.lock().await.is_none();
+                    installer.unset_installing(successful).await?;
 
                     Ok(())
                 };
@@ -489,7 +576,13 @@ impl ServerInstaller {
                                             }
                                             result = status_rx.recv() => {
                                                 match result {
-                                                    Some(super::executor::ProcessStatus::Stopped { .. }) | None => {
+                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) => {
+                                                        tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
+
+                                                        installer.evaluate_install_result(oom_killed).await;
+                                                        break;
+                                                    }
+                                                    None => {
                                                         tracing::info!(server = ?installer.server.uuid, "ending server installation process by container exit");
                                                         break;
                                                     }
@@ -527,7 +620,8 @@ impl ServerInstaller {
                         }
                     }
 
-                    installer.unset_installing(true).await?;
+                    let successful = installer.failure_reason.lock().await.is_none();
+                    installer.unset_installing(successful).await?;
 
                     Ok(())
                 };
@@ -565,6 +659,11 @@ impl ServerInstaller {
             env.push_str(&format!("  {var}\n"));
         }
 
+        let failure = match self.failure_reason.lock().await.as_ref() {
+            Some(reason) => format!("\n  Failure Reason:       {reason}"),
+            None => String::new(),
+        };
+
         let mut file = ServerInstaller::create_install_logs(&self.server).await?;
         file.write_all(
             format!(
@@ -575,7 +674,7 @@ impl ServerInstaller {
 | ------------------------------
   Server UUID:          {}
   Container Image:      {}
-  Container Entrypoint: {}
+  Container Entrypoint: {}{failure}
 
 |
 | Environment Variables

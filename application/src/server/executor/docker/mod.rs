@@ -2296,6 +2296,11 @@ impl super::ServerExecutor for DockerExecutor {
             ));
         }
 
+        env.push(format!(
+            "INSTALL_STATUS_FILE=/mnt/install/{}",
+            super::super::installation::INSTALL_STATUS_FILE_NAME
+        ));
+
         drop(server_config);
 
         let tmp_dir = self.app_config.tmp_data_path(server.uuid);
@@ -2305,10 +2310,16 @@ impl super::ServerExecutor for DockerExecutor {
             script.script.replace("\r\n", "\n"),
         )
         .await?;
+
+        let status_path = tmp_dir.join(super::super::installation::INSTALL_STATUS_FILE_NAME);
+        tokio::fs::write(&status_path, "").await?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
+            tokio::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o666))
+                .await?;
         }
 
         let (mounts, binds) = split_selinux_binds(vec![
