@@ -839,6 +839,26 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         Ok(())
     }
 
+    async fn async_create_symlink_contents(
+        &self,
+        contents: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(), anyhow::Error> {
+        self.check_writable()?;
+        let link = self
+            .async_check_ignored(FileType::Symlink, link.as_ref())
+            .await?;
+
+        self.inner
+            .async_symlink_contents(contents.as_ref(), &link)
+            .await?;
+        if self.is_primary_server_fs {
+            self.server.filesystem.async_chown_path(&link).await?;
+        }
+
+        Ok(())
+    }
+
     fn create_seekable_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),

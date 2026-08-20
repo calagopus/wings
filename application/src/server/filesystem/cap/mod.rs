@@ -115,6 +115,43 @@ impl CapFilesystem {
         })
     }
 
+    pub fn resolve_symlink_contents(link: &Path, target: &Path) -> (PathBuf, PathBuf) {
+        let link = Self::resolve_path(link.strip_prefix("/").unwrap_or(link));
+        let directory = link.parent().unwrap_or(Path::new(""));
+
+        let resolved = match target.strip_prefix("/") {
+            Ok(target) => Self::resolve_path(target),
+            Err(_) => Self::resolve_path(&directory.join(target)),
+        };
+
+        let mut directory_components = directory.components().peekable();
+        let mut resolved_components = resolved.components().peekable();
+        while let (Some(directory_component), Some(resolved_component)) =
+            (directory_components.peek(), resolved_components.peek())
+        {
+            if directory_component != resolved_component {
+                break;
+            }
+
+            directory_components.next();
+            resolved_components.next();
+        }
+
+        let mut contents = PathBuf::new();
+        for _ in directory_components {
+            contents.push("..");
+        }
+        for component in resolved_components {
+            contents.push(component);
+        }
+
+        if contents.as_os_str().is_empty() {
+            contents.push(".");
+        }
+
+        (contents, resolved)
+    }
+
     pub async fn async_create_dir(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
@@ -998,6 +1035,34 @@ impl CapFilesystem {
         Ok(())
     }
 
+    pub async fn async_symlink_contents(
+        &self,
+        contents: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+    ) -> Result<(), std::io::Error> {
+        let contents = contents.as_ref().to_path_buf();
+        let link = self.relative_path(link.as_ref());
+
+        let inner = self.get_inner()?;
+        #[cfg(unix)]
+        tokio::task::spawn_blocking(move || inner.symlink(contents, link)).await??;
+        #[cfg(windows)]
+        tokio::task::spawn_blocking(move || {
+            let target =
+                Self::resolve_path(&link.parent().unwrap_or(Path::new("")).join(&contents));
+
+            let metadata = inner.metadata(&target)?;
+            if metadata.is_dir() {
+                inner.symlink_dir(contents, link)
+            } else {
+                inner.symlink_file(contents, link)
+            }
+        })
+        .await??;
+
+        Ok(())
+    }
+
     pub async fn async_hard_link(
         &self,
         target: impl AsRef<Path>,
@@ -1142,6 +1207,73 @@ mod tests {
         );
     }
 
+    // resolve_symlink_contents
+
+    #[test]
+    fn resolve_symlink_contents_resolves_relative_targets_next_to_the_link() {
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(
+                Path::new("plugins/Foo.jar"),
+                Path::new("Foo-1.0.jar")
+            ),
+            (
+                PathBuf::from("Foo-1.0.jar"),
+                PathBuf::from("plugins/Foo-1.0.jar")
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_symlink_contents_resolves_absolute_targets_from_the_root() {
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(
+                Path::new("/plugins/Foo.jar"),
+                Path::new("/plugins/Foo-1.0.jar")
+            ),
+            (
+                PathBuf::from("Foo-1.0.jar"),
+                PathBuf::from("plugins/Foo-1.0.jar")
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_symlink_contents_walks_up_to_targets_outside_the_link_directory() {
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(
+                Path::new("plugins/nested/Foo.jar"),
+                Path::new("/mods/Foo-1.0.jar")
+            ),
+            (
+                PathBuf::from("../../mods/Foo-1.0.jar"),
+                PathBuf::from("mods/Foo-1.0.jar")
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_symlink_contents_clamps_targets_escaping_the_root() {
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(
+                Path::new("plugins/Foo.jar"),
+                Path::new("../../../etc/passwd")
+            ),
+            (PathBuf::from("../etc/passwd"), PathBuf::from("etc/passwd"))
+        );
+    }
+
+    #[test]
+    fn resolve_symlink_contents_points_at_directories_above_the_link() {
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(Path::new("plugins/here"), Path::new(".")),
+            (PathBuf::from("."), PathBuf::from("plugins"))
+        );
+        assert_eq!(
+            CapFilesystem::resolve_symlink_contents(Path::new("plugins/here"), Path::new("..")),
+            (PathBuf::from(".."), PathBuf::from(""))
+        );
+    }
+
     // reversed walk + remove_dir_all
 
     fn temp_filesystem() -> (tempfile::TempDir, CapFilesystem) {
@@ -1180,6 +1312,35 @@ mod tests {
         // the walk root itself is never emitted, matching the pre-order walker
         assert!(!seen.iter().any(|s| s.as_os_str().is_empty()));
         assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn symlink_contents_are_written_verbatim() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+            std::fs::write(dir.path().join("Foo-1.0.jar"), "x").unwrap();
+
+            let (contents, target) = CapFilesystem::resolve_symlink_contents(
+                Path::new("plugins/Foo.jar"),
+                Path::new("/Foo-1.0.jar"),
+            );
+
+            filesystem
+                .async_symlink_contents(&contents, "plugins/Foo.jar")
+                .await
+                .unwrap();
+
+            assert_eq!(target, PathBuf::from("Foo-1.0.jar"));
+            assert_eq!(
+                std::fs::read_link(dir.path().join("plugins/Foo.jar")).unwrap(),
+                PathBuf::from("../Foo-1.0.jar")
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("plugins/Foo.jar")).unwrap(),
+                b"x"
+            );
+        });
     }
 
     #[test]

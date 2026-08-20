@@ -1078,11 +1078,12 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::NoSuchFile);
         }
 
-        let linkpath = PathBuf::from(linkpath);
-        let targetpath = match self.server.filesystem.async_canonicalize(&targetpath).await {
-            Ok(path) => path,
-            Err(_) => return Err(StatusCode::NoSuchFile),
-        };
+        let linkpath = self.server.filesystem.relative_path(Path::new(&linkpath));
+        let (contents, targetpath) =
+            crate::server::filesystem::cap::CapFilesystem::resolve_symlink_contents(
+                &linkpath,
+                Path::new(&targetpath),
+            );
 
         let metadata = match self
             .server
@@ -1094,10 +1095,9 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if !metadata.is_file()
-            || self
-                .async_is_ignored(&targetpath, metadata.file_type().into())
-                .await
+        if self
+            .async_is_ignored(&targetpath, metadata.file_type().into())
+            .await
             || self.async_is_ignored(&linkpath, FileType::File).await
         {
             return Err(StatusCode::NoSuchFile);
@@ -1106,14 +1106,14 @@ impl russh_sftp::server::Handler for SftpSession {
         if self
             .server
             .filesystem
-            .async_symlink(&targetpath, &linkpath)
+            .async_symlink_contents(&contents, &linkpath)
             .await
             .is_err()
         {
             return Err(StatusCode::Failure);
         }
 
-        if let Err(err) = self.server.filesystem.async_chown_path(&targetpath).await {
+        if let Err(err) = self.server.filesystem.async_chown_path(&linkpath).await {
             tracing::warn!("failed to chown new symlink: {:?}", err);
         }
 
