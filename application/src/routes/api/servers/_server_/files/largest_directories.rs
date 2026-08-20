@@ -68,6 +68,12 @@ mod get {
                 .any(|gi| gi.matched(path, is_dir).is_ignore())
         };
 
+        let root = server
+            .filesystem
+            .async_canonicalize(&root)
+            .await
+            .unwrap_or(root);
+
         let mut entries = Vec::new();
         let directories = server.filesystem.disk_usage.read().await;
 

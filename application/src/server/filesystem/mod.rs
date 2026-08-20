@@ -1620,6 +1620,31 @@ impl Filesystem {
         }
     }
 
+    pub async fn directory_entry_space(
+        &self,
+        real_path: &Path,
+        options: DirectoryEntryOptions,
+    ) -> (u64, u64) {
+        if !options.directory_size || self.config.load().api.disable_directory_size {
+            return (0, 0);
+        }
+
+        if let Some(space) = self.disk_usage.read().await.get_size(real_path) {
+            return (space.get_logical(), space.get_physical());
+        }
+
+        let canonical = match self.async_canonicalize(real_path).await {
+            Ok(canonical) if canonical != real_path => canonical,
+            _ => return (0, 0),
+        };
+
+        self.disk_usage
+            .read()
+            .await
+            .get_size(&canonical)
+            .map_or((0, 0), |space| (space.get_logical(), space.get_physical()))
+    }
+
     pub async fn to_api_entry_buffer(
         &self,
         path: PathBuf,
@@ -1633,13 +1658,7 @@ impl Filesystem {
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
         let (size, size_physical) = if real_metadata.is_dir() {
-            if options.directory_size && !self.config.load().api.disable_directory_size {
-                let space = self.disk_usage.read().await.get_size(real_path);
-
-                space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
-            } else {
-                (0, 0)
-            }
+            self.directory_entry_space(real_path, options).await
         } else {
             (real_metadata.size_logical(), real_metadata.size_physical())
         };
@@ -1714,13 +1733,7 @@ impl Filesystem {
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
         let (size, size_physical) = if real_metadata.is_dir() {
-            if options.directory_size && !self.config.load().api.disable_directory_size {
-                let space = self.disk_usage.read().await.get_size(real_path);
-
-                space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
-            } else {
-                (0, 0)
-            }
+            self.directory_entry_space(real_path, options).await
         } else {
             (real_metadata.size_logical(), real_metadata.size_physical())
         };
@@ -1842,13 +1855,7 @@ impl Filesystem {
             .unwrap_or(&prepared.path);
 
         if real_metadata.is_dir() {
-            if options.directory_size && !self.config.load().api.disable_directory_size {
-                let space = self.disk_usage.read().await.get_size(real_path);
-
-                space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
-            } else {
-                (0, 0)
-            }
+            self.directory_entry_space(real_path, options).await
         } else {
             (real_metadata.size_logical(), real_metadata.size_physical())
         }
