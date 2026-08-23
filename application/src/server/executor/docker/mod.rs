@@ -2300,6 +2300,10 @@ impl super::ServerExecutor for DockerExecutor {
             "INSTALL_STATUS_FILE=/mnt/install/{}",
             super::super::installation::INSTALL_STATUS_FILE_NAME
         ));
+        env.push(format!(
+            "INSTALL_PROGRESS_FILE=/mnt/install/{}",
+            super::super::installation::INSTALL_PROGRESS_FILE_NAME
+        ));
 
         drop(server_config);
 
@@ -2314,11 +2318,16 @@ impl super::ServerExecutor for DockerExecutor {
         let status_path = tmp_dir.join(super::super::installation::INSTALL_STATUS_FILE_NAME);
         tokio::fs::write(&status_path, "").await?;
 
+        let progress_path = tmp_dir.join(super::super::installation::INSTALL_PROGRESS_FILE_NAME);
+        tokio::fs::write(&progress_path, "").await?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
             tokio::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o666))
+                .await?;
+            tokio::fs::set_permissions(&progress_path, std::fs::Permissions::from_mode(0o666))
                 .await?;
         }
 

@@ -146,6 +146,13 @@ pub struct BackupProgress {
     pub files_processed: u64,
 }
 
+#[derive(ToSchema, Serialize)]
+pub struct InstallProgress {
+    pub progress: u64,
+    pub total: u64,
+    pub label: Option<compact_str::CompactString>,
+}
+
 #[derive(ToSchema, Serialize, Deserialize, Clone)]
 pub struct RenameFile {
     pub from: compact_str::CompactString,

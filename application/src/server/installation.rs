@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
 };
 use utoipa::ToSchema;
@@ -23,6 +23,10 @@ pub struct InstallationScript {
 }
 
 pub const INSTALL_STATUS_FILE_NAME: &str = "status";
+pub const INSTALL_PROGRESS_FILE_NAME: &str = "progress";
+
+const INSTALL_FILE_READ_LIMIT: u64 = 4096;
+const INSTALL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct ServerInstaller {
     pub reinstall: bool,
@@ -65,7 +69,15 @@ impl ServerInstaller {
             .join(INSTALL_STATUS_FILE_NAME)
     }
 
-    async fn read_install_status(path: &std::path::Path) -> Option<compact_str::CompactString> {
+    pub fn get_install_progress_path(server: &super::Server) -> std::path::PathBuf {
+        server
+            .app_state
+            .config
+            .tmp_data_path(server.uuid)
+            .join(INSTALL_PROGRESS_FILE_NAME)
+    }
+
+    async fn open_install_file(path: &std::path::Path) -> Option<tokio::fs::File> {
         let mut options = tokio::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -80,8 +92,17 @@ impl ServerInstaller {
             return None;
         }
 
+        Some(file)
+    }
+
+    async fn read_install_status(path: &std::path::Path) -> Option<compact_str::CompactString> {
+        let file = Self::open_install_file(path).await?;
+
         let mut content = Vec::new();
-        file.take(4096).read_to_end(&mut content).await.ok()?;
+        file.take(INSTALL_FILE_READ_LIMIT)
+            .read_to_end(&mut content)
+            .await
+            .ok()?;
 
         let content = String::from_utf8_lossy(&content);
         let line = content.lines().next()?.trim();
@@ -109,6 +130,87 @@ impl ServerInstaller {
         }
 
         Some(reason)
+    }
+
+    async fn read_install_progress(
+        path: &std::path::Path,
+    ) -> Option<crate::models::InstallProgress> {
+        let mut file = Self::open_install_file(path).await?;
+
+        let length = file.metadata().await.ok()?.len();
+        if length > INSTALL_FILE_READ_LIMIT {
+            file.seek(std::io::SeekFrom::Start(length - INSTALL_FILE_READ_LIMIT))
+                .await
+                .ok()?;
+        }
+
+        let mut content = Vec::new();
+        file.take(INSTALL_FILE_READ_LIMIT)
+            .read_to_end(&mut content)
+            .await
+            .ok()?;
+
+        let content = String::from_utf8_lossy(&content);
+        let line = content
+            .lines()
+            .map(|line| line.trim())
+            .rfind(|line| !line.is_empty())?;
+
+        let (progress, label) = match line.split_once(char::is_whitespace) {
+            Some((progress, label)) => (progress, label.trim()),
+            None => (line, ""),
+        };
+
+        let (progress, total) = match progress.split_once('/') {
+            Some((progress, total)) => (progress, total.parse::<i64>().ok()?),
+            None => (progress, 100),
+        };
+        if total <= 0 {
+            return None;
+        }
+
+        let progress = progress.parse::<i64>().ok()?.clamp(0, total);
+        let label: compact_str::CompactString = label
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(255)
+            .collect();
+
+        Some(crate::models::InstallProgress {
+            progress: progress as u64,
+            total: total as u64,
+            label: if label.is_empty() { None } else { Some(label) },
+        })
+    }
+
+    async fn send_install_progress(&self) {
+        let progress =
+            match Self::read_install_progress(&Self::get_install_progress_path(&self.server)).await
+            {
+                Some(progress) => progress,
+                None => return,
+            };
+
+        self.server
+            .websocket
+            .send(
+                super::websocket::WebsocketMessage::builder(
+                    super::websocket::WebsocketEvent::ServerInstallProgress,
+                )
+                .structured_arg(progress)
+                .build(),
+            )
+            .ok();
+    }
+
+    fn install_progress_interval() -> tokio::time::Interval {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + INSTALL_PROGRESS_INTERVAL,
+            INSTALL_PROGRESS_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        interval
     }
 
     async fn evaluate_install_result(&self, oom_killed: bool) {
@@ -394,9 +496,13 @@ impl ServerInstaller {
                                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     handle.start().await.context("Failed to start installation container")?;
 
+                                    let mut progress_tick = Self::install_progress_interval();
                                     let mut seen_running = false;
                                     loop {
                                         tokio::select! {
+                                            _ = progress_tick.tick() => {
+                                                installer.send_install_progress().await;
+                                            }
                                             result = stdout_rx.recv() => {
                                                 match result {
                                                     Ok(line) => {
@@ -553,8 +659,13 @@ impl ServerInstaller {
                                 let installer = Arc::clone(&installer);
 
                                 async move {
+                                    let mut progress_tick = Self::install_progress_interval();
+
                                     loop {
                                         tokio::select! {
+                                            _ = progress_tick.tick() => {
+                                                installer.send_install_progress().await;
+                                            }
                                             result = stdout_rx.recv() => {
                                                 match result {
                                                     Ok(line) => {
@@ -719,5 +830,128 @@ impl ServerInstaller {
 impl Drop for ServerInstaller {
     fn drop(&mut self) {
         self.abort_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(content: &str) -> Option<(u64, u64, Option<String>)> {
+        tokio_test::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(INSTALL_PROGRESS_FILE_NAME);
+            tokio::fs::write(&path, content).await.unwrap();
+
+            ServerInstaller::read_install_progress(&path)
+                .await
+                .map(|p| (p.progress, p.total, p.label.map(|l| l.to_string())))
+        })
+    }
+
+    // ServerInstaller::read_install_progress
+
+    #[test]
+    fn reads_a_bare_percentage_as_a_total_of_100() {
+        assert_eq!(progress("42\n"), Some((42, 100, None)));
+    }
+
+    #[test]
+    fn reads_a_percentage_with_a_label() {
+        assert_eq!(
+            progress("42 Downloading server files\n"),
+            Some((42, 100, Some("Downloading server files".to_string())))
+        );
+    }
+
+    #[test]
+    fn reads_an_explicit_progress_and_total() {
+        assert_eq!(progress("1234/5678\n"), Some((1234, 5678, None)));
+    }
+
+    #[test]
+    fn reads_an_explicit_progress_and_total_with_a_label() {
+        assert_eq!(
+            progress("512/2048 Downloading\n"),
+            Some((512, 2048, Some("Downloading".to_string())))
+        );
+    }
+
+    #[test]
+    fn uses_the_last_written_line_so_appending_scripts_still_report() {
+        assert_eq!(progress("10\n20\n30\n"), Some((30, 100, None)));
+    }
+
+    #[test]
+    fn reads_the_tail_of_a_file_larger_than_the_read_limit() {
+        let mut content = "0 padding\n".repeat(1024);
+        content.push_str("77 done padding\n");
+
+        assert!(content.len() as u64 > INSTALL_FILE_READ_LIMIT);
+        assert_eq!(
+            progress(&content),
+            Some((77, 100, Some("done padding".into())))
+        );
+    }
+
+    #[test]
+    fn clamps_progress_to_the_total() {
+        assert_eq!(progress("500"), Some((100, 100, None)));
+        assert_eq!(progress("-5"), Some((0, 100, None)));
+        assert_eq!(progress("9000/1024"), Some((1024, 1024, None)));
+    }
+
+    #[test]
+    fn ignores_empty_and_unparseable_content() {
+        assert_eq!(progress(""), None);
+        assert_eq!(progress("\n  \n"), None);
+        assert_eq!(progress("not a number"), None);
+        assert_eq!(progress("50%"), None);
+    }
+
+    #[test]
+    fn ignores_malformed_and_zero_totals() {
+        assert_eq!(progress("42/"), None);
+        assert_eq!(progress("/100"), None);
+        assert_eq!(progress("42/0"), None);
+        assert_eq!(progress("42/-1"), None);
+        assert_eq!(progress("42/abc"), None);
+    }
+
+    #[test]
+    fn strips_control_characters_from_labels() {
+        assert_eq!(
+            progress("42 clean\x07label"),
+            Some((42, 100, Some("cleanlabel".to_string())))
+        );
+    }
+
+    #[test]
+    fn ignores_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INSTALL_PROGRESS_FILE_NAME);
+
+        assert_eq!(
+            tokio_test::block_on(ServerInstaller::read_install_progress(&path)).map(|p| p.progress),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_a_symlinked_file() {
+        tokio_test::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            tokio::fs::write(&target, "42").await.unwrap();
+
+            let path = dir.path().join(INSTALL_PROGRESS_FILE_NAME);
+            tokio::fs::symlink(&target, &path).await.unwrap();
+
+            assert!(
+                ServerInstaller::read_install_progress(&path)
+                    .await
+                    .is_none()
+            );
+        });
     }
 }

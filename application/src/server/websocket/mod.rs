@@ -88,6 +88,8 @@ pub enum WebsocketEvent {
     ServerImagePullCompleted,
     #[serde(rename = "install started")]
     ServerInstallStarted,
+    #[serde(rename = "install progress")]
+    ServerInstallProgress,
     #[serde(rename = "install completed")]
     ServerInstallCompleted,
     #[serde(rename = "daemon message")]
