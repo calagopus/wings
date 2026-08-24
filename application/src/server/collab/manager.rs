@@ -85,6 +85,7 @@ fn editor_id(editor: Option<&str>) -> Result<compact_str::CompactString, CollabE
 struct ConnectionState {
     subscriptions: HashMap<compact_str::CompactString, HashSet<compact_str::CompactString>>,
     keys: HashMap<compact_str::CompactString, compact_str::CompactString>,
+    pending_resync: bool,
 }
 
 impl ConnectionState {
@@ -99,6 +100,7 @@ impl ConnectionState {
             .or_default()
             .insert(editor);
         self.keys.insert(raw_path.to_compact_string(), key.clone());
+        self.pending_resync = false;
     }
 
     fn unsubscribe(
@@ -525,7 +527,19 @@ impl CollabManager {
                     if session.participants.lock().await.is_empty()
                         && !session.dirty.load(Ordering::Relaxed)
                     {
-                        let content = Self::read_content(&filesystem, &path, size_cap).await?;
+                        let content = match Self::read_content(&filesystem, &path, size_cap).await {
+                            Ok(content) => content,
+                            Err(err) => {
+                                sessions.remove(&key);
+                                tracing::debug!(
+                                    server = %self.server,
+                                    path = %key,
+                                    "closed empty collaborative editing session after refresh failure"
+                                );
+
+                                return Err(err);
+                            }
+                        };
                         {
                             let mut doc = session.doc.lock();
                             if doc.disk_hash != blake3::hash(content.as_bytes()) {
@@ -604,6 +618,7 @@ impl CollabManager {
                     .arg(key)
                     .arg(BASE64.encode(state))
                     .structured_arg(CollabSyncMeta { dirty, conflict })
+                    .arg(raw_path)
                     .build(),
             )
             .await;
@@ -740,17 +755,21 @@ impl CollabManager {
         user_uuid: uuid::Uuid,
         raw_path: &str,
     ) -> Result<(compact_str::CompactString, Arc<CollabSession>), CollabError> {
-        let (_, key, _) = self.resolve(server, user_uuid, raw_path).await?;
+        let (_, resolved, _) = self.resolve(server, user_uuid, raw_path).await?;
 
-        if !self
-            .connections
-            .lock()
-            .await
-            .get(&connection_id)
-            .is_some_and(|connection| connection.subscriptions.contains_key(&key))
-        {
-            return Err(CollabError::User("not subscribed to this file"));
-        }
+        let key = {
+            let connections = self.connections.lock().await;
+            let Some(connection) = connections.get(&connection_id) else {
+                return Err(CollabError::User("not subscribed to this file"));
+            };
+
+            let key = connection.keys.get(raw_path).cloned().unwrap_or(resolved);
+            if !connection.subscriptions.contains_key(&key) {
+                return Err(CollabError::User("not subscribed to this file"));
+            }
+
+            key
+        };
 
         let session = self
             .sessions
@@ -935,10 +954,8 @@ impl CollabManager {
         let (key, session) = self
             .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
-        let (path, _, filesystem) = self.resolve(server, user_uuid, raw_path).await?;
-        if Path::new(raw_path).parent().is_none() {
-            return Err(CollabError::User("file has no parent"));
-        }
+        let path = session.abs_path.clone();
+        let filesystem = Arc::clone(&session.filesystem);
 
         let _save_guard = session.save_lock.lock().await;
 
@@ -1174,6 +1191,39 @@ impl CollabManager {
         }
 
         Ok(())
+    }
+
+    /// Asks a connection to resubscribe to all of its collaborative sessions after
+    /// targeted websocket messages were dropped (channel lag or an expired jwt), since
+    /// a missed update leaves the client's document permanently stalled. Debounced per
+    /// connection until the client resubscribes. The resync errors are stamped with the
+    /// raw paths the connection subscribed with, not the canonical session keys — a
+    /// client that never received its sync ack only recognizes the former.
+    pub async fn resync_connection(&self, handler: &ServerWebsocketHandler) {
+        let paths: Vec<compact_str::CompactString> = {
+            let mut connections = self.connections.lock().await;
+            let Some(connection) = connections.get_mut(&handler.connection_id) else {
+                return;
+            };
+
+            if connection.pending_resync {
+                return;
+            }
+            connection.pending_resync = true;
+
+            connection.keys.keys().cloned().collect()
+        };
+
+        for key in paths {
+            handler
+                .send_message(
+                    WebsocketMessage::builder(WebsocketEvent::FileCollabError)
+                        .arg(key)
+                        .arg("resync")
+                        .build(),
+                )
+                .await;
+        }
     }
 
     pub async fn disconnect(&self, connection_id: uuid::Uuid) {

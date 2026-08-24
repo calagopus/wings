@@ -135,6 +135,13 @@ pub async fn handle_jwt(
                         }
                     }
 
+                    if websocket_handler
+                        .missed_targeted
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        server.collab.resync_connection(websocket_handler).await;
+                    }
+
                     Ok(None)
                 }
                 Err(err) => {

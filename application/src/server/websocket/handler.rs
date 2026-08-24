@@ -297,6 +297,7 @@ pub async fn handle_ws(
                                                     server = %server.uuid,
                                                     "no socket jwt found, ignoring targeted websocket message",
                                                 );
+                                                websocket_handler.missed_targeted.store(true, Ordering::Relaxed);
                                                 continue;
                                             }
                                         };
@@ -307,6 +308,7 @@ pub async fn handle_ws(
                                                 "invalid jwt when receiving targeted websocket message: {}",
                                                 err
                                             );
+                                            websocket_handler.missed_targeted.store(true, Ordering::Relaxed);
                                             continue;
                                         }
 
@@ -328,6 +330,7 @@ pub async fn handle_ws(
                                             server = %server.uuid,
                                             "targeted websocket lagged behind, messages dropped"
                                         );
+                                        server.collab.resync_connection(&websocket_handler).await;
                                     }
                                 }
                             }

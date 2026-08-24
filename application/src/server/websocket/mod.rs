@@ -329,6 +329,7 @@ pub struct ServerWebsocketHandler {
     socket_jwt: SocketJwt,
     closed: AtomicBool,
     binary_mode: AtomicBool,
+    missed_targeted: AtomicBool,
 }
 
 impl ServerWebsocketHandler {
@@ -344,6 +345,7 @@ impl ServerWebsocketHandler {
             socket_jwt,
             closed: AtomicBool::new(false),
             binary_mode: AtomicBool::new(false),
+            missed_targeted: AtomicBool::new(false),
         }
     }
 
