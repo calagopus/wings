@@ -1586,15 +1586,21 @@ impl DockerProcessHandle {
                     usage.cpu_absolute = cpu_absolute;
                 });
 
-                let boost = stats_app_config.load().docker.runtime_boost;
-                if boost.enabled
-                    && stats_boosted_limit.load(Ordering::Relaxed) == 0
+                if stats_boosted_limit.load(Ordering::Relaxed) == 0
                     && boost_cooldown_until.is_none_or(|until| until <= std::time::Instant::now())
                     && stats_server.state.get_state() == super::super::state::ServerState::Running
                 {
-                    let cpu_limit = stats_server.configuration.read().await.build.cpu_limit;
+                    let (boost, cpu_limit) = {
+                        let configuration = stats_server.configuration.read().await;
 
-                    if cpu_limit > 0
+                        (
+                            configuration.features.runtime_cpu_boost(&stats_app_config),
+                            configuration.build.cpu_limit,
+                        )
+                    };
+
+                    if boost.enabled
+                        && cpu_limit > 0
                         && cpu_absolute >= cpu_limit as f64 * boost.threshold as f64 / 100.0
                     {
                         boost_streak += 1;
@@ -1805,20 +1811,19 @@ impl DockerProcessHandle {
     async fn begin_startup_boost(&self) -> bool {
         static ACTIVE_BOOSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-        let boost = self.app_config.load().docker.startup_boost;
-        if !boost.enabled {
-            return false;
-        }
-
         let Ok(server) = self.get_server() else {
             return false;
         };
 
-        let update_config = server
-            .configuration
-            .read()
-            .await
-            .container_update_config(&self.app_config);
+        let configuration = server.configuration.read().await;
+        let boost = configuration.features.startup_cpu_boost(&self.app_config);
+        if !boost.enabled {
+            return false;
+        }
+
+        let update_config = configuration.container_update_config(&self.app_config);
+        drop(configuration);
+
         let quota = update_config.cpu_quota.unwrap_or(-1);
         let period = update_config.cpu_period.unwrap_or(100000);
         if quota <= 0 {

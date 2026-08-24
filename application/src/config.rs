@@ -500,25 +500,25 @@ fn docker_cfs_burst_enabled() -> bool {
 fn docker_cfs_burst_multiple() -> f64 {
     1.0
 }
-fn docker_startup_boost_timeout() -> u64 {
+pub(crate) fn docker_startup_boost_timeout() -> u64 {
     120
 }
 fn docker_startup_boost_max_concurrent() -> u64 {
     3
 }
-fn docker_runtime_boost_threshold() -> u64 {
+pub(crate) fn docker_runtime_boost_threshold() -> u64 {
     90
 }
-fn docker_runtime_boost_sustained() -> u64 {
+pub(crate) fn docker_runtime_boost_sustained() -> u64 {
     10
 }
-fn docker_runtime_boost_multiple() -> f64 {
+pub(crate) fn docker_runtime_boost_multiple() -> f64 {
     2.0
 }
-fn docker_runtime_boost_duration() -> u64 {
+pub(crate) fn docker_runtime_boost_duration() -> u64 {
     60
 }
-fn docker_runtime_boost_cooldown() -> u64 {
+pub(crate) fn docker_runtime_boost_cooldown() -> u64 {
     300
 }
 fn docker_runtime_boost_max_concurrent() -> u64 {

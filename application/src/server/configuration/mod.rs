@@ -299,6 +299,74 @@ nestify::nest! {
 
         #[serde(default)]
         pub auto_start_behavior: crate::models::ServerAutoStartBehavior,
+
+        #[serde(default)]
+        #[schema(inline)]
+        pub features: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde, Clone, Copy)] pub struct ServerConfigurationFeatures {
+            #[serde(default)]
+            #[schema(inline)]
+            pub startup_cpu_boost: Option<#[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde, Clone, Copy)] #[serde(default)] pub struct ServerConfigurationFeaturesStartupCpuBoost {
+                #[serde(default)]
+                pub enabled: bool,
+                #[serde(default = "crate::config::docker_startup_boost_timeout")]
+                pub timeout: u64,
+            }>,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub runtime_cpu_boost: Option<#[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde, Clone, Copy)] #[serde(default)] pub struct ServerConfigurationFeaturesRuntimeCpuBoost {
+                #[serde(default)]
+                pub enabled: bool,
+                #[serde(default = "crate::config::docker_runtime_boost_threshold")]
+                pub threshold: u64,
+                #[serde(default = "crate::config::docker_runtime_boost_sustained")]
+                pub sustained: u64,
+                #[serde(default = "crate::config::docker_runtime_boost_multiple")]
+                pub multiple: f64,
+                #[serde(default = "crate::config::docker_runtime_boost_duration")]
+                pub duration: u64,
+                #[serde(default = "crate::config::docker_runtime_boost_cooldown")]
+                pub cooldown: u64,
+            }>,
+        },
+    }
+}
+
+impl ServerConfigurationFeatures {
+    pub fn startup_cpu_boost(
+        &self,
+        config: &crate::config::Config,
+    ) -> crate::config::DockerStartupBoost {
+        let node = config.load().docker.startup_boost;
+
+        match self.startup_cpu_boost {
+            Some(boost) => crate::config::DockerStartupBoost {
+                enabled: boost.enabled,
+                timeout: boost.timeout,
+                max_concurrent: node.max_concurrent,
+            },
+            None => node,
+        }
+    }
+
+    pub fn runtime_cpu_boost(
+        &self,
+        config: &crate::config::Config,
+    ) -> crate::config::DockerRuntimeBoost {
+        let node = config.load().docker.runtime_boost;
+
+        match self.runtime_cpu_boost {
+            Some(boost) => crate::config::DockerRuntimeBoost {
+                enabled: boost.enabled,
+                threshold: boost.threshold,
+                sustained: boost.sustained,
+                multiple: boost.multiple,
+                duration: boost.duration,
+                cooldown: boost.cooldown,
+                max_concurrent: node.max_concurrent,
+            },
+            None => node,
+        }
     }
 }
 
@@ -365,6 +433,7 @@ impl ServerConfiguration {
                 seconds: 0,
             },
             auto_start_behavior: crate::models::ServerAutoStartBehavior::default(),
+            features: ServerConfigurationFeatures::default(),
         }
     }
 
