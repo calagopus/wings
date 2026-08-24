@@ -43,6 +43,14 @@ fn resolve_entry_path(destination: &Path, path: &Path) -> Option<PathBuf> {
     ))
 }
 
+pub fn generated_archive_name(extension: &str) -> compact_str::CompactString {
+    compact_str::format_compact!(
+        "archive-{}.{}",
+        chrono::Local::now().format("%Y-%m-%dT%H%M%S%z"),
+        extension
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ArchiveType {
     None,

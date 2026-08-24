@@ -5,7 +5,7 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::archive::StreamableArchiveFormat,
+        server::filesystem::archive::{StreamableArchiveFormat, generated_archive_name},
     };
     use axum::{
         extract::Query,
@@ -84,36 +84,14 @@ mod get {
             .resolve_readable_fs(&server, Path::new(&payload.file_path))
             .await;
 
-        let mut folder_ascii = String::new();
-        for (i, file_path) in payload.file_paths.iter().enumerate() {
-            let file_name = Path::new(file_path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            for c in file_name.chars() {
-                if c.is_ascii() {
-                    folder_ascii.push(c);
-                } else {
-                    folder_ascii.push('_');
-                }
-            }
-
-            if i < payload.file_paths.len() - 1 {
-                folder_ascii.push('_');
-            }
-        }
-
-        folder_ascii.push('.');
-        folder_ascii.push_str(data.archive_format.extension());
+        let archive_name = generated_archive_name(data.archive_format.extension());
 
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Disposition",
             format!(
                 "attachment; filename={}",
-                serde_json::Value::String(folder_ascii)
+                serde_json::Value::String(archive_name.into_string())
             )
             .parse()?,
         );

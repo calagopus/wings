@@ -5,7 +5,11 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::{archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn},
+        server::filesystem::{
+            archive::{ArchiveFormat, generated_archive_name},
+            cap::FileType,
+            virtualfs::IsIgnoredFn,
+        },
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -67,13 +71,9 @@ mod post {
                 .ok();
         }
 
-        let archive_name = data.name.unwrap_or_else(|| {
-            compact_str::format_compact!(
-                "archive-{}.{}",
-                chrono::Local::now().format("%Y-%m-%dT%H%M%S%z"),
-                data.format.extension()
-            )
-        });
+        let archive_name = data
+            .name
+            .unwrap_or_else(|| generated_archive_name(data.format.extension()));
         let file_name = root.join(&archive_name);
 
         let parent = match file_name.parent() {
