@@ -1363,6 +1363,11 @@ impl DockerProcessHandle {
         let stats_server = server.clone();
 
         let boosted_limit_percent = Arc::new(AtomicU32::new(0));
+        let cfs_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let stats_app_config = Arc::clone(&app_config);
+        let stats_cfs_lock = Arc::clone(&cfs_lock);
+        let stats_boosted_limit = Arc::clone(&boosted_limit_percent);
 
         let stats_task = tokio::spawn(async move {
             if !publish_resource_usage {
@@ -1378,6 +1383,9 @@ impl DockerProcessHandle {
             let mut source = StatsSource::Unresolved;
             let mut prev_cpu_total = 0;
             let mut prev_at = None;
+
+            let mut boost_streak = 0u64;
+            let mut boost_cooldown_until: Option<std::time::Instant> = None;
 
             let mut tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -1422,6 +1430,7 @@ impl DockerProcessHandle {
                     });
                     source = StatsSource::Unresolved;
                     prev_at = None;
+                    boost_streak = 0;
 
                     continue;
                 }
@@ -1545,6 +1554,22 @@ impl DockerProcessHandle {
                     }
                 };
 
+                let cpu_absolute = if let Some(prev) = prev_at {
+                    let cpu_delta_ns = sample.cpu_total_ns.saturating_sub(prev_cpu_total) as f64;
+                    let wall_delta_ns = sample.at.duration_since(prev).as_nanos() as f64;
+
+                    if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
+                        ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                prev_cpu_total = sample.cpu_total_ns;
+                prev_at = Some(sample.at);
+
                 stats_usage.send_modify(|usage| {
                     usage.memory_bytes = sample.memory_bytes;
                     usage.memory_limit_bytes = sample.memory_limit_bytes;
@@ -1558,23 +1583,48 @@ impl DockerProcessHandle {
                         usage.network.tx_packets = tx_packets;
                     }
 
-                    usage.cpu_absolute = if let Some(prev) = prev_at {
-                        let cpu_delta_ns =
-                            sample.cpu_total_ns.saturating_sub(prev_cpu_total) as f64;
-                        let wall_delta_ns = sample.at.duration_since(prev).as_nanos() as f64;
-
-                        if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
-                            ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-
-                    prev_cpu_total = sample.cpu_total_ns;
-                    prev_at = Some(sample.at);
+                    usage.cpu_absolute = cpu_absolute;
                 });
+
+                let boost = stats_app_config.load().docker.runtime_boost;
+                if boost.enabled
+                    && stats_boosted_limit.load(Ordering::Relaxed) == 0
+                    && boost_cooldown_until.is_none_or(|until| until <= std::time::Instant::now())
+                    && stats_server.state.get_state() == super::super::state::ServerState::Running
+                {
+                    let cpu_limit = stats_server.configuration.read().await.build.cpu_limit;
+
+                    if cpu_limit > 0
+                        && cpu_absolute >= cpu_limit as f64 * boost.threshold as f64 / 100.0
+                    {
+                        boost_streak += 1;
+                    } else {
+                        boost_streak = 0;
+                    }
+
+                    if boost_streak >= boost.sustained.max(1)
+                        && DockerProcessHandle::begin_runtime_boost(
+                            Arc::clone(&stats_docker),
+                            Arc::clone(&stats_app_config),
+                            stats_id.clone(),
+                            Arc::clone(&stats_cfs_lock),
+                            Arc::clone(&stats_boosted_limit),
+                            Arc::downgrade(&*stats_server),
+                            boost,
+                            cpu_limit,
+                        )
+                    {
+                        boost_streak = 0;
+                        boost_cooldown_until = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(
+                                    boost.duration.saturating_add(boost.cooldown),
+                                ),
+                        );
+                    }
+                } else {
+                    boost_streak = 0;
+                }
             }
         });
 
@@ -1734,7 +1784,7 @@ impl DockerProcessHandle {
             app_config,
             resource_usage,
             publish_resource_usage,
-            cfs_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cfs_lock,
             boosted_limit_percent,
             stdin_tx,
             stdout_ratelimited_rx,
@@ -1884,6 +1934,126 @@ impl DockerProcessHandle {
                 boosted_limit_percent.store(0, Ordering::Relaxed);
                 ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
             }
+        });
+
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_runtime_boost(
+        docker: Arc<bollard::Docker>,
+        app_config: Arc<crate::config::Config>,
+        container_id: String,
+        cfs_lock: Arc<tokio::sync::Mutex<()>>,
+        boosted_limit_percent: Arc<AtomicU32>,
+        server: Weak<super::super::InnerServer>,
+        boost: crate::config::DockerRuntimeBoost,
+        cpu_limit: i64,
+    ) -> bool {
+        static ACTIVE_BOOSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let mut active = ACTIVE_BOOSTS.load(Ordering::Relaxed);
+        loop {
+            if active >= boost.max_concurrent {
+                tracing::debug!(
+                    container = %container_id,
+                    "runtime boost skipped, {} boosts already active",
+                    active
+                );
+
+                return false;
+            }
+
+            match ACTIVE_BOOSTS.compare_exchange(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+
+        if boosted_limit_percent
+            .compare_exchange(0, cpu_limit as u32, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
+
+            return false;
+        }
+
+        tokio::spawn(async move {
+            let period = app_config.load().docker.cpu_period_us();
+            let boosted_quota = (cpu_limit * period / 100) as f64 * boost.multiple.max(1.0);
+
+            {
+                let _cfs_guard = cfs_lock.lock().await;
+
+                docker.clear_cfs_burst(&container_id).await;
+                if let Err(err) = docker
+                    .update_container(
+                        &container_id,
+                        bollard::plugin::ContainerUpdateBody {
+                            cpu_quota: Some(boosted_quota as i64),
+                            cpu_period: Some(period),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        container = %container_id,
+                        "failed to apply runtime boost: {}",
+                        err
+                    );
+                    docker.apply_cfs_burst(&container_id, &app_config).await;
+
+                    boosted_limit_percent.store(0, Ordering::Relaxed);
+                    ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
+
+                    return;
+                }
+                docker.apply_cfs_burst(&container_id, &app_config).await;
+            }
+
+            tracing::debug!(
+                container = %container_id,
+                "runtime boost active, cpu quota raised for {}s",
+                boost.duration
+            );
+
+            tokio::time::sleep(std::time::Duration::from_secs(boost.duration)).await;
+
+            if let Some(server) = server.upgrade() {
+                let update_config = server
+                    .configuration
+                    .read()
+                    .await
+                    .container_update_config(&app_config);
+
+                let _cfs_guard = cfs_lock.lock().await;
+
+                docker.clear_cfs_burst(&container_id).await;
+                if let Err(err) = docker.update_container(&container_id, update_config).await {
+                    tracing::debug!(
+                        container = %container_id,
+                        "failed to restore cpu quota after runtime boost: {}",
+                        err
+                    );
+                }
+                docker.apply_cfs_burst(&container_id, &app_config).await;
+
+                tracing::debug!(
+                    server = %server.uuid,
+                    container = %container_id,
+                    "runtime boost ended, cpu quota restored"
+                );
+            }
+
+            boosted_limit_percent.store(0, Ordering::Relaxed);
+            ACTIVE_BOOSTS.fetch_sub(1, Ordering::Relaxed);
         });
 
         true

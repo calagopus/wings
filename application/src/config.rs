@@ -506,6 +506,24 @@ fn docker_startup_boost_timeout() -> u64 {
 fn docker_startup_boost_max_concurrent() -> u64 {
     3
 }
+fn docker_runtime_boost_threshold() -> u64 {
+    90
+}
+fn docker_runtime_boost_sustained() -> u64 {
+    10
+}
+fn docker_runtime_boost_multiple() -> f64 {
+    2.0
+}
+fn docker_runtime_boost_duration() -> u64 {
+    60
+}
+fn docker_runtime_boost_cooldown() -> u64 {
+    300
+}
+fn docker_runtime_boost_max_concurrent() -> u64 {
+    3
+}
 
 fn docker_installer_limits_timeout() -> u64 {
     30 * 60
@@ -1153,6 +1171,26 @@ nestify::nest! {
                 #[serde(default = "docker_startup_boost_timeout")]
                 pub timeout: u64,
                 #[serde(default = "docker_startup_boost_max_concurrent")]
+                pub max_concurrent: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub runtime_boost: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerRuntimeBoost {
+                #[serde(default)]
+                pub enabled: bool,
+                #[serde(default = "docker_runtime_boost_threshold")]
+                /// % of the configured cpu limit
+                pub threshold: u64,
+                #[serde(default = "docker_runtime_boost_sustained")]
+                pub sustained: u64,
+                #[serde(default = "docker_runtime_boost_multiple")]
+                pub multiple: f64,
+                #[serde(default = "docker_runtime_boost_duration")]
+                pub duration: u64,
+                #[serde(default = "docker_runtime_boost_cooldown")]
+                pub cooldown: u64,
+                #[serde(default = "docker_runtime_boost_max_concurrent")]
                 pub max_concurrent: u64,
             },
 
