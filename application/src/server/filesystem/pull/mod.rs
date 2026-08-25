@@ -92,6 +92,7 @@ impl PullQueryResponse {
             .get(url)
             .send()
             .await
+            .map_err(|err| err.without_url())
             .context("failed to send HEAD request")?;
 
         if !response.status().is_success() {
@@ -165,6 +166,7 @@ impl Download {
             .get(url)
             .send()
             .await
+            .map_err(|err| err.without_url())
             .context("failed to send download request")?;
         let mut real_destination = destination.to_path_buf();
 
@@ -277,7 +279,9 @@ impl Download {
                     let mut run_inner = async || -> Result<(), anyhow::Error> {
                         let mut writer = filesystem.async_create_file(&destination).await?;
 
-                        while let Some(chunk) = response.chunk().await? {
+                        while let Some(chunk) =
+                            response.chunk().await.map_err(|err| err.without_url())?
+                        {
                             writer.write_all(&chunk).await?;
                             progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         }

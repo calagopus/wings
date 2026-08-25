@@ -171,7 +171,7 @@ pub async fn execute(
             tracing::error!(
                 server = %server,
                 "failed to send schedule http request: {:?}",
-                err
+                err.without_url()
             );
 
             return Err("failed to send the http request".into());

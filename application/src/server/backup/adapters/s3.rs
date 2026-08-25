@@ -217,7 +217,7 @@ impl S3Backup {
                         server = %server.uuid,
                         "failed to upload s3 backup part {}: {:#?}",
                         part_number,
-                        err
+                        err.without_url()
                     );
 
                     tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
@@ -696,7 +696,7 @@ impl S3Backup {
                             server = %server.uuid,
                             "failed to upload s3 backup part {}: {:#?}",
                             i + 1,
-                            err
+                            err.without_url()
                         );
 
                         tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
@@ -836,13 +836,19 @@ impl BackupExt for S3Backup {
             }
         };
 
-        let response = get_client(server).get(url.clone()).send().await?;
+        let response = get_client(server)
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|err| err.without_url())?;
         if let Some(content_length) = response.content_length() {
             total.store(content_length, Ordering::SeqCst);
         }
 
         let reader = tokio_util::io::StreamReader::new(Box::pin(
-            response.bytes_stream().map_err(std::io::Error::other),
+            response
+                .bytes_stream()
+                .map_err(|err| std::io::Error::other(err.without_url())),
         ));
 
         let server = server.clone();

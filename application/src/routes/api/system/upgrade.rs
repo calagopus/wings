@@ -95,14 +95,15 @@ mod post {
             .get(data.url.as_str())
             .headers(headers)
             .send()
-            .await?;
+            .await
+            .map_err(|err| err.without_url())?;
         let mut options = tokio::fs::OpenOptions::new();
         options.create(true).write(true).truncate(true).read(true);
         #[cfg(unix)]
         options.mode(0o766);
         let mut file = options.open(&tmp_file).await?;
 
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(|err| err.without_url())? {
             file.write_all(&chunk).await?;
         }
 

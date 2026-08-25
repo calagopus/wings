@@ -178,7 +178,7 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> 
 async fn handle_request(req: Request<Body>, next: Next) -> Result<Response<Body>, StatusCode> {
     tracing::info!(
         path = req.uri().path(),
-        query = req.uri().query().unwrap_or_default(),
+        query = %crate::utils::redact_query(req.uri().query().unwrap_or_default()),
         "http {}",
         req.method().to_string().to_lowercase(),
     );
