@@ -254,8 +254,6 @@ nestify::nest! {
             #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
             pub overhead_memory: i64,
             pub swap: i64,
-            /// Only has an effect with a scheduler that implements weights, CFQ on
-            /// cgroup v1 and BFQ or iocost on v2. It is silently ignored otherwise.
             pub io_weight: Option<u16>,
             pub cpu_limit: i64,
             pub disk_space: u64,
@@ -263,6 +261,8 @@ nestify::nest! {
             pub oom_disabled: bool,
         },
         pub mounts: Vec<Mount>,
+        #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
+        pub firewall: Vec<super::firewall::FirewallRule>,
         #[schema(inline)]
         pub egg: #[derive(ToSchema, Deserialize, Serialize)] pub struct ServerConfigurationEgg {
             pub id: uuid::Uuid,
@@ -415,6 +415,7 @@ impl ServerConfiguration {
                 oom_disabled: false,
             },
             mounts: Vec::new(),
+            firewall: Vec::new(),
             egg: ServerConfigurationEgg {
                 id: uuid::Uuid::new_v4(),
                 file_denylist: Vec::new(),

@@ -106,7 +106,7 @@ pub fn parse_dynamic_index_entries(data: &[u8]) -> Result<Vec<(u64, [u8; 32])>, 
     }
 
     let mut out = Vec::with_capacity(entries.len() / DYNAMIC_INDEX_ENTRY_SIZE);
-    for entry in entries.chunks_exact(DYNAMIC_INDEX_ENTRY_SIZE) {
+    for entry in entries.as_chunks::<DYNAMIC_INDEX_ENTRY_SIZE>().0 {
         let offset_bytes = entry
             .get(0..8)
             .ok_or_else(|| PbsError::Decode("dynamic index entry too short".into()))?;

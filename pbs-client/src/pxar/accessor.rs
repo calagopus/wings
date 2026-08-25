@@ -77,7 +77,10 @@ impl<T: ReadAt + Clone> Directory<T> {
         .await?;
 
         let mut table = Vec::with_capacity(count);
-        for chunk in raw.chunks_exact(super::format::GOODBYE_ITEM_SIZE as usize) {
+        for chunk in raw
+            .as_chunks::<{ super::format::GOODBYE_ITEM_SIZE as usize }>()
+            .0
+        {
             table.push(super::format::GoodbyeItem::from_le_bytes(chunk)?);
         }
 

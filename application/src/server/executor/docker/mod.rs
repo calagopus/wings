@@ -267,6 +267,10 @@ trait DockerServerConfigurationExt {
         config: &crate::config::Config,
     ) -> bollard::models::PortMap;
     fn convert_allocations_exposed(&self) -> Vec<String>;
+    fn convert_firewall_spec(
+        &self,
+        config: &crate::config::Config,
+    ) -> crate::server::firewall::FirewallServerSpec;
 
     async fn container_config(
         &self,
@@ -381,6 +385,43 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         }
 
         map
+    }
+
+    fn convert_firewall_spec(
+        &self,
+        config: &crate::config::Config,
+    ) -> crate::server::firewall::FirewallServerSpec {
+        let config = config.load();
+        let mut bindings = std::collections::BTreeSet::new();
+
+        for (ip, ports) in &self.allocations.mappings {
+            let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+
+            let ip = match HostBinding::resolve(&config.docker.network, ip) {
+                HostBinding::Wildcard => None,
+                HostBinding::Address(address) => Some(address),
+                HostBinding::Unbound => continue,
+            };
+
+            for port in ports {
+                bindings.insert(crate::server::firewall::FirewallBinding { ip, port: *port });
+            }
+        }
+
+        let mut container_ports = std::collections::BTreeSet::new();
+        for ports in self.allocations.mappings.values() {
+            container_ports.extend(ports.iter().copied());
+        }
+
+        crate::server::firewall::FirewallServerSpec {
+            server: self.uuid,
+            bindings: bindings.into_iter().collect(),
+            container_ports: container_ports.into_iter().collect(),
+            container_ips: Vec::new(),
+            rules: self.firewall.clone(),
+        }
     }
 
     fn convert_allocations_exposed(&self) -> Vec<String> {
@@ -803,20 +844,58 @@ impl DockerCfsBurstExt for bollard::Docker {
 pub struct DockerExecutor {
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
+    firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
     stats_sampler: Arc<cgroup::StatsSampler>,
     host_mounts: OnceLock<Option<host_mounts::HostMountTable>>,
     host_gateway: OnceLock<Option<std::net::IpAddr>>,
 }
 
 impl DockerExecutor {
-    pub fn new(docker: Arc<bollard::Docker>, app_config: Arc<crate::config::Config>) -> Self {
+    pub fn new(
+        docker: Arc<bollard::Docker>,
+        app_config: Arc<crate::config::Config>,
+        firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
+    ) -> Self {
         Self {
             docker,
             app_config,
+            firewall,
             stats_sampler: Arc::new(cgroup::StatsSampler::default()),
             host_mounts: OnceLock::new(),
             host_gateway: OnceLock::new(),
         }
+    }
+
+    /// Addresses of the container wings itself runs in, used to exempt
+    /// wings's own connections to servers from the per-server firewalls.
+    /// Empty when wings is not running in a container, or when its own
+    /// container cannot be found.
+    pub async fn own_container_ips(docker: &bollard::Docker) -> Vec<std::net::IpAddr> {
+        if !std::path::Path::new("/.dockerenv").exists() && std::env::var("OCI_CONTAINER").is_err()
+        {
+            return Vec::new();
+        }
+
+        match host_mounts::HostMountTable::own_container_inspect(docker).await {
+            Ok((_, inspect)) => ContainerFirewallState::endpoint_ips(&inspect),
+            Err(err) => {
+                tracing::warn!("failed to inspect own container for firewall exemptions: {err:#}");
+
+                Vec::new()
+            }
+        }
+    }
+
+    pub async fn reconcile_firewall(
+        &self,
+        servers: &[crate::remote::servers::RawServer],
+    ) -> Result<(), anyhow::Error> {
+        let specs: Vec<crate::server::firewall::FirewallServerSpec> = servers
+            .iter()
+            .map(|server| server.settings.convert_firewall_spec(&self.app_config))
+            .collect();
+
+        self.firewall.reconcile(&specs).await
     }
 
     #[inline]
@@ -1215,6 +1294,7 @@ struct DockerProcessHandle {
     docker: Arc<bollard::Docker>,
     server: Weak<super::super::InnerServer>,
     app_config: Arc<crate::config::Config>,
+    firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
 
     resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
     publish_resource_usage: bool,
@@ -1236,6 +1316,7 @@ impl DockerProcessHandle {
         docker: Arc<bollard::Docker>,
         server: &super::super::Server,
         app_config: Arc<crate::config::Config>,
+        firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
         stats_sampler: Arc<cgroup::StatsSampler>,
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
@@ -1638,6 +1719,9 @@ impl DockerProcessHandle {
         let state_id = container_id.clone();
         let state_usage = resource_usage.clone();
         let state_boosted_limit = Arc::clone(&boosted_limit_percent);
+        let state_firewall = Arc::clone(&firewall);
+        let state_app_config = Arc::clone(&app_config);
+        let state_server = Arc::downgrade(&**server);
 
         let state_task = tokio::spawn(async move {
             const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1664,6 +1748,7 @@ impl DockerProcessHandle {
             let mut wait_exit_code = None;
             let mut cached: Option<CachedState> = None;
             let mut last_inspect: Option<std::time::Instant> = None;
+            let mut last_running: Option<bool> = None;
 
             let mut tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -1777,6 +1862,35 @@ impl DockerProcessHandle {
                     wait_exit_code = None;
                 }
 
+                let running = !matches!(process_status, super::ProcessStatus::Stopped { .. });
+                match last_running {
+                    None => last_running = Some(running),
+                    Some(previous) if previous != running => {
+                        last_running = Some(running);
+
+                        if let Some(server) = state_server.upgrade() {
+                            tokio::spawn({
+                                let docker = Arc::clone(&state_docker);
+                                let firewall = Arc::clone(&state_firewall);
+                                let app_config = Arc::clone(&state_app_config);
+                                let container_id = state_id.clone();
+
+                                async move {
+                                    Self::sync_firewall(
+                                        &docker,
+                                        &*firewall,
+                                        &app_config,
+                                        &server,
+                                        &container_id,
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+
                 if status_tx.send(process_status).await.is_err() {
                     break;
                 }
@@ -1788,6 +1902,7 @@ impl DockerProcessHandle {
             docker,
             server: Arc::downgrade(&**server),
             app_config,
+            firewall,
             resource_usage,
             publish_resource_usage,
             cfs_lock,
@@ -1806,6 +1921,39 @@ impl DockerProcessHandle {
         self.server
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("server has been dropped"))
+    }
+
+    async fn sync_firewall(
+        docker: &bollard::Docker,
+        firewall: &dyn crate::server::firewall::FirewallBackend,
+        app_config: &crate::config::Config,
+        server: &super::super::InnerServer,
+        container_id: &str,
+    ) {
+        let mut spec = server
+            .configuration
+            .read()
+            .await
+            .convert_firewall_spec(app_config);
+        match ContainerFirewallState::read(docker, container_id).await {
+            Ok(state) => {
+                spec.bindings = state.bindings;
+                spec.container_ports = state.container_ports;
+                spec.container_ips = state.container_ips;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    server = %spec.server,
+                    "failed to read the container's published ports, firewalling the configured allocations instead: {err:#}"
+                );
+            }
+        }
+        if let Err(err) = firewall.sync(&spec).await {
+            tracing::error!(
+                server = %spec.server,
+                "failed to sync firewall rules: {err:#}"
+            );
+        }
     }
 
     async fn begin_startup_boost(&self) -> bool {
@@ -2134,6 +2282,15 @@ impl super::ProcessHandle for DockerProcessHandle {
     async fn sync_configuration(&self) -> Result<(), anyhow::Error> {
         let server = self.get_server()?;
 
+        Self::sync_firewall(
+            &self.docker,
+            &*self.firewall,
+            &self.app_config,
+            &server,
+            &self.container_id,
+        )
+        .await;
+
         let update_config = server
             .configuration
             .read()
@@ -2157,6 +2314,17 @@ impl super::ProcessHandle for DockerProcessHandle {
         self.docker
             .start_container(&self.container_id, None)
             .await?;
+
+        if let Ok(server) = self.get_server() {
+            Self::sync_firewall(
+                &self.docker,
+                &*self.firewall,
+                &self.app_config,
+                &server,
+                &self.container_id,
+            )
+            .await;
+        }
 
         if !self.begin_startup_boost().await {
             let _cfs_guard = self.cfs_lock.lock().await;
@@ -2234,6 +2402,94 @@ impl super::ProcessHandle for DockerProcessHandle {
 
 type StatusReceiver = tokio::sync::mpsc::Receiver<super::ProcessStatus>;
 
+struct ContainerFirewallState {
+    bindings: Vec<crate::server::firewall::FirewallBinding>,
+    container_ports: Vec<u16>,
+    container_ips: Vec<std::net::IpAddr>,
+}
+
+impl ContainerFirewallState {
+    async fn read(docker: &bollard::Docker, container_id: &str) -> Result<Self, anyhow::Error> {
+        let inspect = docker.inspect_container_settled(container_id, None).await?;
+
+        let container_ips = Self::endpoint_ips(&inspect);
+
+        let mut container_ports = std::collections::BTreeSet::new();
+        for exposed in inspect
+            .config
+            .and_then(|config| config.exposed_ports)
+            .unwrap_or_default()
+        {
+            if let Some(port) = exposed
+                .split('/')
+                .next()
+                .and_then(|port| port.parse::<u16>().ok())
+            {
+                container_ports.insert(port);
+            }
+        }
+
+        let mut bindings = std::collections::BTreeSet::new();
+        for port_bindings in inspect
+            .host_config
+            .and_then(|host_config| host_config.port_bindings)
+            .unwrap_or_default()
+            .into_values()
+        {
+            for binding in port_bindings.into_iter().flatten() {
+                let Some(port) = binding
+                    .host_port
+                    .as_deref()
+                    .and_then(|port| port.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+
+                let ip = match binding.host_ip.as_deref() {
+                    None | Some("") => None,
+                    Some(ip) => match ip.parse::<std::net::IpAddr>() {
+                        Ok(ip) if ip.is_unspecified() => None,
+                        Ok(ip) => Some(ip),
+                        Err(_) => continue,
+                    },
+                };
+
+                bindings.insert(crate::server::firewall::FirewallBinding { ip, port });
+            }
+        }
+
+        Ok(Self {
+            bindings: bindings.into_iter().collect(),
+            container_ports: container_ports.into_iter().collect(),
+            container_ips,
+        })
+    }
+
+    fn endpoint_ips(inspect: &bollard::models::ContainerInspectResponse) -> Vec<std::net::IpAddr> {
+        let mut ips = std::collections::BTreeSet::new();
+        for endpoint in inspect
+            .network_settings
+            .iter()
+            .filter_map(|settings| settings.networks.as_ref())
+            .flat_map(|networks| networks.values())
+        {
+            for ip in [
+                endpoint.ip_address.as_deref(),
+                endpoint.global_ipv6_address.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
+                    ips.insert(ip);
+                }
+            }
+        }
+
+        ips.into_iter().collect()
+    }
+}
+
 async fn find_running_container(
     docker: &bollard::Docker,
     name_filter: &str,
@@ -2276,6 +2532,7 @@ async fn find_running_container(
 impl super::ServerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.app_config.ensure_docker_network(&self.docker).await?;
+        self.firewall.boot().await?;
 
         if std::env::var("OCI_CONTAINER").is_ok() {
             match host_mounts::HostMountTable::discover(&self.docker).await {
@@ -2355,6 +2612,22 @@ impl super::ServerExecutor for DockerExecutor {
             .ensure_vmounts(&self.app_config)
             .await?;
 
+        let firewall_spec = server
+            .configuration
+            .read()
+            .await
+            .convert_firewall_spec(&self.app_config);
+        if let Err(err) = self.firewall.sync(&firewall_spec).await {
+            if firewall_spec.rules.is_empty() {
+                tracing::warn!(
+                    server = %server.uuid,
+                    "failed to clear firewall rules: {err:#}"
+                );
+            } else {
+                return Err(err.context("failed to apply firewall rules"));
+            }
+        }
+
         let container = self
             .docker
             .create_container(
@@ -2373,6 +2646,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
@@ -2396,6 +2670,15 @@ impl super::ServerExecutor for DockerExecutor {
         .await
         .ok_or_else(|| anyhow::anyhow!("no running server container found"))?;
 
+        DockerProcessHandle::sync_firewall(
+            &self.docker,
+            &*self.firewall,
+            &self.app_config,
+            server,
+            &container_id,
+        )
+        .await;
+
         self.docker
             .apply_cfs_burst(&container_id, &self.app_config)
             .await;
@@ -2407,6 +2690,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
@@ -2422,6 +2706,13 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(), anyhow::Error> {
+        if let Err(err) = self.firewall.clear(server.uuid).await {
+            tracing::warn!(
+                server = %server.uuid,
+                "failed to clear firewall rules: {err:#}"
+            );
+        }
+
         let containers = self
             .docker
             .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
@@ -2607,6 +2898,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
@@ -2641,6 +2933,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
                 true,
@@ -2825,6 +3118,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
+                Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
                 false,

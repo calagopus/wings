@@ -420,9 +420,14 @@ async fn main_rt() {
             },
         );
 
+        let own_container_ips =
+            crate::server::executor::docker::DockerExecutor::own_container_ips(&docker).await;
+        let firewall = crate::server::firewall::create(&config, &own_container_ips).await;
+
         Arc::new(crate::server::executor::docker::DockerExecutor::new(
             docker,
             config.clone(),
+            firewall,
         ))
     };
 
@@ -451,6 +456,22 @@ async fn main_rt() {
         Ok(servers) => servers,
         Err(err) => exit_error!("failed to fetch servers from remote: {:?}", err),
     };
+
+    for attempt in 1..=3 {
+        match executor.reconcile_firewall(&servers).await {
+            Ok(()) => break,
+            Err(err) if attempt < 3 => {
+                tracing::warn!(
+                    "failed to reconcile server firewall rules, retrying: {:#}",
+                    err
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(err) => {
+                tracing::error!("failed to reconcile server firewall rules: {:#}", err);
+            }
+        }
+    }
 
     let state = Arc::new(crate::routes::AppState {
         start_time: Instant::now(),

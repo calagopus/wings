@@ -22,6 +22,7 @@ pub mod configuration;
 pub mod diff;
 pub mod executor;
 pub mod filesystem;
+pub mod firewall;
 pub mod installation;
 pub mod manager;
 pub mod permissions;

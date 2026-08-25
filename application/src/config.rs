@@ -1111,6 +1111,13 @@ nestify::nest! {
             },
 
             #[serde(default)]
+            #[schema(inline)]
+            pub firewall: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerFirewall {
+                #[serde(default)]
+                pub backend: crate::server::firewall::FirewallBackendKind,
+            },
+
+            #[serde(default)]
             pub domainname: String,
             #[serde(default)]
             #[schema(inline)]

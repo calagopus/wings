@@ -13,22 +13,7 @@ pub struct HostMountTable {
 
 impl HostMountTable {
     pub async fn discover(docker: &bollard::Docker) -> Result<Self, anyhow::Error> {
-        let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
-            .await
-            .context("failed to read /proc/self/mountinfo")?;
-        let container_id = container_id_from_mountinfo(&mountinfo)?;
-
-        let inspect = docker
-            .inspect_container_settled(&container_id, None)
-            .await
-            .with_context(|| format!("failed to inspect own container {container_id}"))?;
-        if inspect.id.as_deref() != Some(container_id.as_str()) {
-            return Err(anyhow::anyhow!(
-                "container engine returned id {:?} when inspecting own container {}",
-                inspect.id,
-                container_id
-            ));
-        }
+        let (container_id, inspect) = Self::own_container_inspect(docker).await?;
 
         let mut mounts = Vec::new();
         for mount in inspect.mounts.unwrap_or_default() {
@@ -99,6 +84,29 @@ impl HostMountTable {
         }
 
         Ok(())
+    }
+
+    pub async fn own_container_inspect(
+        docker: &bollard::Docker,
+    ) -> Result<(String, bollard::models::ContainerInspectResponse), anyhow::Error> {
+        let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
+            .await
+            .context("failed to read /proc/self/mountinfo")?;
+        let container_id = container_id_from_mountinfo(&mountinfo)?;
+
+        let inspect = docker
+            .inspect_container_settled(&container_id, None)
+            .await
+            .with_context(|| format!("failed to inspect own container {container_id}"))?;
+        if inspect.id.as_deref() != Some(container_id.as_str()) {
+            return Err(anyhow::anyhow!(
+                "container engine returned id {:?} when inspecting own container {}",
+                inspect.id,
+                container_id
+            ));
+        }
+
+        Ok((container_id, inspect))
     }
 }
 
