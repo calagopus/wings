@@ -9,7 +9,7 @@ mod post {
         },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::{cap::FileType, virtualfs::DirectoryWalkFn},
+        server::filesystem::virtualfs::{DirectoryWalkFn, VirtualWalkEntry},
     };
     use axum::http::StatusCode;
     use ignore::{gitignore::GitignoreBuilder, overrides::OverrideBuilder};
@@ -18,7 +18,7 @@ mod post {
     use std::{
         cell::RefCell,
         io::{BufRead, BufReader, Read},
-        path::{Path, PathBuf},
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -257,7 +257,10 @@ mod post {
                                 let needle = Arc::clone(&needle);
                                 let listener = listener.clone();
 
-                                move |file_type: FileType, path: PathBuf| {
+                                move |entry: VirtualWalkEntry| {
+                                    let file_type = entry.file_type;
+                                    let path = entry.path;
+
                                     if crate::unlikely(
                                         listener.is_aborted()
                                             || results_count.load(Ordering::Relaxed) >= limit,
@@ -414,7 +417,10 @@ mod post {
                                 let needle = needle.clone();
                                 let listener = listener.clone();
 
-                                move |file_type: FileType, path: PathBuf| {
+                                move |entry: VirtualWalkEntry| {
+                                    let file_type = entry.file_type;
+                                    let path = entry.path;
+
                                     if crate::unlikely(
                                         listener.is_aborted()
                                             || results_count.load(Ordering::Relaxed)

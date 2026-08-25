@@ -1,6 +1,6 @@
 use crate::server::filesystem::virtualfs::IsIgnoredFn;
 use parking_lot::RwLock;
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy, Debug)]
@@ -59,13 +59,13 @@ impl From<std::fs::FileType> for FileType {
     }
 }
 
-pub struct AsyncCapReadDir(
+pub struct AsyncReadDir(
     pub Option<cap_std::fs::ReadDir>,
-    pub Option<VecDeque<std::io::Result<(FileType, String)>>>,
+    pub Option<VecDeque<std::io::Result<cap_std::fs::DirEntry>>>,
 );
 
-impl AsyncCapReadDir {
-    async fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
+impl AsyncReadDir {
+    pub async fn next(&mut self) -> Option<std::io::Result<cap_std::fs::DirEntry>> {
         if let Some(buffer) = self.1.as_mut()
             && !buffer.is_empty()
         {
@@ -78,12 +78,7 @@ impl AsyncCapReadDir {
         match tokio::task::spawn_blocking(move || {
             for _ in 0..128 {
                 if let Some(entry) = read_dir.next() {
-                    buffer.push_back(entry.map(|e| {
-                        (
-                            e.file_type().map_or(FileType::Unknown, FileType::from),
-                            e.file_name().to_string_lossy().to_string(),
-                        )
-                    }));
+                    buffer.push_back(entry);
                 } else {
                     break;
                 }
@@ -102,80 +97,69 @@ impl AsyncCapReadDir {
             Err(_) => None,
         }
     }
-}
 
-pub struct AsyncTokioReadDir(pub tokio::fs::ReadDir);
-
-impl AsyncTokioReadDir {
-    async fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        match self.0.next_entry().await {
-            Ok(Some(entry)) => Some(Ok((
-                entry
-                    .file_type()
-                    .await
-                    .map_or(FileType::Unknown, FileType::from),
-                entry.file_name().to_string_lossy().to_string(),
-            ))),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
-
-pub enum AsyncReadDir {
-    Cap(AsyncCapReadDir),
-    Tokio(AsyncTokioReadDir),
-}
-
-impl AsyncReadDir {
     pub async fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        match self {
-            AsyncReadDir::Cap(read_dir) => read_dir.next_entry().await,
-            AsyncReadDir::Tokio(read_dir) => read_dir.next_entry().await,
-        }
+        Some(self.next().await?.map(name_and_type))
     }
 }
 
-pub struct CapReadDir(pub cap_std::fs::ReadDir);
-
-impl CapReadDir {
-    pub fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        match self.0.next() {
-            Some(Ok(entry)) => Some(Ok((
-                entry.file_type().map_or(FileType::Unknown, FileType::from),
-                entry.file_name().to_string_lossy().to_string(),
-            ))),
-            Some(Err(err)) => Some(Err(err)),
-            None => None,
-        }
-    }
-}
-
-pub struct StdReadDir(pub std::fs::ReadDir);
-
-impl StdReadDir {
-    pub fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        match self.0.next() {
-            Some(Ok(entry)) => Some(Ok((
-                entry.file_type().map_or(FileType::Unknown, FileType::from),
-                entry.file_name().to_string_lossy().to_string(),
-            ))),
-            Some(Err(err)) => Some(Err(err)),
-            None => None,
-        }
-    }
-}
-
-pub enum ReadDir {
-    Cap(CapReadDir),
-    Std(StdReadDir),
-}
+pub struct ReadDir(pub cap_std::fs::ReadDir);
 
 impl ReadDir {
+    pub fn next(&mut self) -> Option<std::io::Result<cap_std::fs::DirEntry>> {
+        self.0.next()
+    }
+
     pub fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        match self {
-            ReadDir::Cap(read_dir) => read_dir.next_entry(),
-            ReadDir::Std(read_dir) => read_dir.next_entry(),
+        Some(self.next()?.map(name_and_type))
+    }
+}
+
+fn name_and_type(entry: cap_std::fs::DirEntry) -> (FileType, String) {
+    (
+        entry.file_type().map_or(FileType::Unknown, FileType::from),
+        entry.file_name().to_string_lossy().to_string(),
+    )
+}
+
+enum StatSource {
+    Entry(cap_std::fs::DirEntry),
+    Path(super::CapFilesystem),
+}
+
+pub struct WalkEntry {
+    pub path: PathBuf,
+    file_type: FileType,
+    source: StatSource,
+}
+
+impl WalkEntry {
+    #[inline]
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+
+    #[allow(dead_code)]
+    pub fn name(&self) -> Cow<'_, str> {
+        match self.path.file_name() {
+            Some(name) => name.to_string_lossy(),
+            None => Cow::Borrowed(""),
+        }
+    }
+
+    pub fn metadata(&self) -> Result<cap_std::fs::Metadata, std::io::Error> {
+        match &self.source {
+            StatSource::Entry(entry) => entry.metadata(),
+            StatSource::Path(cap_filesystem) => cap_filesystem.symlink_metadata(&self.path),
+        }
+    }
+
+    pub async fn async_metadata(&self) -> Result<cap_std::fs::Metadata, std::io::Error> {
+        match &self.source {
+            StatSource::Entry(entry) => entry.metadata(),
+            StatSource::Path(cap_filesystem) => {
+                cap_filesystem.async_symlink_metadata(&self.path).await
+            }
         }
     }
 }
@@ -213,11 +197,12 @@ impl AsyncWalkDir {
         self
     }
 
-    pub async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), std::io::Error>> {
+    pub async fn next_entry(&mut self) -> Option<Result<WalkEntry, std::io::Error>> {
         'stack: while let Some((parent_path, read_dir)) = self.stack.last_mut() {
-            match read_dir.next_entry().await {
-                Some(Ok((file_type, name))) => {
-                    let full_path = parent_path.join(&name);
+            match read_dir.next().await {
+                Some(Ok(entry)) => {
+                    let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
+                    let full_path = parent_path.join(entry.file_name());
 
                     let Some(full_path) = self.is_ignored.call_async(file_type, full_path).await
                     else {
@@ -235,14 +220,22 @@ impl AsyncWalkDir {
                         }
                     }
 
-                    return Some(Ok((file_type, full_path)));
+                    return Some(Ok(WalkEntry {
+                        path: full_path,
+                        file_type,
+                        source: StatSource::Entry(entry),
+                    }));
                 }
                 Some(Err(err)) => return Some(Err(err)),
                 None => {
                     let (path, _) = self.stack.pop()?;
 
                     if self.reversed && !self.stack.is_empty() {
-                        return Some(Ok((FileType::Dir, path)));
+                        return Some(Ok(WalkEntry {
+                            path,
+                            file_type: FileType::Dir,
+                            source: StatSource::Path(self.cap_filesystem.clone()),
+                        }));
                     }
                 }
             }
@@ -252,7 +245,7 @@ impl AsyncWalkDir {
     }
 
     pub async fn run_multithreaded<
-        F: Fn(FileType, PathBuf) -> Fut + Send + Sync + 'static,
+        F: Fn(WalkEntry) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     >(
         &mut self,
@@ -264,7 +257,7 @@ impl AsyncWalkDir {
 
         while let Some(entry) = self.next_entry().await {
             match entry {
-                Ok((file_type, path)) => {
+                Ok(entry) => {
                     let semaphore = Arc::clone(&semaphore);
                     let error = Arc::clone(&error);
                     let func = Arc::clone(&func);
@@ -279,7 +272,7 @@ impl AsyncWalkDir {
                     };
                     tokio::spawn(async move {
                         let _permit = permit;
-                        match func(file_type, path).await {
+                        match func(entry).await {
                             Ok(_) => {}
                             Err(err) => {
                                 *error.write() = Some(err);
@@ -333,11 +326,12 @@ impl WalkDir {
         self
     }
 
-    pub fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), std::io::Error>> {
+    pub fn next_entry(&mut self) -> Option<Result<WalkEntry, std::io::Error>> {
         'stack: while let Some((parent_path, read_dir)) = self.stack.last_mut() {
-            match read_dir.next_entry() {
-                Some(Ok((file_type, name))) => {
-                    let full_path = parent_path.join(&name);
+            match read_dir.next() {
+                Some(Ok(entry)) => {
+                    let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
+                    let full_path = parent_path.join(entry.file_name());
 
                     let Some(full_path) = (self.is_ignored)(file_type, full_path) else {
                         continue 'stack;
@@ -354,7 +348,11 @@ impl WalkDir {
                         }
                     }
 
-                    return Some(Ok((file_type, full_path)));
+                    return Some(Ok(WalkEntry {
+                        path: full_path,
+                        file_type,
+                        source: StatSource::Entry(entry),
+                    }));
                 }
                 Some(Err(err)) => {
                     return Some(Err(err));
@@ -363,7 +361,11 @@ impl WalkDir {
                     let (path, _) = self.stack.pop()?;
 
                     if self.reversed && !self.stack.is_empty() {
-                        return Some(Ok((FileType::Dir, path)));
+                        return Some(Ok(WalkEntry {
+                            path,
+                            file_type: FileType::Dir,
+                            source: StatSource::Path(self.cap_filesystem.clone()),
+                        }));
                     }
                 }
             }
@@ -373,7 +375,7 @@ impl WalkDir {
     }
 
     pub fn run_multithreaded<
-        F: Fn(FileType, PathBuf) -> Result<(), anyhow::Error> + Send + Sync + 'static,
+        F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
     >(
         &mut self,
         threads: usize,
@@ -383,24 +385,28 @@ impl WalkDir {
             .num_threads(threads)
             .build()?;
         let error = Arc::new(RwLock::new(None));
+        let in_flight = crate::utils::InFlightLimit::new(crate::utils::WALK_IN_FLIGHT_LIMIT);
 
         pool.in_place_scope(|scope| {
             while let Some(entry) = self.next_entry() {
                 match entry {
-                    Ok((file_type, path)) => {
+                    Ok(entry) => {
                         if crate::unlikely(error.read().is_some()) {
                             break;
                         }
 
                         let error = Arc::clone(&error);
                         let func = Arc::clone(&func);
+                        let permit = in_flight.acquire();
 
                         scope.spawn(move |_| {
+                            let _permit = permit;
+
                             if crate::unlikely(error.read().is_some()) {
                                 return;
                             }
 
-                            if let Err(err) = func(file_type, path) {
+                            if let Err(err) = func(entry) {
                                 *error.write() = Some(err);
                             }
                         });

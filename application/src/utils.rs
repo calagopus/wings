@@ -734,3 +734,56 @@ mod tests {
         );
     }
 }
+
+/// A blocking counting semaphore, used to put backpressure on a rayon producer.
+///
+/// `rayon::Scope::spawn` queues work without any bound, so a producer that
+/// outruns its workers keeps allocating boxed jobs - and holds whatever those
+/// jobs captured - until they eventually run. A directory walk feeding one task
+/// per entry can queue millions.
+/// How many entries a directory walk may keep queued on a rayon pool.
+///
+/// High enough that the workers never starve when they keep up - at which point
+/// the limit is simply never reached - and low enough that a producer which does
+/// outrun them cannot grow the queue without bound.
+pub const WALK_IN_FLIGHT_LIMIT: usize = 4096;
+
+pub struct InFlightLimit {
+    limit: usize,
+    count: parking_lot::Mutex<usize>,
+    released: parking_lot::Condvar,
+}
+
+pub struct InFlightPermit(std::sync::Arc<InFlightLimit>);
+
+impl InFlightLimit {
+    pub fn new(limit: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            limit: limit.max(1),
+            count: parking_lot::Mutex::new(0),
+            released: parking_lot::Condvar::new(),
+        })
+    }
+
+    /// Blocks until fewer than `limit` permits are outstanding.
+    ///
+    /// Only ever called from the producer, which is the thread that owns the
+    /// scope rather than one of its workers, so the workers stay free to drain
+    /// the queue and release permits.
+    pub fn acquire(self: &std::sync::Arc<Self>) -> InFlightPermit {
+        let mut count = self.count.lock();
+        while *count >= self.limit {
+            self.released.wait(&mut count);
+        }
+        *count += 1;
+
+        InFlightPermit(std::sync::Arc::clone(self))
+    }
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        *self.0.count.lock() -= 1;
+        self.0.released.notify_one();
+    }
+}

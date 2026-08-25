@@ -898,7 +898,9 @@ impl Filesystem {
                         let destination_filesystem = destination_filesystem.clone();
                         let progress = progress.clone();
 
-                        move |_, path: PathBuf, stream| {
+                        move |entry: virtualfs::VirtualWalkEntry, stream| {
+                            let path = entry.path;
+
                             let server = server.clone();
                             let filesystem = filesystem.clone();
                             let source_path = Arc::clone(&source_path);
@@ -1339,8 +1341,9 @@ impl Filesystem {
                     let inner = cap_filesystem.get_inner()?;
 
                     let func = std::sync::Arc::new(
-                        move |_: crate::server::filesystem::cap::FileType, path: PathBuf| {
+                        move |entry: crate::server::filesystem::cap::WalkEntry| {
                             let fd = inner.as_fd();
+                            let path = entry.path;
 
                             let Ok(stat) = rustix::fs::statx(
                                 fd,

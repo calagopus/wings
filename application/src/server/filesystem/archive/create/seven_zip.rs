@@ -82,20 +82,21 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
                 while let Some(entry) = walker.next_entry() {
-                    let (_, path) = match entry {
+                    let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
                             tracing::debug!("failed to read directory entry while creating 7z archive: {err:#}");
                             break;
                         }
                     };
+                    let path = &entry.path;
 
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
                     };
 
-                    let metadata = match filesystem.symlink_metadata(&path) {
+                    let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(err) => {
                             tracing::debug!(path = %path.display(), "skipping entry while creating 7z archive, failed to read metadata: {err:#}");
@@ -116,7 +117,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                         }
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
-                        let file = filesystem.open(&path)?;
+                        let file = filesystem.open(path)?;
                         let reader = progress.counting_reader(file);
                         let reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);

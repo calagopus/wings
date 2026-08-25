@@ -152,6 +152,40 @@ impl DiskUsage {
         }
     }
 
+    fn component_key(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+        let bytes = name.as_encoded_bytes();
+
+        match std::str::from_utf8(bytes) {
+            Ok(name) => std::borrow::Cow::Borrowed(name),
+            Err(_) => {
+                fn hex(nibble: u8) -> char {
+                    char::from_digit(nibble as u32, 16)
+                        .unwrap_or('0')
+                        .to_ascii_uppercase()
+                }
+
+                let mut escaped = String::with_capacity(bytes.len() + 8);
+                for &byte in bytes {
+                    if byte.is_ascii() && byte != b'%' {
+                        escaped.push(byte as char);
+                    } else {
+                        escaped.push('%');
+                        escaped.push(hex(byte >> 4));
+                        escaped.push(hex(byte & 0x0f));
+                    }
+                }
+
+                std::borrow::Cow::Owned(escaped)
+            }
+        }
+    }
+
+    pub fn path_component_keys(path: &Path) -> Vec<std::borrow::Cow<'_, str>> {
+        path.components()
+            .map(|component| Self::component_key(component.as_os_str()))
+            .collect()
+    }
+
     #[inline]
     pub fn get_entries(&self) -> &[(compact_str::CompactString, DiskUsage)] {
         &self.entries
@@ -164,10 +198,10 @@ impl DiskUsage {
 
         let mut current = self;
         for component in path.components() {
-            let name = component.as_os_str().to_str()?;
+            let name = Self::component_key(component.as_os_str());
             let idx = current
                 .entries
-                .binary_search_by(|(n, _)| n.as_str().cmp(name))
+                .binary_search_by(|(n, _)| n.as_str().cmp(&name))
                 .ok()?;
             current = &current.entries.get(idx)?.1;
         }
@@ -182,10 +216,10 @@ impl DiskUsage {
 
         let mut current = self;
         for component in path.components() {
-            let name = component.as_os_str().to_str()?;
+            let name = Self::component_key(component.as_os_str());
             let idx = current
                 .entries
-                .binary_search_by(|(n, _)| n.as_str().cmp(name))
+                .binary_search_by(|(n, _)| n.as_str().cmp(&name))
                 .ok()?;
             current = &current.entries.get(idx)?.1;
         }
@@ -224,8 +258,7 @@ impl DiskUsage {
 
         let mut current = self;
         for component in path.components() {
-            let key = component.as_os_str().to_str().unwrap_or_default();
-            let entry = current.upsert_entry(key);
+            let entry = current.upsert_entry(&Self::component_key(component.as_os_str()));
 
             if delta.logical >= 0 {
                 entry.space.add_logical(delta.logical as u64);
@@ -294,12 +327,12 @@ impl DiskUsage {
         components: &mut Peekable<impl Iterator<Item = std::path::Component<'a>>>,
     ) -> Option<DiskUsage> {
         let component = components.next()?;
-        let name = component.as_os_str().to_str().unwrap_or_default();
+        let name = Self::component_key(component.as_os_str());
 
         tracing::trace!(?component, "applying path delta");
 
         if components.peek().is_none() {
-            let removed = self.remove_entry(name)?;
+            let removed = self.remove_entry(&name)?;
 
             self.space.sub_logical(removed.space.get_logical());
             self.space.sub_physical(removed.space.get_physical());
@@ -307,7 +340,7 @@ impl DiskUsage {
             return Some(removed);
         }
 
-        if let Some(child) = self.get_mut_entry(name)
+        if let Some(child) = self.get_mut_entry(&name)
             && let Some(removed) = child.recursive_remove(components)
         {
             self.space.sub_logical(removed.space.get_logical());
@@ -369,6 +402,53 @@ mod tests {
         s.set_logical(logical);
         s.set_physical(physical);
         s
+    }
+
+    #[test]
+    fn distinct_non_utf8_names_do_not_share_a_node() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let mut usage = DiskUsage::default();
+            let a = Path::new(std::ffi::OsStr::from_bytes(b"dir/\xff\xfe"));
+            let b = Path::new(std::ffi::OsStr::from_bytes(b"dir/\xfe\xff"));
+
+            usage.update_size(a, SpaceDelta::new(10, 10));
+            usage.update_size(b, SpaceDelta::new(7, 7));
+
+            assert_eq!(usage.get_size(a).map(|s| s.get_logical()), Some(10));
+            assert_eq!(usage.get_size(b).map(|s| s.get_logical()), Some(7));
+            assert_eq!(
+                usage.get_size(Path::new("dir")).map(|s| s.get_logical()),
+                Some(17)
+            );
+        }
+    }
+
+    #[test]
+    fn summed_deltas_match_applying_them_one_at_a_time() {
+        let path = Path::new("a/b");
+
+        let mut per_entry = DiskUsage::default();
+        for (logical, physical) in [(3, 4), (5, 8), (11, 16)] {
+            per_entry.update_size(path, SpaceDelta::new(logical, physical));
+        }
+
+        let mut summed = DiskUsage::default();
+        summed.update_size(path, SpaceDelta::new(3 + 5 + 11, 4 + 8 + 16));
+
+        assert_space(
+            summed.space,
+            per_entry.space.get_logical(),
+            per_entry.space.get_physical(),
+        );
+        for probe in ["a", "a/b"] {
+            let expected = per_entry.get_size(Path::new(probe)).expect("probe missing");
+            let actual = summed.get_size(Path::new(probe)).expect("probe missing");
+
+            assert_space(actual, expected.get_logical(), expected.get_physical());
+        }
     }
 
     fn assert_space(s: UsedSpace, logical: u64, physical: u64) {

@@ -11,6 +11,32 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+#[derive(Default)]
+struct PendingUpdate {
+    pending: Option<(PathBuf, SpaceDelta)>,
+}
+
+impl PendingUpdate {
+    fn push(&mut self, disk_usage: &mut DiskUsage, path: &Path, delta: SpaceDelta) {
+        if let Some((pending_path, pending_delta)) = &mut self.pending
+            && pending_path == path
+        {
+            pending_delta.logical += delta.logical;
+            pending_delta.physical += delta.physical;
+            return;
+        }
+
+        self.flush(disk_usage);
+        self.pending = Some((path.to_path_buf(), delta));
+    }
+
+    fn flush(&mut self, disk_usage: &mut DiskUsage) {
+        if let Some((path, delta)) = self.pending.take() {
+            disk_usage.update_size(&path, delta);
+        }
+    }
+}
+
 pub struct DiskCheckerContext {
     pub config: Arc<crate::config::Config>,
     pub disk_usage: Arc<RwLock<super::usage::DiskUsage>>,
@@ -135,9 +161,11 @@ pub async fn run(ctx: DiskCheckerContext) {
                                 let mut seen_inodes = HashSet::new();
 
                                 let mut walker = cap_filesystem.walk_dir(dir)?;
+                                let mut pending = PendingUpdate::default();
                                 while let Some(entry) = walker.next_entry() {
-                                    let (_, path) = entry?;
-                                    let metadata = match cap_filesystem.symlink_metadata(&path) {
+                                    let entry = entry?;
+                                    let path = &entry.path;
+                                    let metadata = match entry.metadata() {
                                         Ok(metadata) => metadata,
                                         Err(_) => continue,
                                     };
@@ -158,7 +186,8 @@ pub async fn run(ctx: DiskCheckerContext) {
                                         if !metadata.is_dir() && metadata.nlink() > 1 {
                                             if seen_inodes.contains(&metadata.ino()) {
                                                 if let Some(parent) = relative.parent() {
-                                                    tmp_disk_usage.update_size(
+                                                    pending.push(
+                                                        &mut tmp_disk_usage,
                                                         parent,
                                                         SpaceDelta::only_logical(delta.logical),
                                                     );
@@ -171,18 +200,17 @@ pub async fn run(ctx: DiskCheckerContext) {
                                     }
 
                                     if metadata.is_dir() {
-                                        tmp_disk_usage.update_size(relative, delta);
+                                        pending.push(&mut tmp_disk_usage, relative, delta);
                                     } else if let Some(parent) = relative.parent() {
-                                        tmp_disk_usage.update_size(parent, delta);
+                                        pending.push(&mut tmp_disk_usage, parent, delta);
                                     }
                                 }
+                                pending.flush(&mut tmp_disk_usage);
 
                                 let mut disk_usage_write = disk_usage.blocking_write();
                                 disk_usage_write.remove_path(dir);
                                 disk_usage_write.add_directory(
-                                    &dir.components()
-                                        .map(|c| c.as_os_str().to_string_lossy().to_string())
-                                        .collect::<Vec<_>>(),
+                                    &DiskUsage::path_component_keys(dir),
                                     tmp_disk_usage,
                                 );
                                 let root_space = disk_usage_write.space;
@@ -207,11 +235,13 @@ pub async fn run(ctx: DiskCheckerContext) {
                     let mut total_size_physical = 0;
 
                     let mut walker = cap_filesystem.walk_dir(Path::new(""))?;
+                    let mut pending = PendingUpdate::default();
 
                     while let Some(entry) = walker.next_entry() {
-                        let (_, path) = entry?;
+                        let entry = entry?;
+                        let path = &entry.path;
 
-                        let metadata = match cap_filesystem.symlink_metadata(&path) {
+                        let metadata = match entry.metadata() {
                             Ok(metadata) => metadata,
                             Err(_) => continue,
                         };
@@ -229,7 +259,8 @@ pub async fn run(ctx: DiskCheckerContext) {
                             if !metadata.is_dir() && metadata.nlink() > 1 {
                                 if seen_inodes.contains(&metadata.ino()) {
                                     if let Some(parent) = path.parent() {
-                                        tmp_disk_usage.update_size(
+                                        pending.push(
+                                            &mut tmp_disk_usage,
                                             parent,
                                             SpaceDelta::only_logical(delta.logical),
                                         );
@@ -243,14 +274,15 @@ pub async fn run(ctx: DiskCheckerContext) {
                         }
 
                         if metadata.is_dir() {
-                            tmp_disk_usage.update_size(&path, delta);
+                            pending.push(&mut tmp_disk_usage, path, delta);
                         } else if let Some(parent) = path.parent() {
-                            tmp_disk_usage.update_size(parent, delta);
+                            pending.push(&mut tmp_disk_usage, parent, delta);
                         }
 
                         total_size += metadata.size_logical();
                         total_size_physical += metadata.size_physical();
                     }
+                    pending.flush(&mut tmp_disk_usage);
 
                     let old_disk_usage =
                         std::mem::replace(&mut *disk_usage.blocking_write(), tmp_disk_usage);

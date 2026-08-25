@@ -5,12 +5,12 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::{cap::FileType, virtualfs::AsyncDirectoryWalkFn},
+        server::filesystem::virtualfs::{AsyncDirectoryWalkFn, VirtualWalkEntry},
         utils::PortablePermissions,
     };
     use serde::{Deserialize, Serialize};
     use std::{
-        path::{Path, PathBuf},
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -103,7 +103,10 @@ mod post {
                                     let updated_count_arc = updated_count_arc.clone();
                                     let mode = PortablePermissions::from_mode_file(mode);
 
-                                    move |file_type: FileType, path: PathBuf| {
+                                    move |entry: VirtualWalkEntry| {
+                                        let file_type = entry.file_type;
+                                        let path = entry.path;
+
                                         let filesystem = filesystem.clone();
                                         let updated_count_arc = updated_count_arc.clone();
 

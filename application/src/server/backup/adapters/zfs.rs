@@ -180,8 +180,8 @@ impl BackupCreateExt for ZfsBackup {
                         .with_is_ignored(ignore.into());
                     let mut total_size = 0;
                     let mut total_files = 0;
-                    while let Some(Ok((_, path))) = walker.next_entry() {
-                        let metadata = match filesystem.symlink_metadata(&path) {
+                    while let Some(Ok(entry)) = walker.next_entry() {
+                        let metadata = match entry.metadata() {
                             Ok(metadata) => metadata,
                             Err(_) => continue,
                         };
@@ -422,20 +422,22 @@ impl BackupExt for ZfsBackup {
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = filesystem
-                    .async_walk_dir(&PathBuf::from(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    while let Some(Ok(entry)) = walker.next_entry() {
+                        let metadata = match entry.metadata() {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                }
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
+                    }
 
-                Ok::<(), anyhow::Error>(())
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?
             }
         };
 
@@ -452,17 +454,17 @@ impl BackupExt for ZfsBackup {
                         let filesystem = filesystem.clone();
                         let progress = progress.clone();
 
-                        move |_, path: PathBuf| {
+                        move |entry: crate::server::filesystem::cap::WalkEntry| {
                             let server = server.clone();
                             let filesystem = filesystem.clone();
                             let progress = progress.clone();
 
                             async move {
-                                let metadata =
-                                    match filesystem.async_symlink_metadata(&path).await {
-                                        Ok(metadata) => metadata,
-                                        Err(_) => return Ok(()),
-                                    };
+                                let metadata = match entry.async_metadata().await {
+                                    Ok(metadata) => metadata,
+                                    Err(_) => return Ok(()),
+                                };
+                                let path = entry.path;
 
                                 if metadata.is_file() {
                                     server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));

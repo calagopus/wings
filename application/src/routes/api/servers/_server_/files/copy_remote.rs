@@ -12,7 +12,7 @@ mod post {
         server::{
             filesystem::{
                 cap::FileType,
-                virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn},
+                virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualWalkEntry},
             },
             transfer::TransferArchiveFormat,
         },
@@ -198,7 +198,9 @@ mod post {
                                             let bytes_processed = Arc::clone(&bytes_processed);
                                             let files_processed = Arc::clone(&files_processed);
 
-                                            move |_, path: PathBuf, stream| {
+                                            move |entry: VirtualWalkEntry, stream| {
+                                                let path = entry.path;
+
                                                 let server = server.clone();
                                                 let filesystem = filesystem.clone();
                                                 let source_path = Arc::clone(&source_path);

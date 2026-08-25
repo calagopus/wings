@@ -80,20 +80,21 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
                 while let Some(entry) = walker.next_entry() {
-                    let (_, path) = match entry {
+                    let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
                             tracing::debug!("failed to read directory entry while creating zip archive: {err:#}");
                             break;
                         }
                     };
+                    let path = &entry.path;
 
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
                     };
 
-                    let metadata = match filesystem.symlink_metadata(&path) {
+                    let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(err) => {
                             tracing::debug!(path = %path.display(), "skipping entry while creating zip archive, failed to read metadata: {err:#}");
@@ -129,7 +130,7 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                         archive.add_directory(relative.to_string_lossy(), zip_options)?;
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
-                        let file = filesystem.open(&path)?;
+                        let file = filesystem.open(path)?;
                         let reader = progress.counting_reader(file);
                         let mut reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
@@ -137,7 +138,7 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
                         progress.increment_files();
-                    } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
+                    } else if let Ok(link_target) = filesystem.read_link_contents(path) {
                         archive.add_symlink(
                             relative.to_string_lossy(),
                             link_target.to_string_lossy(),
@@ -239,7 +240,7 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
                 while let Some(entry) = walker.next_entry() {
-                    let (_, path) = match entry {
+                    let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
                             tracing::debug!("failed to read directory entry while creating zip archive: {err:#}");
@@ -247,12 +248,14 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                         }
                     };
 
+                    let path = &entry.path;
+
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
                     };
 
-                    let metadata = match filesystem.symlink_metadata(&path) {
+                    let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(err) => {
                             tracing::debug!(path = %path.display(), "skipping entry while creating zip archive, failed to read metadata: {err:#}");
@@ -288,7 +291,7 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                         archive.add_directory(relative.to_string_lossy(), zip_options)?;
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
-                        let file = filesystem.open(&path)?;
+                        let file = filesystem.open(path)?;
                         let reader = progress.counting_reader(file);
                         let mut reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
@@ -296,7 +299,7 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
                         progress.increment_files();
-                    } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
+                    } else if let Ok(link_target) = filesystem.read_link_contents(path) {
                         archive.add_symlink(
                             relative.to_string_lossy(),
                             link_target.to_string_lossy(),

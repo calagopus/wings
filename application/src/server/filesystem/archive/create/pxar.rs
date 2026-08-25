@@ -158,7 +158,7 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                     .collect::<Vec<_>>();
 
                 while let Some(entry) = walker.next_entry() {
-                    let (_, path) = match entry {
+                    let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
                             tracing::debug!("failed to read directory entry while creating pxar archive: {err:#}");
@@ -166,12 +166,14 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                         }
                     };
 
+                    let path = &entry.path;
+
                     let rel = match path.strip_prefix(&base) {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
 
-                    let metadata = match filesystem.symlink_metadata(&path) {
+                    let metadata = match entry.metadata() {
                         Ok(m) => m,
                         Err(err) => {
                             tracing::debug!(path = %path.display(), "skipping entry while creating pxar archive, failed to read metadata: {err:#}");
@@ -197,14 +199,14 @@ pub async fn create_pxar<W: Write + Send + 'static>(
 
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
-                        let file = filesystem.open(&path)?;
+                        let file = filesystem.open(path)?;
                         let reader = progress.counting_reader(file);
                         let mut reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                         archive.add_file(&entry_name, &entry_meta, metadata.len(), &mut reader)?;
                         progress.increment_files();
-                    } else if let Ok(target) = filesystem.read_link_contents(&path) {
+                    } else if let Ok(target) = filesystem.read_link_contents(path) {
                         archive.add_symlink(&entry_name, &target, &entry_meta)?;
 
                         progress.increment_bytes(metadata.len());

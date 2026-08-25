@@ -282,8 +282,8 @@ impl S3Backup {
                         .walk_dir(Path::new(""))?
                         .with_is_ignored(ignore.into());
                     let mut total_files = 0;
-                    while let Some(Ok((_, path))) = walker.next_entry() {
-                        let metadata = match filesystem.symlink_metadata(&path) {
+                    while let Some(Ok(entry)) = walker.next_entry() {
+                        let metadata = match entry.metadata() {
                             Ok(metadata) => metadata,
                             Err(_) => continue,
                         };
@@ -530,8 +530,8 @@ impl S3Backup {
                         .walk_dir(Path::new(""))?
                         .with_is_ignored(ignore.into());
                     let mut total_files = 0;
-                    while let Some(Ok((_, path))) = walker.next_entry() {
-                        let metadata = match filesystem.symlink_metadata(&path) {
+                    while let Some(Ok(entry)) = walker.next_entry() {
+                        let metadata = match entry.metadata() {
                             Ok(metadata) => metadata,
                             Err(_) => continue,
                         };

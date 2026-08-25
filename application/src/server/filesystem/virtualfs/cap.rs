@@ -1,7 +1,7 @@
 use super::{
     AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
     AsyncWritableSeekableFileStream, ByteRange, DirectoryListing, FileMetadata, FileRead, FileType,
-    IsIgnoredFn, WritableSeekableFileStream,
+    IsIgnoredFn, VirtualWalkEntry, WritableSeekableFileStream,
 };
 use crate::{
     io::compression::CompressionLevel,
@@ -450,9 +450,17 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
         impl DirectoryWalk for IgnoreWalkDir {
             fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.inner
-                    .next_entry()
-                    .map(|res| res.map_err(|err| err.into()))
+                self.inner.next_entry().map(|res| {
+                    res.map(|entry| (entry.file_type(), entry.path))
+                        .map_err(|err| err.into())
+                })
+            }
+
+            fn next_walk_entry(&mut self) -> Option<Result<VirtualWalkEntry, anyhow::Error>> {
+                self.inner.next_entry().map(|res| {
+                    res.map(VirtualWalkEntry::with_source)
+                        .map_err(|err| err.into())
+                })
             }
         }
 
@@ -478,10 +486,17 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         #[async_trait::async_trait]
         impl AsyncDirectoryWalk for IgnoreAsyncWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.inner
-                    .next_entry()
-                    .await
-                    .map(|res| res.map_err(|err| err.into()))
+                self.inner.next_entry().await.map(|res| {
+                    res.map(|entry| (entry.file_type(), entry.path))
+                        .map_err(|err| err.into())
+                })
+            }
+
+            async fn next_walk_entry(&mut self) -> Option<Result<VirtualWalkEntry, anyhow::Error>> {
+                self.inner.next_entry().await.map(|res| {
+                    res.map(VirtualWalkEntry::with_source)
+                        .map_err(|err| err.into())
+                })
             }
         }
 
@@ -515,7 +530,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                 let entry = self.inner.next_entry().await?;
 
                 let (file_type, path) = match entry {
-                    Ok((file_type, path)) => (file_type, path),
+                    Ok(entry) => (entry.file_type(), entry.path),
                     Err(err) => return Some(Err(err.into())),
                 };
 

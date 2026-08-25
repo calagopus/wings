@@ -96,7 +96,7 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                     .collect::<Vec<_>>();
 
                 while let Some(entry) = walker.next_entry() {
-                    let (_, path) = match entry {
+                    let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
                             tracing::debug!("failed to read directory entry while creating itaf archive: {err:#}");
@@ -104,12 +104,14 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                         }
                     };
 
+                    let path = &entry.path;
+
                     let rel = match path.strip_prefix(&base) {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
 
-                    let metadata = match filesystem.symlink_metadata(&path) {
+                    let metadata = match entry.metadata() {
                         Ok(m) => m,
                         Err(err) => {
                             tracing::debug!(path = %path.display(), "skipping entry while creating itaf archive, failed to read metadata: {err:#}");
@@ -135,7 +137,7 @@ pub async fn create_itaf<W: Write + Send + 'static>(
 
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
-                        let file = filesystem.open(&path)?;
+                        let file = filesystem.open(path)?;
                         let reader = progress.counting_reader(file);
                         let reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
@@ -143,14 +145,14 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                         archive
                             .add_file(&entry_name, &entry_meta, metadata.len(), &mut { reader })?;
                         progress.increment_files();
-                    } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
+                    } else if let Ok(link_target) = filesystem.read_link_contents(path) {
                         let target = link_target.to_string_lossy();
 
                         if itaf::spec::validate_name(&entry_name).is_ok() {
                             archive.add_symlink(
                                 &entry_name,
                                 &target,
-                                symlink_targets_dir(&filesystem, &path),
+                                symlink_targets_dir(&filesystem, path),
                                 &entry_meta,
                             )?;
                             progress.increment_bytes(metadata.len());

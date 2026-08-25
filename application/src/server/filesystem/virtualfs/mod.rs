@@ -265,8 +265,59 @@ impl From<std::fs::Metadata> for FileMetadata {
     }
 }
 
+pub struct VirtualWalkEntry {
+    pub file_type: FileType,
+    pub path: PathBuf,
+    source: Option<crate::server::filesystem::cap::WalkEntry>,
+}
+
+impl VirtualWalkEntry {
+    pub fn new(file_type: FileType, path: PathBuf) -> Self {
+        Self {
+            file_type,
+            path,
+            source: None,
+        }
+    }
+
+    pub fn with_source(source: crate::server::filesystem::cap::WalkEntry) -> Self {
+        Self {
+            file_type: source.file_type(),
+            path: source.path.clone(),
+            source: Some(source),
+        }
+    }
+
+    pub fn metadata(
+        &self,
+        filesystem: &dyn VirtualReadableFilesystem,
+    ) -> Result<FileMetadata, anyhow::Error> {
+        match &self.source {
+            Some(source) => Ok(source.metadata()?.into()),
+            None => filesystem.symlink_metadata(&self.path),
+        }
+    }
+
+    pub async fn async_metadata(
+        &self,
+        filesystem: &dyn VirtualReadableFilesystem,
+    ) -> Result<FileMetadata, anyhow::Error> {
+        match &self.source {
+            Some(source) => Ok(source.async_metadata().await?.into()),
+            None => filesystem.async_symlink_metadata(&self.path).await,
+        }
+    }
+}
+
 pub trait DirectoryWalk {
     fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>>;
+
+    fn next_walk_entry(&mut self) -> Option<Result<VirtualWalkEntry, anyhow::Error>> {
+        Some(
+            self.next_entry()?
+                .map(|(file_type, path)| VirtualWalkEntry::new(file_type, path)),
+        )
+    }
 
     fn run_multithreaded(
         &mut self,
@@ -277,11 +328,12 @@ pub trait DirectoryWalk {
             .num_threads(threads)
             .build()?;
         let error = Arc::new(RwLock::new(None));
+        let in_flight = crate::utils::InFlightLimit::new(crate::utils::WALK_IN_FLIGHT_LIMIT);
 
         pool.in_place_scope(|scope| {
-            while let Some(entry) = self.next_entry() {
+            while let Some(entry) = self.next_walk_entry() {
                 match entry {
-                    Ok((file_type, path)) => {
+                    Ok(entry) => {
                         if crate::unlikely(error.read().is_some()) {
                             break;
                         }
@@ -289,12 +341,16 @@ pub trait DirectoryWalk {
                         let error = Arc::clone(&error);
                         let func = func.clone();
 
+                        let permit = in_flight.acquire();
+
                         scope.spawn(move |_| {
+                            let _permit = permit;
+
                             if crate::unlikely(error.read().is_some()) {
                                 return;
                             }
 
-                            if let Err(err) = func(file_type, path) {
+                            if let Err(err) = func(entry) {
                                 *error.write() = Some(err);
                             }
                         });
@@ -319,6 +375,14 @@ pub trait DirectoryWalk {
 pub trait AsyncDirectoryWalk {
     async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>>;
 
+    async fn next_walk_entry(&mut self) -> Option<Result<VirtualWalkEntry, anyhow::Error>> {
+        Some(
+            self.next_entry()
+                .await?
+                .map(|(file_type, path)| VirtualWalkEntry::new(file_type, path)),
+        )
+    }
+
     async fn run_multithreaded(
         &mut self,
         threads: usize,
@@ -327,9 +391,9 @@ pub trait AsyncDirectoryWalk {
         let semaphore = Arc::new(Semaphore::new(threads));
         let error = Arc::new(RwLock::new(None));
 
-        while let Some(entry) = self.next_entry().await {
+        while let Some(entry) = self.next_walk_entry().await {
             match entry {
-                Ok((file_type, path)) => {
+                Ok(entry) => {
                     if crate::unlikely(error.read().is_some()) {
                         break;
                     }
@@ -344,7 +408,7 @@ pub trait AsyncDirectoryWalk {
                     };
                     tokio::spawn(async move {
                         let _permit = permit;
-                        match func(file_type, path).await {
+                        match func(entry).await {
                             Ok(_) => {}
                             Err(err) => {
                                 *error.write() = Some(err);
@@ -377,6 +441,16 @@ pub trait AsyncDirectoryStreamWalk {
         &mut self,
     ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>;
 
+    async fn next_walk_entry(
+        &mut self,
+    ) -> Option<Result<(VirtualWalkEntry, AsyncReadableFileStream), anyhow::Error>> {
+        Some(
+            self.next_entry()
+                .await?
+                .map(|(file_type, path, stream)| (VirtualWalkEntry::new(file_type, path), stream)),
+        )
+    }
+
     async fn run_multithreaded(
         &mut self,
         threads: usize,
@@ -385,9 +459,9 @@ pub trait AsyncDirectoryStreamWalk {
         let semaphore = Arc::new(Semaphore::new(threads));
         let error = Arc::new(RwLock::new(None));
 
-        while let Some(entry) = self.next_entry().await {
+        while let Some(entry) = self.next_walk_entry().await {
             match entry {
-                Ok((file_type, path, stream)) => {
+                Ok((entry, stream)) => {
                     let semaphore = Arc::clone(&semaphore);
                     let error = Arc::clone(&error);
                     let func = func.clone();
@@ -403,7 +477,7 @@ pub trait AsyncDirectoryStreamWalk {
                         };
                         tokio::spawn(async move {
                             let _permit = permit;
-                            match func(file_type, path, stream).await {
+                            match func(entry, stream).await {
                                 Ok(_) => {}
                                 Err(err) => {
                                     *error.write() = Some(err);
@@ -411,7 +485,7 @@ pub trait AsyncDirectoryStreamWalk {
                             }
                         });
                     } else {
-                        match func(file_type, path, stream).await {
+                        match func(entry, stream).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }

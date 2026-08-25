@@ -478,8 +478,8 @@ impl OutgoingServerTransfer {
 
                 async move {
                     let mut walker = server.filesystem.async_walk_dir("").await?;
-                    while let Some(Ok((_, entry))) = walker.next_entry().await {
-                        files_sender.send(entry).await?;
+                    while let Some(Ok(entry)) = walker.next_entry().await {
+                        files_sender.send(entry.path).await?;
                     }
 
                     Ok::<_, anyhow::Error>(())

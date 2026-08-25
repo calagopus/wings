@@ -18,7 +18,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod utils;
-pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ReadDir, WalkDir};
+pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ReadDir, WalkDir, WalkEntry};
 
 #[derive(Debug, Clone)]
 pub struct CapFilesystem {
@@ -215,10 +215,13 @@ impl CapFilesystem {
 
         while let Some(entry) = walker.next_entry() {
             match entry {
-                Ok((file_type, entry_path)) => {
-                    if let Err(err) =
-                        Self::remove_entry(&inner, &entry_path, file_type, &mut cleared_parent)
-                    {
+                Ok(entry) => {
+                    if let Err(err) = Self::remove_entry(
+                        &inner,
+                        &entry.path,
+                        entry.file_type(),
+                        &mut cleared_parent,
+                    ) {
                         record(err);
                     }
                 }
@@ -1115,30 +1118,32 @@ impl CapFilesystem {
     ) -> Result<AsyncReadDir, std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
-        Ok(if path.components().next().is_none() {
-            AsyncReadDir::Tokio(utils::AsyncTokioReadDir(
-                tokio::fs::read_dir(&*self.base_path).await?,
-            ))
-        } else {
-            let inner = self.get_inner()?;
-
-            AsyncReadDir::Cap(utils::AsyncCapReadDir(
-                Some(tokio::task::spawn_blocking(move || inner.read_dir(path)).await??),
-                Some(VecDeque::with_capacity(128)),
-            ))
+        let inner = self.get_inner()?;
+        let read_dir = tokio::task::spawn_blocking(move || {
+            if path.components().next().is_none() {
+                inner.entries()
+            } else {
+                inner.read_dir(path)
+            }
         })
+        .await??;
+
+        Ok(AsyncReadDir(
+            Some(read_dir),
+            Some(VecDeque::with_capacity(128)),
+        ))
     }
 
     pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<ReadDir, std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
-        Ok(if path.components().next().is_none() {
-            ReadDir::Std(utils::StdReadDir(std::fs::read_dir(&*self.base_path)?))
-        } else {
-            let inner = self.get_inner()?;
+        let inner = self.get_inner()?;
 
-            ReadDir::Cap(utils::CapReadDir(inner.read_dir(path)?))
-        })
+        Ok(ReadDir(if path.components().next().is_none() {
+            inner.entries()?
+        } else {
+            inner.read_dir(path)?
+        }))
     }
 
     pub async fn async_walk_dir(
@@ -1299,7 +1304,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut walker = filesystem.walk_dir("").unwrap().reversed();
         while let Some(entry) = walker.next_entry() {
-            seen.push(entry.unwrap().1);
+            seen.push(entry.unwrap().path);
         }
 
         let index = |p: &str| seen.iter().position(|s| s == Path::new(p)).unwrap();
