@@ -50,6 +50,54 @@ pub fn build_gitignore_matcher<S: AsRef<str>>(
     builder.build()
 }
 
+/// A subuser deny-list carried on a single panel request.
+///
+/// The panel checks the paths it was handed before calling, but it cannot see file
+/// types, symlink targets, or the entries inside a directory it names, so the list is
+/// applied again here.
+#[derive(Default, Clone)]
+pub struct RequestIgnored(Option<Arc<ignore::gitignore::Gitignore>>);
+
+impl RequestIgnored {
+    /// Unlike [`build_gitignore_matcher`], an unusable pattern is an error rather than a
+    /// dropped line: a deny-list that compiles to nothing hides nothing.
+    pub fn compile<S: AsRef<str>>(patterns: &[S]) -> Result<Self, ignore::Error> {
+        if patterns.is_empty() {
+            return Ok(Self(None));
+        }
+
+        let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+        for pattern in patterns {
+            builder.add_line(None, pattern.as_ref())?;
+        }
+
+        Ok(Self(Some(Arc::new(builder.build()?))))
+    }
+
+    pub async fn is_ignored(
+        &self,
+        server: &crate::server::Server,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
+        match &self.0 {
+            Some(matcher) => {
+                server
+                    .filesystem
+                    .async_is_subuser_ignored(matcher, path, file_type)
+                    .await
+            }
+            None => false,
+        }
+    }
+
+    pub fn filter(&self, server: &crate::server::Server) -> Option<IsIgnoredFn> {
+        self.0
+            .as_ref()
+            .map(|matcher| Filesystem::subuser_deny_filter(server, Arc::clone(matcher)))
+    }
+}
+
 #[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     let mut mode_str = compact_str::CompactString::default();
@@ -224,6 +272,43 @@ impl Filesystem {
         }
     }
 
+    fn subuser_deny_filter(
+        server: &crate::server::Server,
+        matcher: Arc<ignore::gitignore::Gitignore>,
+    ) -> IsIgnoredFn {
+        let (sync_server, async_server) = (server.clone(), server.clone());
+        let async_matcher = Arc::clone(&matcher);
+
+        IsIgnoredFn::new(
+            move |file_type, path: PathBuf| {
+                if sync_server
+                    .filesystem
+                    .is_subuser_ignored(&matcher, &path, file_type)
+                {
+                    None
+                } else {
+                    Some(path)
+                }
+            },
+            move |file_type, path: PathBuf| {
+                let server = async_server.clone();
+                let matcher = Arc::clone(&async_matcher);
+
+                async move {
+                    if server
+                        .filesystem
+                        .async_is_subuser_ignored(&matcher, &path, file_type)
+                        .await
+                    {
+                        None
+                    } else {
+                        Some(path)
+                    }
+                }
+            },
+        )
+    }
+
     fn deny_filter(server: &crate::server::Server) -> IsIgnoredFn {
         let (sync_server, async_server) = (server.clone(), server.clone());
 
@@ -291,6 +376,47 @@ impl Filesystem {
             .load()
             .matched(path, file_type.is_dir())
             .is_ignore()
+    }
+
+    pub fn is_subuser_ignored(
+        &self,
+        matcher: &ignore::gitignore::Gitignore,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
+        let path = if file_type.is_symlink() {
+            self.canonicalize(path)
+                .unwrap_or_else(|_| self.relative_path(path))
+        } else {
+            self.relative_path(path)
+        };
+
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
+        matcher.matched(path, file_type.is_dir()).is_ignore()
+    }
+
+    pub async fn async_is_subuser_ignored(
+        &self,
+        matcher: &ignore::gitignore::Gitignore,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
+        let path = if file_type.is_symlink() {
+            self.async_canonicalize(path)
+                .await
+                .unwrap_or_else(|_| self.relative_path(path))
+        } else {
+            self.relative_path(path)
+        };
+
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
+        matcher.matched(path, file_type.is_dir()).is_ignore()
     }
 
     pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
@@ -406,6 +532,17 @@ impl Filesystem {
         server: &crate::server::Server,
         path: &Path,
     ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
+        self.resolve_readable_fs_ignoring(server, path, &RequestIgnored::default())
+            .await
+    }
+
+    pub async fn resolve_readable_fs_ignoring(
+        &self,
+        server: &crate::server::Server,
+        path: &Path,
+        ignored: &RequestIgnored,
+    ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
+        let ignored = ignored.filter(server);
         let path = self.relative_path(path);
 
         'backupfs: {
@@ -628,7 +765,10 @@ impl Filesystem {
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
-        let fs = fs.with_is_ignored(Self::deny_filter(server));
+        let mut fs = fs.with_is_ignored(Self::deny_filter(server));
+        if let Some(ignored) = ignored.clone() {
+            fs = fs.with_is_ignored(ignored);
+        }
 
         (
             path,
@@ -644,6 +784,17 @@ impl Filesystem {
         server: &crate::server::Server,
         path: impl AsRef<Path>,
     ) -> (PathBuf, Arc<dyn VirtualWritableFilesystem>) {
+        self.resolve_writable_fs_ignoring(server, path, &RequestIgnored::default())
+            .await
+    }
+
+    pub async fn resolve_writable_fs_ignoring(
+        &self,
+        server: &crate::server::Server,
+        path: impl AsRef<Path>,
+        ignored: &RequestIgnored,
+    ) -> (PathBuf, Arc<dyn VirtualWritableFilesystem>) {
+        let ignored = ignored.filter(server);
         let path = self.relative_path(path.as_ref());
 
         let mount_match = {
@@ -699,7 +850,10 @@ impl Filesystem {
                         let mut fs = self.cap_filesystem.get_virtual(server.clone());
                         fs.is_primary_server_fs = true;
                         fs.is_writable = false;
-                        let fs = fs.with_is_ignored(Self::deny_filter(server));
+                        let mut fs = fs.with_is_ignored(Self::deny_filter(server));
+                        if let Some(ignored) = ignored.clone() {
+                            fs = fs.with_is_ignored(ignored);
+                        }
 
                         return (inner_path, Arc::new(fs));
                     }
@@ -710,7 +864,10 @@ impl Filesystem {
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
-        let fs = fs.with_is_ignored(Self::deny_filter(server));
+        let mut fs = fs.with_is_ignored(Self::deny_filter(server));
+        if let Some(ignored) = ignored.clone() {
+            fs = fs.with_is_ignored(ignored);
+        }
 
         (path, Arc::new(fs))
     }

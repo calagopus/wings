@@ -30,8 +30,20 @@ mod get {
         pub base: crate::remote::jwt::BasePayload,
 
         pub file_path: compact_str::CompactString,
+        #[serde(default)]
+        pub ignored_files: Vec<compact_str::CompactString>,
         pub server_uuid: uuid::Uuid,
         pub unique_id: compact_str::CompactString,
+    }
+
+    impl FolderJwtPayload {
+        fn ignored(&self) -> Result<Option<ignore::gitignore::Gitignore>, ignore::Error> {
+            if self.ignored_files.is_empty() {
+                return Ok(None);
+            }
+
+            crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).map(Some)
+        }
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -131,11 +143,27 @@ mod get {
                 .ok();
         }
 
-        let ignore = if filesystem.is_primary_server_fs() {
-            server.filesystem.get_ignored().into()
-        } else {
-            Default::default()
-        };
+        let mut ignore = crate::server::filesystem::virtualfs::IsIgnoredFn::default();
+        if filesystem.is_primary_server_fs() {
+            ignore = server.filesystem.get_ignored().into();
+
+            match payload.ignored() {
+                Ok(Some(ignored)) => ignore = ignore.merge(ignored.into()),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to compile subuser ignored files, denying download: {:#?}",
+                        err
+                    );
+
+                    return ApiResponse::error("directory not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            }
+        }
+
         let reader = filesystem
             .async_read_dir_archive(
                 &path,

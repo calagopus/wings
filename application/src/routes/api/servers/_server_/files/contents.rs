@@ -9,10 +9,8 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
-    use axum::{
-        extract::Query,
-        http::{HeaderMap, StatusCode},
-    };
+    use axum::http::{HeaderMap, StatusCode};
+    use axum_extra::extract::Query;
     use serde::Deserialize;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use utoipa::ToSchema;
@@ -25,6 +23,9 @@ mod get {
         #[serde(default)]
         download: bool,
         max_size: Option<u64>,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -50,8 +51,27 @@ mod get {
             "max_size" = Option<u64>, Query,
             description = "The maximum size of the file to return. If the file is larger than this, an error will be returned.",
         ),
+        (
+            "ignored" = Vec<String>, Query,
+            description = "Additional ignored files",
+        ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let parent = match Path::new(&data.file).parent() {
             Some(parent) => parent,
             None => {
@@ -70,7 +90,10 @@ mod get {
             }
         };
 
-        let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(&server, parent, &ignored)
+            .await;
         let path = root.join(file_name);
 
         let metadata = match filesystem.async_metadata(&path).await {

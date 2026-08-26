@@ -34,6 +34,9 @@ mod post {
         #[schema(minimum = 1, maximum = 1000)]
         #[serde(default = "default_rows")]
         rows: u32,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -73,6 +76,21 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         if data.query.is_empty() || data.query.len() > sqlite::QUERY_MAX_LENGTH {
             return ApiResponse::error("query length is invalid")
                 .with_status(StatusCode::BAD_REQUEST)
@@ -97,7 +115,10 @@ mod post {
             }
         };
 
-        let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(&server, parent, &ignored)
+            .await;
         let path = root.join(file_name);
 
         if !filesystem.is_primary_server_fs() {

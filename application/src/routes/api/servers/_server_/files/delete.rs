@@ -6,6 +6,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
+    use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use std::path::Path;
     use utoipa::ToSchema;
@@ -16,6 +17,9 @@ mod post {
         root: compact_str::CompactString,
 
         files: Vec<compact_str::CompactString>,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -38,11 +42,26 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let mut deleted_count = 0;
         for file in data.files {
             let (source, filesystem) = server
                 .filesystem
-                .resolve_writable_fs(&server, Path::new(&data.root).join(&file))
+                .resolve_writable_fs_ignoring(&server, Path::new(&data.root).join(&file), &ignored)
                 .await;
             if source.as_os_str().is_empty() || source == Path::new(&data.root) {
                 continue;

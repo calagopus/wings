@@ -6,6 +6,7 @@ mod put {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
+    use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
@@ -16,6 +17,9 @@ mod put {
 
         #[schema(inline)]
         files: Vec<crate::models::RenameFile>,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -37,9 +41,24 @@ mod put {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let (root, filesystem) = server
             .filesystem
-            .resolve_writable_fs(&server, &data.root)
+            .resolve_writable_fs_ignoring(&server, &data.root, &ignored)
             .await;
 
         let mut renamed_count = 0;

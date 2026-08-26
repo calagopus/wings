@@ -7,6 +7,7 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::api::servers::_server_::GetServer,
     };
+    use axum::http::StatusCode;
     use axum_extra::extract::Query;
     use compact_str::ToCompactString;
     use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ mod get {
         #[serde(default)]
         root: compact_str::CompactString,
         files: Vec<compact_str::CompactString>,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -58,8 +62,27 @@ mod get {
             "files" = Vec<String>, Query,
             description = "The list of files to fingerprint",
         ),
+        (
+            "ignored" = Vec<String>, Query,
+            description = "Additional ignored files",
+        ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let mut fingerprint_handles = Vec::new();
         fingerprint_handles.reserve_exact(data.files.len());
 
@@ -76,7 +99,10 @@ mod get {
                 None => continue,
             };
 
-            let (path, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_readable_fs_ignoring(&server, parent, &ignored)
+                .await;
             let path = path.join(file_name);
 
             let metadata = match filesystem.async_metadata(&path).await {

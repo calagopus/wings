@@ -9,13 +9,17 @@ mod get {
         routes::api::servers::_server_::GetServer,
         server::filesystem::cap::FileType,
     };
-    use axum::extract::Query;
+    use axum::http::StatusCode;
+    use axum_extra::extract::Query;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
     pub struct Params {
         file: compact_str::CompactString,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -36,8 +40,27 @@ mod get {
             description = "The file path to list revisions for",
             example = "/path/to/file.txt",
         ),
+        (
+            "ignored" = Vec<String>, Query,
+            description = "Additional ignored files",
+        ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let path = server
             .filesystem
             .diff_key(std::path::Path::new(&data.file))
@@ -47,6 +70,7 @@ mod get {
             .filesystem
             .async_is_ignored(&path, FileType::File)
             .await
+            || ignored.is_ignored(&server, &path, FileType::File).await
         {
             return ApiResponse::new_serialized(Response {
                 revisions: Vec::new(),

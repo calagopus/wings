@@ -16,6 +16,9 @@ mod post {
         #[serde(alias = "path")]
         root: compact_str::CompactString,
         name: compact_str::CompactString,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -36,9 +39,24 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let (root, filesystem) = server
             .filesystem
-            .resolve_writable_fs(&server, &data.root)
+            .resolve_writable_fs_ignoring(&server, &data.root, &ignored)
             .await;
 
         let metadata = filesystem.async_metadata(&root).await;

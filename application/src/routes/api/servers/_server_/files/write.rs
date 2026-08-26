@@ -9,9 +9,9 @@ mod post {
     };
     use axum::{
         body::Body,
-        extract::Query,
         http::{HeaderMap, StatusCode},
     };
+    use axum_extra::extract::Query;
     use futures::StreamExt;
     use serde::{Deserialize, Serialize};
     use std::path::Path;
@@ -22,6 +22,9 @@ mod post {
     pub struct Params {
         file: compact_str::CompactString,
         user: Option<uuid::Uuid>,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -48,6 +51,10 @@ mod post {
             description = "The user uuid of the editor. This is used for diff tracking.",
             example = "123e4567-e89b-12d3-a456-426614174000",
         ),
+        (
+            "ignored" = Vec<String>, Query,
+            description = "Additional ignored files",
+        ),
     ), request_body = String)]
     pub async fn route(
         state: GetState,
@@ -56,6 +63,21 @@ mod post {
         Query(data): Query<Params>,
         body: Body,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let parent = match Path::new(&data.file).parent() {
             Some(parent) => parent,
             None => {
@@ -76,7 +98,7 @@ mod post {
 
         let (root, filesystem) = server
             .filesystem
-            .resolve_writable_fs(&server, &parent)
+            .resolve_writable_fs_ignoring(&server, &parent, &ignored)
             .await;
         let path = root.join(file_name);
 

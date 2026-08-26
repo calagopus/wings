@@ -6,8 +6,8 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
-    use axum::extract::Query;
     use axum::http::StatusCode;
+    use axum_extra::extract::Query;
     use compact_str::ToCompactString;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -44,7 +44,20 @@ mod get {
         let ignore = if data.ignored.is_empty() {
             None
         } else {
-            crate::server::filesystem::build_gitignore_matcher(data.ignored.iter()).ok()
+            match crate::server::filesystem::build_gitignore_matcher(data.ignored.iter()) {
+                Ok(ignore) => Some(ignore),
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                        err
+                    );
+
+                    return ApiResponse::error("directory not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            }
         };
 
         let (root, filesystem) = server

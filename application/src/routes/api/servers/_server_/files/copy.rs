@@ -30,6 +30,9 @@ mod post {
         overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -54,6 +57,21 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let parent = match Path::new(&data.path).parent() {
             Some(parent) => parent,
             None => {
@@ -72,7 +90,10 @@ mod post {
             }
         };
 
-        let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(&server, parent, &ignored)
+            .await;
         let path = root.join(file_name);
 
         let metadata = match filesystem.async_metadata(&path).await {
@@ -178,7 +199,7 @@ mod post {
 
         let (destination_path, destination_filesystem) = server
             .filesystem
-            .resolve_writable_fs(&server, destination_parent)
+            .resolve_writable_fs_ignoring(&server, destination_parent, &ignored)
             .await;
         let destination_path = server
             .filesystem

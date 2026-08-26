@@ -31,6 +31,9 @@ mod post {
         overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -61,6 +64,21 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let mut files = Vec::with_capacity(data.files.len());
         let mut skipped = Vec::new();
         for file in data.files {
@@ -69,7 +87,7 @@ mod post {
                 if let (Some(to_parent), Some(to_file_name)) = (to.parent(), to.file_name()) {
                     let (destination_root, destination_filesystem) = server
                         .filesystem
-                        .resolve_writable_fs(&server, to_parent)
+                        .resolve_writable_fs_ignoring(&server, to_parent, &ignored)
                         .await;
 
                     if let Ok(mut entry) = destination_filesystem
@@ -120,7 +138,7 @@ mod post {
                             };
 
                             let (fs_root, filesystem) =
-                                server.filesystem.resolve_readable_fs(&server, parent).await;
+                                server.filesystem.resolve_readable_fs_ignoring(&server, parent, &ignored).await;
 
                             let directory_entry = match filesystem
                                 .async_directory_entry_buffer(&fs_root.join(file_name), &[])
@@ -148,7 +166,7 @@ mod post {
                             };
 
                             let (fs_root, filesystem) =
-                                server.filesystem.resolve_readable_fs(&server, parent).await;
+                                server.filesystem.resolve_readable_fs_ignoring(&server, parent, &ignored).await;
 
                             let from = fs_root.join(file_name);
                             if from == fs_root {
@@ -180,7 +198,7 @@ mod post {
 
                             let (destination_root, destination_filesystem) = server
                                 .filesystem
-                                .resolve_writable_fs(&server, to_parent)
+                                .resolve_writable_fs_ignoring(&server, to_parent, &ignored)
                                 .await;
 
                             if destination_filesystem.is_primary_server_fs()

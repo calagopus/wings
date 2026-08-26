@@ -24,6 +24,9 @@ mod post {
 
         #[serde(default = "foreground")]
         foreground: bool,
+
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -50,6 +53,21 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let root = match server.filesystem.async_canonicalize(data.root).await {
             Ok(path) => path,
             Err(_) => {
@@ -66,8 +84,10 @@ mod post {
                 .ok();
         }
 
-        let (destination_root, destination_filesystem) =
-            server.filesystem.resolve_writable_fs(&server, &root).await;
+        let (destination_root, destination_filesystem) = server
+            .filesystem
+            .resolve_writable_fs_ignoring(&server, &root, &ignored)
+            .await;
 
         if destination_filesystem.is_primary_server_fs()
             && server

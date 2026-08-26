@@ -52,6 +52,11 @@ mod post {
         destination_server: uuid::Uuid,
         destination_path: compact_str::CompactString,
 
+        #[serde(default)]
+        ignored: Vec<compact_str::CompactString>,
+        #[serde(default)]
+        destination_ignored: Vec<compact_str::CompactString>,
+
         #[serde(default = "foreground")]
         foreground: bool,
     }
@@ -81,9 +86,27 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let (source_ignored, destination_ignored) = match (
+            crate::server::filesystem::RequestIgnored::compile(&data.ignored),
+            crate::server::filesystem::RequestIgnored::compile(&data.destination_ignored),
+        ) {
+            (Ok(source), Ok(destination)) => (source, destination),
+            (Err(err), _) | (_, Err(err)) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let (root, filesystem) = server
             .filesystem
-            .resolve_readable_fs(&server, Path::new(&data.root))
+            .resolve_readable_fs_ignoring(&server, Path::new(&data.root), &source_ignored)
             .await;
 
         let metadata = filesystem.async_metadata(&root).await;
@@ -137,7 +160,11 @@ mod post {
 
             let (destination_path, destination_filesystem) = destination_server
                 .filesystem
-                .resolve_writable_fs(&destination_server, &data.destination_path)
+                .resolve_writable_fs_ignoring(
+                    &destination_server,
+                    &data.destination_path,
+                    &destination_ignored,
+                )
                 .await;
 
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -146,7 +173,10 @@ mod post {
                 server.filesystem.get_ignored(),
                 destination_server.filesystem.get_ignored(),
             ];
-            let ignored = IsIgnoredFn::from(ignored);
+            let mut ignored = IsIgnoredFn::from(ignored);
+            if let Some(source_ignored) = source_ignored.filter(&server) {
+                ignored = ignored.merge(source_ignored);
+            }
 
             let (identifier, task) = server
                 .filesystem

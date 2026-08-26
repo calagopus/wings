@@ -22,12 +22,12 @@ pub struct FileJwtPayload {
 }
 
 impl FileJwtPayload {
-    fn ignored(&self) -> Option<ignore::gitignore::Gitignore> {
+    fn ignored(&self) -> Result<Option<ignore::gitignore::Gitignore>, ignore::Error> {
         if self.ignored_files.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).ok()
+        crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).map(Some)
     }
 }
 
@@ -160,7 +160,20 @@ mod post {
             }
         }
 
-        let ignored = payload.ignored();
+        let ignored = match payload.ignored() {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to compile subuser ignored files, denying upload: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let directory = PathBuf::from(params.directory.as_str());
 
@@ -334,7 +347,20 @@ mod head {
             }
         };
 
-        let ignored = payload.ignored();
+        let ignored = match payload.ignored() {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to compile subuser ignored files, denying upload: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
         let parent = match relative.parent() {
@@ -530,7 +556,20 @@ mod patch {
             }
         }
 
-        let ignored = payload.ignored();
+        let ignored = match payload.ignored() {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to compile subuser ignored files, denying upload: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
         let parent = match relative.parent() {

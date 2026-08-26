@@ -28,8 +28,20 @@ mod get {
         pub base: crate::remote::jwt::BasePayload,
 
         pub file_path: compact_str::CompactString,
+        #[serde(default)]
+        pub ignored_files: Vec<compact_str::CompactString>,
         pub server_uuid: uuid::Uuid,
         pub unique_id: compact_str::CompactString,
+    }
+
+    impl FileJwtPayload {
+        fn ignored(&self) -> Result<Option<ignore::gitignore::Gitignore>, ignore::Error> {
+            if self.ignored_files.is_empty() {
+                return Ok(None);
+            }
+
+            crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).map(Some)
+        }
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -118,6 +130,31 @@ mod get {
                     .ok();
             }
         };
+
+        let ignored = match payload.ignored() {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to compile subuser ignored files, denying download: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
+        if filesystem.is_primary_server_fs()
+            && ignored
+                .as_ref()
+                .is_some_and(|o| o.matched(&path, false).is_ignore())
+        {
+            return ApiResponse::error("file not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
 
         let file_read = match filesystem
             .async_read_file(&path, ByteRange::from_headers(&headers))
