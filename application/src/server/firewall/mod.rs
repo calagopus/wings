@@ -9,6 +9,9 @@ use utoipa::ToSchema;
 pub mod iptables;
 pub mod nftables;
 pub mod noop;
+pub mod runner;
+
+use runner::CommandRunner;
 
 #[derive(ToSchema, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +20,7 @@ pub enum FirewallBackendKind {
     Auto,
     Nftables,
     Iptables,
+    Container,
     Disabled,
 }
 
@@ -221,7 +225,8 @@ pub trait FirewallBackend: Send + Sync {
 
 pub async fn create(
     config: &crate::config::Config,
-    own_container_ips: &[IpAddr],
+    docker: &Arc<bollard::Docker>,
+    own_container: Option<&(String, bollard::models::ContainerInspectResponse)>,
 ) -> Arc<dyn FirewallBackend> {
     let backend = config.load().docker.firewall.backend;
 
@@ -242,46 +247,125 @@ pub async fn create(
 
     if config.load().system.user.rootless.enabled {
         tracing::warn!(
-            "server firewalls are not supported with rootless container engines, published port traffic does not traverse the host netfilter forward path - firewall rules will not be applied"
+            "server firewalls are not supported with rootless container engines, published port traffic does not traverse the host netfilter forward path - servers with firewall rules will fail to start (set docker.firewall.backend to disabled to run them unprotected)"
         );
 
         return Arc::new(noop::NoopFirewall::new(true));
     }
 
-    for sysctl in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
-        if std::fs::read_to_string(format!("/proc/sys/net/bridge/{sysctl}"))
-            .is_ok_and(|value| value.trim() == "0")
-        {
-            tracing::warn!(
-                "net.bridge.{sysctl} is disabled, traffic between containers on the same network will bypass server firewall rules"
-            );
-        }
-    }
+    let containerized =
+        std::path::Path::new("/.dockerenv").exists() || std::env::var("OCI_CONTAINER").is_ok();
+    let host_netns = match own_container {
+        Some((_, inspect)) => shares_host_netns(docker, inspect).await,
+        None => {
+            if containerized {
+                tracing::warn!(
+                    "running in a container whose own inspect failed, assuming the host network namespace - server firewall rules may be applied where server traffic never passes"
+                );
+            }
 
-    let exempt_sources = exempt_sources(config, own_container_ips);
+            true
+        }
+    };
+
+    let exempt_sources = if containerized && host_netns && own_container.is_some() {
+        Vec::new()
+    } else {
+        let own_container_ips = own_container
+            .map(|(_, inspect)| {
+                crate::server::executor::docker::DockerExecutor::endpoint_ips(inspect)
+            })
+            .unwrap_or_default();
+
+        exempt_sources(config, &own_container_ips)
+    };
 
     match backend {
-        FirewallBackendKind::Nftables => Arc::new(nftables::NftablesFirewall::new(exempt_sources)),
-        FirewallBackendKind::Iptables => Arc::new(iptables::IptablesFirewall::new(exempt_sources)),
+        FirewallBackendKind::Nftables | FirewallBackendKind::Iptables
+            if containerized && !host_netns =>
+        {
+            tracing::warn!(
+                "docker.firewall.backend is set to {:?}, but wings runs inside a container with its own network namespace where server traffic never passes (container:* network modes are treated as foreign) - use the container backend, or give the wings container host networking",
+                backend
+            );
+
+            Arc::new(noop::NoopFirewall::new(true))
+        }
+        FirewallBackendKind::Nftables => {
+            let runner = CommandRunner::Local;
+            warn_bridge_nf(&runner).await;
+
+            Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+        }
+        FirewallBackendKind::Iptables => {
+            let runner = CommandRunner::Local;
+            warn_bridge_nf(&runner).await;
+
+            Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner))
+        }
+        FirewallBackendKind::Container => {
+            match container_helper(config, docker, own_container).await {
+                Ok(runner) => {
+                    tracing::info!(
+                        "using nftables server firewall backend through a helper container"
+                    );
+                    warn_bridge_nf(&runner).await;
+
+                    Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to set up the firewall helper container, server firewall rules will not be applied: {err:#}"
+                    );
+
+                    Arc::new(noop::NoopFirewall::new(true))
+                }
+            }
+        }
         FirewallBackendKind::Auto => {
-            if run_command(
-                "nft",
-                &["--check", "-f", "-"],
-                Some(b"add table inet wings\n"),
-            )
-            .await
-            .is_ok()
+            if containerized && !host_netns {
+                match container_helper(config, docker, own_container).await {
+                    Ok(runner) => {
+                        tracing::info!(
+                            "using nftables server firewall backend through a helper container"
+                        );
+                        warn_bridge_nf(&runner).await;
+
+                        return Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "wings runs inside a container without host networking and the firewall helper container is unusable, server firewall rules will not be applied: {err:#}"
+                        );
+
+                        return Arc::new(noop::NoopFirewall::new(true));
+                    }
+                }
+            }
+
+            let runner = CommandRunner::Local;
+            if runner
+                .run(
+                    "nft",
+                    &["--check", "-f", "-"],
+                    Some(b"add table inet wings\n"),
+                )
+                .await
+                .is_ok()
             {
                 tracing::info!("using nftables server firewall backend");
+                warn_bridge_nf(&runner).await;
 
-                Arc::new(nftables::NftablesFirewall::new(exempt_sources))
-            } else if run_command("iptables", &["-w", "-S", "FORWARD"], None)
+                Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+            } else if runner
+                .run("iptables", &["-w", "-S", "FORWARD"], None)
                 .await
                 .is_ok()
             {
                 tracing::info!("using iptables server firewall backend");
+                warn_bridge_nf(&runner).await;
 
-                Arc::new(iptables::IptablesFirewall::new(exempt_sources))
+                Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner))
             } else {
                 tracing::warn!(
                     "neither nftables nor iptables are usable on this host, server firewall rules will not be applied"
@@ -291,6 +375,95 @@ pub async fn create(
             }
         }
         FirewallBackendKind::Disabled => Arc::new(noop::NoopFirewall::new(false)),
+    }
+}
+
+async fn container_helper(
+    config: &crate::config::Config,
+    docker: &Arc<bollard::Docker>,
+    own_container: Option<&(String, bollard::models::ContainerInspectResponse)>,
+) -> Result<CommandRunner, anyhow::Error> {
+    let Some((_, inspect)) = own_container else {
+        return Err(anyhow::anyhow!(
+            "the container firewall backend needs wings to run as a container of the connected container engine"
+        ));
+    };
+    let image = inspect
+        .image
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("own container inspect carries no image id"))?;
+
+    let helper =
+        runner::DockerHelper::new(Arc::clone(docker), image, config.load().app_name.clone());
+    helper.ensure().await?;
+
+    let runner = CommandRunner::Docker(helper);
+    if let Err(err) = runner
+        .run(
+            "nft",
+            &["--check", "-f", "-"],
+            Some(b"add table inet wings\n"),
+        )
+        .await
+    {
+        return Err(err.context("nftables is not usable inside the firewall helper container"));
+    }
+
+    Ok(runner)
+}
+
+async fn shares_host_netns(
+    docker: &bollard::Docker,
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> bool {
+    let mut mode = inspect
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.network_mode.clone());
+
+    for _ in 0..4 {
+        let Some(current) = mode else {
+            return false;
+        };
+        if current == "host" {
+            return true;
+        }
+
+        let Some(id) = current.strip_prefix("container:") else {
+            return false;
+        };
+        mode = match docker.inspect_container(id, None).await {
+            Ok(inspect) => inspect
+                .host_config
+                .and_then(|host_config| host_config.network_mode),
+            Err(err) => {
+                tracing::warn!(
+                    "failed to inspect container {id} referenced by wings's own network mode: {err}"
+                );
+
+                return false;
+            }
+        };
+    }
+
+    false
+}
+
+async fn warn_bridge_nf(runner: &CommandRunner) {
+    for sysctl in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
+        let path = format!("/proc/sys/net/bridge/{sysctl}");
+        // read in the namespace the rules will live in, br_netfilter state
+        // is per network namespace
+        let value = match runner {
+            CommandRunner::Local => std::fs::read_to_string(&path).ok(),
+            CommandRunner::Docker(_) => runner.run("cat", &[path.as_str()], None).await.ok(),
+        };
+
+        if value.is_some_and(|value| value.trim() == "0") {
+            tracing::warn!(
+                "net.bridge.{sysctl} is disabled, traffic between containers on the same network will bypass server firewall rules"
+            );
+        }
     }
 }
 
@@ -338,48 +511,7 @@ pub(crate) fn server_chain_name(server: uuid::Uuid) -> String {
     format!("wings-{name}")
 }
 
-pub(crate) async fn run_command(
-    program: &str,
-    args: &[&str],
-    input: Option<&[u8]>,
-) -> Result<String, anyhow::Error> {
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .stdin(if input.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = command.spawn()?;
-
-    if let Some(input) = input {
-        use tokio::io::AsyncWriteExt;
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open stdin of {program}"))?;
-        stdin.write_all(input).await?;
-        drop(stdin);
-    }
-
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "{program} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-pub(crate) async fn flush_denied_conntrack(rules: &[ConcreteRule]) {
+pub(crate) async fn flush_denied_conntrack(runner: &CommandRunner, rules: &[ConcreteRule]) {
     static CONNTRACK_MISSING_WARNED: OnceLock<()> = OnceLock::new();
 
     let mut tuples = BTreeSet::new();
@@ -407,11 +539,12 @@ pub(crate) async fn flush_denied_conntrack(rules: &[ConcreteRule]) {
                 args.extend(["-f", family]);
             }
 
-            match run_command("conntrack", &args, None).await {
+            match runner.run("conntrack", &args, None).await {
                 Ok(_) => {}
                 Err(err) => {
                     let message = err.to_string();
-                    if message.contains("No such file or directory")
+                    if (message.contains("No such file or directory")
+                        || message.contains("executable file not found"))
                         && CONNTRACK_MISSING_WARNED.set(()).is_ok()
                     {
                         tracing::warn!(

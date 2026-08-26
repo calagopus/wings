@@ -420,9 +420,10 @@ async fn main_rt() {
             },
         );
 
-        let own_container_ips =
-            crate::server::executor::docker::DockerExecutor::own_container_ips(&docker).await;
-        let firewall = crate::server::firewall::create(&config, &own_container_ips).await;
+        let own_container =
+            crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
+        let firewall =
+            crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
 
         Arc::new(crate::server::executor::docker::DockerExecutor::new(
             docker,

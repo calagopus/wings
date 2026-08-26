@@ -866,24 +866,33 @@ impl DockerExecutor {
         }
     }
 
-    /// Addresses of the container wings itself runs in, used to exempt
-    /// wings's own connections to servers from the per-server firewalls.
-    /// Empty when wings is not running in a container, or when its own
-    /// container cannot be found.
-    pub async fn own_container_ips(docker: &bollard::Docker) -> Vec<std::net::IpAddr> {
+    /// Id and inspect of the container wings itself runs in, used by the
+    /// firewall to pick a working backend and exempt wings's own connections
+    /// to servers. `None` when wings is not running in a container, or when
+    /// its own container cannot be found.
+    pub async fn own_container(
+        docker: &bollard::Docker,
+    ) -> Option<(String, bollard::models::ContainerInspectResponse)> {
         if !std::path::Path::new("/.dockerenv").exists() && std::env::var("OCI_CONTAINER").is_err()
         {
-            return Vec::new();
+            return None;
         }
 
         match host_mounts::HostMountTable::own_container_inspect(docker).await {
-            Ok((_, inspect)) => ContainerFirewallState::endpoint_ips(&inspect),
+            Ok(own_container) => Some(own_container),
             Err(err) => {
-                tracing::warn!("failed to inspect own container for firewall exemptions: {err:#}");
+                tracing::warn!("failed to inspect own container: {err:#}");
 
-                Vec::new()
+                None
             }
         }
+    }
+
+    #[inline]
+    pub fn endpoint_ips(
+        inspect: &bollard::models::ContainerInspectResponse,
+    ) -> Vec<std::net::IpAddr> {
+        ContainerFirewallState::endpoint_ips(inspect)
     }
 
     pub async fn reconcile_firewall(

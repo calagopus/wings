@@ -1,6 +1,6 @@
 use super::{
     ConcreteRule, FirewallBackend, FirewallRuleAction, FirewallServerSpec, RuleDst, expand_rules,
-    flush_denied_conntrack, run_command, server_chain_name,
+    flush_denied_conntrack, runner::CommandRunner, server_chain_name,
 };
 use std::{collections::BTreeMap, fmt::Write, sync::Arc};
 
@@ -15,14 +15,16 @@ pub struct NftablesFirewall {
 
 struct Inner {
     exempt_sources: Vec<cidr::IpCidr>,
+    runner: CommandRunner,
     state: tokio::sync::Mutex<BTreeMap<uuid::Uuid, Vec<ConcreteRule>>>,
 }
 
 impl NftablesFirewall {
-    pub fn new(exempt_sources: Vec<cidr::IpCidr>) -> Self {
+    pub fn new(exempt_sources: Vec<cidr::IpCidr>, runner: CommandRunner) -> Self {
         Self {
             inner: Arc::new(Inner {
                 exempt_sources,
+                runner,
                 state: tokio::sync::Mutex::new(BTreeMap::new()),
             }),
         }
@@ -36,7 +38,9 @@ impl Inner {
     ) -> Result<(), anyhow::Error> {
         let ruleset = render_ruleset(servers, &self.exempt_sources);
 
-        run_command("nft", &["-f", "-"], Some(ruleset.as_bytes())).await?;
+        self.runner
+            .run("nft", &["-f", "-"], Some(ruleset.as_bytes()))
+            .await?;
 
         Ok(())
     }
@@ -49,7 +53,9 @@ impl Inner {
 
         let intact = servers.is_empty()
             || matches!(
-                run_command("nft", &["list", "chain", "inet", "wings", "forward"], None).await,
+                self.runner
+                    .run("nft", &["list", "chain", "inet", "wings", "forward"], None)
+                    .await,
                 Ok(output) if output.contains("jump")
             );
         if intact && !force {
@@ -75,7 +81,7 @@ impl Inner {
         drop(servers);
 
         for rules in denied {
-            flush_denied_conntrack(&rules).await;
+            flush_denied_conntrack(&self.runner, &rules).await;
         }
     }
 }
@@ -234,7 +240,7 @@ impl FirewallBackend for NftablesFirewall {
         *state = servers;
         drop(state);
 
-        flush_denied_conntrack(&rules).await;
+        flush_denied_conntrack(&self.inner.runner, &rules).await;
 
         Ok(())
     }
@@ -271,7 +277,7 @@ impl FirewallBackend for NftablesFirewall {
         drop(state);
 
         for rules in changed {
-            flush_denied_conntrack(&rules).await;
+            flush_denied_conntrack(&self.inner.runner, &rules).await;
         }
 
         Ok(())

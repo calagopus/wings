@@ -1,6 +1,6 @@
 use super::{
     ConcreteRule, FirewallBackend, FirewallRuleAction, FirewallServerSpec, RuleDst, expand_rules,
-    flush_denied_conntrack, run_command, server_chain_name,
+    flush_denied_conntrack, runner::CommandRunner, server_chain_name,
 };
 use std::{collections::BTreeMap, fmt::Write, sync::Arc};
 
@@ -67,14 +67,16 @@ pub struct IptablesFirewall {
 
 struct Inner {
     exempt_sources: Vec<cidr::IpCidr>,
+    runner: CommandRunner,
     state: tokio::sync::Mutex<BTreeMap<uuid::Uuid, Vec<ConcreteRule>>>,
 }
 
 impl IptablesFirewall {
-    pub fn new(exempt_sources: Vec<cidr::IpCidr>) -> Self {
+    pub fn new(exempt_sources: Vec<cidr::IpCidr>, runner: CommandRunner) -> Self {
         Self {
             inner: Arc::new(Inner {
                 exempt_sources,
+                runner,
                 state: tokio::sync::Mutex::new(BTreeMap::new()),
             }),
         }
@@ -216,7 +218,11 @@ impl Inner {
         servers: &BTreeMap<uuid::Uuid, Vec<ConcreteRule>>,
         family: Family,
     ) -> Result<(), anyhow::Error> {
-        let save_output = match run_command(family.save_tool(), &["-t", "filter"], None).await {
+        let save_output = match self
+            .runner
+            .run(family.save_tool(), &["-t", "filter"], None)
+            .await
+        {
             Ok(output) => output,
             Err(err) => {
                 if self.family_needed(servers, family) {
@@ -238,15 +244,16 @@ impl Inner {
 
         let restore_file =
             render_restore_file(servers, &self.exempt_sources, &stale_chains, family);
-        run_command(
-            family.restore_tool(),
-            &["-w", "-n"],
-            Some(restore_file.as_bytes()),
-        )
-        .await?;
+        self.runner
+            .run(
+                family.restore_tool(),
+                &["-w", "-n"],
+                Some(restore_file.as_bytes()),
+            )
+            .await?;
 
         if needed {
-            ensure_jump(family).await?;
+            ensure_jump(&self.runner, family).await?;
         }
 
         Ok(())
@@ -274,7 +281,7 @@ impl Inner {
                 continue;
             }
 
-            if !has_jump(family).await {
+            if !has_jump(&self.runner, family).await {
                 intact = false;
             }
         }
@@ -301,20 +308,21 @@ impl Inner {
         drop(servers);
 
         for rules in denied {
-            flush_denied_conntrack(&rules).await;
+            flush_denied_conntrack(&self.runner, &rules).await;
         }
     }
 }
 
-async fn has_jump(family: Family) -> bool {
+async fn has_jump(runner: &CommandRunner, family: Family) -> bool {
     for parent in ["DOCKER-USER", "FORWARD"] {
-        if run_command(
-            family.tool(),
-            &["-w", "-C", parent, "-j", DISPATCH_CHAIN],
-            None,
-        )
-        .await
-        .is_ok()
+        if runner
+            .run(
+                family.tool(),
+                &["-w", "-C", parent, "-j", DISPATCH_CHAIN],
+                None,
+            )
+            .await
+            .is_ok()
         {
             return true;
         }
@@ -323,12 +331,13 @@ async fn has_jump(family: Family) -> bool {
     false
 }
 
-async fn ensure_jump(family: Family) -> Result<(), anyhow::Error> {
-    if has_jump(family).await {
+async fn ensure_jump(runner: &CommandRunner, family: Family) -> Result<(), anyhow::Error> {
+    if has_jump(runner, family).await {
         return Ok(());
     }
 
-    let parent = if run_command(family.tool(), &["-w", "-S", "DOCKER-USER"], None)
+    let parent = if runner
+        .run(family.tool(), &["-w", "-S", "DOCKER-USER"], None)
         .await
         .is_ok()
     {
@@ -337,12 +346,13 @@ async fn ensure_jump(family: Family) -> Result<(), anyhow::Error> {
         "FORWARD"
     };
 
-    run_command(
-        family.tool(),
-        &["-w", "-I", parent, "1", "-j", DISPATCH_CHAIN],
-        None,
-    )
-    .await?;
+    runner
+        .run(
+            family.tool(),
+            &["-w", "-I", parent, "1", "-j", DISPATCH_CHAIN],
+            None,
+        )
+        .await?;
 
     Ok(())
 }
@@ -392,7 +402,7 @@ impl FirewallBackend for IptablesFirewall {
         *state = servers;
         drop(state);
 
-        flush_denied_conntrack(&rules).await;
+        flush_denied_conntrack(&self.inner.runner, &rules).await;
 
         Ok(())
     }
@@ -429,7 +439,7 @@ impl FirewallBackend for IptablesFirewall {
         drop(state);
 
         for rules in changed {
-            flush_denied_conntrack(&rules).await;
+            flush_denied_conntrack(&self.inner.runner, &rules).await;
         }
 
         Ok(())
