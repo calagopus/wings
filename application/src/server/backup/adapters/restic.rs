@@ -30,17 +30,13 @@ use serde_default::DefaultFromSerde;
 use std::{
     collections::HashMap,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt},
-    process::Command,
-    sync::RwLock,
-};
+use tokio::{io::AsyncBufReadExt, process::Command, sync::RwLock};
 
 type ResticBackupCache =
     RwLock<HashMap<uuid::Uuid, (ResticSnapshot, Arc<ResticBackupConfiguration>)>>;
@@ -48,6 +44,8 @@ static RESTIC_BACKUP_CACHE: LazyLock<ResticBackupCache> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 const RESTIC_STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
+const MAX_TREE_DEPTH: usize = 1024;
+const MAX_BROWSE_ENTRIES: usize = 10_000_000;
 
 #[derive(Debug, Deserialize)]
 struct ResticSnapshot {
@@ -98,6 +96,15 @@ pub struct ResticTreeNode {
     files: thin_vec::ThinVec<(CompactString, ResticFileMeta)>,
 }
 
+// drops the tree iteratively, recursive dropping would overflow the stack on deeply nested trees
+impl Drop for ResticTreeNode {
+    fn drop(&mut self) {
+        while let Some((_, mut node)) = self.dirs.pop() {
+            self.dirs.append(&mut node.dirs);
+        }
+    }
+}
+
 impl ResticTreeNode {
     fn build(entries: Vec<ResticDirectoryEntry>) -> Self {
         let mut root = ResticTreeNode::default();
@@ -111,13 +118,19 @@ impl ResticTreeNode {
     }
 
     fn insert(&mut self, entry: ResticDirectoryEntry) {
-        let components: Vec<&str> = entry
-            .path
-            .components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect();
+        let mut components: Vec<&str> = Vec::new();
+        for component in entry.path.components() {
+            let Component::Normal(name) = component else {
+                return;
+            };
+            let Some(name) = name.to_str() else {
+                return;
+            };
 
-        if components.is_empty() {
+            components.push(name);
+        }
+
+        if components.is_empty() || components.len() > MAX_TREE_DEPTH {
             return;
         }
 
@@ -229,6 +242,31 @@ pub struct ResticBackup {
 impl ResticBackup {
     pub fn get_restic_cache_dir(config: &crate::config::Config) -> String {
         config.resolve_as_str(|cfg| &cfg.system.backup_directory) + "/.cache/restic"
+    }
+
+    fn spawn_stderr_capture(
+        stderr: tokio::process::ChildStderr,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut output = String::new();
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if output.len() < RESTIC_STDERR_CAPTURE_LIMIT {
+                            output.push_str(&line);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            output
+        })
     }
 }
 
@@ -1114,26 +1152,7 @@ impl BackupExt for ResticBackup {
             .ok_or_else(|| std::io::Error::other("No stderr available"))?;
         let mut line_reader = tokio::io::BufReader::new(stdout).lines();
 
-        let stderr_task = tokio::spawn({
-            async move {
-                let mut reader = tokio::io::BufReader::new(stderr);
-                let mut output = String::new();
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if output.len() < RESTIC_STDERR_CAPTURE_LIMIT {
-                                output.push_str(&line);
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                output
-            }
-        });
+        let stderr_task = Self::spawn_stderr_capture(stderr);
 
         while let Ok(Some(line)) = line_reader.next_line().await {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
@@ -1230,13 +1249,33 @@ impl BackupExt for ResticBackup {
             .stderr(std::process::Stdio::piped())
             .spawn()?;
 
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+
+        let stderr_task = Self::spawn_stderr_capture(stderr);
+
         let mut entries = Vec::new();
+        let mut truncated = false;
 
         if let Some(stdout) = child.stdout.take() {
             let mut line_reader = tokio::io::BufReader::new(stdout).lines();
 
             while let Ok(Some(line)) = line_reader.next_line().await {
                 if line.is_empty() {
+                    continue;
+                }
+
+                if entries.len() >= MAX_BROWSE_ENTRIES {
+                    if !truncated {
+                        truncated = true;
+
+                        tracing::warn!(
+                            "restic snapshot listing exceeds {MAX_BROWSE_ENTRIES} entries, truncating backup browse tree"
+                        );
+                    }
+
                     continue;
                 }
 
@@ -1253,12 +1292,9 @@ impl BackupExt for ResticBackup {
         }
 
         let status = child.wait().await?;
-        if !status.success()
-            && let Some(mut stderr) = child.stderr.take()
-        {
-            let mut stderr_out = String::new();
-            stderr.read_to_string(&mut stderr_out).await?;
+        let stderr_out = stderr_task.await.unwrap_or_default();
 
+        if !status.success() {
             tracing::error!(
                 "failed to list Restic snapshot for browsing: {}",
                 stderr_out.trim()

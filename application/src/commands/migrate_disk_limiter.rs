@@ -131,6 +131,11 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                         crate::server::filesystem::inotify::InotifyManager::new()
                             .expect("failed to initialize inotify manager"),
                     ),
+                    websocket_limiter: Arc::new(
+                        crate::server::websocket::limiter::WebsocketLimiter::new(Arc::clone(
+                            &config,
+                        )),
+                    ),
                     mime_cache: moka::future::Cache::new(20480),
                 });
 

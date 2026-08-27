@@ -424,9 +424,10 @@ impl Filesystem {
     }
 
     pub async fn diff_key(&self, path: &Path) -> PathBuf {
-        self.async_canonicalize(path)
-            .await
-            .unwrap_or_else(|_| self.relative_path(path))
+        match self.async_canonicalize(path).await {
+            Ok(path) => path,
+            Err(_) => self.async_canonicalize_parent(path).await,
+        }
     }
 
     pub async fn pulls(
@@ -898,6 +899,33 @@ impl Filesystem {
             if let Some(parent) = path.parent() {
                 self.async_allocate_in_path(parent, -size, false).await;
             }
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_empty_dir(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+
+        if path.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot remove the server root directory",
+            ));
+        }
+
+        self.async_remove_dir(&path).await?;
+
+        let mut disk_usage = self.disk_usage.write().await;
+        if let Some(removed) = disk_usage.remove_path(&path) {
+            drop(disk_usage);
+            self.try_update_atomics(
+                usage::SpaceDelta::new(
+                    -(removed.space.get_logical() as i64),
+                    -(removed.space.get_physical() as i64),
+                ),
+                false,
+            );
         }
 
         Ok(())

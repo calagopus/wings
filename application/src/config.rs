@@ -37,14 +37,23 @@ fn api_server_remote_download_limit() -> usize {
 fn api_remote_download_blocked_cidrs() -> Vec<cidr::IpCidr> {
     unsafe {
         Vec::from([
+            cidr::IpCidr::from_str("0.0.0.0/8").unwrap_unchecked(),
             cidr::IpCidr::from_str("127.0.0.0/8").unwrap_unchecked(),
             cidr::IpCidr::from_str("10.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("100.64.0.0/10").unwrap_unchecked(),
             cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
             cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
             cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.0.0.0/24").unwrap_unchecked(),
+            cidr::IpCidr::from_str("198.18.0.0/15").unwrap_unchecked(),
+            cidr::IpCidr::from_str("224.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("240.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
             cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+            cidr::IpCidr::from_str("2002::/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("ff00::/8").unwrap_unchecked(),
         ])
     }
 }
@@ -61,9 +70,16 @@ fn api_schedule_steps_http_request_blocked_cidrs() -> Vec<cidr::IpCidr> {
             cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
             cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
             cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.0.0.0/24").unwrap_unchecked(),
+            cidr::IpCidr::from_str("198.18.0.0/15").unwrap_unchecked(),
+            cidr::IpCidr::from_str("224.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("240.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
             cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+            cidr::IpCidr::from_str("2002::/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("ff00::/8").unwrap_unchecked(),
         ])
     }
 }
@@ -337,6 +353,25 @@ fn system_file_collaboration_max_cursors_per_connection() -> u64 {
 }
 fn system_file_collaboration_session_grace_period() -> u64 {
     30
+}
+
+fn system_websocket_max_message_size() -> u64 {
+    1024 * 1024
+}
+fn system_websocket_max_frame_size() -> u64 {
+    1024 * 1024
+}
+fn system_websocket_read_buffer_size() -> u64 {
+    8 * 1024
+}
+fn system_websocket_authentication_timeout() -> u64 {
+    60
+}
+fn system_websocket_unauthenticated_connections_per_ip() -> usize {
+    32
+}
+fn system_websocket_max_connections_total() -> usize {
+    0
 }
 
 fn system_backup_mounting_enabled() -> bool {
@@ -945,6 +980,25 @@ nestify::nest! {
 
                 #[serde(default = "system_file_collaboration_session_grace_period")]
                 pub session_grace_period: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub websocket: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemWebsocket {
+                #[serde(default = "system_websocket_max_message_size")]
+                pub max_message_size: u64,
+                #[serde(default = "system_websocket_max_frame_size")]
+                pub max_frame_size: u64,
+                #[serde(default = "system_websocket_read_buffer_size")]
+                pub read_buffer_size: u64,
+
+                #[serde(default = "system_websocket_authentication_timeout")]
+                pub authentication_timeout: u64,
+
+                #[serde(default = "system_websocket_unauthenticated_connections_per_ip")]
+                pub unauthenticated_connections_per_ip: usize,
+                #[serde(default = "system_websocket_max_connections_total")]
+                pub max_connections_total: usize,
             },
 
             #[serde(default)]

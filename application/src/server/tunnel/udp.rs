@@ -6,7 +6,7 @@ use futures::{SinkExt, StreamExt};
 use std::{io, net::SocketAddr, time::Duration};
 use tokio::net::UdpSocket;
 
-const RECV_BUFFER_SIZE: usize = 65536;
+pub const RECV_BUFFER_SIZE: usize = 65536;
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 

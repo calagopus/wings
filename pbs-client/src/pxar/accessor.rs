@@ -66,6 +66,11 @@ impl<T: ReadAt + Clone> Directory<T> {
         if table_bytes % super::format::GOODBYE_ITEM_SIZE != 0 || table_bytes == 0 {
             return Err(std::io::Error::other("pxar: invalid goodbye table size"));
         }
+        if table_bytes > super::format::MAX_GOODBYE_TABLE_LEN {
+            return Err(std::io::Error::other(
+                "pxar: goodbye table exceeds maximum length",
+            ));
+        }
 
         let count = (table_bytes / super::format::GOODBYE_ITEM_SIZE) as usize - 1;
         let table_ofs = goodbye_ofs + super::format::HEADER_SIZE;
@@ -176,6 +181,12 @@ impl<T: ReadAt + Clone> Directory<T> {
             return Err(std::io::Error::other("pxar: expected a filename header"));
         }
         let content = header.content_size()?;
+        if content > super::format::MAX_FILENAME_LEN {
+            return Err(std::io::Error::other(
+                "pxar: filename exceeds maximum length",
+            ));
+        }
+
         let mut name =
             read_data(&self.input, file_ofs + super::format::HEADER_SIZE, content).await?;
         if name.pop() != Some(0) {
@@ -308,8 +319,14 @@ async fn decode_entry<T: ReadAt>(
             },
         )),
         super::format::PXAR_SYMLINK => {
-            let data =
-                read_data(input, at + super::format::HEADER_SIZE, item.content_size()?).await?;
+            let symlink_size = item.content_size()?;
+            if symlink_size > super::format::MAX_SYMLINK_LEN {
+                return Err(std::io::Error::other(
+                    "pxar: symlink exceeds maximum length",
+                ));
+            }
+
+            let data = read_data(input, at + super::format::HEADER_SIZE, symlink_size).await?;
             Ok((metadata, EntryKind::Symlink(Symlink { data })))
         }
         super::format::PXAR_FILENAME | super::format::PXAR_GOODBYE => {
@@ -363,6 +380,12 @@ async fn read_array<const N: usize, T: ReadAt>(input: &T, offset: u64) -> std::i
 }
 
 async fn read_data<T: ReadAt>(input: &T, offset: u64, size: u64) -> std::io::Result<Vec<u8>> {
+    if size > super::format::MAX_GOODBYE_TABLE_LEN {
+        return Err(std::io::Error::other(
+            "pxar: data section exceeds maximum length",
+        ));
+    }
+
     let size = usize::try_from(size).map_err(std::io::Error::other)?;
     let mut buf = vec![0; size];
     read_exact_at(input, &mut buf, offset).await?;

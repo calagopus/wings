@@ -1,3 +1,4 @@
+use crate::io::SafeSliceExt;
 use rusqlite::fallible_iterator::FallibleIterator;
 use serde::Serialize;
 use std::time::Duration;
@@ -7,6 +8,7 @@ pub const QUERY_MAX_LENGTH: usize = 65535;
 pub const QUERY_DEFAULT_ROWS: u32 = 100;
 pub const QUERY_MAX_ROWS: u32 = 1000;
 const QUERY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const QUERY_MAX_VALUE_BYTES: usize = 256 * 1024;
 pub const QUERY_DEADLINE: Duration = Duration::from_secs(15);
 pub const QUERY_BUSY_TIMEOUT: Duration = Duration::from_millis(3000);
 
@@ -21,15 +23,34 @@ pub struct QueryColumn {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryValue {
     Null,
-    Text { value: String },
-    Binary { value: String },
+    Text { value: String, truncated: bool },
+    Binary { value: String, truncated: bool },
 }
 
 impl QueryValue {
+    fn text(value: &str) -> Self {
+        Self::Text {
+            value: crate::utils::slice_up_to(value, QUERY_MAX_VALUE_BYTES).to_owned(),
+            truncated: value.len() > QUERY_MAX_VALUE_BYTES,
+        }
+    }
+
+    fn binary(bytes: &[u8]) -> Self {
+        let max = QUERY_MAX_VALUE_BYTES / 2;
+
+        Self::Binary {
+            value: match bytes.get_slice(..bytes.len().min(max)) {
+                Ok(slice) => hex::encode(slice),
+                Err(_) => String::new(),
+            },
+            truncated: bytes.len() > max,
+        }
+    }
+
     fn byte_len(&self) -> usize {
         match self {
             Self::Null => 0,
-            Self::Text { value } | Self::Binary { value } => value.len(),
+            Self::Text { value, .. } | Self::Binary { value, .. } => value.len(),
         }
     }
 }
@@ -49,6 +70,7 @@ pub fn run_query(
 ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
     let mut results = Vec::new();
     let mut batch = rusqlite::Batch::new(connection, sql);
+    let mut bytes = 0usize;
 
     while let Some(mut statement) = batch.next()? {
         if statement.column_count() == 0 {
@@ -78,7 +100,6 @@ pub fn run_query(
             .collect();
 
         let mut rows = Vec::new();
-        let mut bytes = 0usize;
         let mut truncated = false;
 
         let mut raw_rows = statement.raw_query();
@@ -94,21 +115,28 @@ pub fn run_query(
                         rusqlite::types::ValueRef::Null => QueryValue::Null,
                         rusqlite::types::ValueRef::Integer(value) => QueryValue::Text {
                             value: value.to_string(),
+                            truncated: false,
                         },
                         rusqlite::types::ValueRef::Real(value) => QueryValue::Text {
                             value: value.to_string(),
+                            truncated: false,
                         },
-                        rusqlite::types::ValueRef::Text(value) => QueryValue::Text {
-                            value: String::from_utf8_lossy(value).into_owned(),
-                        },
-                        rusqlite::types::ValueRef::Blob(value) => QueryValue::Binary {
-                            value: hex::encode(value),
-                        },
+                        rusqlite::types::ValueRef::Text(value) => {
+                            QueryValue::text(&String::from_utf8_lossy(value))
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => QueryValue::binary(value),
                     })
                 })
                 .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
-            bytes += values.iter().map(QueryValue::byte_len).sum::<usize>();
+            let len = values.iter().map(QueryValue::byte_len).sum::<usize>();
+            if bytes + len > QUERY_MAX_BYTES {
+                bytes = QUERY_MAX_BYTES;
+                truncated = true;
+                break;
+            }
+
+            bytes += len;
             rows.push(values);
         }
         drop(raw_rows);

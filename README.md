@@ -28,14 +28,23 @@ api:
   server_remote_download_limit: 3
   # cidrs to block on the remote download pull endpoint
   remote_download_blocked_cidrs:
+  - '0.0.0.0/8'
   - '127.0.0.0/8'
   - '10.0.0.0/8'
+  - '100.64.0.0/10'
   - '172.16.0.0/12'
   - '192.168.0.0/16'
   - '169.254.0.0/16'
-  - ::1
+  - '192.0.0.0/24'
+  - '198.18.0.0/15'
+  - '224.0.0.0/4'
+  - '240.0.0.0/4'
+  - ::/128
+  - ::1/128
   - fe80::/10
   - fc00::/7
+  - 2002::/16
+  - ff00::/8
   # whether to disable the /openapi.json endpoint
   disable_openapi_docs: false
   # how many entries can be listed on a single page on the /list-directory API call, 0 means unlimited

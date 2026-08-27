@@ -37,6 +37,7 @@ use std::{
 use tokio::io::AsyncBufReadExt;
 
 const BACKUP_UUID_TAG: &str = "backup-uuid";
+const MAX_TREE_DEPTH: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1071,11 +1072,21 @@ impl VirtualKopiaBackup {
         &'a self,
         rel: PathBuf,
         oid: Arc<str>,
+        depth: usize,
         is_ignored: &'a IsIgnoredFn,
         out: &'a mut Vec<(FileType, PathBuf, String)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
     {
         Box::pin(async move {
+            if depth >= MAX_TREE_DEPTH {
+                tracing::warn!(
+                    rel = %rel.display(),
+                    "kopia flatten_walk exceeded the maximum tree depth, skipping subtree",
+                );
+
+                return Ok(());
+            }
+
             let dir = match self.load_dir(&oid).await {
                 Ok(dir) => dir,
                 Err(err) => {
@@ -1107,8 +1118,14 @@ impl VirtualKopiaBackup {
                 if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
                     out.push((FileType::Dir, filtered, String::new()));
                 }
-                self.flatten_walk(child_path, Arc::from(entry.oid.as_str()), is_ignored, out)
-                    .await?;
+                self.flatten_walk(
+                    child_path,
+                    Arc::from(entry.oid.as_str()),
+                    depth + 1,
+                    is_ignored,
+                    out,
+                )
+                .await?;
             }
 
             Ok(())
@@ -1119,9 +1136,19 @@ impl VirtualKopiaBackup {
         &self,
         rel: PathBuf,
         oid: Arc<str>,
+        depth: usize,
         is_ignored: &IsIgnoredFn,
         out: &mut Vec<(FileType, PathBuf, String)>,
     ) -> Result<(), anyhow::Error> {
+        if depth >= MAX_TREE_DEPTH {
+            tracing::warn!(
+                rel = %rel.display(),
+                "kopia flatten_walk exceeded the maximum tree depth, skipping subtree",
+            );
+
+            return Ok(());
+        }
+
         let dir = match self.load_dir_blocking(&oid) {
             Ok(dir) => dir,
             Err(err) => {
@@ -1153,7 +1180,13 @@ impl VirtualKopiaBackup {
             if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
                 out.push((FileType::Dir, filtered, String::new()));
             }
-            self.flatten_walk_blocking(child_path, Arc::from(entry.oid.as_str()), is_ignored, out)?;
+            self.flatten_walk_blocking(
+                child_path,
+                Arc::from(entry.oid.as_str()),
+                depth + 1,
+                is_ignored,
+                out,
+            )?;
         }
 
         Ok(())
@@ -1309,7 +1342,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let mut flat: Vec<(FileType, PathBuf, String)> = Vec::new();
 
         if let Ok(oid) = self.resolve_dir_oid_blocking(&base) {
-            self.flatten_walk_blocking(base, oid, &is_ignored, &mut flat)?;
+            self.flatten_walk_blocking(base, oid, 0, &is_ignored, &mut flat)?;
         }
 
         struct TreeWalk {
@@ -1337,7 +1370,8 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let mut flat: Vec<(FileType, PathBuf, String)> = Vec::new();
 
         if let Ok(oid) = self.resolve_dir_oid(&base).await {
-            self.flatten_walk(base, oid, &is_ignored, &mut flat).await?;
+            self.flatten_walk(base, oid, 0, &is_ignored, &mut flat)
+                .await?;
         }
 
         struct TreeWalk {

@@ -143,6 +143,7 @@ pub struct AppState {
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
+    pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
     pub mime_cache: moka::future::Cache<MimeCacheKey, MimeCacheValue>,
 }
 
@@ -162,6 +163,9 @@ impl AppState {
                 crate::server::filesystem::inotify::InotifyManager::new()
                     .expect("Creating inotify manager failed"),
             ),
+            websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
+                Arc::new(crate::config::Config::mock()),
+            )),
             mime_cache: moka::future::Cache::builder().build(),
         })
     }

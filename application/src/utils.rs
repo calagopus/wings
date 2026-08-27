@@ -32,6 +32,20 @@ pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     format!("[{bar}] {formatted_percentage}")
 }
 
+#[inline]
+pub fn slice_up_to(s: &str, max_len: usize) -> &str {
+    if max_len >= s.len() || s.is_empty() {
+        return s;
+    }
+
+    let mut idx = max_len;
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+
+    s.get(..idx).unwrap_or(s)
+}
+
 pub fn is_single_component_file_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
 

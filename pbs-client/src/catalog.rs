@@ -2,6 +2,7 @@ use super::{
     accessor::{ArchiveEntry, ArchiveEntryKind},
     error::PbsError,
     osstr::os_str_from_bytes,
+    pxar::format::validate_filename,
 };
 use std::{
     io::Write,
@@ -231,7 +232,7 @@ impl<W: Write> CatalogWriter<W> {
 }
 
 const MAX_CATALOG_DEPTH: usize = 1024;
-const MAX_CATALOG_ENTRIES: usize = 100_000_000;
+const MAX_CATALOG_ENTRIES: usize = 10_000_000;
 
 fn decode_error(msg: &'static str) -> PbsError {
     PbsError::Decode(msg.into())
@@ -338,6 +339,7 @@ fn read_table(data: &[u8], block_pos: usize) -> Result<Vec<RawEntry>, PbsError> 
         let name_len = usize::try_from(cursor.u64()?)
             .map_err(|_| decode_error("catalog: name length overflow"))?;
         let name = cursor.take(name_len)?.to_vec();
+        validate_filename(&name).map_err(|_| decode_error("catalog: invalid entry name"))?;
 
         let kind = match type_byte {
             ENTRY_DIRECTORY => {
@@ -373,7 +375,7 @@ fn push_walk(
     depth: usize,
     visited: &mut std::collections::HashSet<usize>,
 ) -> Result<(), PbsError> {
-    if depth > MAX_CATALOG_DEPTH {
+    if depth >= MAX_CATALOG_DEPTH {
         return Err(decode_error("catalog: directory nesting too deep"));
     }
     if !visited.insert(block_pos) {

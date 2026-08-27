@@ -22,6 +22,7 @@ use utoipa::ToSchema;
 
 pub mod handler;
 mod jwt;
+pub mod limiter;
 mod message_handler;
 
 #[derive(Deserialize)]
@@ -153,6 +154,86 @@ pub enum WebsocketEvent {
     FileCollabConflict,
     #[serde(rename = "file collab error")]
     FileCollabError,
+}
+
+pub enum BroadcastPermission {
+    Denied,
+    Authenticated,
+    Required(Permission),
+    CalagopusOr(Permission, bool),
+}
+
+impl WebsocketEvent {
+    pub fn broadcast_permission(self) -> BroadcastPermission {
+        match self {
+            Self::ServerStats
+            | Self::ServerStatus
+            | Self::ServerPendingRestart
+            | Self::ServerImagePullProgress
+            | Self::ServerImagePullCompleted
+            | Self::ServerInstallStarted
+            | Self::ServerInstallProgress
+            | Self::ServerInstallCompleted
+            | Self::ServerTransferStatus => BroadcastPermission::Authenticated,
+
+            Self::ServerConsoleOutput | Self::ServerDaemonMessage => {
+                BroadcastPermission::CalagopusOr(Permission::ControlReadConsole, true)
+            }
+
+            Self::ServerInstallOutput => {
+                BroadcastPermission::Required(Permission::AdminWebsocketInstall)
+            }
+            Self::ServerTransferLogs | Self::ServerTransferProgress => {
+                BroadcastPermission::Required(Permission::AdminWebsocketTransfer)
+            }
+            Self::ServerBackupStarted
+            | Self::ServerBackupProgress
+            | Self::ServerBackupCompleted
+            | Self::ServerBackupDeleted
+            | Self::ServerBackupRestoreStarted
+            | Self::ServerBackupRestoreProgress
+            | Self::ServerBackupRestoreCompleted => {
+                BroadcastPermission::Required(Permission::BackupRead)
+            }
+            Self::ServerScheduleStarted
+            | Self::ServerScheduleStepStatus
+            | Self::ServerScheduleStepError
+            | Self::ServerScheduleCompleted => {
+                BroadcastPermission::Required(Permission::ScheduleRead)
+            }
+            Self::ServerOperationProgress
+            | Self::ServerOperationError
+            | Self::ServerOperationCompleted
+            | Self::ServerOperationAborted => BroadcastPermission::Required(Permission::FileRead),
+
+            Self::AuthenticationSuccess
+            | Self::TokenExpiring
+            | Self::TokenExpired
+            | Self::Authentication
+            | Self::ConfigureSocket
+            | Self::SetState
+            | Self::SendServerLogs
+            | Self::SendCommand
+            | Self::SendStats
+            | Self::SendStatus
+            | Self::Error
+            | Self::JwtError
+            | Self::Ping
+            | Self::Pong
+            | Self::ServerCustomEvent
+            | Self::FileCollabSubscribe
+            | Self::FileCollabUnsubscribe
+            | Self::FileCollabUpdate
+            | Self::FileCollabAwareness
+            | Self::FileCollabSave
+            | Self::FileCollabSync
+            | Self::FileCollabParticipants
+            | Self::FileCollabSaved
+            | Self::FileCollabReload
+            | Self::FileCollabConflict
+            | Self::FileCollabError => BroadcastPermission::Denied,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

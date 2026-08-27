@@ -10,6 +10,7 @@ use tokio::{
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+pub const MAX_MESSAGE_SIZE: usize = crate::TRANSFER_BUFFER_SIZE;
 
 pub async fn tunnel(socket: WebSocket, target: SocketAddr) {
     let stream = match TcpStream::connect(target).await {

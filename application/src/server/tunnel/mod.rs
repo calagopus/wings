@@ -51,7 +51,13 @@ pub async fn handle_ws(
     };
 
     match params.protocol {
-        Protocol::Tcp => ws.on_upgrade(move |socket| tcp::tunnel(socket, target)),
-        Protocol::Udp => ws.on_upgrade(move |socket| udp::tunnel(socket, target)),
+        Protocol::Tcp => ws
+            .max_message_size(tcp::MAX_MESSAGE_SIZE)
+            .max_frame_size(tcp::MAX_MESSAGE_SIZE)
+            .on_upgrade(move |socket| tcp::tunnel(socket, target)),
+        Protocol::Udp => ws
+            .max_message_size(udp::RECV_BUFFER_SIZE)
+            .max_frame_size(udp::RECV_BUFFER_SIZE)
+            .on_upgrade(move |socket| udp::tunnel(socket, target)),
     }
 }

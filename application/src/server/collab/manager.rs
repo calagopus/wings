@@ -754,6 +754,7 @@ impl CollabManager {
         connection_id: uuid::Uuid,
         user_uuid: uuid::Uuid,
         raw_path: &str,
+        editor: Option<&str>,
     ) -> Result<(compact_str::CompactString, Arc<CollabSession>), CollabError> {
         let (_, resolved, _) = self.resolve(server, user_uuid, raw_path).await?;
 
@@ -764,7 +765,12 @@ impl CollabManager {
             };
 
             let key = connection.keys.get(raw_path).cloned().unwrap_or(resolved);
-            if !connection.subscriptions.contains_key(&key) {
+            let Some(editors) = connection.subscriptions.get(&key) else {
+                return Err(CollabError::User("not subscribed to this file"));
+            };
+            if let Some(editor) = editor
+                && !editors.contains(editor)
+            {
                 return Err(CollabError::User("not subscribed to this file"));
             }
 
@@ -795,7 +801,13 @@ impl CollabManager {
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
         let (key, session) = self
-            .subscribed_session(server, connection_id, user_uuid, raw_path)
+            .subscribed_session(
+                server,
+                connection_id,
+                user_uuid,
+                raw_path,
+                Some(editor.as_str()),
+            )
             .await?;
 
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
@@ -901,7 +913,7 @@ impl CollabManager {
         payload: &str,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, user_uuid, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path, None)
             .await?;
 
         match BASE64
@@ -952,7 +964,7 @@ impl CollabManager {
         expected_hash: Option<&str>,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, user_uuid, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path, None)
             .await?;
         let path = session.abs_path.clone();
         let filesystem = Arc::clone(&session.filesystem);
@@ -1123,7 +1135,7 @@ impl CollabManager {
         raw_path: &str,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, user_uuid, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path, None)
             .await?;
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
 

@@ -22,6 +22,7 @@ use std::{
 use tokio::sync::{Mutex, RwLock, broadcast::error::RecvError};
 
 const MAX_MISSED_PONGS: usize = 2;
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn handle_ws(
     ws: WebSocketUpgrade,
@@ -40,6 +41,22 @@ pub async fn handle_ws(
     };
 
     let user_ip = state.config.find_ip(&headers, connect_info);
+
+    let Some(mut limiter_guard) = state.websocket_limiter.acquire(user_ip) else {
+        tracing::debug!(server = %server.uuid, %user_ip, "rejecting websocket, connection limit reached");
+
+        return ApiResponse::error("too many connections")
+            .with_status(StatusCode::TOO_MANY_REQUESTS)
+            .into_response();
+    };
+
+    let config = state.config.load();
+    let ws = ws
+        .max_message_size(config.system.websocket.max_message_size as usize)
+        .max_frame_size(config.system.websocket.max_frame_size as usize)
+        .read_buffer_size(config.system.websocket.read_buffer_size as usize);
+    let authentication_timeout = config.system.websocket.authentication_timeout;
+    drop(config);
 
     ws.on_upgrade(move |socket| async move {
         let (sender, mut receiver) = socket.split();
@@ -83,7 +100,10 @@ pub async fn handle_ws(
                         }
                         data = receiver.next() => match data {
                             Some(Ok(data)) => {
-                                missed_pongs.store(0, Ordering::Relaxed);
+                                if !matches!(data, Message::Ping(_)) {
+                                    missed_pongs.store(0, Ordering::Relaxed);
+                                }
+
                                 data
                             }
                             Some(Err(err)) => {
@@ -110,18 +130,13 @@ pub async fn handle_ws(
                         continue;
                     }
 
-                    if let Message::Text(data) = &ws_data && data.len() > crate::BUFFER_SIZE {
-                        tracing::warn!(server = %server.uuid, "got massive websocket message from client, {} bytes", data.len());
-                        continue;
-                    }
-                    if let Message::Binary(data) = &ws_data && data.len() > crate::BUFFER_SIZE {
-                        tracing::warn!(server = %server.uuid, "got massive websocket binary message from client, {} bytes", data.len());
-                        continue;
+                    let jwt_result =
+                        super::jwt::handle_jwt(&state, &server, &websocket_handler, ws_data).await;
+                    if socket_jwt.read().await.is_some() {
+                        limiter_guard.authenticated();
                     }
 
-                    match super::jwt::handle_jwt(&state, &server, &websocket_handler, ws_data)
-                        .await
-                    {
+                    match jwt_result {
                         Ok(Some(message)) => {
                             match super::message_handler::handle_message(
                                 &state, user_ip, &server, &websocket_handler, message,
@@ -205,48 +220,27 @@ pub async fn handle_ws(
                                 match data {
                                     Ok(message) => {
                                         let run = async || -> Result<(), anyhow::Error> {
-                                            match message.event {
-                                                websocket::WebsocketEvent::ServerInstallOutput
-                                                    if !websocket_handler
-                                                        .has_permission(Permission::AdminWebsocketInstall).await?
-                                                    => {
-                                                        return Ok(());
-                                                    }
-                                                websocket::WebsocketEvent::ServerOperationProgress
-                                                | websocket::WebsocketEvent::ServerOperationCompleted
-                                                | websocket::WebsocketEvent::ServerOperationAborted
-                                                | websocket::WebsocketEvent::ServerOperationError
-                                                    if !websocket_handler
-                                                        .has_permission(Permission::FileRead).await?
-                                                    => {
-                                                        return Ok(());
-                                                    }
-                                                websocket::WebsocketEvent::ServerBackupStarted
-                                                | websocket::WebsocketEvent::ServerBackupProgress
-                                                | websocket::WebsocketEvent::ServerBackupCompleted
-                                                | websocket::WebsocketEvent::ServerBackupDeleted
-                                                    if !websocket_handler
-                                                        .has_permission(Permission::BackupRead).await?
-                                                    => {
-                                                        return Ok(());
-                                                    }
-                                                websocket::WebsocketEvent::ServerScheduleStarted
-                                                | websocket::WebsocketEvent::ServerScheduleStepStatus
-                                                | websocket::WebsocketEvent::ServerScheduleStepError
-                                                | websocket::WebsocketEvent::ServerScheduleCompleted
-                                                    if !websocket_handler
-                                                        .has_permission(Permission::ScheduleRead).await?
-                                                    => {
-                                                        return Ok(());
-                                                    }
-                                                websocket::WebsocketEvent::ServerTransferLogs
-                                                | websocket::WebsocketEvent::ServerTransferProgress
-                                                    if !websocket_handler
-                                                        .has_permission(Permission::AdminWebsocketTransfer).await?
-                                                    => {
-                                                        return Ok(());
-                                                    }
-                                                _ => {}
+                                            if socket_jwt.read().await.is_none() {
+                                                return Ok(());
+                                            }
+
+                                            let allowed = match message.event.broadcast_permission() {
+                                                websocket::BroadcastPermission::Denied => false,
+                                                websocket::BroadcastPermission::Authenticated => {
+                                                    websocket_handler
+                                                        .has_permission(Permission::WebsocketConnect).await?
+                                                }
+                                                websocket::BroadcastPermission::Required(permission) => {
+                                                    websocket_handler.has_permission(permission).await?
+                                                }
+                                                websocket::BroadcastPermission::CalagopusOr(permission, default) => {
+                                                    websocket_handler
+                                                        .has_calagopus_permission_or(permission, default).await?
+                                                }
+                                            };
+
+                                            if !allowed {
+                                                return Ok(());
                                             }
 
                                             websocket_handler.send_message(message).await;
@@ -401,11 +395,34 @@ pub async fn handle_ws(
         let pinger = {
             let sender = Arc::clone(&sender);
             let missed_pongs = Arc::clone(&missed_pongs);
+            let socket_jwt = Arc::clone(&socket_jwt);
+            let websocket_handler = Arc::clone(&websocket_handler);
             let server = server.clone();
 
             async move {
+                let mut unauthenticated_for = 0;
+
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(PING_INTERVAL).await;
+
+                    if authentication_timeout > 0 {
+                        if socket_jwt.read().await.is_some() {
+                            unauthenticated_for = 0;
+                        } else {
+                            unauthenticated_for += PING_INTERVAL.as_secs();
+
+                            if unauthenticated_for >= authentication_timeout {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    "closing websocket that stayed unauthenticated for {}s",
+                                    unauthenticated_for,
+                                );
+
+                                websocket_handler.close("authentication timeout").await;
+                                break;
+                            }
+                        }
+                    }
 
                     if missed_pongs.fetch_add(1, Ordering::Relaxed) >= MAX_MISSED_PONGS {
                         tracing::debug!(

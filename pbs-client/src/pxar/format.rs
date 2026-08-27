@@ -5,6 +5,7 @@ pub const STAT_SIZE: u64 = 40;
 pub const MAX_FILENAME_LEN: u64 = 256;
 pub const MAX_SYMLINK_LEN: u64 = 4096;
 pub const MAX_DATA_LEN: u64 = 64 * 1024;
+pub const MAX_GOODBYE_TABLE_LEN: u64 = 2_000_000 * GOODBYE_ITEM_SIZE;
 
 pub const PXAR_FORMAT_VERSION: u64 = 0x730f6c75df16a40d;
 pub const PXAR_ENTRY: u64 = 0xd5956474e588acef;

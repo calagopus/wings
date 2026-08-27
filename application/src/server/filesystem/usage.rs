@@ -122,6 +122,15 @@ pub struct DiskUsage {
     entries: thin_vec::ThinVec<(compact_str::CompactString, DiskUsage)>,
 }
 
+// drops the tree iteratively, recursive dropping would overflow the stack on deeply nested trees
+impl Drop for DiskUsage {
+    fn drop(&mut self) {
+        while let Some((_, mut node)) = self.entries.pop() {
+            self.entries.append(&mut node.entries);
+        }
+    }
+}
+
 impl DiskUsage {
     fn upsert_entry(&mut self, key: &str) -> &mut DiskUsage {
         match self.entries.binary_search_by(|a| a.0.as_str().cmp(key)) {
@@ -737,5 +746,15 @@ mod tests {
         d.space.set_logical(logical);
         d.space.set_physical(physical);
         d
+    }
+
+    #[test]
+    fn drop_handles_deeply_nested_trees() {
+        let mut root = DiskUsage::default();
+        let mut current = &mut root;
+        for _ in 0..500_000 {
+            current = current.upsert_entry("d");
+        }
+        drop(root);
     }
 }

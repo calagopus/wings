@@ -351,6 +351,18 @@ impl CapFilesystem {
         Ok(())
     }
 
+    pub async fn async_remove_dir(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+
+        let inner = self.get_inner()?;
+        tokio::task::spawn_blocking(move || {
+            Self::remove_entry(&inner, &path, FileType::Dir, &mut None)
+        })
+        .await??;
+
+        Ok(())
+    }
+
     pub async fn async_rename(
         &self,
         from: impl AsRef<Path>,
@@ -457,6 +469,21 @@ impl CapFilesystem {
         let canonicalized = tokio::task::spawn_blocking(move || inner.canonicalize(path)).await??;
 
         Ok(canonicalized)
+    }
+
+    /// Canonicalizes every directory component while leaving the final component
+    /// untouched, so paths that do not exist yet still resolve.
+    pub async fn async_canonicalize_parent(&self, path: impl AsRef<Path>) -> PathBuf {
+        let path = self.relative_path(path.as_ref());
+
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return path;
+        };
+
+        match self.async_canonicalize(parent).await {
+            Ok(parent) => parent.join(name),
+            Err(_) => path,
+        }
     }
 
     pub fn canonicalize(&self, path: impl AsRef<Path>) -> Result<PathBuf, std::io::Error> {
@@ -1344,6 +1371,47 @@ mod tests {
             assert_eq!(
                 std::fs::read(dir.path().join("plugins/Foo.jar")).unwrap(),
                 b"x"
+            );
+        });
+    }
+
+    #[test]
+    fn canonicalize_parent_resolves_symlinked_directories_but_not_the_leaf() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::create_dir(dir.path().join("config")).unwrap();
+            std::fs::write(dir.path().join("config/secrets.yml"), "x").unwrap();
+            std::os::unix::fs::symlink("config", dir.path().join("s")).unwrap();
+            std::os::unix::fs::symlink("config/secrets.yml", dir.path().join("link.yml")).unwrap();
+
+            // the deny-list bypass: a symlinked parent no longer hides the real name
+            assert_eq!(
+                filesystem.async_canonicalize_parent("s/secrets.yml").await,
+                PathBuf::from("config/secrets.yml")
+            );
+
+            // a leaf that does not exist yet still resolves through its parent
+            assert_eq!(
+                filesystem.async_canonicalize_parent("s/new.yml").await,
+                PathBuf::from("config/new.yml")
+            );
+
+            // the final component is left alone, so lstat still describes the link
+            assert_eq!(
+                filesystem.async_canonicalize_parent("link.yml").await,
+                PathBuf::from("link.yml")
+            );
+
+            // paths without a parent, and escapes, are unchanged by the resolution
+            assert_eq!(
+                filesystem.async_canonicalize_parent("/top.yml").await,
+                PathBuf::from("top.yml")
+            );
+            assert_eq!(
+                filesystem
+                    .async_canonicalize_parent("../../etc/passwd")
+                    .await,
+                PathBuf::from("etc/passwd")
             );
         });
     }

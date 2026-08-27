@@ -49,108 +49,111 @@ pub async fn handle_ws(
     Path(file): Path<compact_str::CompactString>,
     Query(params): Query<Params>,
 ) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        let Some(path) = super::log_file_path(&state, &file) else {
-            return;
-        };
+    ws.read_buffer_size(crate::WS_READ_BUFFER_SIZE)
+        .on_upgrade(move |socket| async move {
+            let Some(path) = super::log_file_path(&state, &file) else {
+                return;
+            };
 
-        let lines = params.lines.map(|n| n.min(crate::io::tail::LINES_CAP));
-        let compression_type = CompressionType::from_file_name(&file);
+            let lines = params.lines.map(|n| n.min(crate::io::tail::LINES_CAP));
+            let compression_type = CompressionType::from_file_name(&file);
 
-        let Ok(mut file) = tokio::fs::File::open(path).await else {
-            return;
-        };
+            let Ok(mut file) = tokio::fs::File::open(path).await else {
+                return;
+            };
 
-        let socket = Arc::new(Mutex::new(socket));
+            let socket = Arc::new(Mutex::new(socket));
 
-        type ReturnType = dyn Future<Output = Result<(), anyhow::Error>> + Send;
-        let futures: [Pin<Box<ReturnType>>; 2] = [
-            // Log Line Follower
-            Box::pin({
-                let socket = Arc::clone(&socket);
+            type ReturnType = dyn Future<Output = Result<(), anyhow::Error>> + Send;
+            let futures: [Pin<Box<ReturnType>>; 2] = [
+                // Log Line Follower
+                Box::pin({
+                    let socket = Arc::clone(&socket);
 
-                async move {
-                    let mut buf = vec![0; crate::BUFFER_SIZE];
-                    let mut line_buffer = LineBuffer::new();
+                    async move {
+                        let mut buf = vec![0; crate::BUFFER_SIZE];
+                        let mut line_buffer = LineBuffer::new();
 
-                    if !matches!(compression_type, CompressionType::None) {
-                        let reader =
-                            AsyncCompressionReader::new(file.into_std().await, compression_type);
-                        let mut reader: Box<dyn AsyncRead + Send + Unpin> = match lines {
-                            Some(lines) => {
-                                Box::new(crate::io::tail::async_tail_stream(reader, lines).await?)
+                        if !matches!(compression_type, CompressionType::None) {
+                            let reader = AsyncCompressionReader::new(
+                                file.into_std().await,
+                                compression_type,
+                            );
+                            let mut reader: Box<dyn AsyncRead + Send + Unpin> = match lines {
+                                Some(lines) => Box::new(
+                                    crate::io::tail::async_tail_stream(reader, lines).await?,
+                                ),
+                                None => Box::new(reader),
+                            };
+
+                            loop {
+                                let bytes_read = reader.read(&mut buf).await?;
+                                if bytes_read == 0 {
+                                    break;
+                                }
+
+                                line_buffer.extend(buf.get_slice(..bytes_read)?);
+                                send_lines(&socket, &mut line_buffer).await?;
                             }
-                            None => Box::new(reader),
+
+                            if let Some(line) = line_buffer.flush() {
+                                let text = String::from_utf8_lossy(line).into_owned();
+                                socket.lock().await.send(Message::Text(text.into())).await?;
+                            }
+
+                            return Ok(());
+                        }
+
+                        let mut pos = match lines {
+                            Some(lines) => {
+                                file = crate::io::tail::async_tail(file, lines).await?;
+                                file.stream_position().await?
+                            }
+                            None => 0,
                         };
 
                         loop {
-                            let bytes_read = reader.read(&mut buf).await?;
-                            if bytes_read == 0 {
-                                break;
+                            let len = file.seek(SeekFrom::End(0)).await?;
+                            if len < pos {
+                                pos = 0;
+                                line_buffer = LineBuffer::new();
                             }
 
-                            line_buffer.extend(buf.get_slice(..bytes_read)?);
-                            send_lines(&socket, &mut line_buffer).await?;
-                        }
+                            while pos < len {
+                                let to_read =
+                                    std::cmp::min(len - pos, crate::BUFFER_SIZE as u64) as usize;
+                                file.seek(SeekFrom::Start(pos)).await?;
 
-                        if let Some(line) = line_buffer.flush() {
-                            let text = String::from_utf8_lossy(line).into_owned();
-                            socket.lock().await.send(Message::Text(text.into())).await?;
-                        }
+                                let chunk = buf.get_slice_mut(..to_read)?;
+                                file.read_exact(chunk).await?;
+                                pos += to_read as u64;
 
-                        return Ok(());
+                                line_buffer.extend(chunk);
+                                send_lines(&socket, &mut line_buffer).await?;
+                            }
+
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
                     }
-
-                    let mut pos = match lines {
-                        Some(lines) => {
-                            file = crate::io::tail::async_tail(file, lines).await?;
-                            file.stream_position().await?
-                        }
-                        None => 0,
-                    };
-
+                }),
+                // Pinger
+                Box::pin(async move {
                     loop {
-                        let len = file.seek(SeekFrom::End(0)).await?;
-                        if len < pos {
-                            pos = 0;
-                            line_buffer = LineBuffer::new();
-                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-                        while pos < len {
-                            let to_read =
-                                std::cmp::min(len - pos, crate::BUFFER_SIZE as u64) as usize;
-                            file.seek(SeekFrom::Start(pos)).await?;
-
-                            let chunk = buf.get_slice_mut(..to_read)?;
-                            file.read_exact(chunk).await?;
-                            pos += to_read as u64;
-
-                            line_buffer.extend(chunk);
-                            send_lines(&socket, &mut line_buffer).await?;
-                        }
-
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        socket
+                            .lock()
+                            .await
+                            .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
+                            .await?;
                     }
-                }
-            }),
-            // Pinger
-            Box::pin(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }),
+            ];
 
-                    socket
-                        .lock()
-                        .await
-                        .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
-                        .await?;
-                }
-            }),
-        ];
-
-        if let Err(err) = futures::future::try_join_all(futures).await {
-            tracing::debug!("error while serving log websocket: {:?}", err);
-        }
-    })
+            if let Err(err) = futures::future::try_join_all(futures).await {
+                tracing::debug!("error while serving log websocket: {:?}", err);
+            }
+        })
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {

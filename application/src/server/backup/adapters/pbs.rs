@@ -51,6 +51,8 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
+const MAX_TREE_DEPTH: usize = 1024;
+
 pub struct PbsBackup {
     uuid: uuid::Uuid,
     config: PbsConfig,
@@ -806,6 +808,15 @@ struct PbsTreeNode {
     files: Vec<(compact_str::CompactString, PbsFileMeta)>,
 }
 
+// drops the tree iteratively, recursive dropping would overflow the stack on deeply nested trees
+impl Drop for PbsTreeNode {
+    fn drop(&mut self) {
+        while let Some((_, mut node)) = self.dirs.pop() {
+            self.dirs.append(&mut node.dirs);
+        }
+    }
+}
+
 impl PbsTreeNode {
     fn build(entries: Vec<ArchiveEntry>) -> Self {
         let mut root = PbsTreeNode::default();
@@ -823,7 +834,7 @@ impl PbsTreeNode {
             .components()
             .filter_map(|c| c.as_os_str().to_str())
             .collect();
-        if components.is_empty() {
+        if components.is_empty() || components.len() > MAX_TREE_DEPTH {
             return;
         }
 

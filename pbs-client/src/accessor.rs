@@ -26,6 +26,7 @@ use tokio::{
 };
 
 const CHUNK_CACHE_CAPACITY: usize = 32;
+const MAX_CATALOG_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArchiveEntryKind {
@@ -314,6 +315,11 @@ impl PbsArchive {
             let plaintext = tokio::task::spawn_blocking(move || datablob::decode_blob(&encoded))
                 .await
                 .map_err(|err| PbsError::Transport(err.to_string().into()))??;
+
+            if catalog.len().saturating_add(plaintext.len()) > MAX_CATALOG_SIZE {
+                return Err(PbsError::Decode("catalog: size exceeds limit".into()));
+            }
+
             catalog.extend_from_slice(&plaintext);
         }
 
