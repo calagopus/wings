@@ -67,6 +67,7 @@ pub async fn handle_ws(
         let websocket_handler = Arc::new(super::ServerWebsocketHandler::new(
             Arc::clone(&sender),
             Arc::clone(&state),
+            server.clone(),
             Arc::clone(&socket_jwt),
         ));
 

@@ -407,6 +407,7 @@ pub struct ServerWebsocketHandler {
     pub connection_id: uuid::Uuid,
     sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
     state: crate::routes::State,
+    server: crate::server::Server,
     socket_jwt: SocketJwt,
     closed: AtomicBool,
     binary_mode: AtomicBool,
@@ -417,12 +418,14 @@ impl ServerWebsocketHandler {
     fn new(
         sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
         state: crate::routes::State,
+        server: crate::server::Server,
         socket_jwt: SocketJwt,
     ) -> Self {
         Self {
             connection_id: uuid::Uuid::new_v4(),
             sender,
             state,
+            server,
             socket_jwt,
             closed: AtomicBool::new(false),
             binary_mode: AtomicBool::new(false),
@@ -449,13 +452,7 @@ impl ServerWebsocketHandler {
             return Err(anyhow::anyhow!("invalid token: {err}"));
         }
 
-        for server in self.state.server_manager.get_servers().await.iter() {
-            if server.uuid == jwt.server_uuid {
-                return Ok((jwt.user_uuid, server.clone()));
-            }
-        }
-
-        Err(anyhow::anyhow!("unable to find jwt server"))
+        Ok((jwt.user_uuid, self.server.clone()))
     }
 
     async fn has_permission(&self, permission: Permission) -> Result<bool, anyhow::Error> {
