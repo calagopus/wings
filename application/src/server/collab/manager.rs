@@ -24,11 +24,18 @@ use yrs::{
         read::{Cursor, Read},
         write::Write,
     },
-    updates::decoder::Decode,
+    updates::{decoder::Decode, encoder::Encode},
 };
 
 const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const DIVERGED_REBUILD_TICKS: u32 = 5;
+
+#[derive(PartialEq, Eq, Debug)]
+enum Diverged {
+    Repairable,
+    Rebuilt,
+}
 
 const MAX_AWARENESS_INT: u64 = (1 << 53) - 1;
 
@@ -182,6 +189,7 @@ struct CollabDoc {
     text: TextRef,
     applied_update_bytes: u64,
     disk_hash: blake3::Hash,
+    epoch: uuid::Uuid,
 }
 
 impl CollabDoc {
@@ -199,6 +207,7 @@ impl CollabDoc {
             text,
             applied_update_bytes: 0,
             disk_hash: blake3::hash(content.as_bytes()),
+            epoch: uuid::Uuid::new_v4(),
         }
     }
 
@@ -206,6 +215,25 @@ impl CollabDoc {
         self.doc
             .transact()
             .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    fn encode_state_vector(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    fn has_missing_updates(&self) -> bool {
+        self.doc.transact().has_missing_updates()
+    }
+
+    fn rebuild_with(&mut self, content: &str) {
+        let disk_hash = self.disk_hash;
+        *self = Self::new(content);
+        self.disk_hash = disk_hash;
+    }
+
+    fn rebuild(&mut self) {
+        let content = self.content();
+        self.rebuild_with(&content);
     }
 
     fn content(&self) -> String {
@@ -220,6 +248,7 @@ pub struct CollabSession {
     websocket: tokio::sync::broadcast::Sender<TargetedWebsocketMessage>,
     doc: parking_lot::Mutex<CollabDoc>,
     dirty: AtomicBool,
+    diverged_ticks: std::sync::atomic::AtomicU32,
     conflict: parking_lot::Mutex<Option<ConflictState>>,
     participants: tokio::sync::Mutex<HashMap<uuid::Uuid, Participant>>,
     awareness: parking_lot::Mutex<HashMap<uuid::Uuid, HashMap<u64, u64>>>,
@@ -284,6 +313,28 @@ impl CollabSession {
 
     fn current_conflict(&self) -> Option<ConflictState> {
         *self.conflict.lock()
+    }
+
+    fn is_diverged(&self) -> bool {
+        self.doc.lock().has_missing_updates()
+    }
+
+    fn take_diverged(&self) -> Option<Diverged> {
+        let mut doc = self.doc.lock();
+
+        if !doc.has_missing_updates() {
+            self.diverged_ticks.store(0, Ordering::Relaxed);
+            return None;
+        }
+
+        if self.diverged_ticks.fetch_add(1, Ordering::Relaxed) < DIVERGED_REBUILD_TICKS {
+            return Some(Diverged::Repairable);
+        }
+
+        doc.rebuild();
+        self.diverged_ticks.store(0, Ordering::Relaxed);
+
+        Some(Diverged::Rebuilt)
     }
 
     fn track_awareness(
@@ -567,6 +618,7 @@ impl CollabManager {
                         websocket: self.websocket.clone(),
                         doc: parking_lot::Mutex::new(CollabDoc::new(&content)),
                         dirty: AtomicBool::new(false),
+                        diverged_ticks: std::sync::atomic::AtomicU32::new(0),
                         conflict: parking_lot::Mutex::new(None),
                         participants: tokio::sync::Mutex::new(HashMap::new()),
                         awareness: parking_lot::Mutex::new(HashMap::new()),
@@ -603,10 +655,12 @@ impl CollabManager {
             .or_default()
             .subscribe(raw_path, &key, editor);
 
-        let (state, dirty) = {
+        let (state, state_vector, epoch, dirty) = {
             let doc = session.doc.lock();
             (
                 doc.encode_full_state(),
+                doc.encode_state_vector(),
+                doc.epoch,
                 session.dirty.load(Ordering::Relaxed),
             )
         };
@@ -617,8 +671,13 @@ impl CollabManager {
                 WebsocketMessage::builder(WebsocketEvent::FileCollabSync)
                     .arg(key)
                     .arg(BASE64.encode(state))
-                    .structured_arg(CollabSyncMeta { dirty, conflict })
+                    .structured_arg(CollabSyncMeta {
+                        dirty,
+                        conflict,
+                        epoch,
+                    })
                     .arg(raw_path)
+                    .arg(BASE64.encode(state_vector))
                     .build(),
             )
             .await;
@@ -645,6 +704,18 @@ impl CollabManager {
                 let Ok(_save_guard) = session.save_lock.try_lock() else {
                     continue;
                 };
+
+                if let Some(diverged) = session.take_diverged() {
+                    tracing::warn!(
+                        server = %server,
+                        path = %session.path,
+                        "collab: document is missing updates ({:?}), requesting resync",
+                        diverged
+                    );
+                    session.broadcast_resync().await;
+
+                    continue;
+                }
 
                 if session.dirty.load(Ordering::Relaxed) {
                     let converged = {
@@ -869,15 +940,14 @@ impl CollabManager {
                     cap -= 1;
                 }
                 content.truncate(cap);
-                *guard = CollabDoc::new(&content);
+                guard.rebuild_with(&content);
 
                 true
             } else {
                 guard.applied_update_bytes += update.len() as u64;
 
                 if guard.applied_update_bytes > size_cap.saturating_mul(8) {
-                    let content = guard.content();
-                    *guard = CollabDoc::new(&content);
+                    guard.rebuild();
                     true
                 } else {
                     false
@@ -970,6 +1040,17 @@ impl CollabManager {
         let filesystem = Arc::clone(&session.filesystem);
 
         let _save_guard = session.save_lock.lock().await;
+
+        if session.is_diverged() {
+            tracing::warn!(
+                server = %self.server,
+                path = %key,
+                "collab: refusing to save document that is missing updates, requesting resync"
+            );
+            session.broadcast_resync().await;
+
+            return Ok(());
+        }
 
         let (content, doc_disk_hash) = {
             let doc = session.doc.lock();
@@ -1205,6 +1286,16 @@ impl CollabManager {
         Ok(())
     }
 
+    /// Re-arms the resync debounce for a connection. A resync emitted while the client
+    /// could not act on it (an expired jwt dropped the resubscribe, or the socket was
+    /// closing) would otherwise leave `pending_resync` latched and suppress every later
+    /// resync for the life of the connection.
+    pub async fn clear_pending_resync(&self, connection_id: uuid::Uuid) {
+        if let Some(connection) = self.connections.lock().await.get_mut(&connection_id) {
+            connection.pending_resync = false;
+        }
+    }
+
     /// Asks a connection to resubscribe to all of its collaborative sessions after
     /// targeted websocket messages were dropped (channel lag or an expired jwt), since
     /// a missed update leaves the client's document permanently stalled. Debounced per
@@ -1317,5 +1408,173 @@ impl CollabManager {
         if let Some(old) = pending_teardowns.insert(key, task.abort_handle()) {
             old.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replays `edits` into a fresh document, handing back the updates a client would have
+    /// sent for each one so tests can deliver, drop or reorder them individually.
+    fn client_updates(edits: &[(u32, &str)]) -> (Doc, TextRef, Vec<Vec<u8>>) {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("content");
+
+        let mut state = doc.transact().state_vector();
+        let mut updates = Vec::with_capacity(edits.len());
+
+        for (index, chunk) in edits {
+            {
+                let mut txn = doc.transact_mut();
+                text.insert(&mut txn, *index, chunk);
+            }
+
+            let txn = doc.transact();
+            updates.push(txn.encode_diff_v1(&state));
+            state = txn.state_vector();
+        }
+
+        (doc, text, updates)
+    }
+
+    fn apply(doc: &CollabDoc, update: &[u8]) {
+        let mut txn = doc.doc.transact_mut();
+        txn.apply_update(Update::decode_v1(update).unwrap())
+            .unwrap();
+    }
+
+    /// What a client sends back after comparing its document against the state vector
+    /// carried in a sync.
+    fn resync_diff(client: &Doc, doc: &CollabDoc) -> Vec<u8> {
+        let state = StateVector::decode_v1(&doc.encode_state_vector()).unwrap();
+
+        client.transact().encode_diff_v1(&state)
+    }
+
+    #[test]
+    fn dropped_update_leaves_the_document_behind_without_erroring() {
+        let (client, text, updates) = client_updates(&[(0, "aaa"), (3, "bbb"), (6, "ccc")]);
+
+        let doc = CollabDoc::new("");
+        apply(&doc, &updates[0]);
+        // the update whose dependency was dropped still applies without an error
+        apply(&doc, &updates[2]);
+
+        assert_eq!(text.get_string(&client.transact()), "aaabbbccc");
+        assert_eq!(doc.content(), "aaa");
+        assert!(doc.has_missing_updates());
+    }
+
+    #[test]
+    fn resync_diff_repairs_a_document_that_dropped_an_update() {
+        let (client, text, updates) = client_updates(&[(0, "aaa"), (3, "bbb"), (6, "ccc")]);
+
+        let doc = CollabDoc::new("");
+        apply(&doc, &updates[0]);
+        apply(&doc, &updates[2]);
+        assert!(doc.has_missing_updates());
+
+        // the daemon's state vector excludes the orphaned update, so the diff a client
+        // computes from it carries the dependency that went missing
+        apply(&doc, &resync_diff(&client, &doc));
+
+        assert_eq!(doc.content(), text.get_string(&client.transact()));
+        assert!(!doc.has_missing_updates());
+    }
+
+    #[test]
+    fn resync_diff_carries_deletions_that_leave_the_state_vector_untouched() {
+        let client = Doc::new();
+        let text = client.get_or_insert_text("content");
+        {
+            let mut txn = client.transact_mut();
+            text.insert(&mut txn, 0, "hello world");
+        }
+
+        let doc = CollabDoc::new("");
+        apply(
+            &doc,
+            &client.transact().encode_diff_v1(&StateVector::default()),
+        );
+        assert_eq!(doc.content(), "hello world");
+
+        let before = doc.encode_state_vector();
+        {
+            let mut txn = client.transact_mut();
+            text.remove_range(&mut txn, 5, 6);
+        }
+
+        // a deletion creates no new operations, so the client's clocks are unchanged and
+        // the divergence is invisible to any state vector comparison
+        let diff = resync_diff(&client, &doc);
+        apply(&doc, &diff);
+
+        assert_eq!(doc.encode_state_vector(), before);
+        assert_eq!(doc.content(), "hello");
+    }
+
+    #[test]
+    fn take_diverged_leaves_a_repairable_document_alone() {
+        let (_client, _text, updates) = client_updates(&[(0, "aaa"), (3, "bbb"), (6, "ccc")]);
+
+        let mut doc = CollabDoc::new("");
+        let epoch = doc.epoch;
+        apply(&doc, &updates[0]);
+        apply(&doc, &updates[2]);
+
+        // rotating the epoch here would force clients to replace their own document and
+        // discard the very edits that would have repaired this one
+        for _ in 0..DIVERGED_REBUILD_TICKS {
+            assert!(doc.has_missing_updates());
+            assert_eq!(doc.epoch, epoch);
+        }
+
+        doc.rebuild();
+        assert_ne!(doc.epoch, epoch);
+    }
+
+    #[test]
+    fn rebuild_keeps_the_document_from_claiming_it_matches_disk() {
+        let (_client, _text, updates) = client_updates(&[(0, "aaa"), (3, "bbb"), (6, "ccc")]);
+
+        let mut doc = CollabDoc::new("");
+        doc.disk_hash = blake3::hash(b"on disk");
+        apply(&doc, &updates[0]);
+        apply(&doc, &updates[2]);
+
+        doc.rebuild();
+
+        assert_eq!(doc.content(), "aaa");
+        // claiming convergence here makes the reconciler drop `dirty` and reload over
+        // unsaved work
+        assert_eq!(doc.disk_hash, blake3::hash(b"on disk"));
+        assert_ne!(doc.disk_hash, blake3::hash(doc.content().as_bytes()));
+        // and the rebuilt document is clean, so it cannot resync in a loop
+        assert!(!doc.has_missing_updates());
+    }
+
+    #[test]
+    fn a_document_that_received_every_update_is_never_diverged() {
+        let (_client, _text, updates) = client_updates(&[(0, "aaa"), (3, "bbb"), (6, "ccc")]);
+
+        let doc = CollabDoc::new("");
+        for update in &updates {
+            apply(&doc, update);
+        }
+
+        assert!(!doc.has_missing_updates());
+        assert_eq!(doc.content(), "aaabbbccc");
+    }
+
+    #[test]
+    fn every_document_gets_its_own_epoch() {
+        let mut doc = CollabDoc::new("same");
+        let epoch = doc.epoch;
+
+        assert_ne!(CollabDoc::new("same").epoch, epoch);
+
+        doc.rebuild();
+        assert_ne!(doc.epoch, epoch);
     }
 }

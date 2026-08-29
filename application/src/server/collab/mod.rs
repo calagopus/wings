@@ -24,6 +24,7 @@ pub struct CollabParticipant {
 pub struct CollabSyncMeta {
     pub dirty: bool,
     pub conflict: Option<CollabConflict>,
+    pub epoch: uuid::Uuid,
 }
 
 #[derive(Serialize, Clone)]
