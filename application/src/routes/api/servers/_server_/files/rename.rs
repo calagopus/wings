@@ -10,6 +10,10 @@ mod put {
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
+    fn true_fn() -> bool {
+        true
+    }
+
     #[derive(ToSchema, Deserialize)]
     pub struct Payload {
         #[serde(default)]
@@ -20,6 +24,8 @@ mod put {
 
         #[serde(default)]
         ignored: Vec<compact_str::CompactString>,
+        #[serde(default = "true_fn")]
+        create_directories: bool,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -61,6 +67,12 @@ mod put {
             .resolve_writable_fs_ignoring(&server, &data.root, &ignored)
             .await;
 
+        let parents = if data.create_directories {
+            crate::server::filesystem::RenameParents::Create
+        } else {
+            crate::server::filesystem::RenameParents::Require
+        };
+
         let mut renamed_count = 0;
         for file in data.files {
             let from = root.join(file.from);
@@ -100,15 +112,17 @@ mod put {
                     .unwrap_or_else(|_| server.filesystem.relative_path(&from));
                 let to_path = server.filesystem.relative_path(&to);
 
-                if let Err(err) = server.filesystem.rename_path(&from, &to).await {
+                if let Err(err) = server.filesystem.rename_path(&from, &to, parents).await {
                     tracing::debug!(
                         server = %server.uuid,
                         "failed to rename file: {:#?}",
                         err
                     );
-                } else {
-                    renamed_count += 1;
+
+                    continue;
                 }
+
+                renamed_count += 1;
 
                 if let Err(err) = server
                     .diff
