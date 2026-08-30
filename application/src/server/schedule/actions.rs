@@ -2,7 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        filesystem::archive::ArchiveFormat,
+        filesystem::{RenameParents, archive::ArchiveFormat},
     },
 };
 use cap_std::fs::OpenOptions;
@@ -1003,7 +1003,11 @@ impl ScheduleAction {
                     }
 
                     if filesystem.is_primary_server_fs() {
-                        if let Err(err) = server.filesystem.rename_path(from, to).await {
+                        if let Err(err) = server
+                            .filesystem
+                            .rename_path(from, to, RenameParents::Create)
+                            .await
+                        {
                             tracing::debug!(
                                 server = %server.uuid,
                                 "failed to rename file: {:#?}",

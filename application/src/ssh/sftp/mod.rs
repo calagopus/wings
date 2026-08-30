@@ -2,6 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
+        filesystem::RenameParents,
         permissions::Permission,
     },
     utils::PortablePermissions,
@@ -711,7 +712,15 @@ impl russh_sftp::server::Handler for SftpSession {
         if self
             .server
             .filesystem
-            .rename_path(&old_path, &new_path)
+            .rename_path(
+                &old_path,
+                &new_path,
+                if self.has_permission(Permission::FileCreate) {
+                    RenameParents::Create
+                } else {
+                    RenameParents::Require
+                },
+            )
             .await
             .is_err()
         {
