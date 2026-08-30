@@ -3,7 +3,7 @@ use crate::{
     io::{SafeDigestExt, SafeSliceExt, SafeWriteExt},
     server::{
         activity::{Activity, ActivityEvent},
-        filesystem::cap::FileType,
+        filesystem::{RenameParents, cap::FileType},
         permissions::Permission,
     },
     utils::PortablePermissions,
@@ -906,7 +906,15 @@ pub async fn handle_extended(
             if sftp_session
                 .server
                 .filesystem
-                .rename_path(&old_path, &new_path)
+                .rename_path(
+                    &old_path,
+                    &new_path,
+                    if sftp_session.has_permission(Permission::FileCreate) {
+                        RenameParents::Create
+                    } else {
+                        RenameParents::Require
+                    },
+                )
                 .await
                 .is_err()
             {

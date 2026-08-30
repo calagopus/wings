@@ -2,7 +2,9 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        filesystem::{archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn},
+        filesystem::{
+            RenameParents, archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn,
+        },
     },
 };
 use cap_std::fs::OpenOptions;
@@ -1472,7 +1474,10 @@ impl ScheduleAction {
                     }
 
                     let result = if filesystem.is_primary_server_fs() {
-                        server.filesystem.rename_path(from, to).await
+                        server
+                            .filesystem
+                            .rename_path(from, to, RenameParents::Create)
+                            .await
                     } else {
                         filesystem
                             .async_rename(&from, &to, from_metadata.file_type)

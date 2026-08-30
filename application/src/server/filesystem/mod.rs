@@ -50,6 +50,17 @@ pub fn build_gitignore_matcher<S: AsRef<str>>(
     builder.build()
 }
 
+/// Whether a rename may materialise the destination's parent directories.
+///
+/// Renaming `f.txt` to `newdir/f.txt` creates `newdir`, so a caller acting for a user may
+/// only pass [`RenameParents::Create`] once that user has been checked for the create
+/// permission, not merely the update permission the rename itself needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameParents {
+    Create,
+    Require,
+}
+
 #[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     let mut mode_str = compact_str::CompactString::default();
@@ -750,11 +761,14 @@ impl Filesystem {
         &self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
+        parents: RenameParents,
     ) -> Result<(), anyhow::Error> {
         let old_path = self.relative_path(old_path.as_ref());
         let new_path = self.relative_path(new_path.as_ref());
 
-        if let Some(parent) = new_path.parent() {
+        if parents == RenameParents::Create
+            && let Some(parent) = new_path.parent()
+        {
             self.async_create_dir_all(parent).await?;
         }
 
