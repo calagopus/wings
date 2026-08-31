@@ -21,6 +21,7 @@ services:
       # /var/lib/calagopus-wings/vmounts (used for storing temporary mountpoints, DO NOT put this on a tmpfs, thats why its separate)
       # /var/lib/calagopus-wings/archives (unused for wings-rs currently, may get a future use)
       # /var/lib/calagopus-wings/backups (used for storing local backups of servers)
+      # /var/lib/calagopus-wings/tundra (used for the tundra daemon config, identity, binary and control socket, mount the directory and NOT the socket file)
       - "/var/lib/calagopus-wings/:/var/lib/calagopus-wings/"
       - "/var/log/calagopus-wings/:/var/log/calagopus-wings/"
       - "/tmp/calagopus-wings/:/tmp/calagopus-wings/"

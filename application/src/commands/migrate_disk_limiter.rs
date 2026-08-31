@@ -137,6 +137,8 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                         )),
                     ),
                     mime_cache: moka::future::Cache::new(20480),
+                    #[cfg(unix)]
+                    tundra: None,
                 });
 
                 let mut migrated = 0;

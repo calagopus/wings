@@ -1167,7 +1167,7 @@ impl BackupExt for ResticBackup {
                     continue;
                 }
 
-                progress.store_bytes(size);
+                progress.increment_bytes(size);
                 progress.increment_files();
 
                 server.log_daemon(compact_str::format_compact!("(restoring): {}", item));

@@ -16,6 +16,7 @@ mod ports;
 pub mod servers;
 mod system;
 mod transfers;
+mod tundra;
 mod update;
 
 pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<Body>, StatusCode> {
@@ -83,6 +84,11 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest(
             "/ports",
             ports::router(state)
+                .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
+        )
+        .nest(
+            "/tundra",
+            tundra::router(state)
                 .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
         )
         .route(

@@ -9,6 +9,8 @@ pub mod backups;
 pub mod client;
 pub mod jwt;
 pub mod servers;
+#[cfg(unix)]
+pub mod tundra;
 
 #[inline]
 pub fn into_json<T: DeserializeOwned>(value: String) -> Result<T, anyhow::Error> {

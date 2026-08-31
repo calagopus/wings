@@ -145,6 +145,9 @@ pub struct AppState {
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
     pub mime_cache: moka::future::Cache<MimeCacheKey, MimeCacheValue>,
+
+    #[cfg(unix)]
+    pub tundra: Option<Arc<crate::tundra::TundraManager>>,
 }
 
 impl AppState {
@@ -167,6 +170,8 @@ impl AppState {
                 Arc::new(crate::config::Config::mock()),
             )),
             mime_cache: moka::future::Cache::builder().build(),
+            #[cfg(unix)]
+            tundra: None,
         })
     }
 }

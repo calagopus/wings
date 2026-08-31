@@ -446,6 +446,25 @@ impl ServerConfiguration {
         config.vmount_path(self.uuid).join("machine-uuid")
     }
 
+    #[cfg(unix)]
+    fn hosts_path(&self, config: &crate::config::Config) -> PathBuf {
+        config.vmount_path(self.uuid).join("hosts")
+    }
+
+    #[cfg(unix)]
+    fn default_hosts(&self) -> String {
+        format!(
+            "127.0.0.1\tlocalhost\n\
+             ::1\tlocalhost ip6-localhost ip6-loopback\n\
+             fe00::0\tip6-localnet\n\
+             ff00::0\tip6-mcastprefix\n\
+             ff02::1\tip6-allnodes\n\
+             ff02::2\tip6-allrouters\n\
+             127.0.0.2\t{}\n",
+            self.uuid
+        )
+    }
+
     async fn vmounts(&self, config: &crate::config::Config) -> Vec<Mount> {
         let mut mounts = Vec::new();
 
@@ -475,6 +494,19 @@ impl ServerConfiguration {
                     read_only: true,
                 });
             }
+        }
+
+        #[cfg(unix)]
+        if config.load().tundra.enabled {
+            mounts.push(Mount {
+                default: false,
+                target: "/etc/hosts".into(),
+                source: self
+                    .hosts_path(config)
+                    .to_string_lossy()
+                    .to_compact_string(),
+                read_only: true,
+            });
         }
 
         mounts
@@ -584,6 +616,21 @@ impl ServerConfiguration {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&machine_uuid_path, self.uuid.to_string()).await?;
+
+        #[cfg(unix)]
+        if config.load().tundra.enabled {
+            let hosts_path = self.hosts_path(config);
+            if let Some(parent) = hosts_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            let existing = tokio::fs::read_to_string(&hosts_path)
+                .await
+                .unwrap_or_default();
+            if !existing.contains(&format!("\t{}\n", self.uuid)) {
+                tokio::fs::write(&hosts_path, self.default_hosts()).await?;
+            }
+        }
 
         Ok(())
     }

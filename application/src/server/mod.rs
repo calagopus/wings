@@ -816,6 +816,13 @@ impl Server {
         self.setup_startup_task(&*process_handle).await;
         *self.process_handle.write().await = Some(process_handle);
 
+        #[cfg(unix)]
+        if let Some(tundra) = self.app_state.tundra.as_ref()
+            && tundra.hub.connected()
+        {
+            tundra.rebroadcast();
+        }
+
         Ok(())
     }
 

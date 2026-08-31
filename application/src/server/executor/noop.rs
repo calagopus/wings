@@ -1,5 +1,5 @@
 use super::{ProcessHandle, ServerExecutor, StatusReceiver};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub struct NoopExecutor;
 
@@ -74,6 +74,19 @@ impl ServerExecutor for NoopExecutor {
         _port: u16,
     ) -> Result<Option<std::net::SocketAddr>, anyhow::Error> {
         Self::unsupported()
+    }
+    async fn resolve_published_address(
+        &self,
+        _server: &crate::server::Server,
+    ) -> Option<std::net::IpAddr> {
+        None
+    }
+
+    async fn container_refs(
+        &self,
+        _servers: &[crate::server::Server],
+    ) -> HashMap<uuid::Uuid, String> {
+        HashMap::new()
     }
 
     async fn used_ports(

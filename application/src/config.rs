@@ -596,6 +596,26 @@ fn throttles_line_reset_interval() -> u64 {
     100
 }
 
+fn tundra_data_directory() -> SystemPath {
+    #[cfg(unix)]
+    {
+        SystemPath::new("{root_directory}/tundra")
+    }
+    #[cfg(windows)]
+    {
+        SystemPath::new("{root_directory}\\tundra")
+    }
+}
+fn tundra_image() -> String {
+    "debian:trixie-slim".to_string()
+}
+fn tundra_source_image() -> String {
+    "ghcr.io/calagopus/tundra:1.0.0".to_string()
+}
+fn tundra_metrics_port() -> u16 {
+    7101
+}
+
 fn remote_query_timeout() -> u64 {
     30
 }
@@ -1307,6 +1327,27 @@ nestify::nest! {
         },
 
         #[serde(default)]
+        #[schema(inline)]
+        pub tundra: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Tundra {
+            #[serde(default)]
+            pub enabled: bool,
+
+            #[serde(default = "tundra_data_directory")]
+            pub data_directory: SystemPath,
+
+            #[serde(default)]
+            /// when empty, the binary is extracted from source_image
+            pub binary: SystemPath,
+
+            #[serde(default = "tundra_image")]
+            pub image: String,
+            #[serde(default = "tundra_source_image")]
+            pub source_image: String,
+            #[serde(default = "tundra_metrics_port")]
+            pub metrics_port: u16,
+        },
+
+        #[serde(default)]
         pub remote: String,
         #[serde(default)]
         #[schema(inline)]
@@ -1402,6 +1443,10 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.user",
     "system.passwd",
     "docker.socket",
+    "tundra.data_directory",
+    "tundra.binary",
+    "tundra.image",
+    "tundra.source_image",
     "allowed_mounts",
     "ignore_panel_config_updates",
     "ignore_panel_wings_upgrades",

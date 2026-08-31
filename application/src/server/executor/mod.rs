@@ -81,6 +81,9 @@ pub trait ServerExecutor: Send + Sync {
         server: &super::Server,
         port: u16,
     ) -> Result<Option<std::net::SocketAddr>, anyhow::Error>;
+    async fn resolve_published_address(&self, server: &super::Server) -> Option<IpAddr>;
+
+    async fn container_refs(&self, servers: &[super::Server]) -> HashMap<uuid::Uuid, String>;
 
     async fn used_ports(
         &self,

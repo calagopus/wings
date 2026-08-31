@@ -21,7 +21,7 @@ rustls-platform-verifier = "0.7"
 bytes = { workspace = true }
 sha2 = { workspace = true }
 crc32fast = { workspace = true }
-fastcdc = { version = "4.0.1", features = ["tokio"] }
+fastcdc = { version = "5.0.0", features = ["tokio"] }
 zstd = { workspace = true }
 hex = { workspace = true }
 tar = { workspace = true }

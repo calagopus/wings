@@ -35,6 +35,8 @@ mod server;
 mod ssh;
 mod stats;
 mod tls;
+#[cfg(unix)]
+mod tundra;
 mod utils;
 
 use payload::Payload;
@@ -399,7 +401,7 @@ async fn main_rt() {
     });
 
     tracing::info!("connecting to docker");
-    let executor = {
+    let (executor, docker) = {
         let config_ref = config.load();
         let docker = Arc::new(
             match if config_ref.docker.socket.starts_with("http://")
@@ -427,11 +429,14 @@ async fn main_rt() {
         let firewall =
             crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
 
-        Arc::new(crate::server::executor::docker::DockerExecutor::new(
+        (
+            Arc::new(crate::server::executor::docker::DockerExecutor::new(
+                Arc::clone(&docker),
+                config.clone(),
+                firewall,
+            )),
             docker,
-            config.clone(),
-            firewall,
-        ))
+        )
     };
 
     tracing::info!("running server executor boot tasks");
@@ -476,6 +481,18 @@ async fn main_rt() {
         }
     }
 
+    #[cfg(unix)]
+    let tundra = if config.load().tundra.enabled {
+        match crate::tundra::TundraManager::create(&config, Arc::clone(&docker)) {
+            Ok(tundra) => Some(tundra),
+            Err(err) => exit_error!("failed to set up the tundra control plane: {:?}", err),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let _ = docker;
+
     let state = Arc::new(crate::routes::AppState {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
@@ -498,6 +515,8 @@ async fn main_rt() {
             Arc::clone(&config),
         )),
         mime_cache: moka::future::Cache::new(20480),
+        #[cfg(unix)]
+        tundra,
     });
 
     tokio::spawn({
@@ -507,6 +526,21 @@ async fn main_rt() {
             state.server_manager.boot(&state, servers).await;
         }
     });
+
+    #[cfg(unix)]
+    if state.tundra.is_some() {
+        tokio::spawn({
+            let state = Arc::clone(&state);
+
+            async move {
+                if let Err(err) = crate::tundra::shim::serve(state).await {
+                    tracing::error!("the tundra control plane stopped: {:#}", err);
+                }
+            }
+        });
+
+        tokio::spawn(crate::tundra::run(Arc::clone(&state)));
+    }
 
     let app = OpenApiRouter::new()
         .merge(crate::routes::router(&state))

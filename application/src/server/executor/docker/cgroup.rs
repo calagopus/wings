@@ -311,7 +311,20 @@ impl StatFiles {
         })
     }
 
+    fn parse_net_dev_counters(counters: &str) -> Option<(u64, u64, u64, u64)> {
+        let mut fields = counters.split_whitespace();
+
+        let rx_bytes = fields.next()?.parse().ok()?;
+        let rx_packets = fields.next()?.parse().ok()?;
+        let tx_bytes = fields.nth(6)?.parse().ok()?;
+        let tx_packets = fields.next()?.parse().ok()?;
+
+        Some((rx_bytes, rx_packets, tx_bytes, tx_packets))
+    }
+
     pub fn parse_net_dev(contents: &str) -> Option<(u64, u64, u64, u64)> {
+        let mut totals: Option<(u64, u64, u64, u64)> = None;
+
         for line in contents.lines().skip(2) {
             let Some((iface, counters)) = line.split_once(':') else {
                 continue;
@@ -320,16 +333,20 @@ impl StatFiles {
                 continue;
             }
 
-            let mut fields = counters.split_whitespace();
-            let rx_bytes = fields.next()?.parse().ok()?;
-            let rx_packets = fields.next()?.parse().ok()?;
-            let tx_bytes = fields.nth(6)?.parse().ok()?;
-            let tx_packets = fields.next()?.parse().ok()?;
+            let Some((rx_bytes, rx_packets, tx_bytes, tx_packets)) =
+                Self::parse_net_dev_counters(counters)
+            else {
+                continue;
+            };
 
-            return Some((rx_bytes, rx_packets, tx_bytes, tx_packets));
+            let total = totals.get_or_insert((0, 0, 0, 0));
+            total.0 = total.0.saturating_add(rx_bytes);
+            total.1 = total.1.saturating_add(rx_packets);
+            total.2 = total.2.saturating_add(tx_bytes);
+            total.3 = total.3.saturating_add(tx_packets);
         }
 
-        None
+        totals
     }
 }
 
@@ -628,6 +645,20 @@ mod tests {
         assert_eq!(
             StatFiles::parse_net_dev(net_dev),
             Some((5000, 50, 7000, 70))
+        );
+    }
+
+    #[test]
+    fn parse_net_dev_sums_every_real_interface() {
+        let net_dev = "Inter-|   Receive                                                |  Transmit\n\
+             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+                lo:    1000      10    0    0    0     0          0         0     1000      10    0    0    0     0       0          0\n\
+              eth0:    5000      50    0    0    0     0          0         0     7000      70    0    0    0     0       0          0\n\
+              eth1:     500       5    0    0    0     0          0         0      700       7    0    0    0     0       0          0\n";
+
+        assert_eq!(
+            StatFiles::parse_net_dev(net_dev),
+            Some((5500, 55, 7700, 77))
         );
     }
 

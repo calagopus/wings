@@ -16,17 +16,25 @@ struct GithubAsset {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FUSEQUOTA_RELEASE");
+    println!("cargo:rerun-if-env-changed=FUSEQUOTA_BINARY_PATH");
 
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string());
     let target_env =
         std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_else(|_| "unknown".to_string());
-    let release_env = std::env::var("FUSEQUOTA_RELEASE").unwrap_or_default();
 
     println!("cargo:rustc-env=CARGO_TARGET={target_arch}-{target_env}");
 
     handle_git_info();
+    handle_fusequota(&target_arch, &target_os);
+    handle_seccomp();
+}
+
+#[allow(clippy::panic)]
+fn handle_fusequota(target_arch: &str, target_os: &str) {
+    let release_env = std::env::var("FUSEQUOTA_RELEASE").unwrap_or_default();
+    let binary_path_env = std::env::var("FUSEQUOTA_BINARY_PATH").unwrap_or_default();
 
     let bin_dir = Path::new("bins");
     if !bin_dir.exists() {
@@ -36,29 +44,71 @@ fn main() {
     let bin_path = bin_dir.join("fusequota");
     let version_path = bin_dir.join("fusequota.version");
 
+    if !binary_path_env.is_empty() {
+        let source_data = std::fs::read(&binary_path_env).unwrap_or_else(|err| {
+            panic!("Failed to read FUSEQUOTA_BINARY_PATH {binary_path_env}: {err}")
+        });
+
+        println!(
+            "cargo:warning=Compressing fusequota from local path {binary_path_env} ({} bytes)...",
+            source_data.len()
+        );
+
+        let compressed_data = zstd::encode_all(source_data.as_slice(), 22)
+            .expect("Failed to compress binary with zstd");
+
+        let mut file = File::create(&bin_path).expect("Failed to create bin");
+        file.write_all(&compressed_data)
+            .expect("Failed to write compressed bin");
+
+        let version = if release_env.is_empty() {
+            "nightly".to_string()
+        } else {
+            release_env
+        };
+        std::fs::write(&version_path, &version).ok();
+
+        println!("cargo:rustc-env=FUSEQUOTA_VERSION={version}");
+        return;
+    }
+
     let existing_version = std::fs::read_to_string(&version_path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
     let mut final_version = existing_version.clone();
 
+    let has_usable_bin = std::fs::metadata(&bin_path).is_ok_and(|meta| meta.len() > 0);
+
     let should_check_github = if release_env.starts_with("latest") {
         true
-    } else if release_env.is_empty() && bin_path.exists() {
+    } else if release_env.is_empty() && has_usable_bin {
         false
     } else {
-        !bin_path.exists() || (!release_env.is_empty() && release_env != existing_version)
+        !has_usable_bin || (!release_env.is_empty() && release_env != existing_version)
     };
 
     if should_check_github
         && target_os == "linux"
-        && let Some((tag, url)) = fetch_release_metadata(&target_arch)
+        && let Some((tag, url)) = fetch_release_metadata(target_arch)
         && (tag != existing_version || release_env.starts_with("latest"))
         && let Ok(mut resp) = ureq::get(url).call()
         && resp.status().is_success()
     {
+        println!(
+            "cargo:warning=Downloading and compressing fusequota version {tag} for {target_arch} from GitHub..."
+        );
+
         let compressed_data = zstd::encode_all(resp.body_mut().as_reader(), 22)
             .expect("Failed to compress binary with zstd");
+
+        println!(
+            "cargo:warning=Compressed binary size: {} bytes -> {} bytes",
+            resp.headers()
+                .get("Content-Length")
+                .map_or("?", |v| v.to_str().unwrap_or("?")),
+            compressed_data.len()
+        );
 
         let mut file = File::create(&bin_path).expect("Failed to create bin");
         file.write_all(&compressed_data)
@@ -74,13 +124,17 @@ fn main() {
         }
     }
 
-    if !bin_path.exists() {
+    if !std::fs::metadata(&bin_path).is_ok_and(|meta| meta.len() > 0) {
+        if target_os == "linux" {
+            panic!(
+                "failed to obtain a fusequota binary for {target_arch}, refusing to build without one, set FUSEQUOTA_BINARY_PATH to build from a local binary"
+            );
+        }
+
         File::create(&bin_path).ok();
     }
 
     println!("cargo:rustc-env=FUSEQUOTA_VERSION={final_version}");
-
-    handle_seccomp();
 }
 
 fn fetch_release_metadata(arch: &str) -> Option<(String, String)> {
@@ -90,7 +144,12 @@ fn fetch_release_metadata(arch: &str) -> Option<(String, String)> {
         .ok()?;
     let release: GithubRelease = serde_json::from_reader(resp.body_mut().as_reader()).ok()?;
 
-    let expected_name = format!("fusequota-{arch}-linux");
+    let release_arch = match arch {
+        "powerpc64" => "ppc64le",
+        arch => arch,
+    };
+
+    let expected_name = format!("fusequota-{release_arch}-linux");
     let asset = release
         .assets
         .into_iter()

@@ -955,6 +955,24 @@ impl DockerExecutor {
         None
     }
 
+    async fn container_name(&self, server: &super::super::Server) -> String {
+        let cfg = server.configuration.read().await;
+
+        if self.app_config.load().docker.server_name_in_container_name {
+            let mut filtered = String::new();
+            for c in cfg.meta.name.chars() {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    filtered.push(c);
+                }
+            }
+            filtered.truncate(63 - 1 - 36);
+
+            format!("{}.{}", filtered, cfg.uuid)
+        } else {
+            cfg.uuid.to_string()
+        }
+    }
+
     async fn image_exists(&self, image_name: &str) -> bool {
         self.docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
@@ -1624,14 +1642,17 @@ impl DockerProcessHandle {
                                 .and_then(|memory| memory.limit)
                                 .unwrap_or(0),
                             network: stats.networks.as_ref().and_then(|networks| {
-                                networks.values().next().map(|net| {
-                                    (
-                                        net.rx_bytes.unwrap_or(0),
-                                        net.rx_packets.unwrap_or(0),
-                                        net.tx_bytes.unwrap_or(0),
-                                        net.tx_packets.unwrap_or(0),
-                                    )
-                                })
+                                let mut totals: Option<(u64, u64, u64, u64)> = None;
+
+                                for net in networks.values() {
+                                    let total = totals.get_or_insert((0, 0, 0, 0));
+                                    total.0 = total.0.saturating_add(net.rx_bytes.unwrap_or(0));
+                                    total.1 = total.1.saturating_add(net.rx_packets.unwrap_or(0));
+                                    total.2 = total.2.saturating_add(net.tx_bytes.unwrap_or(0));
+                                    total.3 = total.3.saturating_add(net.tx_packets.unwrap_or(0));
+                                }
+
+                                totals
                             }),
                             cpu_total_ns: stats
                                 .cpu_stats
@@ -2587,21 +2608,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         self.pull_image(&image, server, false).await?;
 
-        let container_name = {
-            let cfg = server.configuration.read().await;
-            if self.app_config.load().docker.server_name_in_container_name {
-                let mut filtered = String::new();
-                for c in cfg.meta.name.chars() {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        filtered.push(c);
-                    }
-                }
-                filtered.truncate(63 - 1 - 36);
-                format!("{}.{}", filtered, cfg.uuid)
-            } else {
-                cfg.uuid.to_string()
-            }
-        };
+        let container_name = self.container_name(server).await;
 
         let bollard_config = server
             .configuration
@@ -3227,6 +3234,79 @@ impl super::ServerExecutor for DockerExecutor {
             Some(ip) => Ok(Some(std::net::SocketAddr::new(ip.parse()?, port))),
             None => Ok(None),
         }
+    }
+    async fn resolve_published_address(
+        &self,
+        server: &super::super::Server,
+    ) -> Option<std::net::IpAddr> {
+        let config = self.app_config.load();
+
+        if config.docker.network.mode != "host" && !config.system.user.rootless.enabled {
+            return None;
+        }
+
+        let ip = {
+            let configuration = server.configuration.read().await;
+            configuration
+                .allocations
+                .default
+                .as_ref()?
+                .ip
+                .parse::<std::net::IpAddr>()
+                .ok()?
+        };
+
+        match HostBinding::resolve(&config.docker.network, ip) {
+            HostBinding::Address(address) => Some(address),
+            HostBinding::Wildcard => Some(std::net::Ipv4Addr::LOCALHOST.into()),
+            HostBinding::Unbound => None,
+        }
+    }
+
+    async fn container_refs(
+        &self,
+        servers: &[super::super::Server],
+    ) -> HashMap<uuid::Uuid, String> {
+        let containers = self
+            .docker
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([
+                    ("status".to_string(), vec!["running".to_string()]),
+                    (
+                        "label".to_string(),
+                        vec!["ContainerType=server_process".to_string()],
+                    ),
+                ])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+
+        let mut running = HashMap::new();
+        for container in containers {
+            if container.state != Some(bollard::plugin::ContainerSummaryStateEnum::RUNNING) {
+                continue;
+            }
+
+            if let Some(server) = container_server(container.names.as_deref())
+                && let Some(id) = container.id
+            {
+                running.insert(server, id);
+            }
+        }
+
+        let mut refs = HashMap::with_capacity(servers.len());
+        for server in servers {
+            let container = match running.remove(&server.uuid) {
+                Some(id) => id,
+                None => self.container_name(server).await,
+            };
+
+            refs.insert(server.uuid, container);
+        }
+
+        refs
     }
 
     async fn used_ports(

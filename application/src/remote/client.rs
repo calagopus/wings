@@ -485,4 +485,31 @@ impl Client {
         )
         .await
     }
+
+    #[cfg(unix)]
+    #[tracing::instrument(skip(self))]
+    pub async fn tundra_state(&self) -> Result<tundra_common::state::Snapshot, anyhow::Error> {
+        tracing::debug!("fetching tundra state");
+
+        super::tundra::get_state(self).await
+    }
+
+    #[cfg(unix)]
+    #[tracing::instrument(skip(self))]
+    pub async fn tundra_store_cert(
+        &self,
+        cert_sha256: tundra_common::hash::Hash32,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("publishing the tundra certificate digest");
+
+        super::tundra::store_cert(self, cert_sha256).await
+    }
+
+    #[cfg(unix)]
+    #[tracing::instrument(skip(self))]
+    pub async fn tundra_connect_token(&self, target: uuid::Uuid) -> Result<String, anyhow::Error> {
+        tracing::debug!("requesting a tundra connect token");
+
+        super::tundra::get_connect_token(self, target).await
+    }
 }
