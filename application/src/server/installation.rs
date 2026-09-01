@@ -498,12 +498,13 @@ impl ServerInstaller {
 
                                     let mut progress_tick = Self::install_progress_interval();
                                     let mut seen_running = false;
+                                    let mut stdout_open = true;
                                     loop {
                                         tokio::select! {
                                             _ = progress_tick.tick() => {
                                                 installer.send_install_progress().await;
                                             }
-                                            result = stdout_rx.recv() => {
+                                            result = stdout_rx.recv(), if stdout_open => {
                                                 match result {
                                                     Ok(line) => {
                                                         installer
@@ -518,7 +519,7 @@ impl ServerInstaller {
                                                             )
                                                             .ok();
                                                     }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_open = false,
                                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                                 }
                                             }
@@ -527,7 +528,7 @@ impl ServerInstaller {
                                                     Some(super::executor::ProcessStatus::Running) => {
                                                         seen_running = true;
                                                     }
-                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running => {
+                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running || !stdout_open => {
                                                         tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
 
                                                         installer.evaluate_install_result(oom_killed).await;
@@ -660,13 +661,14 @@ impl ServerInstaller {
 
                                 async move {
                                     let mut progress_tick = Self::install_progress_interval();
+                                    let mut stdout_open = true;
 
                                     loop {
                                         tokio::select! {
                                             _ = progress_tick.tick() => {
                                                 installer.send_install_progress().await;
                                             }
-                                            result = stdout_rx.recv() => {
+                                            result = stdout_rx.recv(), if stdout_open => {
                                                 match result {
                                                     Ok(line) => {
                                                     installer
@@ -681,7 +683,7 @@ impl ServerInstaller {
                                                         )
                                                         .ok();
                                                     }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_open = false,
                                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                                 }
                                             }
