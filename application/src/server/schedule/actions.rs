@@ -286,6 +286,17 @@ pub enum ScheduleAction {
         root: ScheduleDynamicParameter,
         file: ScheduleDynamicParameter,
     },
+    PullFile {
+        ignore_failure: bool,
+        foreground: bool,
+
+        root: ScheduleDynamicParameter,
+        url: ScheduleDynamicParameter,
+        #[serde(default)]
+        file_name: Option<ScheduleDynamicParameter>,
+        #[serde(default)]
+        use_header: bool,
+    },
     UpdateStartupVariable {
         ignore_failure: bool,
 
@@ -350,6 +361,7 @@ impl ScheduleAction {
             ScheduleAction::RenameFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CompressFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::DecompressFile { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::PullFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupVariable { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupCommand { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupDockerImage { ignore_failure, .. } => *ignore_failure,
@@ -1866,6 +1878,155 @@ impl ScheduleAction {
                             );
 
                             return Err("failed to decompress file".into());
+                        }
+                    }
+                }
+            }
+            ScheduleAction::PullFile {
+                foreground,
+                root,
+                url,
+                file_name,
+                use_header,
+                ..
+            } => {
+                let raw_root = match execution_context.resolve_parameter(root) {
+                    Some(root) => root,
+                    None => {
+                        return Err("unable to resolve parameter `root` into a string.".into());
+                    }
+                };
+                let url = match execution_context.resolve_parameter(url) {
+                    Some(url) => url.to_compact_string(),
+                    None => {
+                        return Err("unable to resolve parameter `url` into a string.".into());
+                    }
+                };
+                let file_name = match file_name {
+                    Some(file_name) => match execution_context.resolve_parameter(file_name) {
+                        Some(file_name) => Some(file_name.to_compact_string()),
+                        None => {
+                            return Err(
+                                "unable to resolve parameter `file_name` into a string.".into()
+                            );
+                        }
+                    },
+                    None => None,
+                };
+
+                if state.config.load().api.disable_remote_download {
+                    return Err("remote pulling is disabled".into());
+                }
+
+                let (root, filesystem) = server
+                    .filesystem
+                    .resolve_writable_fs(server, raw_root)
+                    .await;
+
+                let metadata = filesystem.async_symlink_metadata(&root).await;
+                if !metadata.map_or(true, |m| m.file_type.is_dir()) {
+                    return Err("root is not a directory".into());
+                }
+
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(&root, FileType::Dir)
+                        .await
+                {
+                    return Err("root not found".into());
+                }
+
+                if let Err(err) = filesystem.async_create_dir_all(&root).await {
+                    tracing::error!(path = %root.display(), "failed to create directory: {:?}", err);
+
+                    return Err("failed to create directory".into());
+                }
+
+                let download = match crate::server::filesystem::pull::Download::new(
+                    server.clone(),
+                    filesystem,
+                    &root,
+                    file_name,
+                    url.clone(),
+                    *use_header,
+                )
+                .await
+                {
+                    Ok(download) => Arc::new(tokio::sync::RwLock::new(download)),
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to create pull: {:?}",
+                            err,
+                        );
+
+                        return Err(format!("failed to create pull: {err}").into());
+                    }
+                };
+
+                let mut pulls = server.filesystem.pulls.write().await;
+                {
+                    let operations = server.filesystem.operations.operations().await;
+                    pulls.retain(|key, _| operations.contains_key(key));
+                }
+
+                if pulls.len() >= state.config.load().api.server_remote_download_limit {
+                    return Err("too many concurrent pulls".into());
+                }
+
+                let (identifier, task) = match download.write().await.start().await {
+                    Ok(started) => started,
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to start pull: {:?}",
+                            err,
+                        );
+
+                        return Err(format!("failed to start pull: {err}").into());
+                    }
+                };
+                pulls.insert(identifier, Arc::clone(&download));
+                drop(pulls);
+
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FilePull,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": raw_root,
+                        "url": url,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
+
+                if *foreground {
+                    match task.await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(None) => {
+                            return Err("pull aborted by another source".into());
+                        }
+                        Ok(Some(Err(err))) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                root = %root.display(),
+                                "failed to pull file: {:#?}",
+                                err,
+                            );
+
+                            return Err(format!("failed to pull file: {err}").into());
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                root = %root.display(),
+                                "failed to pull file: {:#?}",
+                                err,
+                            );
+
+                            return Err("failed to pull file".into());
                         }
                     }
                 }
