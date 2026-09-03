@@ -421,6 +421,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             container_ports: container_ports.into_iter().collect(),
             container_ips: Vec::new(),
             rules: self.firewall.clone(),
+            files: None,
         }
     }
 
@@ -899,12 +900,46 @@ impl DockerExecutor {
         &self,
         servers: &[crate::remote::servers::RawServer],
     ) -> Result<(), anyhow::Error> {
-        let specs: Vec<crate::server::firewall::FirewallServerSpec> = servers
-            .iter()
-            .map(|server| server.settings.convert_firewall_spec(&self.app_config))
-            .collect();
+        let mut specs = Vec::with_capacity(servers.len());
+        for server in servers {
+            let mut spec = server.settings.convert_firewall_spec(&self.app_config);
+
+            if spec.references_files() {
+                match crate::server::filesystem::cap::CapFilesystem::new(
+                    &self.app_config.data_path(spec.server),
+                )
+                .await
+                {
+                    Ok(filesystem) => {
+                        spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
+                            filesystem,
+                            notifier: None,
+                            server: None,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            server = %spec.server,
+                            "failed to open the server directory for its firewall source files: {err}"
+                        );
+                    }
+                }
+            }
+
+            specs.push(spec);
+        }
 
         self.firewall.reconcile(&specs).await
+    }
+
+    fn firewall_file_access(
+        server: &Arc<super::super::InnerServer>,
+    ) -> crate::server::firewall::sets::FirewallFileAccess {
+        crate::server::firewall::sets::FirewallFileAccess {
+            filesystem: (*server.filesystem).clone(),
+            notifier: Some(server.filesystem.server_notifier().clone()),
+            server: Some(Arc::downgrade(server)),
+        }
     }
 
     #[inline]
@@ -1957,7 +1992,7 @@ impl DockerProcessHandle {
         docker: &bollard::Docker,
         firewall: &dyn crate::server::firewall::FirewallBackend,
         app_config: &crate::config::Config,
-        server: &super::super::InnerServer,
+        server: &Arc<super::super::InnerServer>,
         container_id: &str,
     ) {
         let mut spec = server
@@ -1965,6 +2000,7 @@ impl DockerProcessHandle {
             .read()
             .await
             .convert_firewall_spec(app_config);
+        spec.files = Some(DockerExecutor::firewall_file_access(server));
         match ContainerFirewallState::read(docker, container_id).await {
             Ok(state) => {
                 spec.bindings = state.bindings;
@@ -2628,11 +2664,12 @@ impl super::ServerExecutor for DockerExecutor {
             .ensure_vmounts(&self.app_config)
             .await?;
 
-        let firewall_spec = server
+        let mut firewall_spec = server
             .configuration
             .read()
             .await
             .convert_firewall_spec(&self.app_config);
+        firewall_spec.files = Some(Self::firewall_file_access(server));
         if let Err(err) = self.firewall.sync(&firewall_spec).await {
             if firewall_spec.rules.is_empty() {
                 tracing::warn!(

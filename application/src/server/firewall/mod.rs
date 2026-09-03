@@ -10,6 +10,7 @@ pub mod iptables;
 pub mod nftables;
 pub mod noop;
 pub mod runner;
+pub mod sets;
 
 use runner::CommandRunner;
 
@@ -60,20 +61,23 @@ pub struct FirewallRule {
     pub sources: Vec<cidr::IpCidr>,
     #[serde(default)]
     pub ports: Option<Vec<u16>>,
+    #[serde(default)]
+    pub source_file: Option<compact_str::CompactString>,
 }
 
 impl FirewallRule {
     fn expand_sources(
         &self,
+        server: uuid::Uuid,
         concrete: &mut Vec<ConcreteRule>,
         protocol: FirewallRuleProtocol,
         dst: RuleDst,
     ) {
-        if self.sources.is_empty() {
+        if self.sources.is_empty() && self.source_file.is_none() {
             concrete.push(ConcreteRule {
                 protocol,
                 dst,
-                source: None,
+                source: RuleSource::Any,
                 action: self.action,
             });
 
@@ -91,9 +95,32 @@ impl FirewallRule {
             concrete.push(ConcreteRule {
                 protocol,
                 dst,
-                source: Some(*source),
+                source: RuleSource::Cidr(*source),
                 action: self.action,
             });
+        }
+
+        if let Some(file) = &self.source_file {
+            let set = sets::set_base_name(server, &sets::source_file_path(file));
+
+            for family in [AddressFamily::V4, AddressFamily::V6] {
+                if dst
+                    .ip()
+                    .is_some_and(|ip| ip.is_ipv4() != (family == AddressFamily::V4))
+                {
+                    continue;
+                }
+
+                concrete.push(ConcreteRule {
+                    protocol,
+                    dst,
+                    source: RuleSource::Set {
+                        name: set.clone(),
+                        family,
+                    },
+                    action: self.action,
+                });
+            }
         }
     }
 }
@@ -110,6 +137,14 @@ pub struct FirewallServerSpec {
     pub container_ports: Vec<u16>,
     pub container_ips: Vec<IpAddr>,
     pub rules: Vec<FirewallRule>,
+    pub files: Option<sets::FirewallFileAccess>,
+}
+
+impl FirewallServerSpec {
+    #[inline]
+    pub fn references_files(&self) -> bool {
+        self.rules.iter().any(|rule| rule.source_file.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,25 +170,66 @@ impl RuleDst {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    V4,
+    V6,
+}
+
+impl AddressFamily {
+    #[inline]
+    pub fn set_suffix(self) -> &'static str {
+        match self {
+            Self::V4 => "-4",
+            Self::V6 => "-6",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSource {
+    Any,
+    Cidr(cidr::IpCidr),
+    Set { name: String, family: AddressFamily },
+}
+
+impl RuleSource {
+    #[inline]
+    pub fn applies_to_v4(&self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Cidr(cidr) => matches!(cidr, cidr::IpCidr::V4(_)),
+            Self::Set { family, .. } => *family == AddressFamily::V4,
+        }
+    }
+
+    #[inline]
+    pub fn applies_to_v6(&self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Cidr(cidr) => matches!(cidr, cidr::IpCidr::V6(_)),
+            Self::Set { family, .. } => *family == AddressFamily::V6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConcreteRule {
     pub protocol: FirewallRuleProtocol,
     pub dst: RuleDst,
-    pub source: Option<cidr::IpCidr>,
+    pub source: RuleSource,
     pub action: FirewallRuleAction,
 }
 
 impl ConcreteRule {
     #[inline]
     pub fn applies_to_v4(&self) -> bool {
-        self.dst.ip().is_none_or(|ip| ip.is_ipv4())
-            && self.source.is_none_or(|s| matches!(s, cidr::IpCidr::V4(_)))
+        self.dst.ip().is_none_or(|ip| ip.is_ipv4()) && self.source.applies_to_v4()
     }
 
     #[inline]
     pub fn applies_to_v6(&self) -> bool {
-        self.dst.ip().is_none_or(|ip| ip.is_ipv6())
-            && self.source.is_none_or(|s| matches!(s, cidr::IpCidr::V6(_)))
+        self.dst.ip().is_none_or(|ip| ip.is_ipv6()) && self.source.applies_to_v6()
     }
 }
 
@@ -178,6 +254,7 @@ pub fn expand_rules(spec: &FirewallServerSpec) -> Vec<ConcreteRule> {
 
             for protocol in &protocols {
                 rule.expand_sources(
+                    spec.server,
                     &mut concrete,
                     *protocol,
                     RuleDst::Published {
@@ -198,6 +275,7 @@ pub fn expand_rules(spec: &FirewallServerSpec) -> Vec<ConcreteRule> {
             for ip in &spec.container_ips {
                 for protocol in &protocols {
                     rule.expand_sources(
+                        spec.server,
                         &mut concrete,
                         *protocol,
                         RuleDst::Container {
@@ -229,6 +307,7 @@ pub async fn create(
     own_container: Option<&(String, bollard::models::ContainerInspectResponse)>,
 ) -> Arc<dyn FirewallBackend> {
     let backend = config.load().docker.firewall.backend;
+    let limits = sets::SourceFileLimits::from_config(config);
 
     if backend == FirewallBackendKind::Disabled {
         return Arc::new(noop::NoopFirewall::new(false));
@@ -295,13 +374,17 @@ pub async fn create(
             let runner = CommandRunner::Local;
             warn_bridge_nf(&runner).await;
 
-            Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+            Arc::new(nftables::NftablesFirewall::new(
+                exempt_sources,
+                runner,
+                limits,
+            ))
         }
         FirewallBackendKind::Iptables => {
             let runner = CommandRunner::Local;
             warn_bridge_nf(&runner).await;
 
-            Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner))
+            Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner, limits).await)
         }
         FirewallBackendKind::Container => {
             match container_helper(config, docker, own_container).await {
@@ -311,7 +394,11 @@ pub async fn create(
                     );
                     warn_bridge_nf(&runner).await;
 
-                    Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+                    Arc::new(nftables::NftablesFirewall::new(
+                        exempt_sources,
+                        runner,
+                        limits,
+                    ))
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -331,7 +418,11 @@ pub async fn create(
                         );
                         warn_bridge_nf(&runner).await;
 
-                        return Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner));
+                        return Arc::new(nftables::NftablesFirewall::new(
+                            exempt_sources,
+                            runner,
+                            limits,
+                        ));
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -356,7 +447,11 @@ pub async fn create(
                 tracing::info!("using nftables server firewall backend");
                 warn_bridge_nf(&runner).await;
 
-                Arc::new(nftables::NftablesFirewall::new(exempt_sources, runner))
+                Arc::new(nftables::NftablesFirewall::new(
+                    exempt_sources,
+                    runner,
+                    limits,
+                ))
             } else if runner
                 .run("iptables", &["-w", "-S", "FORWARD"], None)
                 .await
@@ -365,7 +460,7 @@ pub async fn create(
                 tracing::info!("using iptables server firewall backend");
                 warn_bridge_nf(&runner).await;
 
-                Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner))
+                Arc::new(iptables::IptablesFirewall::new(exempt_sources, runner, limits).await)
             } else {
                 tracing::warn!(
                     "neither nftables nor iptables are usable on this host, server firewall rules will not be applied"
@@ -571,6 +666,7 @@ mod tests {
             container_ports: Vec::new(),
             container_ips: Vec::new(),
             rules,
+            files: None,
         }
     }
 
@@ -597,6 +693,7 @@ mod tests {
                 protocols: HashSet::new(),
                 sources: Vec::new(),
                 ports: None,
+                source_file: None,
             }],
         ));
 
@@ -606,7 +703,7 @@ mod tests {
                 .iter()
                 .all(|r| r.action == FirewallRuleAction::Deny)
         );
-        assert!(concrete.iter().all(|r| r.source.is_none()));
+        assert!(concrete.iter().all(|r| r.source == RuleSource::Any));
     }
 
     #[test]
@@ -618,6 +715,7 @@ mod tests {
                 protocols: HashSet::from([FirewallRuleProtocol::Tcp]),
                 sources: Vec::new(),
                 ports: Some(vec![25565, 9999]),
+                source_file: None,
             }],
         ));
 
@@ -634,6 +732,7 @@ mod tests {
                 protocols: HashSet::from([FirewallRuleProtocol::Tcp]),
                 sources: Vec::new(),
                 ports: None,
+                source_file: None,
             }],
         );
         spec.container_ports = vec![25565];
@@ -663,6 +762,7 @@ mod tests {
                 protocols: HashSet::from([FirewallRuleProtocol::Udp]),
                 sources: Vec::new(),
                 ports: None,
+                source_file: None,
             }],
         );
         spec.container_ports = vec![25565];
@@ -692,6 +792,7 @@ mod tests {
                     cidr::IpCidr::from_str("2001:db8::/32").unwrap(),
                 ],
                 ports: None,
+                source_file: None,
             }],
         );
         spec.container_ports = vec![25565];
@@ -702,7 +803,7 @@ mod tests {
         assert_eq!(concrete.len(), 1);
         assert_eq!(
             concrete.first().unwrap().source,
-            Some(cidr::IpCidr::from_str("10.0.0.0/8").unwrap())
+            RuleSource::Cidr(cidr::IpCidr::from_str("10.0.0.0/8").unwrap())
         );
     }
 
@@ -718,13 +819,14 @@ mod tests {
                     cidr::IpCidr::from_str("2001:db8::/32").unwrap(),
                 ],
                 ports: None,
+                source_file: None,
             }],
         ));
 
         assert_eq!(concrete.len(), 1);
         assert_eq!(
             concrete.first().unwrap().source,
-            Some(cidr::IpCidr::from_str("10.0.0.0/8").unwrap())
+            RuleSource::Cidr(cidr::IpCidr::from_str("10.0.0.0/8").unwrap())
         );
     }
 
@@ -740,6 +842,7 @@ mod tests {
                     cidr::IpCidr::from_str("2001:db8::/32").unwrap(),
                 ],
                 ports: None,
+                source_file: None,
             }],
         ));
 
@@ -756,12 +859,14 @@ mod tests {
                     protocols: HashSet::from([FirewallRuleProtocol::Tcp]),
                     sources: vec![cidr::IpCidr::from_str("10.0.0.0/8").unwrap()],
                     ports: None,
+                    source_file: None,
                 },
                 FirewallRule {
                     action: FirewallRuleAction::Deny,
                     protocols: HashSet::from([FirewallRuleProtocol::Tcp]),
                     sources: Vec::new(),
                     ports: None,
+                    source_file: None,
                 },
             ],
         ));
@@ -769,6 +874,82 @@ mod tests {
         assert_eq!(
             concrete.iter().map(|r| r.action).collect::<Vec<_>>(),
             vec![FirewallRuleAction::Allow, FirewallRuleAction::Deny]
+        );
+    }
+
+    #[test]
+    fn expand_rules_emits_set_rules_per_family_for_a_source_file() {
+        let server = uuid::Uuid::new_v4();
+        let mut spec = spec(
+            vec![binding(Some("192.168.1.5"), 25565), binding(None, 25566)],
+            vec![FirewallRule {
+                action: FirewallRuleAction::Allow,
+                protocols: HashSet::from([FirewallRuleProtocol::Tcp]),
+                sources: Vec::new(),
+                ports: None,
+                source_file: Some("lists/allow.txt".into()),
+            }],
+        );
+        spec.server = server;
+
+        let concrete = expand_rules(&spec);
+        let set = sets::set_base_name(server, std::path::Path::new("lists/allow.txt"));
+
+        assert!(concrete.iter().all(|r| r.source != RuleSource::Any));
+        assert_eq!(
+            concrete
+                .iter()
+                .map(|r| (r.dst.port(), r.source.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    25565,
+                    RuleSource::Set {
+                        name: set.clone(),
+                        family: AddressFamily::V4
+                    }
+                ),
+                (
+                    25566,
+                    RuleSource::Set {
+                        name: set.clone(),
+                        family: AddressFamily::V4
+                    }
+                ),
+                (
+                    25566,
+                    RuleSource::Set {
+                        name: set,
+                        family: AddressFamily::V6
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_rules_unions_inline_sources_with_a_source_file() {
+        let concrete = expand_rules(&spec(
+            vec![binding(None, 25565)],
+            vec![FirewallRule {
+                action: FirewallRuleAction::Deny,
+                protocols: HashSet::from([FirewallRuleProtocol::Udp]),
+                sources: vec![cidr::IpCidr::from_str("10.0.0.0/8").unwrap()],
+                ports: None,
+                source_file: Some("deny.txt".into()),
+            }],
+        ));
+
+        assert_eq!(concrete.len(), 3);
+        assert!(matches!(
+            concrete.first().unwrap().source,
+            RuleSource::Cidr(_)
+        ));
+        assert!(
+            concrete
+                .iter()
+                .skip(1)
+                .all(|rule| matches!(rule.source, RuleSource::Set { .. }))
         );
     }
 
@@ -785,6 +966,7 @@ mod tests {
         assert!(rule.protocols.is_empty());
         assert!(rule.sources.is_empty());
         assert_eq!(rule.ports, None);
+        assert_eq!(rule.source_file, None);
     }
 
     #[test]
@@ -805,7 +987,7 @@ mod tests {
                 ip: None,
                 port: 25565,
             },
-            source: None,
+            source: RuleSource::Any,
             action: FirewallRuleAction::Deny,
         };
 
@@ -821,7 +1003,7 @@ mod tests {
                 ip: Some("2001:db8::1".parse().unwrap()),
                 port: 25565,
             },
-            source: None,
+            source: RuleSource::Any,
             action: FirewallRuleAction::Deny,
         };
 
@@ -834,7 +1016,7 @@ mod tests {
                 ip: "172.18.0.5".parse().unwrap(),
                 port: 25565,
             },
-            source: None,
+            source: RuleSource::Any,
             action: FirewallRuleAction::Deny,
         };
 

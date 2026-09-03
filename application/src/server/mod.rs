@@ -96,6 +96,72 @@ impl Drop for InnerServer {
 #[repr(transparent)]
 pub struct Server(Arc<InnerServer>);
 
+impl InnerServer {
+    pub fn log_daemon(&self, message: compact_str::CompactString) {
+        self.websocket
+            .send(
+                websocket::WebsocketMessage::builder(
+                    websocket::WebsocketEvent::ServerDaemonMessage,
+                )
+                .arg(message)
+                .build(),
+            )
+            .ok();
+    }
+
+    pub fn log_daemon_install(&self, message: compact_str::CompactString) {
+        self.websocket
+            .send(
+                websocket::WebsocketMessage::builder(
+                    websocket::WebsocketEvent::ServerInstallOutput,
+                )
+                .arg(message)
+                .build(),
+            )
+            .ok();
+    }
+
+    pub fn log_daemon_with_prelude(&self, message: &str) {
+        let prelude = self.app_state.config.daemon_prelude();
+
+        self.websocket
+            .send(
+                websocket::WebsocketMessage::builder(
+                    websocket::WebsocketEvent::ServerConsoleOutput,
+                )
+                .arg(compact_str::format_compact!(
+                    "{} {}",
+                    prelude,
+                    nu_ansi_term::Style::new().bold().paint(message)
+                ))
+                .build(),
+            )
+            .ok();
+    }
+
+    pub fn log_daemon_error(&self, message: &str) {
+        self.log_daemon(
+            nu_ansi_term::Style::new()
+                .bold()
+                .on(nu_ansi_term::Color::Red)
+                .paint(message)
+                .to_compact_string(),
+        );
+    }
+
+    pub fn get_daemon_error(&self, message: &str) -> websocket::WebsocketMessage {
+        websocket::WebsocketMessage::builder(websocket::WebsocketEvent::ServerDaemonMessage)
+            .arg(
+                nu_ansi_term::Style::new()
+                    .bold()
+                    .on(nu_ansi_term::Color::Red)
+                    .paint(message)
+                    .to_compact_string(),
+            )
+            .build()
+    }
+}
+
 impl Server {
     pub fn new(
         configuration: configuration::ServerConfiguration,
@@ -983,70 +1049,6 @@ impl Server {
             >,
         > = Box::pin(stream);
         Box::new(pinned)
-    }
-
-    pub fn log_daemon(&self, message: compact_str::CompactString) {
-        self.websocket
-            .send(
-                websocket::WebsocketMessage::builder(
-                    websocket::WebsocketEvent::ServerDaemonMessage,
-                )
-                .arg(message)
-                .build(),
-            )
-            .ok();
-    }
-
-    pub fn log_daemon_install(&self, message: compact_str::CompactString) {
-        self.websocket
-            .send(
-                websocket::WebsocketMessage::builder(
-                    websocket::WebsocketEvent::ServerInstallOutput,
-                )
-                .arg(message)
-                .build(),
-            )
-            .ok();
-    }
-
-    pub fn log_daemon_with_prelude(&self, message: &str) {
-        let prelude = self.app_state.config.daemon_prelude();
-
-        self.websocket
-            .send(
-                websocket::WebsocketMessage::builder(
-                    websocket::WebsocketEvent::ServerConsoleOutput,
-                )
-                .arg(compact_str::format_compact!(
-                    "{} {}",
-                    prelude,
-                    nu_ansi_term::Style::new().bold().paint(message)
-                ))
-                .build(),
-            )
-            .ok();
-    }
-
-    pub fn log_daemon_error(&self, message: &str) {
-        self.log_daemon(
-            nu_ansi_term::Style::new()
-                .bold()
-                .on(nu_ansi_term::Color::Red)
-                .paint(message)
-                .to_compact_string(),
-        );
-    }
-
-    pub fn get_daemon_error(&self, message: &str) -> websocket::WebsocketMessage {
-        websocket::WebsocketMessage::builder(websocket::WebsocketEvent::ServerDaemonMessage)
-            .arg(
-                nu_ansi_term::Style::new()
-                    .bold()
-                    .on(nu_ansi_term::Color::Red)
-                    .paint(message)
-                    .to_compact_string(),
-            )
-            .build()
     }
 
     pub async fn start(

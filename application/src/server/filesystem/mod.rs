@@ -527,6 +527,11 @@ impl Filesystem {
     }
 
     #[inline]
+    pub fn server_notifier(&self) -> &inotify::InotifyServerNotifier {
+        &self.server_notifier
+    }
+
+    #[inline]
     pub fn base(&self) -> compact_str::CompactString {
         self.base_path.to_string_lossy().to_compact_string()
     }

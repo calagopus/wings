@@ -10,6 +10,7 @@ use std::{
 };
 
 type ServerNotifiers = Arc<Mutex<HashMap<uuid::Uuid, InotifyServerNotifier>>>;
+type FirewallFiles = Arc<Mutex<Option<(Vec<PathBuf>, Arc<tokio::sync::Notify>)>>>;
 
 pub struct InotifyManager {
     watcher: Arc<Mutex<notify::RecommendedWatcher>>,
@@ -110,6 +111,7 @@ pub struct InotifyServerNotifier {
     modified_paths: Arc<Mutex<Vec<PathBuf>>>,
     is_trusted: Arc<AtomicBool>,
     dirty_flags: [Arc<AtomicBool>; 2],
+    firewall_files: FirewallFiles,
 }
 
 impl InotifyServerNotifier {
@@ -119,7 +121,16 @@ impl InotifyServerNotifier {
             modified_paths: Arc::new(Mutex::new(vec![path])),
             is_trusted: Arc::new(AtomicBool::new(true)),
             dirty_flags,
+            firewall_files: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn watch_firewall_files(&self, paths: Vec<PathBuf>, changed: Arc<tokio::sync::Notify>) {
+        *self.firewall_files.lock() = if paths.is_empty() {
+            None
+        } else {
+            Some((paths, changed))
+        };
     }
 
     fn add_path(&self, path: PathBuf) {
@@ -127,6 +138,12 @@ impl InotifyServerNotifier {
 
         for flag in &self.dirty_flags {
             flag.store(true, Ordering::Relaxed);
+        }
+
+        if let Some((files, changed)) = &*self.firewall_files.lock()
+            && files.iter().any(|file| file.starts_with(&path))
+        {
+            changed.notify_one();
         }
 
         let mut paths = self.modified_paths.lock();

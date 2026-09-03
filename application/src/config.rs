@@ -507,6 +507,13 @@ fn docker_network_interfaces_v6_gateway() -> String {
     "fdba:17c8:6c94::1011".to_string()
 }
 
+fn docker_firewall_source_file_max_entries() -> u64 {
+    10000
+}
+fn docker_firewall_source_file_max_bytes() -> u64 {
+    1024 * 1024
+}
+
 fn docker_registry_image_fetch_cache_enabled() -> bool {
     true
 }
@@ -1189,6 +1196,10 @@ nestify::nest! {
             pub firewall: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerFirewall {
                 #[serde(default)]
                 pub backend: crate::server::firewall::FirewallBackendKind,
+                #[serde(default = "docker_firewall_source_file_max_entries")]
+                pub source_file_max_entries: u64,
+                #[serde(default = "docker_firewall_source_file_max_bytes")]
+                pub source_file_max_bytes: u64,
             },
 
             #[serde(default)]
