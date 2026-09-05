@@ -5,7 +5,10 @@ use crate::{
         hash_reader::{AsyncHashReader, HashReader},
         limited_reader::LimitedReader,
     },
-    server::filesystem::archive::{ArchiveFormat, StreamableArchiveFormat},
+    server::{
+        backup::adapters::wings::WingsBackupFile,
+        filesystem::archive::{ArchiveFormat, StreamableArchiveFormat},
+    },
 };
 use futures::{FutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -115,7 +118,10 @@ impl BackupSender {
                 TransferPart {
                     reader: Box::pin(file),
                     file_name: format!("{}.{}", uuid, backup.format.extension()),
-                    content_type: "backup/wings",
+                    content_type: match backup.format {
+                        WingsBackupFile::Archive(_) => "backup/wings",
+                        WingsBackupFile::Dump { .. } => "backup/wings-dump",
+                    },
                     ignore: None,
                 }
             }
@@ -404,15 +410,29 @@ impl BackupReceiver {
         };
 
         match field.content_type() {
-            Some("backup/wings") => {
+            Some(content_type @ ("backup/wings" | "backup/wings-dump")) => {
                 if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
                     tracing::warn!("invalid backup file name: {file_name}");
                     return Ok(());
                 }
 
-                let Ok(archive_format) = ArchiveFormat::from_str(&file_name) else {
-                    tracing::warn!("invalid backup file format: {file_name}");
-                    return Ok(());
+                let format = if content_type == "backup/wings-dump" {
+                    let Some(format) = file_name
+                        .strip_prefix(&format!("{uuid}."))
+                        .and_then(WingsBackupFile::parse_dump)
+                    else {
+                        tracing::warn!("invalid database dump file name: {file_name}");
+                        return Ok(());
+                    };
+
+                    format
+                } else {
+                    let Ok(archive_format) = ArchiveFormat::from_str(&file_name) else {
+                        tracing::warn!("invalid backup file format: {file_name}");
+                        return Ok(());
+                    };
+
+                    WingsBackupFile::Archive(archive_format)
                 };
 
                 let file_name = self
@@ -474,8 +494,8 @@ impl BackupReceiver {
                         checksum: checksum.clone(),
                         checksum_type: "sha256".into(),
                         browsable: matches!(
-                            archive_format,
-                            ArchiveFormat::Zip | ArchiveFormat::SevenZip
+                            format.archive_format(),
+                            Some(ArchiveFormat::Zip | ArchiveFormat::SevenZip)
                         ),
                         streaming: false,
                         adapter: crate::server::backup::adapters::BackupAdapter::Wings,

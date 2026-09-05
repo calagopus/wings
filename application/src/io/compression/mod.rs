@@ -19,6 +19,19 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
+    #[inline]
+    pub fn variants() -> &'static [Self] {
+        &[
+            Self::None,
+            Self::Gz,
+            Self::Xz,
+            Self::Lzip,
+            Self::Bz2,
+            Self::Lz4,
+            Self::Zstd,
+        ]
+    }
+
     pub fn from_mime(mime: &str) -> Self {
         match mime {
             "application/gzip" => CompressionType::Gz,

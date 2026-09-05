@@ -33,6 +33,9 @@ pub enum ScheduleTrigger {
     BackupStatus {
         status: crate::models::ServerBackupStatus,
     },
+    DatabaseBackupStatus {
+        status: crate::models::ServerBackupStatus,
+    },
     ScheduleCompletion {
         schedule: uuid::Uuid,
         successful: bool,
@@ -70,6 +73,10 @@ impl PartialEq for ScheduleTrigger {
             (
                 ScheduleTrigger::BackupStatus { status: s1 },
                 ScheduleTrigger::BackupStatus { status: s2 },
+            ) => s1 == s2,
+            (
+                ScheduleTrigger::DatabaseBackupStatus { status: s1 },
+                ScheduleTrigger::DatabaseBackupStatus { status: s2 },
             ) => s1 == s2,
             (
                 ScheduleTrigger::ScheduleCompletion {

@@ -55,10 +55,24 @@ pub struct PbsBackupConfiguration {
     pub backup_id_prefix: Option<String>,
     #[serde(default)]
     pub server_uuid: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub kind: crate::models::ServerBackupKind,
     pub backup_created: chrono::DateTime<chrono::Utc>,
 }
 
 impl PbsBackupConfiguration {
+    #[inline]
+    pub fn group_id(&self) -> Option<compact_str::CompactString> {
+        let server_uuid = self.server_uuid?;
+
+        Some(match self.kind {
+            crate::models::ServerBackupKind::Server => server_uuid.to_compact_string(),
+            crate::models::ServerBackupKind::DatabaseInstance => {
+                compact_str::format_compact!("{server_uuid}-db")
+            }
+        })
+    }
+
     #[inline]
     pub fn fingerprint(&self) -> Option<&str> {
         self.fingerprint
@@ -137,6 +151,66 @@ pub async fn set_backup_restore_status(
             "server_uuid": server,
             "successful": successful,
         }))
+        .send()
+        .await?
+        .error_for_remote_status()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn set_database_backup_restore_status(
+    client: &Client,
+    uuid: uuid::Uuid,
+    database_instance: uuid::Uuid,
+    successful: bool,
+) -> Result<(), anyhow::Error> {
+    client
+        .client
+        .post(format!("{}/backups/{}/database/restore", client.url, uuid))
+        .json(&json!({
+            "database_instance": database_instance,
+            "successful": successful,
+        }))
+        .send()
+        .await?
+        .error_for_remote_status()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn database_backup_source(
+    client: &Client,
+    uuid: uuid::Uuid,
+    database_instance: uuid::Uuid,
+) -> Result<reqwest::Response, anyhow::Error> {
+    client
+        .stream_client
+        .get(format!(
+            "{}/backups/{}/database/source?instance={}",
+            client.url, uuid, database_instance
+        ))
+        .send()
+        .await?
+        .error_for_remote_status()
+        .await
+}
+
+pub async fn database_backup_restore_target(
+    client: &Client,
+    uuid: uuid::Uuid,
+    database_instance: uuid::Uuid,
+    body: reqwest::Body,
+) -> Result<(), anyhow::Error> {
+    client
+        .stream_client
+        .post(format!(
+            "{}/backups/{}/database/restore-target?instance={}",
+            client.url, uuid, database_instance
+        ))
+        .header("Content-Type", "application/octet-stream")
+        .body(body)
         .send()
         .await?
         .error_for_remote_status()
@@ -308,6 +382,60 @@ pub async fn restore_backup(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn restore_database_backup(
+    client: &Client,
+    server: uuid::Uuid,
+    schedule: Option<uuid::Uuid>,
+    backup: Option<uuid::Uuid>,
+    backup_name: Option<&str>,
+    backup_group: Option<uuid::Uuid>,
+    oldest: bool,
+    source_database_instance: Option<uuid::Uuid>,
+    database_instance: Option<uuid::Uuid>,
+    request_uuid: uuid::Uuid,
+) -> Result<(uuid::Uuid, uuid::Uuid), anyhow::Error> {
+    let response: Response = super::into_json(
+        client
+            .client
+            .post(format!(
+                "{}/servers/{}/backups/restore-database",
+                client.url, server
+            ))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "backup_uuid": backup,
+                "backup_name": backup_name,
+                "backup_group_uuid": backup_group,
+                "oldest": oldest,
+                "source_database_instance_uuid": source_database_instance,
+                "database_instance_uuid": database_instance,
+                "request_uuid": request_uuid,
+            }))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        uuid: uuid::Uuid,
+        database_instance_uuid: uuid::Uuid,
+        request_uuid: Option<uuid::Uuid>,
+    }
+
+    if response.request_uuid != Some(request_uuid) {
+        return Err(anyhow::anyhow!(
+            "panel does not support tracking database backup restore requests"
+        ));
+    }
+
+    Ok((response.uuid, response.database_instance_uuid))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_backup(
     client: &Client,
     server: uuid::Uuid,
@@ -327,6 +455,46 @@ pub async fn delete_backup(
                 "backup_name": backup_name,
                 "backup_group_uuid": backup_group,
                 "oldest": oldest,
+            }))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        uuid: uuid::Uuid,
+    }
+
+    Ok(response.uuid)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn delete_database_backup(
+    client: &Client,
+    server: uuid::Uuid,
+    schedule: Option<uuid::Uuid>,
+    backup: Option<uuid::Uuid>,
+    backup_name: Option<&str>,
+    backup_group: Option<uuid::Uuid>,
+    oldest: bool,
+    database_instance: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, anyhow::Error> {
+    let response: Response = super::into_json(
+        client
+            .client
+            .delete(format!("{}/servers/{}/backups", client.url, server))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "backup_uuid": backup,
+                "backup_name": backup_name,
+                "backup_group_uuid": backup_group,
+                "oldest": oldest,
+                "kind": "database_instance",
+                "database_instance_uuid": database_instance,
             }))
             .send()
             .await?
@@ -381,6 +549,89 @@ pub async fn move_backup(
     }
 
     Ok(response.uuid)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn move_database_backup(
+    client: &Client,
+    server: uuid::Uuid,
+    schedule: Option<uuid::Uuid>,
+    backup: Option<uuid::Uuid>,
+    backup_name: Option<&str>,
+    backup_group: Option<uuid::Uuid>,
+    oldest: bool,
+    target_backup_group: Option<uuid::Uuid>,
+    database_instance: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, anyhow::Error> {
+    let response: Response = super::into_json(
+        client
+            .client
+            .patch(format!("{}/servers/{}/backups", client.url, server))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "backup_uuid": backup,
+                "backup_name": backup_name,
+                "backup_group_uuid": backup_group,
+                "oldest": oldest,
+                "target_backup_group_uuid": target_backup_group,
+                "kind": "database_instance",
+                "database_instance_uuid": database_instance,
+            }))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        uuid: uuid::Uuid,
+    }
+
+    Ok(response.uuid)
+}
+
+pub async fn create_database_backup(
+    client: &Client,
+    server: uuid::Uuid,
+    schedule: Option<uuid::Uuid>,
+    database_instance: uuid::Uuid,
+    name: Option<&str>,
+    backup_group: Option<uuid::Uuid>,
+) -> Result<(BackupAdapter, uuid::Uuid, compact_str::CompactString), anyhow::Error> {
+    let response: Response = super::into_json(
+        client
+            .client
+            .post(format!("{}/servers/{}/backups", client.url, server))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "name": name,
+                "backup_group_uuid": backup_group,
+                "database_instance_uuid": database_instance,
+                "ignored_files": [],
+            }))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        adapter: BackupAdapter,
+        uuid: uuid::Uuid,
+        extension: Option<compact_str::CompactString>,
+    }
+
+    let extension = response
+        .extension
+        .ok_or_else(|| anyhow::anyhow!("panel did not return a database dump extension"))?;
+
+    Ok((response.adapter, response.uuid, extension))
 }
 
 pub async fn create_backup(

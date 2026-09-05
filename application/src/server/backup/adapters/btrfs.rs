@@ -2,7 +2,10 @@ use crate::{
     remote::backups::RawServerBackup,
     response::ApiResponse,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::StreamableArchiveFormat,
             virtualfs::{ByteRange, VirtualReadableFilesystem},
@@ -700,6 +703,31 @@ impl BackupExt for BtrfsBackup {
                 .get_virtual(server.clone())
                 .with_is_ignored(ignore.into()),
         ))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamCreateExt for BtrfsBackup {
+    async fn create_from_stream(
+        _state: &crate::routes::State,
+        _uuid: uuid::Uuid,
+        _extension: &str,
+        _reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "btrfs backups snapshot the server dataset and cannot store database dumps"
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for BtrfsBackup {
+    async fn read_stream(
+        &self,
+        _state: &crate::routes::State,
+        _download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        Err(anyhow::anyhow!("btrfs backups do not store database dumps"))
     }
 }
 

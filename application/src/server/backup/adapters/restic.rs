@@ -8,7 +8,10 @@ use crate::{
     response::ApiResponse,
     routes::MimeCacheValue,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::StreamableArchiveFormat,
             cap::FileType,
@@ -36,7 +39,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::{io::AsyncBufReadExt, process::Command, sync::RwLock};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    process::Command,
+    sync::RwLock,
+};
 
 type ResticBackupCache =
     RwLock<HashMap<uuid::Uuid, (ResticSnapshot, Arc<ResticBackupConfiguration>)>>;
@@ -816,6 +823,236 @@ impl BackupCreateExt for ResticBackup {
             streaming: true,
             parts: vec![],
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamCreateExt for ResticBackup {
+    async fn create_from_stream(
+        state: &crate::routes::State,
+        uuid: uuid::Uuid,
+        extension: &str,
+        mut reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let file_name = format!("{uuid}.{extension}");
+
+        let (mut child, configuration) = if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
+        {
+            let config = state.config.load();
+
+            (
+                Command::new("restic")
+                    .envs(&config.system.backups.restic.environment)
+                    .arg("--json")
+                    .arg("--repo")
+                    .arg(&*config.system.backups.restic.repository.as_str(&config))
+                    .arg("--password-file")
+                    .arg(&*config.system.backups.restic.password_file.as_str(&config))
+                    .arg("--cache-dir")
+                    .arg(Self::get_restic_cache_dir(&state.config))
+                    .arg("--retry-lock")
+                    .arg(format!(
+                        "{}s",
+                        config.system.backups.restic.retry_lock_seconds
+                    ))
+                    .arg("backup")
+                    .arg("--stdin")
+                    .arg("--stdin-filename")
+                    .arg(&file_name)
+                    .arg("--tag")
+                    .arg(uuid.to_string())
+                    .arg("--group-by")
+                    .arg("tags")
+                    .arg("--limit-download")
+                    .arg((config.system.backups.read_limit.as_kib()).to_compact_string())
+                    .arg("--limit-upload")
+                    .arg((config.system.backups.write_limit.as_kib()).to_compact_string())
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?,
+                ResticBackupConfiguration {
+                    repository: config
+                        .system
+                        .backups
+                        .restic
+                        .repository
+                        .as_str(&config)
+                        .into(),
+                    password_file: Some(
+                        config
+                            .system
+                            .backups
+                            .restic
+                            .password_file
+                            .as_str(&config)
+                            .into(),
+                    ),
+                    retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
+                    environment: config.system.backups.restic.environment.clone(),
+                },
+            )
+        } else {
+            let configuration = state
+                .config
+                .client
+                .backup_restic_configuration(uuid)
+                .await?;
+            let config = state.config.load();
+
+            (
+                Command::new("restic")
+                    .envs(&configuration.environment)
+                    .arg("--json")
+                    .arg("--repo")
+                    .arg(&configuration.repository)
+                    .arg("--cache-dir")
+                    .arg(Self::get_restic_cache_dir(&state.config))
+                    .arg("--retry-lock")
+                    .arg(format!("{}s", configuration.retry_lock_seconds))
+                    .arg("backup")
+                    .arg("--stdin")
+                    .arg("--stdin-filename")
+                    .arg(&file_name)
+                    .arg("--tag")
+                    .arg(uuid.to_string())
+                    .arg("--group-by")
+                    .arg("tags")
+                    .arg("--limit-download")
+                    .arg((config.system.backups.read_limit.as_kib()).to_compact_string())
+                    .arg("--limit-upload")
+                    .arg((config.system.backups.write_limit.as_kib()).to_compact_string())
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?,
+                configuration,
+            )
+        };
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stdin available"))?;
+        let stdout = child.take_stdout()?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+
+        let stdin_task = tokio::spawn(async move {
+            let result = tokio::io::copy(&mut reader, &mut stdin).await;
+            stdin.shutdown().await.ok();
+
+            result
+        });
+        let stderr_task = Self::spawn_stderr_capture(stderr);
+
+        let mut line_reader = tokio::io::BufReader::new(stdout).lines();
+
+        let mut snapshot_id = None;
+        let mut total_bytes_processed = 0;
+
+        while let Ok(Some(line)) = line_reader.next_line().await {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
+                && json.get("message_type").and_then(|v| v.as_str()) == Some("summary")
+            {
+                total_bytes_processed = json
+                    .get("total_bytes_processed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                snapshot_id = json
+                    .get("snapshot_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
+
+        let status = child.wait().await?;
+        let stdin_result = stdin_task.await?;
+        let stderr_output = stderr_task.await.unwrap_or_default();
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to create restic database backup {}: {}",
+                uuid,
+                stderr_output
+            ));
+        }
+        stdin_result?;
+
+        let Some(snapshot_id) = snapshot_id else {
+            return Err(anyhow::anyhow!(
+                "restic did not report a snapshot id for database backup {}",
+                uuid
+            ));
+        };
+
+        RESTIC_BACKUP_CACHE.write().await.insert(
+            uuid,
+            (
+                ResticSnapshot {
+                    short_id: snapshot_id.clone(),
+                    tags: vec![uuid.to_compact_string()],
+                    paths: vec![format!("/{file_name}").into()],
+                    summary: ResticSnapshotSummary {
+                        total_bytes_processed,
+                    },
+                },
+                Arc::new(configuration),
+            ),
+        );
+
+        Ok(RawServerBackup {
+            checksum: snapshot_id,
+            checksum_type: "restic".into(),
+            size: total_bytes_processed,
+            files: 0,
+            successful: true,
+            browsable: false,
+            streaming: false,
+            parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for ResticBackup {
+    async fn read_stream(
+        &self,
+        _state: &crate::routes::State,
+        _download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        let file_name = self
+            .server_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(compact_str::CompactString::from)
+            .ok_or_else(|| anyhow::anyhow!("restic snapshot has no dump file path"))?;
+
+        let child = Command::new("restic")
+            .envs(&self.configuration.environment)
+            .arg("--no-lock")
+            .arg("--repo")
+            .arg(&self.configuration.repository)
+            .args(self.configuration.password())
+            .arg("--cache-dir")
+            .arg(Self::get_restic_cache_dir(&self.config))
+            .arg("dump")
+            .arg(&self.short_id)
+            .arg(&self.server_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        BackupStream::from_process(child, Some(self.total_bytes_processed), file_name)
     }
 }
 

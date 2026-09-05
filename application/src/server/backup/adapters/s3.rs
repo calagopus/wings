@@ -1,13 +1,20 @@
 use crate::{
     io::{
         SafeAsyncWriteExt, SafeDigestExt, SafeSliceMutExt,
-        compression::{CompressionType, reader::CompressionReader},
+        compression::{
+            CompressionType,
+            reader::{AsyncCompressionReader, CompressionReader},
+            writer::CompressionWriter,
+        },
         limited_reader::{AsyncLimitedReader, LimitedReader},
         limited_writer::LimitedWriter,
     },
     remote::backups::RawServerBackup,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::{Archive, ArchiveFormat, StreamableArchiveFormat},
             virtualfs::{ByteRange, VirtualReadableFilesystem},
@@ -15,6 +22,7 @@ use crate::{
     },
     utils::PortablePermissions,
 };
+use compact_str::ToCompactString;
 use futures::TryStreamExt;
 use sha2::Digest;
 use std::{
@@ -26,28 +34,19 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
-fn get_client(server: &crate::server::Server) -> Arc<reqwest::Client> {
+fn get_client(config: &Arc<crate::config::Config>) -> Arc<reqwest::Client> {
     CLIENT
         .get_or_init(|| {
             Arc::new(
                 reqwest::ClientBuilder::new()
                     .timeout(std::time::Duration::from_secs(
-                        server
-                            .app_state
-                            .config
-                            .load()
-                            .system
-                            .backups
-                            .s3
-                            .part_upload_timeout,
+                        config.load().system.backups.s3.part_upload_timeout,
                     ))
-                    .tls_danger_accept_invalid_certs(
-                        server.app_state.config.ignore_certificate_errors,
-                    )
+                    .tls_danger_accept_invalid_certs(config.ignore_certificate_errors)
                     .build()
                     .expect("failed to build HTTP client"),
             )
@@ -66,7 +65,7 @@ impl S3Backup {
     /// returned proxy must stay alive for as long as the client is used;
     /// without one the shared direct client is handed out instead.
     async fn upload_client(
-        server: &crate::server::Server,
+        config: &Arc<crate::config::Config>,
         sample_url: Option<&str>,
     ) -> (
         Option<crate::net::CongestionControlProxy>,
@@ -75,12 +74,7 @@ impl S3Backup {
         let proxy = match sample_url.and_then(|url| reqwest::Url::parse(url).ok()) {
             Some(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
                 (Some(host), Some(port)) => {
-                    crate::net::CongestionControlProxy::start(
-                        &server.app_state.config,
-                        host.to_string(),
-                        port,
-                    )
-                    .await
+                    crate::net::CongestionControlProxy::start(config, host.to_string(), port).await
                 }
                 _ => None,
             },
@@ -91,18 +85,9 @@ impl S3Backup {
             Some(active_proxy) => {
                 let mut builder = reqwest::ClientBuilder::new()
                     .timeout(std::time::Duration::from_secs(
-                        server
-                            .app_state
-                            .config
-                            .load()
-                            .system
-                            .backups
-                            .s3
-                            .part_upload_timeout,
+                        config.load().system.backups.s3.part_upload_timeout,
                     ))
-                    .tls_danger_accept_invalid_certs(
-                        server.app_state.config.ignore_certificate_errors,
-                    );
+                    .tls_danger_accept_invalid_certs(config.ignore_certificate_errors);
 
                 match reqwest::Proxy::all(active_proxy.url()) {
                     Ok(reqwest_proxy) => builder = builder.proxy(reqwest_proxy),
@@ -113,10 +98,10 @@ impl S3Backup {
 
                 match builder.build() {
                     Ok(client) => Arc::new(client),
-                    Err(_) => get_client(server),
+                    Err(_) => get_client(config),
                 }
             }
-            None => get_client(server),
+            None => get_client(config),
         };
 
         (proxy, client)
@@ -136,7 +121,7 @@ impl S3Backup {
     }
 
     async fn upload_part(
-        server: &crate::server::Server,
+        config: &Arc<crate::config::Config>,
         client: &reqwest::Client,
         scratch: &mut tokio::fs::File,
         valid_len: u64,
@@ -144,7 +129,7 @@ impl S3Backup {
         part_number: usize,
         backup_uuid: uuid::Uuid,
     ) -> Result<String, anyhow::Error> {
-        let retry_limit = server.app_state.config.load().system.backups.s3.retry_limit;
+        let retry_limit = config.load().system.backups.s3.retry_limit;
         let mut attempts = 0;
 
         loop {
@@ -157,11 +142,10 @@ impl S3Backup {
             }
 
             tracing::debug!(
-                "uploading s3 backup part {} of size {} for backup {} for {}",
+                "uploading s3 backup part {} of size {} for backup {}",
                 part_number,
                 valid_len,
-                backup_uuid,
-                server.uuid
+                backup_uuid
             );
 
             scratch.seek(std::io::SeekFrom::Start(0)).await?;
@@ -170,14 +154,7 @@ impl S3Backup {
             let reader = reader_handle.take(valid_len);
             let reader = AsyncLimitedReader::new_with_bytes_per_second(
                 reader,
-                server
-                    .app_state
-                    .config
-                    .load()
-                    .system
-                    .backups
-                    .write_limit
-                    .as_bytes(),
+                config.load().system.backups.write_limit.as_bytes(),
             );
 
             let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
@@ -205,7 +182,6 @@ impl S3Backup {
                 Ok(response) => {
                     tracing::error!(
                         backup = %backup_uuid,
-                        server = %server.uuid,
                         "failed to upload s3 backup part {}: status code {}",
                         part_number,
                         response.status()
@@ -214,7 +190,6 @@ impl S3Backup {
                 Err(err) => {
                     tracing::error!(
                         backup = %backup_uuid,
-                        server = %server.uuid,
                         "failed to upload s3 backup part {}: {:#?}",
                         part_number,
                         err.without_url()
@@ -226,6 +201,138 @@ impl S3Backup {
         }
     }
 
+    async fn upload_parts(
+        config: &Arc<crate::config::Config>,
+        uuid: uuid::Uuid,
+        mut reader: impl AsyncRead + Unpin,
+        part_size: u64,
+        initial_urls: Vec<String>,
+        total: Arc<AtomicU64>,
+    ) -> Result<
+        (
+            String,
+            Vec<crate::remote::backups::RawServerBackupPart>,
+            u64,
+        ),
+        anyhow::Error,
+    > {
+        if part_size == 0 {
+            return Err(anyhow::anyhow!(
+                "remote returned a part size of 0 for s3 backup, cannot upload backup"
+            ));
+        }
+
+        let scratch_path = Self::get_scratch_file_name(config, uuid);
+        let mut scratch = tokio::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&scratch_path)
+            .await?;
+
+        let result = async {
+            let mut hasher = sha2::Sha256::new();
+            let mut total_size: u64 = 0;
+            let mut parts = Vec::new();
+
+            let mut url_queue: std::collections::VecDeque<String> =
+                initial_urls.into_iter().collect();
+            let mut part_number = 1;
+            let mut buffer = vec![0; crate::BUFFER_SIZE];
+
+            let (_upload_proxy, upload_http) =
+                Self::upload_client(config, url_queue.front().map(String::as_str)).await;
+
+            'parts: loop {
+                scratch.seek(std::io::SeekFrom::Start(0)).await?;
+
+                let mut valid_len: u64 = 0;
+                let mut eof = false;
+
+                while valid_len < part_size {
+                    let want = std::cmp::min(buffer.len() as u64, part_size - valid_len) as usize;
+                    let bytes_read = reader.read(buffer.get_slice_mut(..want)?).await?;
+                    if crate::unlikely(bytes_read == 0) {
+                        eof = true;
+                        break;
+                    }
+
+                    hasher.safe_update(&buffer, bytes_read)?;
+                    scratch.safe_write_all(&buffer, bytes_read).await?;
+
+                    valid_len += bytes_read as u64;
+                    total.fetch_add(bytes_read as u64, Ordering::Relaxed);
+                }
+
+                scratch.flush().await?;
+
+                if valid_len == 0 {
+                    break 'parts;
+                }
+
+                let url = match url_queue.pop_front() {
+                    Some(url) => url,
+                    None => {
+                        let (_, new_urls) =
+                            config.client.backup_s3_part_urls(uuid, part_number).await?;
+                        url_queue.extend(new_urls);
+
+                        url_queue.pop_front().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "failed to retrieve presigned URL for part {} of backup",
+                                part_number
+                            )
+                        })?
+                    }
+                };
+
+                let etag = Self::upload_part(
+                    config,
+                    &upload_http,
+                    &mut scratch,
+                    valid_len,
+                    &url,
+                    part_number,
+                    uuid,
+                )
+                .await?;
+
+                parts.push(crate::remote::backups::RawServerBackupPart { etag, part_number });
+                total_size += valid_len;
+                part_number += 1;
+
+                if eof {
+                    break 'parts;
+                }
+            }
+
+            Ok::<_, anyhow::Error>((hex::encode(hasher.finalize()), parts, total_size))
+        }
+        .await;
+
+        drop(scratch);
+        if let Err(err) = tokio::fs::remove_file(&scratch_path).await {
+            tracing::warn!(
+                backup = %uuid,
+                "failed to remove s3 scratch file: {:?}",
+                err
+            );
+        }
+
+        result
+    }
+
+    /// The panel names the object after the backup, so its final path segment
+    /// carries the compression Wings must apply.
+    fn compression_from_url(url: &reqwest::Url) -> CompressionType {
+        CompressionType::from_file_name(
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .unwrap_or_default(),
+        )
+    }
+
     async fn create_streaming(
         server: &crate::server::Server,
         uuid: uuid::Uuid,
@@ -235,12 +342,6 @@ impl S3Backup {
         part_size: u64,
         initial_urls: Vec<String>,
     ) -> Result<RawServerBackup, anyhow::Error> {
-        if part_size == 0 {
-            return Err(anyhow::anyhow!(
-                "remote returned a part size of 0 for s3 backup, cannot upload backup"
-            ));
-        }
-
         let url = match initial_urls
             .first()
             .map(|url| reqwest::Url::parse(url))
@@ -260,16 +361,7 @@ impl S3Backup {
             }
         };
 
-        let scratch_path = Self::get_scratch_file_name(&server.app_state.config, uuid);
-        let mut scratch = tokio::fs::OpenOptions::new()
-            .read(true)
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&scratch_path)
-            .await?;
-
-        let (mut archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -364,106 +456,17 @@ impl S3Backup {
             }
         };
 
-        let upload_task = {
-            let server = server.clone();
-            let scratch = &mut scratch;
-
-            async move {
-                let mut hasher = sha2::Sha256::new();
-                let mut total_size: u64 = 0;
-                let mut parts = Vec::new();
-
-                let mut url_queue: std::collections::VecDeque<String> =
-                    initial_urls.into_iter().collect();
-                let mut part_number = 1;
-                let mut buffer = vec![0; crate::BUFFER_SIZE];
-
-                let (_upload_proxy, upload_http) =
-                    Self::upload_client(&server, url_queue.front().map(String::as_str)).await;
-
-                'parts: loop {
-                    scratch.seek(std::io::SeekFrom::Start(0)).await?;
-
-                    let mut valid_len: u64 = 0;
-                    let mut eof = false;
-
-                    while valid_len < part_size {
-                        let want =
-                            std::cmp::min(buffer.len() as u64, part_size - valid_len) as usize;
-                        let bytes_read = archive_reader.read(buffer.get_slice_mut(..want)?).await?;
-                        if crate::unlikely(bytes_read == 0) {
-                            eof = true;
-                            break;
-                        }
-
-                        hasher.safe_update(&buffer, bytes_read)?;
-                        scratch.safe_write_all(&buffer, bytes_read).await?;
-
-                        valid_len += bytes_read as u64;
-                        total.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                    }
-
-                    scratch.flush().await?;
-
-                    if valid_len == 0 {
-                        break 'parts;
-                    }
-
-                    let url = match url_queue.pop_front() {
-                        Some(url) => url,
-                        None => {
-                            let (_, new_urls) = server
-                                .app_state
-                                .config
-                                .client
-                                .backup_s3_part_urls(uuid, part_number)
-                                .await?;
-                            url_queue.extend(new_urls);
-
-                            url_queue.pop_front().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "failed to retrieve presigned URL for part {} of backup",
-                                    part_number
-                                )
-                            })?
-                        }
-                    };
-
-                    let etag = Self::upload_part(
-                        &server,
-                        &upload_http,
-                        scratch,
-                        valid_len,
-                        &url,
-                        part_number,
-                        uuid,
-                    )
-                    .await?;
-
-                    parts.push(crate::remote::backups::RawServerBackupPart { etag, part_number });
-                    total_size += valid_len;
-                    part_number += 1;
-
-                    if eof {
-                        break 'parts;
-                    }
-                }
-
-                Ok::<_, anyhow::Error>((hex::encode(hasher.finalize()), parts, total_size))
-            }
-        };
+        let upload_task = Self::upload_parts(
+            &server.app_state.config,
+            uuid,
+            archive_reader,
+            part_size,
+            initial_urls,
+            Arc::clone(&total),
+        );
 
         let ((checksum, parts, size), total_files, _) =
             tokio::try_join!(upload_task, total_task, archive_task)?;
-
-        drop(scratch);
-        if let Err(err) = tokio::fs::remove_file(&scratch_path).await {
-            tracing::warn!(
-                backup = %uuid,
-                "failed to remove s3 scratch file: {:?}",
-                err
-            );
-        }
 
         if size == 0 {
             return Err(anyhow::anyhow!(
@@ -617,8 +620,11 @@ impl S3Backup {
             ));
         }
 
-        let (_upload_proxy, upload_http) =
-            Self::upload_client(server, part_urls.first().map(String::as_str)).await;
+        let (_upload_proxy, upload_http) = Self::upload_client(
+            &server.app_state.config,
+            part_urls.first().map(String::as_str),
+        )
+        .await;
 
         let mut remaining_size = size;
         let mut parts = Vec::with_capacity(part_urls.len());
@@ -785,6 +791,139 @@ impl BackupCreateExt for S3Backup {
 }
 
 #[async_trait::async_trait]
+impl BackupStreamCreateExt for S3Backup {
+    async fn create_from_stream(
+        state: &crate::routes::State,
+        uuid: uuid::Uuid,
+        _extension: &str,
+        reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let (part_size, initial_urls) = state.config.client.backup_s3_part_urls(uuid, 1).await?;
+
+        let url = initial_urls
+            .first()
+            .map(|url| reqwest::Url::parse(url))
+            .transpose()
+            .map_err(|err| anyhow::anyhow!("failed to parse initial url for s3 backup: {:?}", err))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no initial urls provided for s3 backup, cannot upload backup")
+            })?;
+        let compression = Self::compression_from_url(&url);
+
+        let config = state.config.load();
+        let compression_level = config.system.backups.compression_level;
+        let threads = config.system.backups.s3.create_threads;
+        let write_limit = config.system.backups.write_limit.as_bytes();
+        drop(config);
+
+        let (compressed_reader, compressed_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+
+        let compress_task = tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+            let writer = LimitedWriter::new_with_bytes_per_second(
+                tokio_util::io::SyncIoBridge::new(compressed_writer),
+                write_limit,
+            );
+            let mut writer =
+                CompressionWriter::new(writer, compression, compression_level, threads)?;
+            let mut reader = tokio_util::io::SyncIoBridge::new(reader);
+
+            crate::io::copy(&mut reader, &mut writer)?;
+            writer.finish()?.into_inner().shutdown()?;
+
+            Ok(())
+        });
+
+        let total = Arc::new(AtomicU64::new(0));
+        let upload_task = Self::upload_parts(
+            &state.config,
+            uuid,
+            compressed_reader,
+            part_size,
+            initial_urls,
+            Arc::clone(&total),
+        );
+
+        let (upload_result, compress_result) = tokio::join!(upload_task, compress_task);
+        compress_result??;
+        let (checksum, parts, size) = upload_result?;
+
+        if size == 0 {
+            return Err(anyhow::anyhow!("database dump is 0 bytes"));
+        }
+
+        Ok(RawServerBackup {
+            checksum,
+            checksum_type: "sha256".into(),
+            size,
+            files: 0,
+            successful: true,
+            browsable: false,
+            streaming: false,
+            parts,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for S3Backup {
+    async fn read_stream(
+        &self,
+        state: &crate::routes::State,
+        download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        let download_url = download_url.ok_or_else(|| {
+            anyhow::anyhow!("unable to read s3 database backup without download_url")
+        })?;
+        let url = reqwest::Url::parse(&download_url)
+            .map_err(|err| anyhow::anyhow!("failed to parse s3 download url: {:?}", err))?;
+        let compression = Self::compression_from_url(&url);
+
+        let file_name = url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .map(|name| {
+                name.strip_suffix(super::wings::WingsBackupFile::compression_suffix(
+                    compression,
+                ))
+                .unwrap_or(name)
+            })
+            .filter(|name| !name.is_empty())
+            .map(compact_str::CompactString::from)
+            .unwrap_or_else(|| self.uuid.to_compact_string());
+
+        let response = get_client(&state.config)
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_length = response.content_length();
+
+        let reader = AsyncLimitedReader::new_with_bytes_per_second(
+            tokio_util::io::StreamReader::new(
+                response.bytes_stream().map_err(std::io::Error::other),
+            ),
+            state.config.load().system.backups.read_limit.as_bytes(),
+        );
+
+        Ok(match compression {
+            CompressionType::None => BackupStream {
+                reader: Box::new(reader),
+                size: content_length,
+                file_name,
+            },
+            compression => BackupStream {
+                reader: Box::new(AsyncCompressionReader::new(
+                    tokio_util::io::SyncIoBridge::new(reader),
+                    compression,
+                )),
+                size: None,
+                file_name,
+            },
+        })
+    }
+}
+
+#[async_trait::async_trait]
 impl BackupExt for S3Backup {
     #[inline]
     fn uuid(&self) -> uuid::Uuid {
@@ -836,7 +975,7 @@ impl BackupExt for S3Backup {
             }
         };
 
-        let response = get_client(server)
+        let response = get_client(&server.app_state.config)
             .get(url.clone())
             .send()
             .await

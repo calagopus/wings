@@ -50,6 +50,7 @@ enum Outcome {
 pub struct FallibleReader<R> {
     inner: R,
     outcome: Outcome,
+    require_eof: bool,
 }
 
 impl<R> FallibleReader<R> {
@@ -61,11 +62,20 @@ impl<R> FallibleReader<R> {
             Self {
                 inner,
                 outcome: Outcome::Waiting(receiver),
+                require_eof: false,
             },
             FallibleSignal {
                 sender: Some(sender),
             },
         )
+    }
+
+    #[inline]
+    pub fn new_with_eof(inner: R) -> (Self, FallibleSignal) {
+        let (mut reader, signal) = Self::new(inner);
+        reader.require_eof = true;
+
+        (reader, signal)
     }
 }
 
@@ -82,9 +92,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for FallibleReader<R> {
         }
 
         let filled = buf.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+        let read_result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        match &read_result {
             Poll::Ready(Ok(())) if buf.filled().len() != filled => return Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Err(_)) => return read_result,
             Poll::Ready(Ok(())) | Poll::Pending => {}
         }
 
@@ -103,7 +114,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for FallibleReader<R> {
 
         match &this.outcome {
             Outcome::Failed(err) => Poll::Ready(Err(std::io::Error::other(err.clone()))),
-            _ => Poll::Ready(Ok(())),
+            Outcome::Succeeded if !this.require_eof => Poll::Ready(Ok(())),
+            _ => read_result,
         }
     }
 }
@@ -122,6 +134,34 @@ mod tests {
         let (reader, signal) = FallibleReader::new(reader);
 
         (reader, writer, signal)
+    }
+
+    #[test]
+    fn succeeding_producer_waits_for_reader_eof() -> Result<(), std::io::Error> {
+        tokio_test::block_on(async {
+            let (reader, mut writer) = tokio::io::simplex(64);
+            let (mut reader, signal) = FallibleReader::new_with_eof(reader);
+            signal.succeed();
+
+            let mut buffer = [0; 8];
+            let mut buf = ReadBuf::new(&mut buffer);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Pin::new(&mut reader)
+                    .poll_read(&mut cx, &mut buf)
+                    .is_pending()
+            );
+
+            writer.write_all(b"archive").await?;
+            writer.shutdown().await?;
+            drop(writer);
+
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await?;
+            assert_eq!(out, b"archive");
+
+            Ok(())
+        })
     }
 
     #[test]

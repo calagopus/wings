@@ -11,7 +11,10 @@ use crate::{
     response::ApiResponse,
     routes::MimeCacheValue,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::{Archive, StreamableArchiveFormat, create::CreatePxarOptions},
             cap::FileType,
@@ -52,6 +55,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
 const MAX_TREE_DEPTH: usize = 1024;
+const DUMP_ARCHIVE_NAME: &str = "dump.didx";
 
 pub struct PbsBackup {
     uuid: uuid::Uuid,
@@ -78,7 +82,7 @@ fn build_config(remote: PbsBackupConfiguration) -> PbsConfig {
 impl BackupFindExt for PbsBackup {
     async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
         match state.config.client.backup_pbs_configuration(uuid).await {
-            Ok(remote) => Ok(remote.server_uuid.is_some()),
+            Ok(remote) => Ok(remote.group_id().is_some()),
             Err(_) => Ok(false),
         }
     }
@@ -92,13 +96,13 @@ impl BackupFindExt for PbsBackup {
             Err(_) => return Ok(None),
         };
 
-        let Some(server_uuid) = remote.server_uuid else {
+        let Some(group_id) = remote.group_id() else {
             return Ok(None);
         };
         let backup_time = remote.backup_created.timestamp();
 
         let config = build_config(remote);
-        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), server_uuid);
+        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
 
         Ok(Some(Backup::ProxmoxBackupServer(PbsBackup {
             uuid,
@@ -126,10 +130,13 @@ impl BackupCreateExt for PbsBackup {
             .backup_pbs_configuration(uuid)
             .await?;
         let backup_time = remote.backup_created.timestamp();
+        let group_id = remote.group_id().ok_or_else(|| {
+            anyhow::anyhow!("panel did not return a backup group for pbs backup {uuid}")
+        })?;
         let config = build_config(remote);
         config.validate().map_err(|err| anyhow::anyhow!("{err}"))?;
 
-        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), server.uuid);
+        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
 
         let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
@@ -290,6 +297,151 @@ impl BackupCreateExt for PbsBackup {
             browsable: true,
             streaming: true,
             parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamCreateExt for PbsBackup {
+    async fn create_from_stream(
+        state: &crate::routes::State,
+        uuid: uuid::Uuid,
+        extension: &str,
+        reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let remote = state.config.client.backup_pbs_configuration(uuid).await?;
+        let Some(group_id) = remote.group_id() else {
+            return Err(anyhow::anyhow!(
+                "panel did not return a backup group for pbs database backup {uuid}"
+            ));
+        };
+        let backup_time = remote.backup_created.timestamp();
+        let server_uuid = remote.server_uuid;
+        let config = build_config(remote);
+        config.validate().map_err(|err| anyhow::anyhow!("{err}"))?;
+
+        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
+        let compression_threads = state.config.load().system.backups.pbs.create_threads;
+
+        let mut writer = PbsBackupWriter::connect(&config, &backup_id, backup_time).await?;
+
+        let result = async {
+            let archive = writer
+                .upload_archive_named(
+                    DUMP_ARCHIVE_NAME,
+                    reader,
+                    Default::default(),
+                    compression_threads,
+                )
+                .await?;
+
+            let metadata = serde_json::json!({
+                "backup_uuid": uuid,
+                "server_uuid": server_uuid,
+                "backup_id": backup_id,
+                "backup_time": backup_time,
+                "archive": DUMP_ARCHIVE_NAME,
+                "dump_file_name": format!("{uuid}.{extension}"),
+                "wings_version": env!("CARGO_PKG_VERSION"),
+            });
+            let meta_file = writer
+                .upload_blob(META_BLOB_NAME, &serde_json::to_vec(&metadata)?)
+                .await?;
+
+            let mut manifest = BackupManifest::new(
+                pbs_client::naming::BACKUP_TYPE,
+                backup_id.as_str(),
+                backup_time,
+            );
+            let checksum = archive.file.csum.clone();
+            manifest.add_file(archive.file);
+            manifest.add_file(meta_file);
+            writer.finish(&manifest).await?;
+
+            Ok::<_, anyhow::Error>((archive.size, checksum))
+        }
+        .await;
+
+        writer.close().await;
+        let (size, checksum) = result?;
+
+        Ok(RawServerBackup {
+            checksum,
+            checksum_type: "sha256".into(),
+            size,
+            files: 0,
+            successful: true,
+            browsable: false,
+            streaming: false,
+            parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for PbsBackup {
+    async fn read_stream(
+        &self,
+        state: &crate::routes::State,
+        _download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        let mut reader =
+            PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
+
+        let meta_raw = reader.download_file(META_BLOB_NAME).await?;
+        let meta = pbs_client::datablob::decode_blob(&meta_raw)?;
+        let meta: serde_json::Value = serde_json::from_slice(&meta)?;
+        let file_name = meta
+            .get("dump_file_name")
+            .and_then(|name| name.as_str())
+            .map(compact_str::CompactString::from)
+            .ok_or_else(|| anyhow::anyhow!("pbs snapshot does not contain a database dump"))?;
+
+        let mut size = None;
+        if let Ok(manifest_raw) = reader.download_file(MANIFEST_BLOB_NAME).await
+            && let Ok(json) = pbs_client::datablob::decode_blob(&manifest_raw)
+            && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&json)
+            && let Some(files) = manifest.get("files").and_then(|files| files.as_array())
+        {
+            for file in files {
+                if file.get("filename").and_then(|name| name.as_str()) == Some(DUMP_ARCHIVE_NAME) {
+                    size = file.get("size").and_then(|size| size.as_u64());
+                }
+            }
+        }
+
+        let (dump_reader, mut dump_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (dump_reader, signal) =
+            crate::io::fallible_reader::FallibleReader::new_with_eof(dump_reader);
+        let download_concurrency = state.config.load().system.backups.pbs.download_concurrency;
+        let uuid = self.uuid;
+
+        tokio::spawn(async move {
+            if let Err(err) = reader
+                .reassemble_archive_named(
+                    DUMP_ARCHIVE_NAME,
+                    &mut dump_writer,
+                    None,
+                    download_concurrency,
+                )
+                .await
+            {
+                tracing::error!(backup = %uuid, "failed to read pbs database dump: {:#?}", err);
+                signal.fail(err);
+
+                return;
+            }
+
+            match dump_writer.shutdown().await {
+                Ok(()) => signal.succeed(),
+                Err(err) => signal.fail(err),
+            }
+        });
+
+        Ok(BackupStream {
+            reader: Box::new(dump_reader),
+            size,
+            file_name,
         })
     }
 }

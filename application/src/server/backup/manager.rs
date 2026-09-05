@@ -3,6 +3,7 @@ use crate::{
     server::{backup::adapters::BackupAdapter, filesystem::virtualfs::VirtualReadableFilesystem},
 };
 use compact_str::ToCompactString;
+use futures::TryStreamExt;
 use ignore::gitignore::GitignoreBuilder;
 use std::sync::{
     Arc,
@@ -14,11 +15,59 @@ pub struct BackupManager {
     cached_browse_backups: moka::future::Cache<uuid::Uuid, Arc<dyn VirtualReadableFilesystem>>,
     cached_browse_backup_locks: moka::future::Cache<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>,
     cached_backup_adapters: moka::future::Cache<uuid::Uuid, BackupAdapter>,
+    database_backup_restores: tokio::sync::broadcast::Sender<DatabaseBackupRestore>,
+}
+
+#[derive(Clone)]
+struct DatabaseBackupRestore {
+    request_uuid: uuid::Uuid,
+    completion: tokio::sync::watch::Receiver<Option<bool>>,
+}
+
+pub struct DatabaseBackupRestoreWaiter {
+    receiver: tokio::sync::broadcast::Receiver<DatabaseBackupRestore>,
+}
+
+impl DatabaseBackupRestoreWaiter {
+    pub async fn wait(
+        mut self,
+        request_uuid: uuid::Uuid,
+        start_timeout: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        let mut completion = tokio::time::timeout(start_timeout, async {
+            loop {
+                let restore = self.receiver.recv().await?;
+                if restore.request_uuid == request_uuid {
+                    return Ok::<_, anyhow::Error>(restore.completion);
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("database backup restore did not start before the timeout")
+        })??;
+
+        loop {
+            if let Some(successful) = *completion.borrow_and_update() {
+                return if successful {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("database backup restore failed"))
+                };
+            }
+
+            completion
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("database backup restore ended without a result"))?;
+        }
+    }
 }
 
 impl Default for BackupManager {
     fn default() -> Self {
         Self {
+            database_backup_restores: tokio::sync::broadcast::channel(128).0,
             cached_backups: moka::future::CacheBuilder::new(128)
                 .time_to_live(std::time::Duration::from_mins(10))
                 .build(),
@@ -32,6 +81,27 @@ impl Default for BackupManager {
 }
 
 impl BackupManager {
+    pub fn subscribe_database_backup_restores(&self) -> DatabaseBackupRestoreWaiter {
+        DatabaseBackupRestoreWaiter {
+            receiver: self.database_backup_restores.subscribe(),
+        }
+    }
+
+    fn start_database_backup_restore(
+        &self,
+        request_uuid: uuid::Uuid,
+    ) -> tokio::sync::watch::Sender<Option<bool>> {
+        let (sender, completion) = tokio::sync::watch::channel(None);
+        self.database_backup_restores
+            .send(DatabaseBackupRestore {
+                request_uuid,
+                completion,
+            })
+            .ok();
+
+        sender
+    }
+
     pub async fn fast_contains(&self, server: &crate::server::Server, uuid: uuid::Uuid) -> bool {
         self.cached_backups.contains_key(&uuid)
             || server.configuration.read().await.backups.contains(&uuid)
@@ -227,6 +297,320 @@ impl BackupManager {
         );
 
         Ok(backup)
+    }
+
+    fn spawn_backup_progress_task(
+        server: &crate::server::Server,
+        event: crate::server::websocket::WebsocketEvent,
+        uuid: uuid::Uuid,
+        database_instance: Option<uuid::Uuid>,
+        progress: Arc<AtomicU64>,
+        total: Arc<AtomicU64>,
+    ) -> tokio::task::JoinHandle<()> {
+        let server = server.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let mut builder = crate::server::websocket::WebsocketMessage::builder(event)
+                    .arg(uuid.to_compact_string());
+                if let Some(database_instance) = database_instance {
+                    builder = builder.arg(database_instance.to_compact_string());
+                }
+
+                server
+                    .websocket
+                    .send(
+                        builder
+                            .structured_arg(crate::models::BackupProgress {
+                                bytes_processed: progress.load(Ordering::SeqCst),
+                                bytes_total: total.load(Ordering::SeqCst),
+                                files_processed: 0,
+                            })
+                            .build(),
+                    )
+                    .ok();
+
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        })
+    }
+
+    async fn finish_database_backup(
+        &self,
+        server: &crate::server::Server,
+        adapter: BackupAdapter,
+        uuid: uuid::Uuid,
+        result: Result<RawServerBackup, anyhow::Error>,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let backup = match result {
+            Ok(backup) => backup,
+            Err(err) => {
+                if let Err(err) = adapter.clean(server, uuid).await {
+                    tracing::error!(server = %server.uuid, adapter = ?adapter, "failed to clean up backup {} after error: {:#?}", uuid, err);
+                }
+
+                server
+                    .schedules
+                    .execute_database_backup_status_trigger(
+                        crate::models::ServerBackupStatus::Failed,
+                    )
+                    .await;
+                server
+                    .app_state
+                    .config
+                    .client
+                    .set_backup_status(uuid, &RawServerBackup::default())
+                    .await?;
+                server.websocket.send(
+                    crate::server::websocket::WebsocketMessage::builder(
+                        crate::server::websocket::WebsocketEvent::ServerBackupCompleted,
+                    )
+                    .arg(uuid.to_compact_string())
+                    .structured_arg(serde_json::json!({
+                        "checksum_type": "",
+                        "checksum": "",
+                        "size": 0,
+                        "files": 0,
+                        "successful": false,
+                        "browsable": false,
+                        "streaming": false,
+                    }))
+                    .build(),
+                )?;
+                self.cached_backup_adapters.insert(uuid, adapter).await;
+
+                return Err(err);
+            }
+        };
+
+        server
+            .schedules
+            .execute_database_backup_status_trigger(crate::models::ServerBackupStatus::Finished)
+            .await;
+        server
+            .app_state
+            .config
+            .client
+            .set_backup_status(uuid, &backup)
+            .await?;
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
+                crate::server::websocket::WebsocketEvent::ServerBackupCompleted,
+            )
+            .arg(uuid.to_compact_string())
+            .structured_arg(serde_json::json!({
+                "checksum_type": backup.checksum_type,
+                "checksum": backup.checksum,
+                "size": backup.size,
+                "files": backup.files,
+                "successful": backup.successful,
+                "browsable": backup.browsable,
+                "streaming": backup.streaming,
+            }))
+            .build(),
+        )?;
+        server.configuration.write().await.backups.push(uuid);
+        self.cached_backup_adapters.insert(uuid, adapter).await;
+
+        Ok(backup)
+    }
+
+    pub async fn create_database(
+        &self,
+        adapter: BackupAdapter,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+        extension: &str,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        tracing::info!(
+            server = %server.uuid,
+            backup = %uuid,
+            database_instance = %database_instance,
+            adapter = ?adapter,
+            "creating database backup",
+        );
+
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+
+        let progress_task = Self::spawn_backup_progress_task(
+            server,
+            crate::server::websocket::WebsocketEvent::ServerBackupProgress,
+            uuid,
+            None,
+            Arc::clone(&progress),
+            Arc::clone(&total),
+        );
+
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
+                crate::server::websocket::WebsocketEvent::ServerBackupStarted,
+            )
+            .arg(uuid.to_compact_string())
+            .build(),
+        )?;
+        server
+            .schedules
+            .execute_database_backup_status_trigger(crate::models::ServerBackupStatus::Starting)
+            .await;
+
+        let result = async {
+            super::validate_dump_extension(extension)?;
+
+            let response = server
+                .app_state
+                .config
+                .client
+                .database_backup_source(uuid, database_instance)
+                .await?;
+            if let Some(length) = response.content_length() {
+                total.store(length, Ordering::SeqCst);
+            }
+
+            let reader = tokio_util::io::StreamReader::new(
+                response.bytes_stream().map_err(std::io::Error::other),
+            );
+            let reader = crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
+                reader,
+                Arc::clone(&progress),
+            );
+
+            adapter
+                .create_from_stream(&server.app_state, uuid, extension, Box::new(reader))
+                .await
+        }
+        .await;
+
+        progress_task.abort();
+
+        let backup = self
+            .finish_database_backup(server, adapter, uuid, result)
+            .await?;
+
+        tracing::info!(
+            server = %server.uuid,
+            adapter = ?adapter,
+            "completed database backup {}",
+            uuid,
+        );
+
+        Ok(backup)
+    }
+
+    pub async fn restore_database(
+        &self,
+        backup: &super::Backup,
+        server: &crate::server::Server,
+        database_instance: uuid::Uuid,
+        download_url: Option<compact_str::CompactString>,
+        request_uuid: Option<uuid::Uuid>,
+    ) -> Result<(), anyhow::Error> {
+        let completion = request_uuid.map(|uuid| self.start_database_backup_restore(uuid));
+        let uuid = backup.uuid();
+
+        tracing::info!(
+            server = %server.uuid,
+            backup = %uuid,
+            database_instance = %database_instance,
+            adapter = ?backup.adapter(),
+            "restoring database backup",
+        );
+
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+
+        let progress_task = Self::spawn_backup_progress_task(
+            server,
+            crate::server::websocket::WebsocketEvent::ServerDatabaseBackupRestoreProgress,
+            uuid,
+            Some(database_instance),
+            Arc::clone(&progress),
+            Arc::clone(&total),
+        );
+
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
+                crate::server::websocket::WebsocketEvent::ServerDatabaseBackupRestoreStarted,
+            )
+            .arg(uuid.to_compact_string())
+            .arg(database_instance.to_compact_string())
+            .build(),
+        )?;
+
+        let import_result = async {
+            let stream = backup.read_stream(&server.app_state, download_url).await?;
+            if let Some(size) = stream.size {
+                total.store(size, Ordering::SeqCst);
+            }
+
+            let reader = crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
+                stream.reader,
+                Arc::clone(&progress),
+            );
+            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
+                reader,
+                crate::BUFFER_SIZE,
+            ));
+
+            server
+                .app_state
+                .config
+                .client
+                .database_backup_restore_target(uuid, database_instance, body)
+                .await
+        }
+        .await;
+
+        progress_task.abort();
+
+        let import_successful = import_result.is_ok();
+        let status_result = server
+            .app_state
+            .config
+            .client
+            .set_database_backup_restore_status(uuid, database_instance, import_successful)
+            .await;
+        if import_result.is_err()
+            && let Err(err) = &status_result
+        {
+            tracing::error!(
+                server = %server.uuid,
+                backup = %uuid,
+                database_instance = %database_instance,
+                "failed to report database backup restore status: {:#?}",
+                err
+            );
+        }
+
+        let successful = import_successful && status_result.is_ok();
+
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
+                crate::server::websocket::WebsocketEvent::ServerDatabaseBackupRestoreCompleted,
+            )
+            .arg(uuid.to_compact_string())
+            .arg(database_instance.to_compact_string())
+            .arg(if successful { "true" } else { "false" })
+            .build(),
+        )?;
+
+        if successful {
+            tracing::info!(
+                server = %server.uuid,
+                backup = %uuid,
+                adapter = ?backup.adapter(),
+                "completed restore of database backup",
+            );
+        }
+
+        if let Some(completion) = completion {
+            completion.send_replace(Some(successful));
+        }
+
+        import_result?;
+
+        status_result.map_err(|err| err.context("failed to report database backup restore status"))
     }
 
     pub async fn restore(
@@ -505,5 +889,143 @@ impl BackupManager {
 
         self.cached_browse_backups.run_pending_tasks().await;
         self.cached_browse_backup_locks.run_pending_tasks().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn database_restore_completion_before_wait_is_preserved() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let request_uuid = uuid::Uuid::new_v4();
+            let completion = manager.start_database_backup_restore(request_uuid);
+            completion.send_replace(Some(true));
+            drop(completion);
+
+            waiter.wait(request_uuid, Duration::from_secs(1)).await
+        })
+    }
+
+    #[test]
+    fn database_restore_waits_for_its_own_completion() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let old = manager.start_database_backup_restore(uuid::Uuid::new_v4());
+            let request_uuid = uuid::Uuid::new_v4();
+            let completion = manager.start_database_backup_restore(request_uuid);
+            old.send_replace(Some(true));
+
+            let wait = waiter.wait(request_uuid, Duration::from_secs(1));
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            completion.send_replace(Some(true));
+            wait.await
+        })
+    }
+
+    #[test]
+    fn database_restore_failure_reaches_waiter() {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let request_uuid = uuid::Uuid::new_v4();
+            let completion = manager.start_database_backup_restore(request_uuid);
+            completion.send_replace(Some(false));
+
+            assert!(
+                waiter
+                    .wait(request_uuid, Duration::from_secs(1))
+                    .await
+                    .is_err_and(|err| err.to_string().contains("restore failed"))
+            );
+        });
+    }
+
+    #[test]
+    fn database_restore_missing_start_times_out() {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let unrelated = manager.start_database_backup_restore(uuid::Uuid::new_v4());
+            unrelated.send_replace(Some(true));
+
+            assert!(
+                waiter
+                    .wait(uuid::Uuid::new_v4(), Duration::from_millis(5))
+                    .await
+                    .is_err_and(|err| err.to_string().contains("did not start"))
+            );
+        });
+    }
+
+    #[test]
+    fn database_restore_dropped_task_fails_waiter() {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let request_uuid = uuid::Uuid::new_v4();
+            drop(manager.start_database_backup_restore(request_uuid));
+
+            assert!(
+                waiter
+                    .wait(request_uuid, Duration::from_secs(1))
+                    .await
+                    .is_err_and(|err| err.to_string().contains("without a result"))
+            );
+        });
+    }
+
+    #[test]
+    fn database_restore_lagged_or_closed_notifications_fail_waiter() {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let request_uuid = uuid::Uuid::new_v4();
+            let completion = manager.start_database_backup_restore(request_uuid);
+            completion.send_replace(Some(true));
+            for _ in 0..128 {
+                manager.start_database_backup_restore(uuid::Uuid::new_v4());
+            }
+
+            assert!(
+                waiter
+                    .wait(request_uuid, Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+
+            let waiter = manager.subscribe_database_backup_restores();
+            drop(manager);
+            assert!(
+                waiter
+                    .wait(request_uuid, Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn database_restore_completion_has_no_start_deadline() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let manager = BackupManager::default();
+            let waiter = manager.subscribe_database_backup_restores();
+            let request_uuid = uuid::Uuid::new_v4();
+            let completion = manager.start_database_backup_restore(request_uuid);
+            let wait = waiter.wait(request_uuid, Duration::from_millis(1));
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(futures::poll!(&mut wait).is_pending());
+            completion.send_replace(Some(true));
+
+            wait.await
+        })
     }
 }

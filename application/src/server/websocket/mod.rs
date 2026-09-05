@@ -109,6 +109,12 @@ pub enum WebsocketEvent {
     ServerBackupRestoreProgress,
     #[serde(rename = "backup restore completed")]
     ServerBackupRestoreCompleted,
+    #[serde(rename = "database backup restore started")]
+    ServerDatabaseBackupRestoreStarted,
+    #[serde(rename = "database backup restore progress")]
+    ServerDatabaseBackupRestoreProgress,
+    #[serde(rename = "database backup restore completed")]
+    ServerDatabaseBackupRestoreCompleted,
     #[serde(rename = "transfer logs")]
     ServerTransferLogs,
     #[serde(rename = "transfer status")]
@@ -192,7 +198,10 @@ impl WebsocketEvent {
             | Self::ServerBackupDeleted
             | Self::ServerBackupRestoreStarted
             | Self::ServerBackupRestoreProgress
-            | Self::ServerBackupRestoreCompleted => {
+            | Self::ServerBackupRestoreCompleted
+            | Self::ServerDatabaseBackupRestoreStarted
+            | Self::ServerDatabaseBackupRestoreProgress
+            | Self::ServerDatabaseBackupRestoreCompleted => {
                 BroadcastPermission::Required(Permission::BackupRead)
             }
             Self::ServerScheduleStarted

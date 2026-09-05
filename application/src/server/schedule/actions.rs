@@ -164,6 +164,12 @@ pub enum ScheduleAction {
     Exit {
         successful: bool,
     },
+    WaitForState {
+        ignore_failure: bool,
+
+        state: crate::server::state::ServerState,
+        timeout: u64,
+    },
     Format {
         format: String,
         output_into: ScheduleVariable,
@@ -185,12 +191,6 @@ pub enum ScheduleAction {
         timeout: u64,
 
         output_into: Option<ScheduleVariable>,
-    },
-    WaitForState {
-        ignore_failure: bool,
-
-        state: crate::server::state::ServerState,
-        timeout: u64,
     },
     SendPower {
         ignore_failure: bool,
@@ -235,6 +235,46 @@ pub enum ScheduleAction {
         backup: ScheduleBackupSelector,
         #[serde(default)]
         backup_group_uuid: Option<uuid::Uuid>,
+    },
+    CreateDatabaseBackup {
+        ignore_failure: bool,
+        foreground: bool,
+
+        name: Option<ScheduleDynamicParameter>,
+        database_instance_uuid: uuid::Uuid,
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
+
+        #[serde(default)]
+        output_into: Option<ScheduleVariable>,
+    },
+    DeleteDatabaseBackup {
+        #[serde(default)]
+        ignore_failure: bool,
+
+        backup: ScheduleBackupSelector,
+        #[serde(default)]
+        database_instance_uuid: Option<uuid::Uuid>,
+    },
+    MoveDatabaseBackup {
+        #[serde(default)]
+        ignore_failure: bool,
+
+        backup: ScheduleBackupSelector,
+        #[serde(default)]
+        database_instance_uuid: Option<uuid::Uuid>,
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
+    },
+    RestoreDatabaseBackup {
+        #[serde(default)]
+        ignore_failure: bool,
+
+        backup: ScheduleBackupSelector,
+        #[serde(default)]
+        source_database_instance_uuid: Option<uuid::Uuid>,
+        #[serde(default)]
+        database_instance_uuid: Option<uuid::Uuid>,
     },
     CreateDirectory {
         ignore_failure: bool,
@@ -344,16 +384,20 @@ impl ScheduleAction {
             ScheduleAction::Else => false,
             ScheduleAction::EndIf => false,
             ScheduleAction::Exit { .. } => false,
+            ScheduleAction::WaitForState { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::Format { .. } => false,
             ScheduleAction::MatchRegex { .. } => false,
             ScheduleAction::WaitForConsoleLine { ignore_failure, .. } => *ignore_failure,
-            ScheduleAction::WaitForState { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::SendPower { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::SendCommand { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CreateBackup { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::RestoreBackup { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::DeleteBackup { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::MoveBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::CreateDatabaseBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::DeleteDatabaseBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::MoveDatabaseBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::RestoreDatabaseBackup { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CreateDirectory { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::WriteFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CopyFile { ignore_failure, .. } => *ignore_failure,
@@ -395,6 +439,23 @@ impl ScheduleAction {
             ScheduleAction::Ensure { condition } => {
                 if !condition.evaluate(server, execution_context).await {
                     return Err("condition did not evaluate with success.".into());
+                }
+            }
+            ScheduleAction::WaitForState {
+                state: target_state,
+                timeout,
+                ..
+            } => {
+                if !server
+                    .state
+                    .wait_for_state(*target_state, std::time::Duration::from_millis(*timeout))
+                    .await
+                {
+                    return Err(format!(
+                        "timeout while waiting for server state `{}`.",
+                        target_state.to_str()
+                    )
+                    .into());
                 }
             }
             ScheduleAction::Format {
@@ -558,23 +619,6 @@ impl ScheduleAction {
                 }
 
                 return Err("timeout while waiting for matching console output.".into());
-            }
-            ScheduleAction::WaitForState {
-                state: target_state,
-                timeout,
-                ..
-            } => {
-                if !server
-                    .state
-                    .wait_for_state(*target_state, std::time::Duration::from_millis(*timeout))
-                    .await
-                {
-                    return Err(format!(
-                        "timeout while waiting for server state `{}`.",
-                        target_state.to_str()
-                    )
-                    .into());
-                }
             }
             ScheduleAction::SendPower { action, .. } => match action {
                 crate::models::ServerPowerAction::Start => {
@@ -1017,6 +1061,226 @@ impl ScheduleAction {
                         &err,
                         "failed to move backup",
                     ));
+                }
+            }
+            ScheduleAction::CreateDatabaseBackup {
+                foreground,
+                name,
+                database_instance_uuid,
+                backup_group_uuid,
+                output_into,
+                ..
+            } => {
+                let name = match name {
+                    Some(name) => match execution_context.resolve_parameter(name) {
+                        Some(name) => Some(name.as_str()),
+                        None => {
+                            return Err("unable to resolve parameter `name` into a string.".into());
+                        }
+                    },
+                    None => None,
+                };
+
+                let (adapter, uuid, extension) = match state
+                    .config
+                    .client
+                    .create_database_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        *database_instance_uuid,
+                        name,
+                        *backup_group_uuid,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to create database backup: {:#?}",
+                            err
+                        );
+
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to create database backup",
+                        ));
+                    }
+                };
+
+                if state.backup_manager.fast_contains(server, uuid).await {
+                    return Err("backup already exists".into());
+                }
+
+                if let Some(output_into) = output_into {
+                    execution_context.store_variable(output_into, uuid.to_compact_string())?;
+                }
+
+                let thread = tokio::spawn({
+                    let state = Arc::clone(state);
+                    let server = server.clone();
+                    let database_instance_uuid = *database_instance_uuid;
+
+                    async move {
+                        if let Err(err) = state
+                            .backup_manager
+                            .create_database(
+                                adapter,
+                                &server,
+                                uuid,
+                                database_instance_uuid,
+                                &extension,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                "failed to create database backup {} (adapter = {:?}) for {}: {}",
+                                uuid,
+                                adapter,
+                                server.uuid,
+                                err
+                            );
+
+                            return Err("failed to create database backup".into());
+                        }
+
+                        Ok::<_, Cow<'static, str>>(())
+                    }
+                });
+
+                if *foreground && let Ok(Err(err)) = thread.await {
+                    return Err(err);
+                }
+            }
+            ScheduleAction::DeleteDatabaseBackup {
+                backup,
+                database_instance_uuid,
+                ..
+            } => {
+                let selector = backup.resolve(execution_context)?;
+
+                if let Err(err) = state
+                    .config
+                    .client
+                    .delete_database_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                        *database_instance_uuid,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to delete database backup: {:#?}",
+                        err
+                    );
+
+                    return Err(crate::remote::ApiError::message_or(
+                        &err,
+                        "failed to delete database backup",
+                    ));
+                }
+            }
+            ScheduleAction::MoveDatabaseBackup {
+                backup,
+                database_instance_uuid,
+                backup_group_uuid,
+                ..
+            } => {
+                let selector = backup.resolve(execution_context)?;
+
+                if let Err(err) = state
+                    .config
+                    .client
+                    .move_database_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                        *backup_group_uuid,
+                        *database_instance_uuid,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to move database backup: {:#?}",
+                        err
+                    );
+
+                    return Err(crate::remote::ApiError::message_or(
+                        &err,
+                        "failed to move database backup",
+                    ));
+                }
+            }
+            ScheduleAction::RestoreDatabaseBackup {
+                backup,
+                source_database_instance_uuid,
+                database_instance_uuid,
+                ..
+            } => {
+                let selector = backup.resolve(execution_context)?;
+                let request_uuid = uuid::Uuid::new_v4();
+                let restore_waiter = state.backup_manager.subscribe_database_backup_restores();
+
+                let (uuid, database_instance_uuid) = match state
+                    .config
+                    .client
+                    .restore_database_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                        *source_database_instance_uuid,
+                        *database_instance_uuid,
+                        request_uuid,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to request database backup restore: {:#?}",
+                            err
+                        );
+
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to request database backup restore",
+                        ));
+                    }
+                };
+
+                tracing::info!(
+                    server = %server.uuid,
+                    backup = %uuid,
+                    database_instance = %database_instance_uuid,
+                    "requested database backup restore"
+                );
+
+                if let Err(err) = restore_waiter
+                    .wait(request_uuid, std::time::Duration::from_secs(60))
+                    .await
+                {
+                    tracing::error!(
+                        server = %server.uuid,
+                        backup = %uuid,
+                        database_instance = %database_instance_uuid,
+                        "failed to restore database backup: {:#?}",
+                        err
+                    );
+
+                    return Err("failed to restore database backup".into());
                 }
             }
             ScheduleAction::CreateDirectory { root, name, .. } => {

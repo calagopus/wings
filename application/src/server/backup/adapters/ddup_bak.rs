@@ -7,7 +7,10 @@ use crate::{
     remote::backups::RawServerBackup,
     response::ApiResponse,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::StreamableArchiveFormat,
             cap::FileType,
@@ -97,6 +100,20 @@ pub struct DdupBakBackup {
 }
 
 impl DdupBakBackup {
+    fn get_dump_staging_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(".ddup-bak-dumps")
+            .join(uuid.to_string())
+    }
+
+    fn dump_entry(&self) -> Option<&Entry> {
+        self.archive
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry, Entry::File(_)))
+    }
+
     fn tar_convert_entries(
         entry: &Entry,
         repository: &ddup_bak::repository::Repository,
@@ -475,6 +492,148 @@ impl BackupCreateExt for DdupBakBackup {
             browsable: true,
             streaming: true,
             parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamCreateExt for DdupBakBackup {
+    async fn create_from_stream(
+        state: &crate::routes::State,
+        uuid: uuid::Uuid,
+        extension: &str,
+        mut reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let repository = get_repository(&state.config).await?;
+        let path = repository.archive_path(&uuid.to_string());
+
+        let staging_dir = Self::get_dump_staging_path(&state.config, uuid);
+        tokio::fs::create_dir_all(&staging_dir).await?;
+        let staged_file = staging_dir.join(format!("{uuid}.{extension}"));
+
+        let result = async {
+            let mut file = tokio::fs::File::create(&staged_file).await?;
+            tokio::io::copy(&mut reader, &mut file).await?;
+            file.sync_all().await?;
+            drop(file);
+
+            let compression_format = state
+                .config
+                .load()
+                .system
+                .backups
+                .ddup_bak
+                .compression_format;
+            let create_threads = state.config.load().system.backups.ddup_bak.create_threads;
+            let repository = Arc::clone(&repository);
+            let staging_dir = staging_dir.clone();
+
+            tokio::task::spawn_blocking(move || -> Result<u64, anyhow::Error> {
+                let archive = repository.create_archive(
+                    &uuid.to_string(),
+                    Some(
+                        WalkBuilder::new(&staging_dir)
+                            .ignore(false)
+                            .git_ignore(false)
+                            .follow_links(false)
+                            .git_global(false)
+                            .hidden(false)
+                            .build(),
+                    ),
+                    Some(&staging_dir),
+                    None,
+                    Some(Arc::new(move |_, _| match compression_format {
+                        crate::config::SystemBackupsDdupBakCompressionFormat::None => {
+                            ddup_bak::archive::CompressionFormat::None
+                        }
+                        crate::config::SystemBackupsDdupBakCompressionFormat::Deflate => {
+                            ddup_bak::archive::CompressionFormat::Deflate
+                        }
+                        crate::config::SystemBackupsDdupBakCompressionFormat::Gzip => {
+                            ddup_bak::archive::CompressionFormat::Gzip
+                        }
+                        crate::config::SystemBackupsDdupBakCompressionFormat::Brotli => {
+                            ddup_bak::archive::CompressionFormat::Brotli
+                        }
+                    })),
+                    create_threads,
+                )?;
+
+                repository.save()?;
+
+                let mut total_size = 0;
+                let mut total_files = 0;
+
+                for entry in archive.entries.iter() {
+                    calculate_entry_size(&mut total_size, &mut total_files, entry);
+                }
+
+                Ok(total_size)
+            })
+            .await?
+        }
+        .await;
+
+        if let Err(err) = tokio::fs::remove_dir_all(&staging_dir).await {
+            tracing::warn!(backup = %uuid, "failed to remove ddup-bak dump staging directory: {:?}", err);
+        }
+
+        let total_size = result?;
+
+        let mut sha1 = sha1::Sha1::new();
+        let mut file = tokio::fs::File::open(path).await?;
+
+        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            sha1.safe_update(&buffer, bytes_read)?;
+        }
+
+        Ok(RawServerBackup {
+            checksum: format!(
+                "{}-{}",
+                file.metadata().await?.len(),
+                hex::encode(sha1.finalize())
+            ),
+            checksum_type: "ddup-sha1".into(),
+            size: total_size,
+            files: 0,
+            successful: true,
+            browsable: false,
+            streaming: false,
+            parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for DdupBakBackup {
+    async fn read_stream(
+        &self,
+        state: &crate::routes::State,
+        _download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        let repository = get_repository(&state.config).await?;
+
+        let Some(Entry::File(file)) = self.dump_entry() else {
+            return Err(anyhow::anyhow!(
+                "ddup-bak archive does not contain a database dump"
+            ));
+        };
+
+        let reader = repository.entry_reader(Entry::File(file.clone()))?;
+
+        Ok(BackupStream {
+            reader: Box::new(crate::io::compression::reader::AsyncCompressionReader::new(
+                reader,
+                crate::io::compression::CompressionType::None,
+            )),
+            size: Some(file.size_real),
+            file_name: file.name.as_str().into(),
         })
     }
 }

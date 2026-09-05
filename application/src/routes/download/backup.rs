@@ -30,6 +30,8 @@ mod get {
         pub server_uuid: Option<uuid::Uuid>,
         pub backup_uuid: uuid::Uuid,
         pub unique_id: compact_str::CompactString,
+        #[serde(default)]
+        pub database: bool,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -93,14 +95,19 @@ mod get {
             }
         };
 
-        match backup
-            .download(
-                &state,
-                data.archive_format,
-                ByteRange::from_headers(&headers),
-            )
-            .await
-        {
+        let download = if payload.database {
+            backup.download_database(&state).await
+        } else {
+            backup
+                .download(
+                    &state,
+                    data.archive_format,
+                    ByteRange::from_headers(&headers),
+                )
+                .await
+        };
+
+        match download {
             Ok(response) => response,
             Err(err) => {
                 tracing::error!("failed to download backup: {:?}", err);

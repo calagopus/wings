@@ -66,6 +66,14 @@ pub enum ServerBackupStatus {
     Failed,
 }
 
+#[derive(ToSchema, Default, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerBackupKind {
+    #[default]
+    Server,
+    DatabaseInstance,
+}
+
 #[derive(ToSchema, Serialize)]
 pub struct Server {
     pub state: ServerState,

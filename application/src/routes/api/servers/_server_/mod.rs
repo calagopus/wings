@@ -11,6 +11,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod backup;
 mod commands;
+mod database_backup;
 mod files;
 mod install;
 mod logs;
@@ -124,6 +125,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/ws", ws::router(state))
         .nest("/files", files::router(state))
         .nest("/backup", backup::router(state))
+        .nest("/database-backup", database_backup::router(state))
         .nest("/schedules", schedules::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))

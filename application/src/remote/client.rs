@@ -10,6 +10,7 @@ pub struct Client {
     pub(super) config: crate::config::RemoteQuery,
 
     pub(super) client: reqwest::Client,
+    pub(super) stream_client: reqwest::Client,
     pub(super) url: String,
 }
 
@@ -48,13 +49,21 @@ impl Client {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .tls_danger_accept_invalid_certs(ignore_certificate_errors)
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .build()
             .expect("failed to build HTTP client");
+        let stream_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.remote_query.timeout))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tls_danger_accept_invalid_certs(ignore_certificate_errors)
+            .default_headers(headers)
+            .build()
+            .expect("failed to build streaming HTTP client");
 
         Self {
             config: config.remote_query,
             client,
+            stream_client,
             url: format!("{}/api/remote", config.remote.trim_end_matches('/')),
         }
     }
@@ -324,6 +333,74 @@ impl Client {
     }
 
     #[tracing::instrument(skip(self))]
+    pub async fn set_database_backup_restore_status(
+        &self,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+        successful: bool,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("setting database backup restore status");
+
+        self.retry(
+            || {
+                super::backups::set_database_backup_restore_status(
+                    self,
+                    uuid,
+                    database_instance,
+                    successful,
+                )
+            },
+            Self::skip_client_errors,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn database_backup_source(
+        &self,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+    ) -> Result<reqwest::Response, anyhow::Error> {
+        tracing::info!("opening database backup source stream");
+
+        super::backups::database_backup_source(self, uuid, database_instance).await
+    }
+
+    #[tracing::instrument(skip(self, body))]
+    pub async fn database_backup_restore_target(
+        &self,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+        body: reqwest::Body,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("streaming database backup into restore target");
+
+        super::backups::database_backup_restore_target(self, uuid, database_instance, body).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn create_database_backup(
+        &self,
+        server: uuid::Uuid,
+        schedule: Option<uuid::Uuid>,
+        database_instance: uuid::Uuid,
+        name: Option<&str>,
+        backup_group: Option<uuid::Uuid>,
+    ) -> Result<(BackupAdapter, uuid::Uuid, compact_str::CompactString), anyhow::Error> {
+        tracing::info!("creating database backup");
+
+        super::backups::create_database_backup(
+            self,
+            server,
+            schedule,
+            database_instance,
+            name,
+            backup_group,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
     pub async fn backup_upload_urls(
         &self,
         uuid: uuid::Uuid,
@@ -436,6 +513,37 @@ impl Client {
 
     #[tracing::instrument(skip(self))]
     #[allow(clippy::too_many_arguments)]
+    pub async fn restore_database_backup(
+        &self,
+        server: uuid::Uuid,
+        schedule: Option<uuid::Uuid>,
+        backup: Option<uuid::Uuid>,
+        backup_name: Option<&str>,
+        backup_group: Option<uuid::Uuid>,
+        oldest: bool,
+        source_database_instance: Option<uuid::Uuid>,
+        database_instance: Option<uuid::Uuid>,
+        request_uuid: uuid::Uuid,
+    ) -> Result<(uuid::Uuid, uuid::Uuid), anyhow::Error> {
+        tracing::info!("requesting database backup restore");
+
+        super::backups::restore_database_backup(
+            self,
+            server,
+            schedule,
+            backup,
+            backup_name,
+            backup_group,
+            oldest,
+            source_database_instance,
+            database_instance,
+            request_uuid,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_backup(
         &self,
         server: uuid::Uuid,
@@ -455,6 +563,33 @@ impl Client {
             backup_name,
             backup_group,
             oldest,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_database_backup(
+        &self,
+        server: uuid::Uuid,
+        schedule: Option<uuid::Uuid>,
+        backup: Option<uuid::Uuid>,
+        backup_name: Option<&str>,
+        backup_group: Option<uuid::Uuid>,
+        oldest: bool,
+        database_instance: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        tracing::info!("requesting database backup deletion");
+
+        super::backups::delete_database_backup(
+            self,
+            server,
+            schedule,
+            backup,
+            backup_name,
+            backup_group,
+            oldest,
+            database_instance,
         )
         .await
     }
@@ -482,6 +617,35 @@ impl Client {
             backup_group,
             oldest,
             target_backup_group,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn move_database_backup(
+        &self,
+        server: uuid::Uuid,
+        schedule: Option<uuid::Uuid>,
+        backup: Option<uuid::Uuid>,
+        backup_name: Option<&str>,
+        backup_group: Option<uuid::Uuid>,
+        oldest: bool,
+        target_backup_group: Option<uuid::Uuid>,
+        database_instance: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        tracing::info!("requesting database backup move");
+
+        super::backups::move_database_backup(
+            self,
+            server,
+            schedule,
+            backup,
+            backup_name,
+            backup_group,
+            oldest,
+            target_backup_group,
+            database_instance,
         )
         .await
     }

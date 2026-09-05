@@ -8,7 +8,10 @@ use crate::{
     response::ApiResponse,
     routes::MimeCacheValue,
     server::{
-        backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
+        backup::{
+            Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
+            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+        },
         filesystem::{
             archive::StreamableArchiveFormat,
             cap::FileType,
@@ -88,6 +91,12 @@ impl KopiaBackup {
         config
             .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join(".kopia")
+    }
+
+    fn get_dump_staging_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
+        Self::get_kopia_state_path(config)
+            .join("dumps")
+            .join(uuid.to_string())
     }
 
     fn get_config_file_path(
@@ -468,6 +477,136 @@ impl BackupCreateExt for KopiaBackup {
             streaming: true,
             parts: vec![],
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamCreateExt for KopiaBackup {
+    async fn create_from_stream(
+        state: &crate::routes::State,
+        uuid: uuid::Uuid,
+        extension: &str,
+        mut reader: DumpReader,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let remote = state.config.client.backup_kopia_configuration(uuid).await?;
+
+        let config_file = Self::get_config_file_path(&state.config, &remote);
+        let cache_dir = Self::get_cache_dir_path(&state.config, &remote);
+        Self::ensure_connected(&config_file, &cache_dir, &remote).await?;
+
+        let staging_dir = Self::get_dump_staging_path(&state.config, uuid);
+        tokio::fs::create_dir_all(&staging_dir).await?;
+        let staged_file = staging_dir.join(format!("{uuid}.{extension}"));
+
+        let result =
+            async {
+                let mut file = tokio::fs::File::create(&staged_file).await?;
+                tokio::io::copy(&mut reader, &mut file).await?;
+                file.sync_all().await?;
+                drop(file);
+
+                let output =
+                    Self::get_tokio_command(&config_file, &remote)
+                        .arg("snapshot")
+                        .arg("create")
+                        .arg(&staged_file)
+                        .arg("--json")
+                        .arg("--description")
+                        .arg(format!("wings database backup {uuid}"))
+                        .arg("--tags")
+                        .arg(format!("{BACKUP_UUID_TAG}:{uuid}"))
+                        .args(remote.tags.iter().flat_map(|(key, value)| {
+                            ["--tags".to_string(), format!("{key}:{value}")]
+                        }))
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .output()
+                        .await?;
+
+                if !output.status.success() {
+                    return Err(anyhow::anyhow!(
+                        "failed to create Kopia snapshot: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+
+                let manifest: KopiaManifest = serde_json::from_slice(&output.stdout)?;
+                let size = tokio::fs::metadata(&staged_file).await?.len();
+
+                Ok::<_, anyhow::Error>((manifest.id, size))
+            }
+            .await;
+
+        if let Err(err) = tokio::fs::remove_dir_all(&staging_dir).await {
+            tracing::warn!(backup = %uuid, "failed to remove kopia dump staging directory: {:?}", err);
+        }
+
+        let (checksum, size) = result?;
+
+        Ok(RawServerBackup {
+            checksum,
+            checksum_type: "kopia".into(),
+            size,
+            files: 0,
+            successful: true,
+            browsable: false,
+            streaming: false,
+            parts: vec![],
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupStreamExt for KopiaBackup {
+    async fn read_stream(
+        &self,
+        _state: &crate::routes::State,
+        _download_url: Option<compact_str::CompactString>,
+    ) -> Result<BackupStream, anyhow::Error> {
+        let cache_dir = Self::get_cache_dir_path(&self.config, &self.remote);
+        Self::ensure_connected(&self.config_file, &cache_dir, &self.remote).await?;
+
+        let output = Self::get_tokio_command(&self.config_file, &self.remote)
+            .arg("snapshot")
+            .arg("list")
+            .arg("--json")
+            .arg("--all")
+            .arg("--tags")
+            .arg(format!("{BACKUP_UUID_TAG}:{}", self.uuid))
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to list Kopia snapshots: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let manifests: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        let file_name = manifests
+            .iter()
+            .find(|manifest| {
+                manifest.get("id").and_then(|id| id.as_str()) == Some(&self.manifest_id)
+            })
+            .and_then(|manifest| manifest.get("source"))
+            .and_then(|source| source.get("path"))
+            .and_then(|path| path.as_str())
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .map(compact_str::CompactString::from)
+            .ok_or_else(|| anyhow::anyhow!("kopia snapshot does not contain a database dump"))?;
+
+        let child = Self::get_tokio_command(&self.config_file, &self.remote)
+            .arg("show")
+            .arg(&self.root_oid)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        BackupStream::from_process(
+            child,
+            (self.total_size > 0).then_some(self.total_size),
+            file_name,
+        )
     }
 }
 
