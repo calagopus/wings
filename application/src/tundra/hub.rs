@@ -29,6 +29,17 @@ pub struct Hub {
     requests: AtomicU64,
 }
 
+struct PendingRequest<'a> {
+    hub: &'a Hub,
+    req_id: u64,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.hub.pending.lock().remove(&self.req_id);
+    }
+}
+
 pub struct Registration {
     pub id: u64,
     pub commands: mpsc::Receiver<RemoteMsg>,
@@ -93,28 +104,19 @@ impl Hub {
             .ok_or_else(|| anyhow::anyhow!("the tundra daemon is not connected"))?;
 
         self.pending.lock().insert(req_id, tx);
+        let _pending = PendingRequest { hub: self, req_id };
         if let Err(err) = sender.try_send(RemoteMsg::MetricsRequest { req_id }) {
-            self.pending.lock().remove(&req_id);
-
             return Err(anyhow::anyhow!("the tundra daemon outbox is full: {err}"));
         }
 
         match tokio::time::timeout(METRICS_TIMEOUT, rx).await {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => {
-                self.pending.lock().remove(&req_id);
-
-                Err(anyhow::anyhow!(
-                    "the tundra daemon websocket closed before replying with metrics"
-                ))
-            }
-            Err(_) => {
-                self.pending.lock().remove(&req_id);
-
-                Err(anyhow::anyhow!(
-                    "the tundra daemon did not reply with metrics within {METRICS_TIMEOUT:?}"
-                ))
-            }
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "the tundra daemon websocket closed before replying with metrics"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "the tundra daemon did not reply with metrics within {METRICS_TIMEOUT:?}"
+            )),
         }
     }
 
@@ -205,6 +207,26 @@ mod tests {
                 req_id: 9999,
                 body: serde_json::Value::Null,
             });
+        });
+    }
+
+    #[test]
+    fn cancelled_metrics_requests_release_their_pending_entry() {
+        tokio_test::block_on(async {
+            let hub = Arc::new(Hub::default());
+            let mut registration = hub.register();
+            let request = tokio::spawn({
+                let hub = Arc::clone(&hub);
+                async move { hub.request_metrics().await }
+            });
+            assert!(matches!(
+                registration.commands.recv().await,
+                Some(RemoteMsg::MetricsRequest { .. })
+            ));
+            assert_eq!(hub.pending.lock().len(), 1);
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(hub.pending.lock().is_empty());
         });
     }
 

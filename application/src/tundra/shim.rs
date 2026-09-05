@@ -183,7 +183,13 @@ async fn send(
 ) -> Result<(), ()> {
     let text = serde_json::to_string(message).map_err(|_| ())?;
 
-    sink.send(Message::Text(text.into())).await.map_err(|_| ())
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sink.send(Message::Text(text.into())),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
 }
 
 async fn task(socket: WebSocket, state: State) {
@@ -193,6 +199,11 @@ async fn task(socket: WebSocket, state: State) {
 
     let mut registration = tundra.hub.register();
     let conn_id = registration.id;
+    if !tundra.serving() {
+        tundra.hub.unregister(conn_id);
+        return;
+    }
+
     tracing::info!(conn_id, "tundra daemon websocket connected");
 
     let (mut sink, mut stream) = socket.split();

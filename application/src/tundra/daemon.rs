@@ -1,7 +1,7 @@
 use super::TundraManager;
-use crate::routes::State;
-use anyhow::Context;
+use crate::{io::hash_reader::HashReader, routes::State};
 use futures::StreamExt;
+use sha2::Digest;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -38,16 +38,7 @@ fn image_digest_path(manager: &TundraManager) -> PathBuf {
 fn sync_binary(source: &Path, dest: &Path) -> Result<bool, anyhow::Error> {
     use std::os::unix::fs::PermissionsExt;
 
-    let source_meta =
-        std::fs::metadata(source).context(format!("failed to stat {}", source.display()))?;
-    let unchanged = std::fs::metadata(dest).is_ok_and(|dest_meta| {
-        dest_meta.len() == source_meta.len()
-            && match (dest_meta.modified(), source_meta.modified()) {
-                (Ok(dest), Ok(source)) => dest >= source,
-                _ => false,
-            }
-    });
-    if unchanged {
+    if std::fs::metadata(dest).is_ok() && file_hash(source)? == file_hash(dest)? {
         return Ok(false);
     }
 
@@ -103,9 +94,22 @@ async fn extract_binary(
 
     let dest = binary_path(manager);
     let digest_path = image_digest_path(manager);
-    if std::fs::metadata(&dest).is_ok()
-        && std::fs::read_to_string(&digest_path).is_ok_and(|current| current.trim() == digest)
-    {
+    let guard = std::sync::Arc::clone(&manager.filesystem)
+        .lock_owned()
+        .await;
+    let unchanged = tokio::task::spawn_blocking({
+        let dest = dest.clone();
+        let digest_path = digest_path.clone();
+        let digest = digest.clone();
+        move || {
+            let _guard = guard;
+            std::fs::metadata(dest).is_ok()
+                && std::fs::read_to_string(digest_path)
+                    .is_ok_and(|current| current.trim() == digest)
+        }
+    })
+    .await?;
+    if unchanged {
         return Ok(false);
     }
 
@@ -132,40 +136,49 @@ async fn extract_binary(
     let archive = download_binary(docker, &entrypoint).await;
     remove_container(docker, EXTRACT_CONTAINER_NAME).await?;
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let staged = dest.with_extension("incoming");
-    let mut extracted = false;
-    for entry in tar::Archive::new(std::io::Cursor::new(archive?)).entries()? {
-        let mut entry = entry?;
-        if entry.header().entry_type().is_file() {
-            let mut file = std::fs::File::create(&staged)?;
-            std::io::copy(&mut entry, &mut file)?;
-            extracted = true;
-
-            break;
+    let archive = archive?;
+    let image = image.to_string();
+    let guard = std::sync::Arc::clone(&manager.filesystem)
+        .lock_owned()
+        .await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-    }
 
-    if !extracted {
-        return Err(anyhow::anyhow!(
-            "{entrypoint} is not a regular file in {image}"
-        ));
-    }
+        let staged = dest.with_extension("incoming");
+        let mut extracted = false;
+        for entry in tar::Archive::new(std::io::Cursor::new(archive)).entries()? {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_file() {
+                let mut file = std::fs::File::create(&staged)?;
+                std::io::copy(&mut entry, &mut file)?;
+                extracted = true;
 
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&staged, &dest)?;
-    std::fs::write(&digest_path, &digest)?;
+                break;
+            }
+        }
 
-    tracing::info!(
-        binary = %dest.display(),
-        image = %image,
-        "extracted the tundra daemon binary"
-    );
+        if !extracted {
+            return Err(anyhow::anyhow!(
+                "{entrypoint} is not a regular file in {image}"
+            ));
+        }
 
-    Ok(true)
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&staged, &dest)?;
+        std::fs::write(&digest_path, &digest)?;
+
+        tracing::info!(
+            binary = %dest.display(),
+            image = %image,
+            "extracted the tundra daemon binary"
+        );
+
+        Ok::<_, anyhow::Error>(true)
+    })
+    .await?
 }
 
 fn render_config(
@@ -190,13 +203,12 @@ fn render_config(
     .map_err(Into::into)
 }
 
-fn sync_config(manager: &TundraManager, rendered: &str) -> Result<bool, anyhow::Error> {
-    let path = config_path(manager);
-    if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
+fn sync_config(path: &Path, rendered: &str) -> Result<bool, anyhow::Error> {
+    if std::fs::read_to_string(path).is_ok_and(|current| current == rendered) {
         return Ok(false);
     }
 
-    super::write_private(&path, rendered.as_bytes())?;
+    super::write_private(path, rendered.as_bytes())?;
     tracing::info!(config = %path.display(), "wrote the tundra daemon config");
 
     Ok(true)
@@ -371,7 +383,64 @@ async fn remove_container(docker: &bollard::Docker, id: &str) -> Result<(), anyh
     }
 }
 
+fn file_hash(path: &Path) -> Result<tundra_common::hash::Hash32, anyhow::Error> {
+    let mut reader = HashReader::new_with_hasher(std::fs::File::open(path)?, sha2::Sha256::new());
+    std::io::copy(&mut reader, &mut std::io::sink())?;
+    Ok(tundra_common::hash::Hash32(reader.finish().into()))
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+struct Applied {
+    binary_sha256: tundra_common::hash::Hash32,
+    config_sha256: tundra_common::hash::Hash32,
+}
+
+impl Applied {
+    fn matches(&self, metrics: &serde_json::Value) -> bool {
+        metrics
+            .get("applied")
+            .and_then(|applied| serde_json::from_value::<Self>(applied.clone()).ok())
+            .is_some_and(|applied| applied == *self)
+    }
+}
+
+pub async fn stop(manager: &TundraManager) -> Result<(), anyhow::Error> {
+    let docker = manager.docker();
+    let inspect = match docker.inspect_container(CONTAINER_NAME, None).await {
+        Ok(inspect) => inspect,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get("ContainerType"))
+        .is_some_and(|value| value == CONTAINER_TYPE)
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to stop an unowned tundra container"
+        ));
+    }
+    if !manager.disabled() {
+        return Ok(());
+    }
+    remove_container(
+        &docker,
+        &inspect.id.unwrap_or_else(|| CONTAINER_NAME.to_string()),
+    )
+    .await?;
+    manager.hub.disconnect();
+    Ok(())
+}
+
 pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow::Error> {
+    if !manager.serving() {
+        return Ok(());
+    }
+
     let config = state.config.load();
     let Some(own) = manager.cached().and_then(|snapshot| {
         snapshot
@@ -400,20 +469,41 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     let desired = create_body(state, manager, &image);
     drop(config);
 
-    let binary_changed = if source.as_os_str().is_empty() {
-        extract_binary(&docker, manager, &source_image).await?
+    if source.as_os_str().is_empty() {
+        extract_binary(&docker, manager, &source_image).await?;
     } else {
-        let changed = sync_binary(&source, &binary_path(manager))?;
-        std::fs::remove_file(image_digest_path(manager)).ok();
+        let dest = binary_path(manager);
+        let digest_path = image_digest_path(manager);
+        let guard = std::sync::Arc::clone(&manager.filesystem)
+            .lock_owned()
+            .await;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            sync_binary(&source, &dest)?;
+            std::fs::remove_file(digest_path).ok();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+    }
 
-        changed
-    };
-    let config_changed = sync_config(
-        manager,
-        &render_config(manager, own.tunnel_port, metrics_port, &hosts_path)?,
-    )?;
-    if binary_changed || config_changed {
-        manager.set_restart_pending(true);
+    let rendered = render_config(manager, own.tunnel_port, metrics_port, &hosts_path)?;
+    let path = config_path(manager);
+    let binary = binary_path(manager);
+    let guard = std::sync::Arc::clone(&manager.filesystem)
+        .lock_owned()
+        .await;
+    let wanted = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        sync_config(&path, &rendered)?;
+        Ok::<_, anyhow::Error>(Applied {
+            binary_sha256: file_hash(&binary)?,
+            config_sha256: tundra_common::hash::sha256(rendered.as_bytes()),
+        })
+    })
+    .await??;
+
+    if !manager.serving() {
+        return Ok(());
     }
 
     let image_id = match docker.inspect_image(&image).await {
@@ -492,12 +582,19 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     };
 
     if running {
-        if manager.restart_pending() {
-            tracing::info!("restarting the tundra daemon in place");
-            restart_in_place(&docker, manager).await?;
-            manager.set_restart_pending(false);
+        let applied = manager.hub.request_metrics().await;
+        if applied
+            .as_ref()
+            .is_ok_and(|metrics| wanted.matches(metrics))
+        {
+            return Ok(());
         }
 
+        if manager.serving() && manager.restart_due() {
+            tracing::info!("requesting the tundra daemon to apply its current binary and config");
+            tokio::time::timeout(Duration::from_secs(30), restart_in_place(&docker, manager))
+                .await??;
+        }
         return Ok(());
     }
 
@@ -507,6 +604,10 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     }
 
     for attempt in 1..=CREATE_ATTEMPTS {
+        if !manager.serving() {
+            return Ok(());
+        }
+
         match docker
             .create_container(
                 Some(bollard::query_parameters::CreateContainerOptions {
@@ -527,6 +628,10 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
         }
     }
 
+    if !manager.serving() {
+        return Ok(());
+    }
+
     match docker.start_container(CONTAINER_NAME, None).await {
         Ok(())
         | Err(bollard::errors::Error::DockerResponseServerError {
@@ -535,7 +640,9 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
         Err(err) => return Err(err.into()),
     }
 
-    manager.set_restart_pending(false);
+    if manager.disabled() {
+        return stop(manager).await;
+    }
 
     tracing::info!(
         tunnel_port = own.tunnel_port,

@@ -3,7 +3,30 @@ use serde::Deserialize;
 use serde_json::json;
 use tundra_common::{hash::Hash32, state::Snapshot};
 
-pub async fn get_state(client: &Client) -> Result<Snapshot, anyhow::Error> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum TunnelState {
+    Enabled(Snapshot),
+    Disabled { disabled: Disabled },
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "bool")]
+pub struct Disabled;
+
+impl TryFrom<bool> for Disabled {
+    type Error = &'static str;
+
+    fn try_from(value: bool) -> Result<Self, Self::Error> {
+        if value {
+            Ok(Self)
+        } else {
+            Err("disabled must be true")
+        }
+    }
+}
+
+pub async fn get_state(client: &Client) -> Result<TunnelState, anyhow::Error> {
     super::into_json(
         client
             .client

@@ -652,7 +652,7 @@ impl Client {
 
     #[cfg(unix)]
     #[tracing::instrument(skip(self))]
-    pub async fn tundra_state(&self) -> Result<tundra_common::state::Snapshot, anyhow::Error> {
+    pub async fn tundra_state(&self) -> Result<super::tundra::TunnelState, anyhow::Error> {
         tracing::debug!("fetching tundra state");
 
         super::tundra::get_state(self).await

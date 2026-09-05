@@ -5,6 +5,7 @@ version = "1.2.0"
 edition = "2024"
 
 [dependencies]
+tempfile = "3.27.0"
 unrar = { path = "../unrar-rs" }
 pbs-client = { path = "../pbs-client" }
 tundra-common = { git = "https://github.com/calagopus/tundra.git" }
@@ -116,7 +117,6 @@ libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
 
 [dev-dependencies]
 tokio-test = "0.4.5"
-tempfile = "3.27.0"
 
 [build-dependencies]
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
