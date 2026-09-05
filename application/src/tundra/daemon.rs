@@ -5,6 +5,7 @@ use sha2::Digest;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -81,11 +82,6 @@ async fn extract_binary(
     image: &str,
 ) -> Result<bool, anyhow::Error> {
     use std::os::unix::fs::PermissionsExt;
-
-    if !image_exists(docker, image).await {
-        tracing::info!(image = %image, "pulling the tundra source image");
-        pull_image(docker, image).await?;
-    }
 
     let inspect = docker.inspect_image(image).await?;
     let digest = inspect
@@ -214,22 +210,27 @@ fn sync_config(path: &Path, rendered: &str) -> Result<bool, anyhow::Error> {
     Ok(true)
 }
 
-async fn image_exists(docker: &bollard::Docker, image: &str) -> bool {
-    docker
-        .list_images(Some(bollard::query_parameters::ListImagesOptions {
-            all: true,
-            filters: Some(HashMap::from([(
-                "reference".to_string(),
-                vec![image.to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .is_ok_and(|images| !images.is_empty())
+async fn local_image_id(
+    docker: &bollard::Docker,
+    image: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    match docker.inspect_image(image).await {
+        Ok(inspect) => Ok(inspect.id),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
-async fn pull_image(docker: &bollard::Docker, image: &str) -> Result<(), anyhow::Error> {
-    let (name, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
+async fn pull_image(
+    docker: &bollard::Docker,
+    state: &State,
+    image: &str,
+) -> Result<(), anyhow::Error> {
+    let (name, tag) = crate::server::executor::docker::split_image_reference(image);
+    let registry_auth =
+        crate::server::executor::docker::registry_credentials(&state.config.load(), image);
 
     let mut stream = docker.create_image(
         Some(bollard::query_parameters::CreateImageOptions {
@@ -238,11 +239,46 @@ async fn pull_image(docker: &bollard::Docker, image: &str) -> Result<(), anyhow:
             ..Default::default()
         }),
         None,
-        None,
+        registry_auth,
     );
 
     while let Some(chunk) = stream.next().await {
         chunk?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_image(
+    docker: &bollard::Docker,
+    state: &State,
+    image: &str,
+    purpose: &str,
+    refresh: bool,
+) -> Result<(), anyhow::Error> {
+    let current = local_image_id(docker, image).await?;
+    if current.is_some() && !refresh {
+        return Ok(());
+    }
+
+    tracing::info!(image = %image, "pulling the tundra {} image", purpose);
+    match pull_image(docker, state, image).await {
+        Ok(()) => {}
+        Err(err) if current.is_some() => {
+            tracing::warn!(
+                image = %image,
+                "failed to refresh the tundra {} image, keeping the local copy: {:#}",
+                purpose,
+                err
+            );
+
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    }
+
+    if current.is_some() && local_image_id(docker, image).await? != current {
+        tracing::info!(image = %image, "the tundra {} image has an update, applying it", purpose);
     }
 
     Ok(())
@@ -469,7 +505,10 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     let desired = create_body(state, manager, &image);
     drop(config);
 
+    let refresh = !manager.images_refreshed.load(Ordering::Relaxed);
+
     if source.as_os_str().is_empty() {
+        ensure_image(&docker, state, &source_image, "source", refresh).await?;
         extract_binary(&docker, manager, &source_image).await?;
     } else {
         let dest = binary_path(manager);
@@ -506,13 +545,10 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
         return Ok(());
     }
 
-    let image_id = match docker.inspect_image(&image).await {
-        Ok(inspect) => inspect.id,
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => None,
-        Err(err) => return Err(err.into()),
-    };
+    ensure_image(&docker, state, &image, "daemon", refresh).await?;
+    manager.images_refreshed.store(true, Ordering::Relaxed);
+
+    let image_id = local_image_id(&docker, &image).await?;
 
     let running = match docker.inspect_container(CONTAINER_NAME, None).await {
         Ok(inspect) => {
@@ -596,11 +632,6 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
                 .await??;
         }
         return Ok(());
-    }
-
-    if !image_exists(&docker, &image).await {
-        tracing::info!(image = %image, "pulling the tundra daemon image");
-        pull_image(&docker, &image).await?;
     }
 
     for attempt in 1..=CREATE_ATTEMPTS {

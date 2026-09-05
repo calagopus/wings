@@ -20,6 +20,37 @@ use tokio::io::{AsyncWriteExt, ReadBuf};
 pub mod cgroup;
 pub mod host_mounts;
 
+pub fn split_image_reference(image: &str) -> (&str, &str) {
+    match image.rsplit_once(':') {
+        Some((name, tag)) if !tag.is_empty() => {
+            let colon_is_tag_sep = image.rfind('/').is_none_or(|slash| slash < name.len());
+            if colon_is_tag_sep {
+                (name, tag)
+            } else {
+                (image, "latest")
+            }
+        }
+        _ => (image, "latest"),
+    }
+}
+
+pub fn registry_credentials(
+    config: &crate::config::InnerConfig,
+    image: &str,
+) -> Option<bollard::auth::DockerCredentials> {
+    config
+        .docker
+        .registries
+        .iter()
+        .find(|(registry, _)| image.starts_with(registry.as_str()))
+        .map(|(registry, config)| bollard::auth::DockerCredentials {
+            username: Some(config.username.clone()),
+            password: Some(config.password.clone()),
+            serveraddress: Some(registry.clone()),
+            ..Default::default()
+        })
+}
+
 #[inline]
 pub fn string_to_option(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -1032,17 +1063,7 @@ impl DockerExecutor {
             return Ok(());
         }
 
-        let (image_name, tag) = match image.rsplit_once(':') {
-            Some((name, tag)) if !tag.is_empty() => {
-                let colon_is_tag_sep = image.rfind('/').is_none_or(|slash| slash < name.len());
-                if colon_is_tag_sep {
-                    (name, tag)
-                } else {
-                    (image, "latest")
-                }
-            }
-            _ => (image, "latest"),
-        };
+        let (image_name, tag) = split_image_reference(image);
 
         let pull_cache = {
             type InnerMap = HashMap<
@@ -1086,18 +1107,7 @@ impl DockerExecutor {
 
         let cache_config = self.app_config.load().docker.registry_image_fetch_cache;
 
-        let mut registry_auth = None;
-        for (registry, config) in self.app_config.load().docker.registries.iter() {
-            if image.starts_with(registry.as_str()) {
-                registry_auth = Some(bollard::auth::DockerCredentials {
-                    username: Some(config.username.clone()),
-                    password: Some(config.password.clone()),
-                    serveraddress: Some(registry.clone()),
-                    ..Default::default()
-                });
-                break;
-            }
-        }
+        let registry_auth = registry_credentials(&self.app_config.load(), image);
 
         if cache_config.background_refresh && self.image_exists(image_name).await {
             let entry = {
