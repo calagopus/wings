@@ -117,6 +117,40 @@ async fn get_root_pool_name(path: &Path) -> Result<String, std::io::Error> {
     )))
 }
 
+async fn get_pool_altroot(pool: &str) -> Option<PathBuf> {
+    let output = Command::new("zpool")
+        .arg("get")
+        .arg("-H")
+        .arg("-o")
+        .arg("value")
+        .arg("altroot")
+        .arg(pool)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let altroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if altroot.is_empty() || altroot == "-" {
+        return None;
+    }
+
+    Some(PathBuf::from(altroot))
+}
+
+async fn get_dataset_mountpoint(pool: &str, path: &Path) -> PathBuf {
+    if let Some(altroot) = get_pool_altroot(pool).await
+        && let Ok(stripped) = path.strip_prefix(&altroot)
+    {
+        return Path::new("/").join(stripped);
+    }
+
+    path.to_path_buf()
+}
+
 pub struct ZfsDatasetLimiter<'a> {
     pub filesystem: &'a crate::server::filesystem::Filesystem,
 }
@@ -136,13 +170,11 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
             .await
             .is_err()
         {
+            let mountpoint = get_dataset_mountpoint(&pool_name, &self.filesystem.base_path).await;
             let output = Command::new("zfs")
                 .arg("create")
                 .arg("-o")
-                .arg(format!(
-                    "mountpoint={}",
-                    self.filesystem.base_path.display()
-                ))
+                .arg(format!("mountpoint={}", mountpoint.display()))
                 .arg(&dataset_name)
                 .output()
                 .await?;
@@ -263,7 +295,14 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
             .await?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
             super::remove_volume(self.filesystem).await.ok();
+            DISK_USAGE.write().await.remove(&self.filesystem.uuid);
+
+            return Err(std::io::Error::other(format!(
+                "failed to destroy zfs dataset {dataset_name}: {stderr}"
+            )));
         }
 
         DISK_USAGE.write().await.remove(&self.filesystem.uuid);

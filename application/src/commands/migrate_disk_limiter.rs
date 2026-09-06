@@ -168,11 +168,15 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                             .arg("list")
                             .arg("-H")
                             .arg("-o")
-                            .arg("name")
+                            .arg("mountpoint")
                             .arg(&base_path)
                             .output()
                             .await
-                            .map(|o| o.status.success()),
+                            .map(|o| {
+                                o.status.success()
+                                    && Path::new(String::from_utf8_lossy(&o.stdout).trim())
+                                        == base_path
+                            }),
                     };
                     match already_migrated {
                         Ok(true) => {

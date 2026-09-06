@@ -205,7 +205,7 @@ impl BackupCreateExt for ZfsBackup {
             let output = Command::new("zfs")
                 .arg("list")
                 .arg("-o")
-                .arg("name")
+                .arg("name,mountpoint")
                 .arg("-H")
                 .arg(&server.filesystem.base_path)
                 .output()
@@ -219,7 +219,20 @@ impl BackupCreateExt for ZfsBackup {
                 ));
             }
 
-            let dataset_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut columns = stdout.trim().split('\t');
+            let dataset_name = columns.next().unwrap_or_default().to_string();
+            let mountpoint = columns.next().unwrap_or_default();
+
+            if Path::new(mountpoint) != server.filesystem.base_path {
+                return Err(anyhow::anyhow!(
+                    "server volume {} is not its own ZFS dataset (found {} mounted at {}); \
+                     enable the zfs_dataset disk limiter and migrate the server first",
+                    server.filesystem.base_path.display(),
+                    dataset_name,
+                    mountpoint
+                ));
+            }
 
             tokio::fs::write(&ignored_path, ignore_raw).await?;
             tokio::fs::write(backup_path.join("dataset"), &dataset_name).await?;

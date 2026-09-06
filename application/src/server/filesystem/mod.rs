@@ -1819,11 +1819,20 @@ impl Filesystem {
             .await;
 
         if let Err(err) = self.get_disk_limiter().destroy().await {
-            tracing::error!(
+            tracing::debug!(
                 path = %self.base_path.display(),
-                "failed to delete server base directory for: {}",
+                "disk limiter destroy failed, retrying without an open handle: {}",
                 err
             );
+            self.close();
+
+            if let Err(err) = self.get_disk_limiter().destroy().await {
+                tracing::error!(
+                    path = %self.base_path.display(),
+                    "failed to delete server base directory for: {}",
+                    err
+                );
+            }
         }
     }
 
