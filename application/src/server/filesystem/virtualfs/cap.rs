@@ -1,7 +1,8 @@
 use super::{
     AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
-    AsyncWritableSeekableFileStream, ByteRange, DirectoryListing, FileMetadata, FileRead, FileType,
-    IsIgnoredFn, VirtualWalkEntry, WritableSeekableFileStream,
+    AsyncWritableSeekableFileStream, ByteRange, DirectoryListing, DirectoryWalkFilterFn,
+    DirectoryWalkFn, FileMetadata, FileRead, FileType, IsIgnoredFn, VirtualWalkEntry,
+    WritableSeekableFileStream,
 };
 use crate::{
     io::compression::CompressionLevel,
@@ -20,6 +21,7 @@ use std::{
     cmp::Ordering,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -252,6 +254,24 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .await)
     }
 
+    fn directory_entry_from_metadata(
+        &self,
+        path: &Path,
+        metadata: &cap_std::fs::Metadata,
+        buffer: Option<&[u8]>,
+    ) -> Option<DirectoryEntry> {
+        if metadata.is_dir() {
+            return None;
+        }
+
+        Some(self.server.filesystem.to_api_file_entry_buffer(
+            path.to_path_buf(),
+            metadata,
+            DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            buffer,
+        ))
+    }
+
     async fn async_read_dir(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -461,6 +481,19 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                     res.map(VirtualWalkEntry::with_source)
                         .map_err(|err| err.into())
                 })
+            }
+
+            fn run_parallel(
+                &mut self,
+                threads: usize,
+                filter: Option<DirectoryWalkFilterFn>,
+                func: DirectoryWalkFn,
+            ) -> Result<(), anyhow::Error> {
+                self.inner.run_parallel(
+                    threads,
+                    filter,
+                    Arc::new(move |entry| func(VirtualWalkEntry::with_source(entry))),
+                )
             }
         }
 

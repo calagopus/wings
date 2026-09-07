@@ -34,6 +34,12 @@ opt-level = "s"
 codegen-units = 1
 strip = true
 
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.aho-corasick]
+opt-level = 3
+
 [profile.release]
 opt-level = "s"
 lto = "fat"

@@ -1,6 +1,14 @@
-use crate::server::filesystem::virtualfs::IsIgnoredFn;
+use crate::server::filesystem::virtualfs::{DirectoryWalkFilterFn, IsIgnoredFn};
 use parking_lot::RwLock;
-use std::{borrow::Cow, collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +159,15 @@ impl WalkEntry {
         match &self.source {
             StatSource::Entry(entry) => entry.metadata(),
             StatSource::Path(cap_filesystem) => cap_filesystem.symlink_metadata(&self.path),
+        }
+    }
+
+    /// Opens the entry for reading relative to the directory it was listed from,
+    /// which skips resolving the whole path from the sandbox root again.
+    pub fn open(&self) -> Result<std::fs::File, std::io::Error> {
+        match &self.source {
+            StatSource::Entry(entry) => Ok(entry.open()?.into_std()),
+            StatSource::Path(cap_filesystem) => cap_filesystem.open(&self.path),
         }
     }
 
@@ -381,13 +398,28 @@ impl WalkDir {
         threads: usize,
         func: Arc<F>,
     ) -> Result<(), anyhow::Error> {
+        self.run_multithreaded_filtered(threads, None, func)
+    }
+
+    pub fn run_multithreaded_filtered<
+        F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
+    >(
+        &mut self,
+        threads: usize,
+        filter: Option<DirectoryWalkFilterFn>,
+        func: Arc<F>,
+    ) -> Result<(), anyhow::Error> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()?;
         let error = Arc::new(RwLock::new(None));
-        let in_flight = crate::utils::InFlightLimit::new(crate::utils::WALK_IN_FLIGHT_LIMIT);
+        let in_flight = crate::utils::InFlightLimit::new(
+            crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE,
+        );
 
         pool.in_place_scope(|scope| {
+            let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+
             while let Some(entry) = self.next_entry() {
                 match entry {
                     Ok(entry) => {
@@ -395,27 +427,54 @@ impl WalkDir {
                             break;
                         }
 
-                        let error = Arc::clone(&error);
-                        let func = Arc::clone(&func);
+                        if let Some(filter) = &filter
+                            && !filter(entry.file_type, &entry.path)
+                        {
+                            continue;
+                        }
+
+                        batch.push(entry);
+                        if batch.len() < crate::utils::WALK_BATCH_SIZE {
+                            continue;
+                        }
+
+                        let batch = std::mem::replace(
+                            &mut batch,
+                            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+                        );
                         let permit = in_flight.acquire();
 
-                        scope.spawn(move |_| {
-                            let _permit = permit;
-
-                            if crate::unlikely(error.read().is_some()) {
-                                return;
-                            }
-
-                            if let Err(err) = func(entry) {
-                                *error.write() = Some(err);
-                            }
-                        });
+                        crate::utils::spawn_walk_batch(
+                            scope,
+                            Arc::clone(&error),
+                            {
+                                let func = Arc::clone(&func);
+                                move |entry| func(entry)
+                            },
+                            permit,
+                            batch,
+                        );
                     }
                     Err(err) => {
                         *error.write() = Some(err.into());
                         break;
                     }
                 }
+            }
+
+            if !batch.is_empty() {
+                let permit = in_flight.acquire();
+
+                crate::utils::spawn_walk_batch(
+                    scope,
+                    Arc::clone(&error),
+                    {
+                        let func = Arc::clone(&func);
+                        move |entry| func(entry)
+                    },
+                    permit,
+                    batch,
+                );
             }
         });
 
@@ -424,5 +483,161 @@ impl WalkDir {
         }
 
         Ok(())
+    }
+
+    /// Reads directories as independent pool tasks instead of from one producer
+    /// thread. Entries arrive in no particular order; a directory that fails to
+    /// open fails the walk like the serial walker does. Only a fresh, pre-order
+    /// walker can be split this way, anything else takes the serial path.
+    pub fn run_parallel<F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static>(
+        &mut self,
+        threads: usize,
+        filter: Option<DirectoryWalkFilterFn>,
+        func: Arc<F>,
+    ) -> Result<(), anyhow::Error> {
+        if self.reversed || self.stack.len() != 1 {
+            return self.run_multithreaded_filtered(threads, filter, func);
+        }
+
+        let (root, root_read_dir) = self.stack.pop().expect("stack holds the root");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        let context = ParallelWalkContext {
+            cap_filesystem: self.cap_filesystem.clone(),
+            is_ignored: self.is_ignored.clone(),
+            filter,
+            func,
+            error: RwLock::new(None),
+            stopped: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
+        };
+
+        pool.in_place_scope(|scope| {
+            parallel_walk_visit(scope, &context, root, Some(root_read_dir));
+        });
+
+        if let Some(err) = context.error.write().take() {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+}
+
+struct ParallelWalkContext<F> {
+    cap_filesystem: super::CapFilesystem,
+    is_ignored: IsIgnoredFn,
+    filter: Option<DirectoryWalkFilterFn>,
+    func: Arc<F>,
+    error: RwLock<Option<anyhow::Error>>,
+    stopped: AtomicBool,
+    queued: AtomicUsize,
+}
+
+impl<F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static> ParallelWalkContext<F> {
+    #[inline]
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    fn fail(&self, err: anyhow::Error) {
+        self.stopped.store(true, Ordering::Relaxed);
+
+        let mut error = self.error.write();
+        if error.is_none() {
+            *error = Some(err);
+        }
+    }
+
+    fn process_batch(&self, batch: Vec<WalkEntry>) {
+        for entry in batch {
+            if crate::unlikely(self.stopped()) {
+                return;
+            }
+
+            if let Err(err) = (self.func)(entry) {
+                self.fail(err);
+                return;
+            }
+        }
+    }
+}
+
+fn parallel_walk_visit<'scope, F>(
+    scope: &rayon::Scope<'scope>,
+    context: &'scope ParallelWalkContext<F>,
+    path: PathBuf,
+    read_dir: Option<ReadDir>,
+) where
+    F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
+{
+    if context.stopped() {
+        return;
+    }
+
+    let mut read_dir = match read_dir {
+        Some(read_dir) => read_dir,
+        None => match context.cap_filesystem.read_dir(&path) {
+            Ok(read_dir) => read_dir,
+            Err(err) => return context.fail(err.into()),
+        },
+    };
+    let queue_limit = crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE;
+    let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+
+    while let Some(entry) = read_dir.next() {
+        if context.stopped() {
+            return;
+        }
+
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => return context.fail(err.into()),
+        };
+        let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
+        let full_path = path.join(entry.file_name());
+
+        let Some(full_path) = (context.is_ignored)(file_type, full_path) else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            let child = full_path.clone();
+            scope.spawn(move |scope| parallel_walk_visit(scope, context, child, None));
+        }
+
+        if let Some(filter) = &context.filter
+            && !filter(file_type, &full_path)
+        {
+            continue;
+        }
+
+        batch.push(WalkEntry {
+            path: full_path,
+            file_type,
+            source: StatSource::Entry(entry),
+        });
+        if batch.len() < crate::utils::WALK_BATCH_SIZE {
+            continue;
+        }
+
+        let batch = std::mem::replace(
+            &mut batch,
+            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+        );
+        if context.queued.load(Ordering::Relaxed) < queue_limit {
+            context.queued.fetch_add(1, Ordering::Relaxed);
+            scope.spawn(move |_| {
+                context.process_batch(batch);
+                context.queued.fetch_sub(1, Ordering::Relaxed);
+            });
+        } else {
+            context.process_batch(batch);
+        }
+    }
+
+    if !batch.is_empty() {
+        context.process_batch(batch);
     }
 }

@@ -1887,6 +1887,49 @@ impl Filesystem {
             crate::utils::detect_mime_type(real_path, buffer)
         };
 
+        Self::assemble_api_entry(
+            path,
+            metadata,
+            real_metadata,
+            options,
+            (size, size_physical),
+            detected_mime,
+        )
+    }
+
+    /// Synchronous counterpart of [`Self::to_api_entry_buffer`] for entries that are
+    /// not directories, whose size never needs a walk.
+    pub fn to_api_file_entry_buffer(
+        &self,
+        path: PathBuf,
+        metadata: &Metadata,
+        options: DirectoryEntryOptions,
+        buffer: Option<&[u8]>,
+    ) -> crate::models::DirectoryEntry {
+        let detected_mime = if metadata.is_symlink() {
+            MimeCacheValue::symlink()
+        } else {
+            crate::utils::detect_mime_type(&path, buffer)
+        };
+
+        Self::assemble_api_entry(
+            path,
+            metadata,
+            metadata,
+            options,
+            (metadata.size_logical(), metadata.size_physical()),
+            detected_mime,
+        )
+    }
+
+    fn assemble_api_entry(
+        path: PathBuf,
+        metadata: &Metadata,
+        real_metadata: &Metadata,
+        options: DirectoryEntryOptions,
+        (size, size_physical): (u64, u64),
+        detected_mime: MimeCacheValue,
+    ) -> crate::models::DirectoryEntry {
         crate::models::DirectoryEntry {
             name: path
                 .file_name()

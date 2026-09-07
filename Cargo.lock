@@ -6228,6 +6228,7 @@ name = "wings-rs"
 version = "1.2.1"
 dependencies = [
  "accept-header",
+ "aho-corasick",
  "anyhow",
  "arc-swap",
  "async-channel",

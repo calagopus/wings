@@ -872,6 +872,38 @@ mod tests {
 /// the limit is simply never reached - and low enough that a producer which does
 /// outrun them cannot grow the queue without bound.
 pub const WALK_IN_FLIGHT_LIMIT: usize = 4096;
+/// Entries handed to one rayon task by the multithreaded walkers. One task per
+/// entry made the walk thread spend most of its time on job allocation and
+/// permit wake-ups rather than on reading directories.
+pub const WALK_BATCH_SIZE: usize = 32;
+
+/// Runs `func` over `batch` on the pool, stopping at the first error or as soon
+/// as another task has already failed.
+pub fn spawn_walk_batch<'scope, T, F>(
+    scope: &rayon::Scope<'scope>,
+    error: std::sync::Arc<parking_lot::RwLock<Option<anyhow::Error>>>,
+    func: F,
+    permit: InFlightPermit,
+    batch: Vec<T>,
+) where
+    T: Send + 'scope,
+    F: Fn(T) -> Result<(), anyhow::Error> + Send + 'scope,
+{
+    scope.spawn(move |_| {
+        let _permit = permit;
+
+        for entry in batch {
+            if crate::unlikely(error.read().is_some()) {
+                return;
+            }
+
+            if let Err(err) = func(entry) {
+                *error.write() = Some(err);
+                return;
+            }
+        }
+    });
+}
 
 pub struct InFlightLimit {
     limit: usize,

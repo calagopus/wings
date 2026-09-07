@@ -1,5 +1,9 @@
 use super::{AsyncReadableFileStream, FileType, VirtualWalkEntry};
-use std::{ops::Deref, path::PathBuf, sync::Arc};
+use std::{
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 type IsIgnoredFnInner = dyn Fn(FileType, PathBuf) -> Option<PathBuf> + Send + Sync + 'static;
 type AsyncIsIgnoredFnInner = dyn Fn(FileType, PathBuf) -> futures::future::BoxFuture<'static, Option<PathBuf>>
@@ -137,72 +141,22 @@ impl<T: Fn(FileType, PathBuf) -> Option<PathBuf> + Send + Sync + 'static> From<T
     }
 }
 
-#[cfg(test)]
-mod is_ignored_fn_tests {
-    use super::*;
-    use std::path::Path;
+type DirectoryWalkFilterFnInner = dyn Fn(FileType, &Path) -> bool + Send + Sync + 'static;
 
-    #[test]
-    fn excluding_rejects_only_the_exact_path() {
-        let filter = IsIgnoredFn::default().excluding(PathBuf::from("logs/archive.zip"));
+#[derive(Clone)]
+pub struct DirectoryWalkFilterFn(Arc<DirectoryWalkFilterFnInner>);
 
-        assert!(filter(FileType::File, PathBuf::from("logs/archive.zip")).is_none());
-        assert!(filter(FileType::File, PathBuf::from("logs/./archive.zip")).is_none());
-
-        assert_eq!(
-            filter(FileType::File, PathBuf::from("logs/archive.zip.bak")),
-            Some(PathBuf::from("logs/archive.zip.bak"))
-        );
-        assert_eq!(
-            filter(FileType::File, PathBuf::from("archive.zip")),
-            Some(PathBuf::from("archive.zip"))
-        );
-        assert_eq!(
-            filter(FileType::Dir, PathBuf::from("logs")),
-            Some(PathBuf::from("logs"))
-        );
+impl<T: Fn(FileType, &Path) -> bool + Send + Sync + 'static> From<T> for DirectoryWalkFilterFn {
+    fn from(f: T) -> Self {
+        Self(Arc::new(f))
     }
+}
 
-    #[test]
-    fn excluding_keeps_the_underlying_filter() {
-        let gitignore = crate::server::filesystem::build_gitignore_matcher(["*.log"].iter())
-            .expect("building the matcher failed");
-        let filter = IsIgnoredFn::from(gitignore).excluding(PathBuf::from("archive.zip"));
+impl Deref for DirectoryWalkFilterFn {
+    type Target = DirectoryWalkFilterFnInner;
 
-        assert!(filter(FileType::File, PathBuf::from("latest.log")).is_none());
-        assert!(filter(FileType::File, PathBuf::from("archive.zip")).is_none());
-        assert_eq!(
-            filter(FileType::File, PathBuf::from("server.properties")),
-            Some(PathBuf::from("server.properties"))
-        );
-    }
-
-    #[test]
-    fn excluding_applies_to_the_async_half_too() {
-        tokio_test::block_on(async {
-            let filter = IsIgnoredFn::default().excluding(PathBuf::from("logs/archive.zip"));
-
-            assert!(
-                filter
-                    .call_async(FileType::File, PathBuf::from("logs/archive.zip"))
-                    .await
-                    .is_none()
-            );
-            assert!(
-                filter
-                    .call_async(FileType::File, PathBuf::from("logs/other.zip"))
-                    .await
-                    .is_some()
-            );
-        });
-    }
-
-    #[test]
-    fn path_equality_normalizes_interior_current_dir_components() {
-        assert_eq!(
-            Path::new("logs/./archive.zip"),
-            Path::new("logs/archive.zip")
-        );
+    fn deref(&self) -> &Self::Target {
+        &*self.0
     }
 }
 

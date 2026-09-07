@@ -11,7 +11,8 @@ use crate::{
 };
 use axum::http::{HeaderMap, HeaderValue};
 pub use functions::{
-    AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, DirectoryWalkFn, IsIgnoredFn,
+    AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, DirectoryWalkFilterFn, DirectoryWalkFn,
+    IsIgnoredFn,
 };
 use parking_lot::RwLock;
 use std::{
@@ -307,6 +308,18 @@ impl VirtualWalkEntry {
             None => filesystem.async_symlink_metadata(&self.path).await,
         }
     }
+
+    /// Metadata taken straight from the directory entry the walker read (a single
+    /// `statx` on the parent directory), when this walk has one.
+    pub fn source_metadata(&self) -> Option<Result<cap_std::fs::Metadata, std::io::Error>> {
+        self.source.as_ref().map(|source| source.metadata())
+    }
+
+    /// Opens the entry relative to the directory the walker read it from, when this
+    /// walk has one. The walker already applied its ignore filter to this path.
+    pub fn open_source(&self) -> Option<Result<std::fs::File, std::io::Error>> {
+        self.source.as_ref().map(|source| source.open())
+    }
 }
 
 pub trait DirectoryWalk {
@@ -324,13 +337,26 @@ pub trait DirectoryWalk {
         threads: usize,
         func: DirectoryWalkFn,
     ) -> Result<(), anyhow::Error> {
+        self.run_multithreaded_filtered(threads, None, func)
+    }
+
+    fn run_multithreaded_filtered(
+        &mut self,
+        threads: usize,
+        filter: Option<DirectoryWalkFilterFn>,
+        func: DirectoryWalkFn,
+    ) -> Result<(), anyhow::Error> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()?;
         let error = Arc::new(RwLock::new(None));
-        let in_flight = crate::utils::InFlightLimit::new(crate::utils::WALK_IN_FLIGHT_LIMIT);
+        let in_flight = crate::utils::InFlightLimit::new(
+            crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE,
+        );
 
         pool.in_place_scope(|scope| {
+            let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+
             while let Some(entry) = self.next_walk_entry() {
                 match entry {
                     Ok(entry) => {
@@ -338,28 +364,54 @@ pub trait DirectoryWalk {
                             break;
                         }
 
-                        let error = Arc::clone(&error);
-                        let func = func.clone();
+                        if let Some(filter) = &filter
+                            && !filter(entry.file_type, &entry.path)
+                        {
+                            continue;
+                        }
 
+                        batch.push(entry);
+                        if batch.len() < crate::utils::WALK_BATCH_SIZE {
+                            continue;
+                        }
+
+                        let batch = std::mem::replace(
+                            &mut batch,
+                            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+                        );
                         let permit = in_flight.acquire();
 
-                        scope.spawn(move |_| {
-                            let _permit = permit;
-
-                            if crate::unlikely(error.read().is_some()) {
-                                return;
-                            }
-
-                            if let Err(err) = func(entry) {
-                                *error.write() = Some(err);
-                            }
-                        });
+                        crate::utils::spawn_walk_batch(
+                            scope,
+                            Arc::clone(&error),
+                            {
+                                let func = func.clone();
+                                move |entry| func(entry)
+                            },
+                            permit,
+                            batch,
+                        );
                     }
                     Err(err) => {
                         *error.write() = Some(err);
                         break;
                     }
                 }
+            }
+
+            if !batch.is_empty() {
+                let permit = in_flight.acquire();
+
+                crate::utils::spawn_walk_batch(
+                    scope,
+                    Arc::clone(&error),
+                    {
+                        let func = func.clone();
+                        move |entry| func(entry)
+                    },
+                    permit,
+                    batch,
+                );
             }
         });
 
@@ -368,6 +420,15 @@ pub trait DirectoryWalk {
         }
 
         Ok(())
+    }
+
+    fn run_parallel(
+        &mut self,
+        threads: usize,
+        filter: Option<DirectoryWalkFilterFn>,
+        func: DirectoryWalkFn,
+    ) -> Result<(), anyhow::Error> {
+        self.run_multithreaded_filtered(threads, filter, func)
     }
 }
 
@@ -545,6 +606,14 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error>;
+    fn directory_entry_from_metadata(
+        &self,
+        _path: &Path,
+        _metadata: &cap_std::fs::Metadata,
+        _buffer: Option<&[u8]>,
+    ) -> Option<DirectoryEntry> {
+        None
+    }
 
     async fn async_read_dir(
         &self,

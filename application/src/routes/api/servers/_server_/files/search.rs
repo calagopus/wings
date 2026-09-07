@@ -6,11 +6,14 @@ mod post {
         config::ApiFileSearchContext,
         io::{
             SafeSliceExt, SafeSliceMutExt, UninterruptedReadExt,
-            abort::{AbortGuard, AbortReader},
+            abort::{AbortGuard, AbortListener, AbortReader},
         },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::virtualfs::{DirectoryWalkFn, VirtualWalkEntry},
+        server::filesystem::virtualfs::{
+            DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
+            VirtualWalkEntry,
+        },
     };
     use axum::http::StatusCode;
     use ignore::{gitignore::GitignoreBuilder, overrides::OverrideBuilder};
@@ -18,7 +21,7 @@ mod post {
     use serde::{Deserialize, Serialize};
     use std::{
         cell::RefCell,
-        io::{BufRead, BufReader, Read},
+        io::Read,
         path::Path,
         sync::{
             Arc,
@@ -69,42 +72,68 @@ mod post {
         });
     }
 
+    enum Matcher {
+        Exact(Box<memchr::memmem::Finder<'static>>),
+        CaseInsensitive(aho_corasick::AhoCorasick),
+    }
+
     struct Needle {
-        finder: memchr::memmem::Finder<'static>,
-        case_insensitive: bool,
+        matcher: Matcher,
+        len: usize,
     }
 
     impl Needle {
-        fn new(substr: &str, case_insensitive: bool) -> Self {
-            let bytes = if case_insensitive {
-                substr.to_ascii_lowercase().into_bytes()
+        fn new(substr: &str, case_insensitive: bool) -> Result<Self, anyhow::Error> {
+            let needs_folding =
+                case_insensitive && substr.bytes().any(|byte| byte.is_ascii_alphabetic());
+            let matcher = if needs_folding {
+                Matcher::CaseInsensitive(
+                    aho_corasick::AhoCorasick::builder()
+                        .ascii_case_insensitive(true)
+                        .build([substr])?,
+                )
             } else {
-                substr.as_bytes().to_vec()
+                Matcher::Exact(Box::new(
+                    memchr::memmem::Finder::new(substr.as_bytes()).into_owned(),
+                ))
             };
 
-            Self {
-                finder: memchr::memmem::Finder::new(&bytes).into_owned(),
-                case_insensitive,
+            Ok(Self {
+                matcher,
+                len: substr.len(),
+            })
+        }
+
+        #[inline]
+        fn find(&self, haystack: &[u8]) -> Option<usize> {
+            match &self.matcher {
+                Matcher::Exact(finder) => finder.find(haystack),
+                Matcher::CaseInsensitive(automaton) => {
+                    automaton.find(haystack).map(|found| found.start())
+                }
             }
         }
 
         fn len(&self) -> usize {
-            self.finder.needle().len()
+            self.len
         }
 
         fn is_empty(&self) -> bool {
-            self.finder.needle().is_empty()
+            self.len == 0
         }
+    }
+
+    enum Scan {
+        Binary,
+        NoMatch,
+        Match(Option<ContentMatches>),
     }
 
     fn search_in_stream(
         reader: &mut (dyn std::io::Read + Unpin + Send),
         needle: &Needle,
-    ) -> Result<bool, std::io::Error> {
-        if needle.is_empty() {
-            return Ok(true);
-        }
-
+        head: &mut [u8],
+    ) -> Result<(Scan, usize), std::io::Error> {
         let needle_len = needle.len();
 
         SEARCH_SCRATCH.with(|scratch| {
@@ -115,26 +144,37 @@ mod post {
             }
 
             let mut valid_bytes = 0;
+            let mut head_len = None;
 
             loop {
                 let bytes_read = reader.read_uninterrupted(
                     buffer.get_slice_mut(valid_bytes..valid_bytes + crate::BUFFER_SIZE)?,
                 )?;
-
-                if crate::unlikely(bytes_read == 0) {
-                    return Ok(false);
-                }
-
                 let data_end = valid_bytes + bytes_read;
 
-                if needle.case_insensitive {
-                    buffer
-                        .get_slice_mut(valid_bytes..data_end)?
-                        .make_ascii_lowercase();
+                let head_len = match head_len {
+                    Some(head_len) => head_len,
+                    None => {
+                        let len = data_end.min(head.len());
+                        head.get_slice_mut(..len)?
+                            .copy_from_slice(buffer.get_slice(..len)?);
+                        if !crate::utils::is_valid_utf8_slice(head.get_slice(..len)?) {
+                            return Ok((Scan::Binary, len));
+                        }
+                        if needle.is_empty() {
+                            return Ok((Scan::Match(None), len));
+                        }
+
+                        *head_len.insert(len)
+                    }
+                };
+
+                if crate::unlikely(bytes_read == 0) {
+                    return Ok((Scan::NoMatch, head_len));
                 }
 
-                if crate::unlikely(needle.finder.find(buffer.get_slice(..data_end)?).is_some()) {
-                    return Ok(true);
+                if crate::unlikely(needle.find(buffer.get_slice(..data_end)?).is_some()) {
+                    return Ok((Scan::Match(None), head_len));
                 }
 
                 if data_end >= needle_len {
@@ -155,7 +195,8 @@ mod post {
         max_size: u64,
         size: u64,
         max_context_bytes: usize,
-    ) -> std::io::Result<Option<ContentMatches>> {
+        head: &mut [u8],
+    ) -> std::io::Result<(Scan, usize)> {
         let max_size = usize::try_from(max_size)
             .ok()
             .filter(|size| *size < isize::MAX as usize)
@@ -164,6 +205,14 @@ mod post {
             })?;
         let mut bytes = Vec::with_capacity(size.min(max_size as u64) as usize + 1);
         reader.take(max_size as u64 + 1).read_to_end(&mut bytes)?;
+
+        let head_len = bytes.len().min(head.len());
+        head.get_slice_mut(..head_len)?
+            .copy_from_slice(bytes.get_slice(..head_len)?);
+        if !crate::utils::is_valid_utf8_slice(head.get_slice(..head_len)?) {
+            return Ok((Scan::Binary, head_len));
+        }
+
         let mut truncated = bytes.len() > max_size;
         bytes.truncate(max_size);
 
@@ -172,12 +221,10 @@ mod post {
         } else {
             bytes.len()
         };
-        let lowercase = needle.case_insensitive.then(|| bytes.to_ascii_lowercase());
-        let searchable = lowercase.as_deref().unwrap_or(&bytes);
         let mut spans = Vec::new();
         let mut cursor = 0;
 
-        while let Some(offset) = needle.finder.find(searchable.get_slice(cursor..)?) {
+        while let Some(offset) = needle.find(bytes.get_slice(cursor..)?) {
             if spans.len() == context.max_matches {
                 truncated = true;
                 break;
@@ -189,7 +236,7 @@ mod post {
         }
 
         if spans.is_empty() {
-            return Ok(None);
+            return Ok((Scan::NoMatch, head_len));
         }
 
         let mut windows: Vec<(usize, usize)> = Vec::new();
@@ -262,7 +309,39 @@ mod post {
             });
         }
 
-        Ok(Some(result))
+        Ok((Scan::Match(Some(result)), head_len))
+    }
+
+    fn open_walked_file(
+        entry: &VirtualWalkEntry,
+        filesystem: &dyn VirtualReadableFilesystem,
+        listener: &AbortListener,
+    ) -> Option<Box<dyn Read + Send>> {
+        let reader: Box<dyn Read + Send> = match entry.open_source() {
+            Some(Ok(file)) => Box::new(file),
+            Some(Err(_)) => return None,
+            None => filesystem.read_file(&entry.path, None).ok()?.reader,
+        };
+
+        Some(Box::new(AbortReader::new(reader, listener.clone())))
+    }
+
+    fn walked_directory_entry(
+        entry: &VirtualWalkEntry,
+        filesystem: &dyn VirtualReadableFilesystem,
+        metadata: Option<cap_std::fs::Metadata>,
+        buffer: &[u8],
+        handle: &tokio::runtime::Handle,
+    ) -> Result<crate::models::DirectoryEntry, anyhow::Error> {
+        let metadata = metadata.or_else(|| entry.source_metadata().and_then(Result::ok));
+        if let Some(metadata) = metadata
+            && let Some(directory_entry) =
+                filesystem.directory_entry_from_metadata(&entry.path, &metadata, Some(buffer))
+        {
+            return Ok(directory_entry);
+        }
+
+        handle.block_on(filesystem.async_directory_entry_buffer(&entry.path, buffer))
     }
 
     #[derive(ToSchema, Deserialize)]
@@ -457,13 +536,10 @@ mod post {
                         .ok();
                 }
 
-                let ignored = if filesystem.is_primary_server_fs() {
-                    server.filesystem.get_ignored().into()
-                } else {
-                    Default::default()
+                let needle = match Needle::new(&data.query, true) {
+                    Ok(needle) => Arc::new(needle),
+                    Err(_) => return ApiResponse::error("invalid query").ok(),
                 };
-
-                let needle = Arc::new(Needle::new(&data.query, true));
 
                 tokio::task::spawn_blocking({
                     let root = Arc::new(root);
@@ -471,10 +547,15 @@ mod post {
                     let listener = listener.clone();
 
                     move || {
-                        let mut walker = filesystem.walk_dir(&*root, ignored)?;
+                        let mut walker = filesystem.walk_dir(&*root, IsIgnoredFn::default())?;
 
-                        let result = walker.run_multithreaded(
+                        let result = walker.run_parallel(
                             state.config.load().api.file_search_threads,
+                            Some(DirectoryWalkFilterFn::from(
+                                |file_type: crate::server::filesystem::cap::FileType, _: &Path| {
+                                    file_type.is_file()
+                                },
+                            )),
                             DirectoryWalkFn::from({
                                 let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
@@ -485,9 +566,6 @@ mod post {
                                 let listener = listener.clone();
 
                                 move |entry: VirtualWalkEntry| {
-                                    let file_type = entry.file_type;
-                                    let path = entry.path;
-
                                     if crate::unlikely(
                                         listener.is_aborted()
                                             || results_count.load(Ordering::Relaxed) >= limit,
@@ -495,20 +573,22 @@ mod post {
                                         return Err(anyhow::anyhow!("walk stopped"));
                                     }
 
-                                    if !file_type.is_file() {
-                                        return Ok(());
-                                    }
-
-                                    if path.to_string_lossy().contains(data.query.as_str()) {
-                                        let mut entry = handle
-                                            .block_on(filesystem.async_directory_entry(&path))?;
-                                        entry.name = match path.strip_prefix(&*root) {
+                                    if entry.path.to_string_lossy().contains(data.query.as_str()) {
+                                        let mut directory_entry = walked_directory_entry(
+                                            &entry,
+                                            &*filesystem,
+                                            None,
+                                            &[],
+                                            &handle,
+                                        )?;
+                                        directory_entry.name = match entry.path.strip_prefix(&*root)
+                                        {
                                             Ok(path) => path.to_string_lossy().into(),
                                             Err(_) => return Ok(()),
                                         };
 
                                         if results_count.fetch_add(1, Ordering::Relaxed) < limit {
-                                            results.lock().push(entry, None);
+                                            results.lock().push(directory_entry, None);
                                         }
                                         return Ok(());
                                     }
@@ -517,49 +597,54 @@ mod post {
                                         return Ok(());
                                     }
 
-                                    let metadata = match filesystem.symlink_metadata(&path) {
-                                        Ok(metadata) => metadata,
-                                        Err(_) => return Ok(()),
+                                    let metadata = match entry.source_metadata() {
+                                        Some(Ok(metadata)) => Some(metadata),
+                                        Some(Err(_)) => return Ok(()),
+                                        None => None,
                                     };
-
-                                    if metadata.size > max_size {
-                                        return Ok(());
-                                    }
-
-                                    let file_read = match filesystem.read_file(&path, None) {
-                                        Ok(reader) => reader,
-                                        Err(_) => return Ok(()),
-                                    };
-                                    let reader =
-                                        AbortReader::new(file_read.reader, listener.clone());
-                                    let mut reader = BufReader::new(reader);
-                                    let buffer = match reader.fill_buf() {
-                                        Ok(buffer) => {
-                                            match buffer.get_slice(..buffer.len().min(64)) {
-                                                Ok(slice) => slice.to_vec(),
-                                                Err(_) => return Ok(()),
-                                            }
-                                        }
-                                        Err(_) => return Ok(()),
-                                    };
-
-                                    if !crate::utils::is_valid_utf8_slice(&buffer) {
-                                        return Ok(());
-                                    }
-
-                                    if search_in_stream(&mut (&mut reader).take(max_size), &needle)?
-                                    {
-                                        let mut entry = handle.block_on(
-                                            filesystem.async_directory_entry_buffer(&path, &buffer),
-                                        )?;
-                                        entry.name = match path.strip_prefix(&*root) {
-                                            Ok(path) => path.to_string_lossy().into(),
+                                    let size = match &metadata {
+                                        Some(metadata) => metadata.len(),
+                                        None => match filesystem.symlink_metadata(&entry.path) {
+                                            Ok(metadata) => metadata.size,
                                             Err(_) => return Ok(()),
-                                        };
+                                        },
+                                    };
 
-                                        if results_count.fetch_add(1, Ordering::Relaxed) < limit {
-                                            results.lock().push(entry, None);
-                                        }
+                                    if size > max_size
+                                        || (!needle.is_empty() && size < needle.len() as u64)
+                                    {
+                                        return Ok(());
+                                    }
+
+                                    let Some(mut reader) =
+                                        open_walked_file(&entry, &*filesystem, &listener)
+                                    else {
+                                        return Ok(());
+                                    };
+                                    let mut head = [0; 64];
+                                    let (scan, head_len) = search_in_stream(
+                                        &mut (&mut reader).take(max_size),
+                                        &needle,
+                                        &mut head,
+                                    )?;
+                                    if !matches!(scan, Scan::Match(_)) {
+                                        return Ok(());
+                                    }
+
+                                    let mut directory_entry = walked_directory_entry(
+                                        &entry,
+                                        &*filesystem,
+                                        metadata,
+                                        head.get_slice(..head_len)?,
+                                        &handle,
+                                    )?;
+                                    directory_entry.name = match entry.path.strip_prefix(&*root) {
+                                        Ok(path) => path.to_string_lossy().into(),
+                                        Err(_) => return Ok(()),
+                                    };
+
+                                    if results_count.fetch_add(1, Ordering::Relaxed) < limit {
+                                        results.lock().push(directory_entry, None);
                                     }
 
                                     Ok(())
@@ -609,17 +694,15 @@ mod post {
                     .as_ref()
                     .is_some_and(|pf| !pf.include.is_empty());
                 let path_includes = Arc::new(override_builder.build()?);
+                let ignored: IsIgnoredFn = ignore_builder.build()?.into();
 
-                let ignored = if filesystem.is_primary_server_fs() {
-                    vec![server.filesystem.get_ignored(), ignore_builder.build()?].into()
-                } else {
-                    ignore_builder.build()?.into()
+                let needle = match &data.content_filter {
+                    Some(cf) => match Needle::new(&cf.query, cf.case_insensitive) {
+                        Ok(needle) => Some(Arc::new(needle)),
+                        Err(_) => return ApiResponse::error("invalid content query").ok(),
+                    },
+                    None => None,
                 };
-
-                let needle = data
-                    .content_filter
-                    .as_ref()
-                    .map(|cf| Arc::new(Needle::new(&cf.query, cf.case_insensitive)));
 
                 let per_page = data.per_page;
 
@@ -631,8 +714,18 @@ mod post {
                     move || {
                         let mut walker = filesystem.walk_dir(&*root, ignored)?;
 
-                        let result = walker.run_multithreaded(
+                        let result = walker.run_parallel(
                             state.config.load().api.file_search_threads,
+                            Some(DirectoryWalkFilterFn::from({
+                                let path_includes = Arc::clone(&path_includes);
+
+                                move |file_type: crate::server::filesystem::cap::FileType,
+                                      path: &Path| {
+                                    file_type.is_file()
+                                        && (!has_path_includes
+                                            || path_includes.matched(path, false).is_whitelist())
+                                }
+                            })),
                             DirectoryWalkFn::from({
                                 let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
@@ -640,14 +733,10 @@ mod post {
                                 let results = Arc::clone(&results);
                                 let data = Arc::new(data);
                                 let root = Arc::clone(&root);
-                                let path_includes = Arc::clone(&path_includes);
                                 let needle = needle.clone();
                                 let listener = listener.clone();
 
                                 move |entry: VirtualWalkEntry| {
-                                    let file_type = entry.file_type;
-                                    let path = entry.path;
-
                                     if crate::unlikely(
                                         listener.is_aborted()
                                             || results_count.load(Ordering::Relaxed)
@@ -656,22 +745,23 @@ mod post {
                                         return Err(anyhow::anyhow!("walk stopped"));
                                     }
 
-                                    if !file_type.is_file() {
-                                        return Ok(());
-                                    }
-
-                                    if has_path_includes
-                                        && !path_includes.matched(&path, false).is_whitelist()
-                                    {
-                                        return Ok(());
-                                    }
-
+                                    let mut metadata = None;
                                     let size = if data.size_filter.is_some()
                                         || data.content_filter.is_some()
                                     {
-                                        match filesystem.symlink_metadata(&path) {
-                                            Ok(metadata) => metadata.size,
-                                            Err(_) => return Ok(()),
+                                        match entry.source_metadata() {
+                                            Some(Ok(source_metadata)) => {
+                                                let size = source_metadata.len();
+                                                metadata = Some(source_metadata);
+                                                size
+                                            }
+                                            Some(Err(_)) => return Ok(()),
+                                            None => {
+                                                match filesystem.symlink_metadata(&entry.path) {
+                                                    Ok(metadata) => metadata.size,
+                                                    Err(_) => return Ok(()),
+                                                }
+                                            }
                                         }
                                     } else {
                                         0
@@ -684,66 +774,60 @@ mod post {
                                     }
 
                                     let mut content_matches = None;
-                                    let mut local_buffer = [0; 128];
+                                    let mut head = [0; 128];
                                     let buffer = if let Some(content_filter) = &data.content_filter
+                                        && let Some(needle) = &needle
                                         && filesystem.is_fast()
                                         && (size <= content_filter.max_search_size
                                             || content_filter.include_unmatched)
                                     {
-                                        let file_read = match filesystem.read_file(&path, None) {
-                                            Ok(reader) => reader,
-                                            Err(_) => return Ok(()),
-                                        };
-                                        let reader =
-                                            AbortReader::new(file_read.reader, listener.clone());
-                                        let mut reader = BufReader::new(reader);
-                                        let buffer = match reader.fill_buf() {
-                                            Ok(buffer) => buffer,
-                                            Err(_) => return Ok(()),
-                                        };
-
-                                        let buf_len = buffer.len().min(128);
-                                        local_buffer
-                                            .get_slice_mut(..buf_len)?
-                                            .copy_from_slice(buffer.get_slice(..buf_len)?);
-
                                         if size <= content_filter.max_search_size {
-                                            if !crate::utils::is_valid_utf8_slice(
-                                                local_buffer.get_slice(..buf_len)?,
-                                            ) {
+                                            if !needle.is_empty() && size < needle.len() as u64 {
                                                 return Ok(());
                                             }
 
-                                            let context_search_size = content_filter
-                                                .max_search_size
-                                                .min(context_limits.max_search_size);
-
-                                            if let Some(needle) = &needle {
-                                                if let Some(context) = &data.match_context
-                                                    && size <= context_search_size
-                                                {
-                                                    content_matches = search_with_context(
-                                                        &mut reader,
-                                                        needle,
-                                                        context,
-                                                        context_search_size,
-                                                        size,
-                                                        context_limits.max_response_size as usize,
-                                                    )?;
-                                                    if content_matches.is_none() {
-                                                        return Ok(());
-                                                    }
-                                                } else if !search_in_stream(
+                                            let Some(mut reader) =
+                                                open_walked_file(&entry, &*filesystem, &listener)
+                                            else {
+                                                return Ok(());
+                                            };
+                                            let (scan, head_len) = match &data.match_context {
+                                                Some(context) => search_with_context(
+                                                    &mut reader,
+                                                    needle,
+                                                    context,
+                                                    content_filter.max_search_size,
+                                                    size,
+                                                    context_limits.max_response_size as usize,
+                                                    &mut head,
+                                                )?,
+                                                None => search_in_stream(
                                                     &mut (&mut reader)
                                                         .take(content_filter.max_search_size),
                                                     needle,
-                                                )? {
-                                                    return Ok(());
-                                                }
+                                                    &mut head,
+                                                )?,
+                                            };
+                                            match scan {
+                                                Scan::Match(matches) => content_matches = matches,
+                                                Scan::Binary | Scan::NoMatch => return Ok(()),
                                             }
-                                        }
 
-                                        local_buffer.get_slice(..buf_len)?
+                                            head.get_slice(..head_len)?
+                                        } else {
+                                            let Some(mut reader) =
+                                                open_walked_file(&entry, &*filesystem, &listener)
+                                            else {
+                                                return Ok(());
+                                            };
+                                            let head_len =
+                                                match reader.read_uninterrupted(&mut head) {
+                                                    Ok(head_len) => head_len,
+                                                    Err(_) => return Ok(()),
+                                                };
+
+                                            head.get_slice(..head_len)?
+                                        }
                                     } else if data
                                         .content_filter
                                         .as_ref()
@@ -751,35 +835,36 @@ mod post {
                                     {
                                         return Ok(());
                                     } else if filesystem.is_fast() {
-                                        let mut file_read = match filesystem.read_file(&path, None)
-                                        {
-                                            Ok(reader) => reader,
-                                            Err(_) => return Ok(()),
+                                        let Some(mut reader) =
+                                            open_walked_file(&entry, &*filesystem, &listener)
+                                        else {
+                                            return Ok(());
                                         };
-                                        let bytes_read = match file_read
-                                            .reader
-                                            .read_uninterrupted(&mut local_buffer)
-                                        {
-                                            Ok(bytes_read) => bytes_read,
+                                        let head_len = match reader.read_uninterrupted(&mut head) {
+                                            Ok(head_len) => head_len,
                                             Err(_) => return Ok(()),
                                         };
 
-                                        local_buffer.get_slice(..bytes_read)?
+                                        head.get_slice(..head_len)?
                                     } else {
                                         &[]
                                     };
 
-                                    let mut entry = handle.block_on(
-                                        filesystem.async_directory_entry_buffer(&path, buffer),
+                                    let mut directory_entry = walked_directory_entry(
+                                        &entry,
+                                        &*filesystem,
+                                        metadata,
+                                        buffer,
+                                        &handle,
                                     )?;
-                                    entry.name = match path.strip_prefix(&*root) {
+                                    directory_entry.name = match entry.path.strip_prefix(&*root) {
                                         Ok(path) => path.to_string_lossy().into(),
                                         Err(_) => return Ok(()),
                                     };
 
                                     if results_count.fetch_add(1, Ordering::Relaxed) < data.per_page
                                     {
-                                        results.lock().push(entry, content_matches);
+                                        results.lock().push(directory_entry, content_matches);
                                     }
 
                                     Ok(())

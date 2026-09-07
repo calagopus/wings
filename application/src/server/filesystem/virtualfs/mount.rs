@@ -179,6 +179,16 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         }
     }
 
+    fn directory_entry_from_metadata(
+        &self,
+        path: &Path,
+        metadata: &cap_std::fs::Metadata,
+        buffer: Option<&[u8]>,
+    ) -> Option<DirectoryEntry> {
+        self.inner
+            .directory_entry_from_metadata(path, metadata, buffer)
+    }
+
     async fn async_read_dir(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
