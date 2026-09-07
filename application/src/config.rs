@@ -98,6 +98,15 @@ fn api_directory_entry_limit() -> usize {
 fn api_file_search_threads() -> usize {
     4
 }
+fn api_file_search_context_max_search_size() -> u64 {
+    8 * 1024 * 1024
+}
+fn api_file_search_context_max_matches() -> usize {
+    100
+}
+fn api_file_search_context_max_response_size() -> u64 {
+    8 * 1024 * 1024
+}
 fn api_file_copy_threads() -> usize {
     4
 }
@@ -617,7 +626,7 @@ fn tundra_image() -> String {
     "debian:trixie-slim".to_string()
 }
 fn tundra_source_image() -> String {
-    "ghcr.io/calagopus/tundra:1.0.0".to_string()
+    "ghcr.io/calagopus/tundra:latest".to_string()
 }
 fn tundra_metrics_port() -> u16 {
     7101
@@ -756,6 +765,16 @@ nestify::nest! {
             pub send_offline_server_logs: bool,
             #[serde(default = "api_file_search_threads")]
             pub file_search_threads: usize,
+            #[serde(default)]
+            #[schema(inline)]
+            pub file_search_context: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiFileSearchContext {
+                #[serde(default = "api_file_search_context_max_search_size")]
+                pub max_search_size: u64,
+                #[serde(default = "api_file_search_context_max_matches")]
+                pub max_matches: usize,
+                #[serde(default = "api_file_search_context_max_response_size")]
+                pub max_response_size: u64,
+            },
             #[serde(default = "api_file_copy_threads")]
             pub file_copy_threads: usize,
             #[serde(default = "api_file_decompression_threads")]

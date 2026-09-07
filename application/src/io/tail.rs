@@ -57,6 +57,30 @@ pub async fn async_tail<R: AsyncRead + AsyncSeek + Unpin>(
     Ok(reader)
 }
 
+async fn read_line<R, E>(
+    reader: &mut R,
+    mut consume: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E>
+where
+    R: AsyncBufRead + Unpin,
+    E: From<std::io::Error>,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+
+        let newline = memchr::memchr(b'\n', available);
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        consume(available.get_slice(..consumed)?)?;
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
+}
+
 async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Vec<u8>>> {
@@ -64,32 +88,14 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
     let mut truncated = false;
     let mut hit_newline = false;
 
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            break;
-        }
-
-        let newline = available.iter().position(|&b| b == b'\n');
-        let consumed = newline.map_or(available.len(), |idx| idx + 1);
-
-        if line.len() < MAX_LINE_LENGTH {
-            let take = (MAX_LINE_LENGTH - line.len()).min(consumed);
-            line.extend_from_slice(available.get_slice(..take)?);
-            if take < consumed {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
-
-        reader.consume(consumed);
-
-        if newline.is_some() {
-            hit_newline = true;
-            break;
-        }
-    }
+    read_line(reader, |chunk| {
+        let take = (MAX_LINE_LENGTH - line.len()).min(chunk.len());
+        line.extend_from_slice(chunk.get_slice(..take)?);
+        truncated |= take < chunk.len();
+        hit_newline = chunk.last() == Some(&b'\n');
+        Ok::<(), std::io::Error>(())
+    })
+    .await?;
 
     if line.is_empty() {
         return Ok(None);
@@ -100,6 +106,81 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
     }
 
     Ok(Some(line))
+}
+
+#[derive(Debug)]
+pub struct FileLines {
+    pub start_line: Option<u64>,
+    pub end_line: Option<u64>,
+    pub content: String,
+    pub eof: bool,
+}
+
+#[derive(Debug)]
+pub enum ReadLinesError {
+    Io(std::io::Error),
+    Limit,
+    InvalidUtf8,
+}
+
+impl From<std::io::Error> for ReadLinesError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+pub async fn async_read_lines<R: AsyncRead + Unpin>(
+    reader: R,
+    start_line: u64,
+    end_line: u64,
+    max_scan_bytes: usize,
+    max_content_bytes: usize,
+) -> Result<FileLines, ReadLinesError> {
+    if start_line == 0 || end_line < start_line {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid line range").into(),
+        );
+    }
+
+    let mut reader =
+        tokio::io::BufReader::new(reader.take((max_scan_bytes as u64).saturating_add(1)));
+    let mut scanned = 0;
+    let mut line = 1;
+    let mut content = Vec::new();
+    let mut actual_end = None;
+    let eof = loop {
+        if reader.fill_buf().await?.is_empty() {
+            break true;
+        }
+        if line > end_line {
+            break false;
+        }
+
+        read_line(&mut reader, |chunk| {
+            if chunk.len() > max_scan_bytes - scanned {
+                return Err(ReadLinesError::Limit);
+            }
+            if line >= start_line {
+                if chunk.len() > max_content_bytes - content.len() {
+                    return Err(ReadLinesError::Limit);
+                }
+                content.extend_from_slice(chunk);
+                actual_end = Some(line);
+            }
+            scanned += chunk.len();
+            Ok(())
+        })
+        .await?;
+
+        line += 1;
+    };
+
+    Ok(FileLines {
+        start_line: actual_end.map(|_| start_line),
+        end_line: actual_end,
+        content: String::from_utf8(content).map_err(|_| ReadLinesError::InvalidUtf8)?,
+        eof,
+    })
 }
 
 /// Consumes an entire AsyncRead stream, keeping only the last `lines` lines in memory.
@@ -417,6 +498,90 @@ mod tests {
                 Some(b"rest".to_vec())
             );
             assert_eq!(read_line_capped(&mut r).await.unwrap(), None);
+        });
+    }
+
+    // async_read_lines
+
+    #[test]
+    fn read_lines_preserves_content_and_actual_range() {
+        tokio_test::block_on(async {
+            let result = async_read_lines(Cursor::new(b"skip\n\r\nhello\r\nlast"), 2, 3, 100, 100)
+                .await
+                .unwrap();
+            assert_eq!((result.start_line, result.end_line), (Some(2), Some(3)));
+            assert_eq!(result.content, "\r\nhello\r\n");
+            assert!(!result.eof);
+
+            let result = async_read_lines(Cursor::new(b"skip\nlast"), 2, 12, 100, 100)
+                .await
+                .unwrap();
+            assert_eq!((result.start_line, result.end_line), (Some(2), Some(2)));
+            assert_eq!(result.content, "last");
+            assert!(result.eof);
+
+            for bytes in [b"".as_slice(), b"skip\n"] {
+                let result = async_read_lines(Cursor::new(bytes), 2, 12, 100, 100)
+                    .await
+                    .unwrap();
+                assert_eq!((result.start_line, result.end_line), (None, None));
+                assert!(result.content.is_empty());
+                assert!(result.eof);
+            }
+        });
+    }
+
+    #[test]
+    fn read_lines_size_limit_excludes_skipped_content() {
+        tokio_test::block_on(async {
+            let mut bytes = vec![b'x'; crate::BUFFER_SIZE * 2];
+            bytes.extend_from_slice(b"\nhit\nlarge suffix");
+            let result = async_read_lines(Cursor::new(&bytes), 2, 2, bytes.len(), 4)
+                .await
+                .unwrap();
+            assert_eq!(result.content, "hit\n");
+            assert!(!result.eof);
+            assert!(matches!(
+                async_read_lines(Cursor::new(&bytes), 2, 2, bytes.len(), 3).await,
+                Err(ReadLinesError::Limit)
+            ));
+            assert!(matches!(
+                async_read_lines(Cursor::new(&bytes), 2, 2, crate::BUFFER_SIZE, 4).await,
+                Err(ReadLinesError::Limit)
+            ));
+        });
+    }
+
+    #[test]
+    fn read_lines_validates_only_selected_utf8() {
+        tokio_test::block_on(async {
+            let result = async_read_lines(Cursor::new(b"\xff\nhit\n\xff"), 2, 2, 100, 4)
+                .await
+                .unwrap();
+            assert_eq!(result.content, "hit\n");
+            assert!(matches!(
+                async_read_lines(Cursor::new(b"hit\xff"), 1, 1, 100, 100).await,
+                Err(ReadLinesError::InvalidUtf8)
+            ));
+        });
+    }
+
+    #[test]
+    fn read_lines_checks_scan_boundary_and_range() {
+        tokio_test::block_on(async {
+            for (bytes, eof) in [(b"a\n".as_slice(), true), (b"a\nb", false)] {
+                let result = async_read_lines(Cursor::new(bytes), 1, 1, 2, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(result.content, "a\n");
+                assert_eq!(result.eof, eof);
+            }
+            for (start, end) in [(0, 1), (2, 1)] {
+                assert!(matches!(
+                    async_read_lines(Cursor::new(b"hit\n"), start, end, 100, 100).await,
+                    Err(ReadLinesError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput
+                ));
+            }
         });
     }
 }

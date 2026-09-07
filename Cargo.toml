@@ -14,7 +14,7 @@ rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
 bytes = "1"
 sha2 = "0.11.0"
 crc32fast = "1.4.2"
-zstd = { version = "0.13.3", features = ["zstdmt"] }
+zstd = { version = "0.14.0", features = ["zstdmt"] }
 hex = "0.4.3"
 tar = "0.4.44"
 compact_str = { version = "0.10.0", features = ["serde"] }

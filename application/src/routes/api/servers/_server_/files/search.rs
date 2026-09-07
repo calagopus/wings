@@ -3,6 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
+        config::ApiFileSearchContext,
         io::{
             SafeSliceExt, SafeSliceMutExt, UninterruptedReadExt,
             abort::{AbortGuard, AbortReader},
@@ -28,6 +29,44 @@ mod post {
 
     thread_local! {
         static SEARCH_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct SearchResults {
+        entries: Vec<crate::models::DirectoryEntry>,
+        content_matches: Option<Vec<ContentMatches>>,
+        context_bytes: usize,
+        max_context_bytes: usize,
+    }
+
+    impl SearchResults {
+        fn push(&mut self, entry: crate::models::DirectoryEntry, matches: Option<ContentMatches>) {
+            if let Some(mut matches) = matches
+                && let Some(content_matches) = &mut self.content_matches
+            {
+                matches.file = entry.name.clone();
+                limit_context(&mut matches, self.max_context_bytes - self.context_bytes);
+                self.context_bytes += matches
+                    .blocks
+                    .iter()
+                    .map(|b| b.content.len())
+                    .sum::<usize>();
+                content_matches.push(matches);
+            }
+
+            self.entries.push(entry);
+        }
+    }
+
+    fn limit_context(matches: &mut ContentMatches, mut remaining: usize) {
+        matches.blocks.retain(|block| {
+            if block.content.len() > remaining {
+                matches.truncated = true;
+                false
+            } else {
+                remaining -= block.content.len();
+                true
+            }
+        });
     }
 
     struct Needle {
@@ -109,6 +148,123 @@ mod post {
         })
     }
 
+    fn search_with_context(
+        reader: &mut impl Read,
+        needle: &Needle,
+        context: &MatchContext,
+        max_size: u64,
+        size: u64,
+        max_context_bytes: usize,
+    ) -> std::io::Result<Option<ContentMatches>> {
+        let max_size = usize::try_from(max_size)
+            .ok()
+            .filter(|size| *size < isize::MAX as usize)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "search size is too large")
+            })?;
+        let mut bytes = Vec::with_capacity(size.min(max_size as u64) as usize + 1);
+        reader.take(max_size as u64 + 1).read_to_end(&mut bytes)?;
+        let mut truncated = bytes.len() > max_size;
+        bytes.truncate(max_size);
+
+        let complete_end = if truncated {
+            memchr::memrchr(b'\n', &bytes).map_or(0, |offset| offset + 1)
+        } else {
+            bytes.len()
+        };
+        let lowercase = needle.case_insensitive.then(|| bytes.to_ascii_lowercase());
+        let searchable = lowercase.as_deref().unwrap_or(&bytes);
+        let mut spans = Vec::new();
+        let mut cursor = 0;
+
+        while let Some(offset) = needle.finder.find(searchable.get_slice(cursor..)?) {
+            if spans.len() == context.max_matches {
+                truncated = true;
+                break;
+            }
+
+            let start = cursor + offset;
+            spans.push((start, start + needle.len()));
+            cursor = start + 1;
+        }
+
+        if spans.is_empty() {
+            return Ok(None);
+        }
+
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for &(start, end) in &spans {
+            if end > complete_end {
+                truncated = true;
+                continue;
+            }
+
+            let window_start = memchr::memchr_iter(b'\n', bytes.get_slice(..start)?)
+                .rev()
+                .nth(context.before)
+                .map_or(0, |offset| offset + 1);
+            let window_end = memchr::memchr_iter(b'\n', bytes.get_slice(end - 1..complete_end)?)
+                .nth(context.after)
+                .map_or(complete_end, |offset| end + offset);
+
+            if let Some((_, previous_end)) = windows.last_mut()
+                && window_start <= *previous_end
+            {
+                *previous_end = (*previous_end).max(window_end);
+            } else {
+                windows.push((window_start, window_end));
+            }
+        }
+
+        let mut result = ContentMatches {
+            file: compact_str::CompactString::default(),
+            truncated,
+            blocks: Vec::new(),
+        };
+        let mut remaining = max_context_bytes.min(bytes.len());
+        let mut line_cursor = 0;
+        let mut line_number = 1;
+
+        for (start, end) in windows {
+            if end - start > remaining {
+                result.truncated = true;
+                continue;
+            }
+
+            let content = match std::str::from_utf8(bytes.get_slice(start..end)?) {
+                Ok(content) => content,
+                Err(_) => {
+                    result.truncated = true;
+                    continue;
+                }
+            };
+            line_number +=
+                memchr::memchr_iter(b'\n', bytes.get_slice(line_cursor..start)?).count() as u64;
+            line_cursor = start;
+            let end_line = line_number
+                + memchr::memchr_iter(b'\n', content.as_bytes()).count() as u64
+                - u64::from(content.ends_with('\n'));
+            let matches = spans
+                .iter()
+                .filter_map(|&(match_start, match_end)| {
+                    (match_start >= start && match_end <= end).then_some(MatchSpan {
+                        start_byte: match_start.saturating_sub(start),
+                        end_byte: match_end.saturating_sub(start),
+                    })
+                })
+                .collect();
+            remaining -= content.len();
+            result.blocks.push(MatchBlock {
+                start_line: line_number,
+                end_line,
+                content: content.to_owned(),
+                matches,
+            });
+        }
+
+        Ok(Some(result))
+    }
+
     #[derive(ToSchema, Deserialize)]
     pub struct PayloadV1 {
         #[serde(default)]
@@ -148,6 +304,14 @@ mod post {
     }
 
     #[derive(ToSchema, Deserialize)]
+    pub struct MatchContext {
+        before: usize,
+        after: usize,
+        #[schema(minimum = 1)]
+        max_matches: usize,
+    }
+
+    #[derive(ToSchema, Deserialize)]
     pub struct PayloadV2 {
         #[serde(default)]
         root: compact_str::CompactString,
@@ -157,8 +321,34 @@ mod post {
         size_filter: Option<SizeFilter>,
         #[schema(inline)]
         content_filter: Option<ContentFilter>,
+        #[schema(inline)]
+        match_context: Option<MatchContext>,
 
         per_page: usize,
+    }
+
+    impl PayloadV2 {
+        fn validate_match_context(
+            &self,
+            limits: &ApiFileSearchContext,
+        ) -> Result<(), &'static str> {
+            let Some(context) = &self.match_context else {
+                return Ok(());
+            };
+
+            if context.max_matches == 0 || context.max_matches > limits.max_matches {
+                return Err("match count exceeds the configured context search limit");
+            }
+            if self
+                .content_filter
+                .as_ref()
+                .is_none_or(|filter| filter.query.is_empty())
+            {
+                return Err("match context requires a nonempty content query");
+            }
+
+            Ok(())
+        }
     }
 
     #[derive(Deserialize)]
@@ -190,12 +380,36 @@ mod post {
     }
 
     #[derive(ToSchema, Serialize)]
+    struct MatchSpan {
+        start_byte: usize,
+        end_byte: usize,
+    }
+
+    #[derive(ToSchema, Serialize)]
+    struct MatchBlock {
+        start_line: u64,
+        end_line: u64,
+        content: String,
+        matches: Vec<MatchSpan>,
+    }
+
+    #[derive(ToSchema, Serialize)]
+    struct ContentMatches {
+        file: compact_str::CompactString,
+        truncated: bool,
+        blocks: Vec<MatchBlock>,
+    }
+
+    #[derive(ToSchema, Serialize)]
     struct Response<'a> {
         results: &'a [crate::models::DirectoryEntry],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_matches: Option<&'a [ContentMatches]>,
     }
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
     ), params(
         (
@@ -209,8 +423,21 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let context_limits = state.config.load().api.file_search_context;
+        let include_context = matches!(&data, Payload::V2(data) if data.match_context.is_some());
+        if let Payload::V2(data) = &data
+            && let Err(err) = data.validate_match_context(&context_limits)
+        {
+            return ApiResponse::error(err).ok();
+        }
+
         let results_count = Arc::new(AtomicUsize::new(0));
-        let results = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::new(Mutex::new(SearchResults {
+            entries: Vec::new(),
+            content_matches: include_context.then(Vec::new),
+            context_bytes: 0,
+            max_context_bytes: context_limits.max_response_size as usize,
+        }));
         let (_guard, listener) = AbortGuard::new();
 
         match data {
@@ -281,7 +508,7 @@ mod post {
                                         };
 
                                         if results_count.fetch_add(1, Ordering::Relaxed) < limit {
-                                            results.lock().push(entry);
+                                            results.lock().push(entry, None);
                                         }
                                         return Ok(());
                                     }
@@ -331,7 +558,7 @@ mod post {
                                         };
 
                                         if results_count.fetch_add(1, Ordering::Relaxed) < limit {
-                                            results.lock().push(entry);
+                                            results.lock().push(entry, None);
                                         }
                                     }
 
@@ -456,6 +683,7 @@ mod post {
                                         return Ok(());
                                     }
 
+                                    let mut content_matches = None;
                                     let mut local_buffer = [0; 128];
                                     let buffer = if let Some(content_filter) = &data.content_filter
                                         && filesystem.is_fast()
@@ -486,14 +714,32 @@ mod post {
                                                 return Ok(());
                                             }
 
-                                            if let Some(needle) = &needle
-                                                && !search_in_stream(
+                                            let context_search_size = content_filter
+                                                .max_search_size
+                                                .min(context_limits.max_search_size);
+
+                                            if let Some(needle) = &needle {
+                                                if let Some(context) = &data.match_context
+                                                    && size <= context_search_size
+                                                {
+                                                    content_matches = search_with_context(
+                                                        &mut reader,
+                                                        needle,
+                                                        context,
+                                                        context_search_size,
+                                                        size,
+                                                        context_limits.max_response_size as usize,
+                                                    )?;
+                                                    if content_matches.is_none() {
+                                                        return Ok(());
+                                                    }
+                                                } else if !search_in_stream(
                                                     &mut (&mut reader)
                                                         .take(content_filter.max_search_size),
                                                     needle,
-                                                )?
-                                            {
-                                                return Ok(());
+                                                )? {
+                                                    return Ok(());
+                                                }
                                             }
                                         }
 
@@ -533,7 +779,7 @@ mod post {
 
                                     if results_count.fetch_add(1, Ordering::Relaxed) < data.per_page
                                     {
-                                        results.lock().push(entry);
+                                        results.lock().push(entry, content_matches);
                                     }
 
                                     Ok(())
@@ -552,8 +798,10 @@ mod post {
             }
         }
 
+        let results = results.lock();
         ApiResponse::new_serialized(Response {
-            results: &results.lock(),
+            results: &results.entries,
+            content_matches: results.content_matches.as_deref(),
         })
         .ok()
     }

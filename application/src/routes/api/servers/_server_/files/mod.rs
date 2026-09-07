@@ -13,6 +13,7 @@ mod decompress;
 mod delete;
 mod fingerprints;
 mod largest_directories;
+mod lines;
 mod list;
 mod list_directory;
 mod operations;
@@ -26,6 +27,7 @@ mod write;
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .nest("/contents", contents::router(state))
+        .nest("/lines", lines::router(state))
         .nest("/list-directory", list_directory::router(state))
         .nest("/list", list::router(state))
         .nest("/rename", rename::router(state))

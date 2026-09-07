@@ -53,6 +53,15 @@ api:
   send_offline_server_logs: false
   # how many threads to use when searching files using file search
   file_search_threads: 4
+
+  file_search_context:
+    # maximum scanned bytes per file when returning match context
+    max_search_size: 8388608
+    # maximum matches returned per file
+    max_matches: 100
+    # maximum total bytes of preview content per response
+    max_response_size: 8388608
+
   # how many threads to use when copying directories
   file_copy_threads: 4
   # how many threads to use when decompressing .zip/.7z/.ddup
