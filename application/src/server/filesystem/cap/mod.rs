@@ -436,7 +436,7 @@ impl CapFilesystem {
         } else {
             let inner = self.get_inner()?;
 
-            tokio::task::spawn_blocking(move || inner.symlink_metadata(path)).await??
+            tokio::task::spawn_blocking(move || Self::stat_beneath(&inner, &path)).await??
         };
 
         Ok(metadata)
@@ -450,10 +450,22 @@ impl CapFilesystem {
         } else {
             let inner = self.get_inner()?;
 
-            inner.symlink_metadata(path)?
+            Self::stat_beneath(&inner, &path)?
         };
 
         Ok(metadata)
+    }
+
+    /// `cap-primitives` only reaches its `statx` fast path for a single-component
+    /// no-follow stat, anything deeper falls back to `O_PATH` + `File::metadata`,
+    /// which carries no birth time outside `target_env = "gnu"`.
+    fn stat_beneath(inner: &cap_std::fs::Dir, path: &Path) -> Result<Metadata, std::io::Error> {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                inner.open_dir(parent)?.symlink_metadata(name)
+            }
+            _ => inner.symlink_metadata(path),
+        }
     }
 
     pub async fn async_canonicalize(
