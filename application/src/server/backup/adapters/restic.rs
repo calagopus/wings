@@ -1070,7 +1070,8 @@ impl BackupExt for ResticBackup {
         _range: Option<ByteRange>,
     ) -> Result<crate::response::ApiResponse, anyhow::Error> {
         let compression_level = state.config.load().system.backups.compression_level;
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
@@ -1092,8 +1093,8 @@ impl BackupExt for ResticBackup {
                         .spawn()
                 })?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let writer = writer.into_sync();
                     let mut archive = zip::ZipWriter::new_stream(writer);
 
                     let mut subtar = tar::Archive::new(child.into_stdout()?);
@@ -1165,9 +1166,9 @@ impl BackupExt for ResticBackup {
                 })?;
 
                 let file_compression_threads = self.config.load().api.file_compression_threads;
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -1207,9 +1208,9 @@ impl BackupExt for ResticBackup {
                 })?;
 
                 let file_compression_threads = self.config.load().api.file_compression_threads;
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -1722,7 +1723,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         )))
     }
 
-    async fn async_directory_entry_buffer(
+    fn directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
@@ -1743,6 +1744,13 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             std::io::ErrorKind::NotFound,
             "File not found"
         )))
+    }
+    async fn async_directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        self.directory_entry_buffer(path, buffer)
     }
 
     async fn async_read_dir(
@@ -2038,7 +2046,6 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             let entry_wanted_notifier = Arc::clone(&entry_wanted_notifier);
                             let is_ignored = is_ignored.clone();
                             tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                                let runtime = tokio::runtime::Handle::current();
                                 let mut restic_tar = tar::Archive::new(child.into_stdout()?);
                                 let entries = restic_tar.entries()?;
 
@@ -2058,7 +2065,8 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         continue;
                                     };
 
-                                    let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                                    let (reader, writer) =
+                                        crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
                                     entry_channel_tx.blocking_send(Ok((
                                         file_type,
@@ -2066,11 +2074,19 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         Box::new(reader) as AsyncReadableFileStream,
                                     )))?;
 
-                                    let mut writer = tokio_util::io::SyncIoBridge::new(writer);
+                                    let mut writer = writer.into_sync();
                                     crate::io::copy(&mut entry, &mut writer)?;
                                     writer.shutdown()?;
 
-                                    runtime.block_on(entry_wanted_notifier.notified());
+                                    if !futures::executor::block_on(async {
+                                        tokio::select! {
+                                            biased;
+                                            _ = entry_channel_tx.closed() => false,
+                                            _ = entry_wanted_notifier.notified() => true,
+                                        }
+                                    }) {
+                                        return Ok(());
+                                    }
                                 }
 
                                 entry_wanted_notifier.notify_one();
@@ -2225,7 +2241,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
@@ -2238,7 +2254,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let full_path = self.server_path.join(path);
         let path = path.as_ref().to_path_buf();
 
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let configuration = self.configuration.clone();
@@ -2275,7 +2291,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut child = spawn_restic()?;
 
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
@@ -2355,7 +2371,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let mut child = spawn_restic()?;
 
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -2407,7 +2423,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let mut child = spawn_restic()?;
 
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -2555,7 +2571,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
@@ -2568,7 +2584,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let full_path = self.server_path.join(path);
         let path = path.as_ref().to_path_buf();
 
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let configuration = self.configuration.clone();
@@ -2639,7 +2655,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         match archive_format {
             StreamableArchiveFormat::Zip => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
@@ -2769,7 +2785,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             f if f.is_tar() => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -2847,7 +2863,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             f if f.is_itaf() => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,

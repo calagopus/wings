@@ -162,6 +162,23 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         }
     }
 
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        match self.inner.directory_entry_buffer(path, buffer) {
+            Ok(e) => Ok(e),
+            Err(err) => {
+                if self.is_virtual_dir(path.as_ref()) {
+                    Ok(Self::virtual_dir_entry(path.as_ref()))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -385,7 +402,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         self.inner
             .async_read_dir_archive(
                 path,

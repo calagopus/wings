@@ -8,7 +8,7 @@ use tokio::{
     sync::oneshot,
 };
 
-pub type FallibleSimplexReader = FallibleReader<tokio::io::ReadHalf<tokio::io::SimplexStream>>;
+pub type FalliblePipeReader = FallibleReader<crate::io::pipe::PipeReader>;
 
 pub struct FallibleSignal {
     sender: Option<oneshot::Sender<Option<String>>>,
@@ -126,11 +126,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn stream() -> (
-        FallibleSimplexReader,
-        tokio::io::WriteHalf<tokio::io::SimplexStream>,
+        FalliblePipeReader,
+        crate::io::pipe::PipeWriter,
         FallibleSignal,
     ) {
-        let (reader, writer) = tokio::io::simplex(64);
+        let (reader, writer) = crate::io::pipe::pipe(64);
         let (reader, signal) = FallibleReader::new(reader);
 
         (reader, writer, signal)
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn succeeding_producer_waits_for_reader_eof() -> Result<(), std::io::Error> {
         tokio_test::block_on(async {
-            let (reader, mut writer) = tokio::io::simplex(64);
+            let (reader, mut writer) = crate::io::pipe::pipe(64);
             let (mut reader, signal) = FallibleReader::new_with_eof(reader);
             signal.succeed();
 

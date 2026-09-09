@@ -389,29 +389,33 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .await
     }
 
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        let metadata = self.inner.symlink_metadata(path)?;
+        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+
+        Ok(self.server.filesystem.to_api_entry_buffer_blocking(
+            path,
+            &metadata,
+            DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            Some(buffer),
+            None,
+            None,
+        ))
+    }
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let metadata = self.inner.async_symlink_metadata(path).await?;
+        let this = self.clone();
+        let path = path.as_ref().to_path_buf();
+        let buffer = buffer.to_owned();
 
-        let path = self
-            .async_check_ignored(metadata.file_type().into(), path.as_ref())
-            .await?;
-
-        Ok(self
-            .server
-            .filesystem
-            .to_api_entry_buffer(
-                path,
-                &metadata,
-                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
-                Some(buffer),
-                None,
-                None,
-            )
-            .await)
+        tokio::task::spawn_blocking(move || this.directory_entry_buffer(&path, &buffer)).await?
     }
 
     fn directory_entry_from_metadata(
@@ -823,7 +827,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let names = self.inner.async_read_dir_all(path).await?;
         let file_compression_threads = self
             .server
@@ -832,7 +836,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .load()
             .api
             .file_compression_threads;
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
@@ -845,7 +849,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             let path = path.as_ref().to_path_buf();
 
             async move {
-                let writer = tokio_util::io::SyncIoBridge::new(writer);
+                let writer = writer.into_sync();
 
                 match archive_format {
                     StreamableArchiveFormat::Zip => {
@@ -1427,6 +1431,71 @@ mod tests {
         result
             .expect("listing stalled with one blocking worker")
             .expect("listing test failed");
+    }
+
+    #[test]
+    fn buffered_entries_match_async_lookup_without_runtime() {
+        with_one_blocking_worker(|| async {
+            let fixture = ListingFixture::new(0).await?;
+
+            for path in [
+                "a.txt",
+                "cached",
+                "nested/data.bin",
+                "denied.txt",
+                "missing",
+            ] {
+                let filesystem = fixture.fs.clone();
+                let sync = std::thread::spawn(move || {
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                    filesystem.directory_entry_buffer(&path, b"plain text")
+                })
+                .join()
+                .expect("buffered entry worker panicked");
+                let asynchronous = fixture
+                    .fs
+                    .async_directory_entry_buffer(&path, b"plain text")
+                    .await;
+
+                match (sync, asynchronous) {
+                    (Ok(sync), Ok(asynchronous)) => {
+                        assert_eq!(
+                            serde_json::to_value(&sync)?,
+                            serde_json::to_value(asynchronous)?
+                        );
+                        if path == "cached" {
+                            assert_eq!((sync.size, sync.size_physical), (123, 4096));
+                            assert_eq!(sync.mime, "inode/directory");
+                        }
+                    }
+                    (Err(sync), Err(asynchronous)) => {
+                        assert_eq!(sync.to_string(), asynchronous.to_string());
+                    }
+                    _ => panic!("sync and async buffered entries differ for {path}"),
+                }
+            }
+
+            #[cfg(unix)]
+            for path in ["file-link", "dir-link", "broken-link"] {
+                let filesystem = fixture.fs.clone();
+                let sync = std::thread::spawn(move || {
+                    filesystem.directory_entry_buffer(&path, b"plain text")
+                })
+                .join()
+                .expect("symlink entry worker panicked")?;
+                let asynchronous = fixture
+                    .fs
+                    .async_directory_entry_buffer(&path, b"plain text")
+                    .await?;
+                assert!(sync.symlink);
+                assert_eq!(
+                    serde_json::to_value(sync)?,
+                    serde_json::to_value(asynchronous)?
+                );
+            }
+
+            Ok(())
+        });
     }
 
     #[test]

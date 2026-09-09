@@ -1,6 +1,6 @@
 use crate::{
     io::{
-        SafeAsyncWriteExt, SafeSliceExt, UninterruptedReadExt,
+        SafeSliceExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
     },
     models::DirectoryEntry,
@@ -27,7 +27,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::io::AsyncWriteExt;
 
 pub trait BetterZipArchiveExt<R: Read + Seek> {
     fn better_by_path(
@@ -415,42 +414,43 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         Ok(entry)
     }
 
-    async fn async_directory_entry_buffer(
+    fn directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let mut archive = self.archive.clone();
-        let archive_created = self.archive_created;
-        let mime_cache = self.mime_cache.clone();
-        let sizes = self.sizes.clone();
+        let path = path.as_ref();
+
+        match archive.better_index_for_path(path) {
+            Some(entry_index) => {
+                let entry = archive.by_index(entry_index)?;
+                Ok(Self::zip_entry_to_directory_entry(
+                    &self.archive_created,
+                    path,
+                    entry_index,
+                    &self.mime_cache,
+                    &self.sizes,
+                    Some(buffer),
+                    entry,
+                ))
+            }
+            None if Self::is_virtual_directory(&self.sizes, path) => Ok(
+                Self::virtual_directory_entry(&self.archive_created, path, &self.sizes),
+            ),
+            None => Err(zip::result::ZipError::FileNotFound.into()),
+        }
+    }
+    async fn async_directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        let this = self.clone();
         let path = path.as_ref().to_path_buf();
         let buffer = buffer.to_owned();
 
-        let entry =
-            tokio::task::spawn_blocking(move || -> Result<DirectoryEntry, anyhow::Error> {
-                match archive.better_index_for_path(&path) {
-                    Some(entry_index) => {
-                        let entry = archive.by_index(entry_index)?;
-                        Ok(Self::zip_entry_to_directory_entry(
-                            &archive_created,
-                            &path,
-                            entry_index,
-                            &mime_cache,
-                            &sizes,
-                            Some(&buffer),
-                            entry,
-                        ))
-                    }
-                    None if Self::is_virtual_directory(&sizes, &path) => Ok(
-                        Self::virtual_directory_entry(&archive_created, &path, &sizes),
-                    ),
-                    None => Err(zip::result::ZipError::FileNotFound.into()),
-                }
-            })
-            .await??;
-
-        Ok(entry)
+        tokio::task::spawn_blocking(move || this.directory_entry_buffer(&path, &buffer)).await?
     }
 
     async fn async_read_dir(
@@ -751,44 +751,21 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     if let Some(name) = self.is_ignored.call_async(file_type, name).await {
                         if entry.is_file() {
-                            let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                            let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+                            let (reader, signal) =
+                                crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
+                            let mut writer = writer.into_sync();
 
                             drop(entry);
 
-                            tokio::task::spawn_blocking({
-                                let runtime = tokio::runtime::Handle::current();
+                            crate::spawn_blocking_signalled(signal, {
                                 let mut archive = self.archive.clone();
 
-                                move || {
-                                    let Ok(mut entry) = archive.by_index(i) else {
-                                        return;
-                                    };
+                                move || -> Result<(), anyhow::Error> {
+                                    let mut entry = archive.by_index(i)?;
+                                    crate::io::pipe::copy_and_shutdown(&mut entry, &mut writer)?;
 
-                                    let mut buffer = vec![0; crate::BUFFER_SIZE];
-                                    loop {
-                                        match entry.read_uninterrupted(&mut buffer) {
-                                            Ok(0) => break,
-                                            Ok(bytes_read) => {
-                                                if runtime
-                                                    .block_on(
-                                                        writer.safe_write_all(&buffer, bytes_read),
-                                                    )
-                                                    .is_err()
-                                                {
-                                                    break;
-                                                }
-                                            }
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    "error reading from zip entry: {:?}",
-                                                    err
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    runtime.block_on(writer.shutdown()).ok();
+                                    Ok(())
                                 }
                             });
 
@@ -850,42 +827,24 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let mut archive = self.archive.clone();
 
         let size = archive.better_by_path(path.as_ref())?.size();
-        let (simplex_reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (pipe_reader, signal) =
+            crate::io::fallible_reader::FallibleReader::new_with_eof(pipe_reader);
+        let mut writer = writer.into_sync();
 
         let path = path.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Handle::current();
-            let Ok(mut entry) = archive.better_by_path(&path) else {
-                return;
-            };
+        crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+            let mut entry = archive.better_by_path(&path)?;
+            crate::io::pipe::copy_and_shutdown(&mut entry, &mut writer)?;
 
-            let mut buffer = vec![0; crate::BUFFER_SIZE];
-            loop {
-                match entry.read_uninterrupted(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        if runtime
-                            .block_on(writer.safe_write_all(&buffer, bytes_read))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!("error reading from zip entry: {:?}", err);
-                        break;
-                    }
-                }
-            }
-
-            runtime.block_on(writer.shutdown()).ok();
+            Ok(())
         });
 
         Ok(AsyncFileRead {
             size,
             total_size: size,
             reader_range: None,
-            reader: Box::new(simplex_reader),
+            reader: Box::new(pipe_reader),
         })
     }
 
@@ -948,18 +907,17 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let mut archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
-        let (simplex_reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-        let (simplex_reader, signal) =
-            crate::io::fallible_reader::FallibleReader::new(simplex_reader);
+        let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (pipe_reader, signal) = crate::io::fallible_reader::FallibleReader::new(pipe_reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     for i in 0..archive.len() {
@@ -1006,7 +964,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             }
             f if f.is_tar() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1092,7 +1050,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             }
             f if f.is_itaf() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1225,10 +1183,96 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             }
         }
 
-        Ok(simplex_reader)
+        Ok(pipe_reader)
     }
 
     async fn close(&self) -> Result<(), anyhow::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn async_file_reads_finish_and_release_producer_on_drop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("creating archive test runtime failed");
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let temp = tempfile::tempdir()?;
+                let state = crate::routes::AppState::mock();
+                state
+                    .config
+                    .mutate_in_place_for_testing()
+                    .system
+                    .data_directory =
+                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+                let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+                server.filesystem.disk_checker.abort();
+
+                let payload = vec![b'x'; crate::BUFFER_SIZE * 4];
+                let mut file = tempfile::tempfile()?;
+                {
+                    let mut zip = zip::ZipWriter::new(&mut file);
+                    zip.start_file(
+                        "entry.txt",
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored),
+                    )?;
+                    zip.write_all(&payload)?;
+                    zip.finish()?;
+                }
+
+                let mut backing_file = file.try_clone()?;
+                let archive = VirtualZipArchive::new(
+                    server,
+                    zip::ZipArchive::new(MultiReader::new(Arc::new(file))?)?,
+                    Default::default(),
+                );
+                let mut complete = archive.async_read_file(&"entry.txt", None).await?;
+                let mut contents = Vec::new();
+                complete.reader.read_to_end(&mut contents).await?;
+                assert_eq!(contents, payload);
+
+                let mut partial = archive.async_read_file(&"entry.txt", None).await?;
+                let mut byte = [0];
+                partial.reader.read_exact(&mut byte).await?;
+                drop(partial);
+
+                tokio::task::spawn_blocking(|| {}).await?;
+
+                let data_start = archive
+                    .archive
+                    .clone()
+                    .by_index(0)?
+                    .data_start()
+                    .ok_or_else(|| anyhow::anyhow!("ZIP entry has no data offset"))?;
+                backing_file.seek(std::io::SeekFrom::Start(data_start))?;
+                backing_file.write_all(b"y")?;
+
+                let mut corrupted = archive.async_read_file(&"entry.txt", None).await?;
+                let err = corrupted
+                    .reader
+                    .read_to_end(&mut Vec::new())
+                    .await
+                    .expect_err("corrupt ZIP entry must report its checksum failure");
+                assert!(err.to_string().contains("Invalid checksum"));
+
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+        result
+            .expect("archive producer remained blocked after reader drop")
+            .expect("archive streaming test failed");
     }
 }

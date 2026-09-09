@@ -295,14 +295,14 @@ impl BackupExt for ZfsBackup {
         let names = filesystem.async_read_dir_all(Path::new("")).await?;
         let ignore = Self::get_ignore(&state.config, self.uuid).await?;
 
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
             let config = Arc::clone(&state.config);
 
             async move {
-                let writer = tokio_util::io::SyncIoBridge::new(writer);
+                let writer = writer.into_sync();
 
                 match archive_format {
                     StreamableArchiveFormat::Zip => {

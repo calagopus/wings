@@ -7,7 +7,7 @@ pub async fn script_server(
     server: &super::Server,
     executor: &Arc<dyn crate::server::executor::ServerExecutor>,
     container_script: InstallationScript,
-) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+) -> Result<crate::io::pipe::PipeReader, anyhow::Error> {
     let (handle, _) = executor
         .setup_script_process(server, &container_script)
         .await
@@ -24,7 +24,7 @@ pub async fn script_server(
         .await
         .context("Failed to start script container")?;
 
-    let (buf_stdout_rx, mut buf_stdout_tx) = tokio::io::simplex(crate::BUFFER_SIZE);
+    let (buf_stdout_rx, mut buf_stdout_tx) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
     tokio::spawn(async move {
         loop {

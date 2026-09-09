@@ -331,7 +331,6 @@ mod post {
         filesystem: &dyn VirtualReadableFilesystem,
         metadata: Option<cap_std::fs::Metadata>,
         buffer: &[u8],
-        handle: &tokio::runtime::Handle,
     ) -> Result<crate::models::DirectoryEntry, anyhow::Error> {
         let metadata = metadata.or_else(|| entry.source_metadata().and_then(Result::ok));
         if let Some(metadata) = metadata
@@ -341,7 +340,7 @@ mod post {
             return Ok(directory_entry);
         }
 
-        handle.block_on(filesystem.async_directory_entry_buffer(&entry.path, buffer))
+        filesystem.directory_entry_buffer(&entry.path, buffer)
     }
 
     #[derive(ToSchema, Deserialize)]
@@ -557,7 +556,6 @@ mod post {
                                 },
                             )),
                             DirectoryWalkFn::from({
-                                let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
                                 let results_count = Arc::clone(&results_count);
                                 let results = Arc::clone(&results);
@@ -579,7 +577,6 @@ mod post {
                                             &*filesystem,
                                             None,
                                             &[],
-                                            &handle,
                                         )?;
                                         directory_entry.name = match entry.path.strip_prefix(&*root)
                                         {
@@ -636,7 +633,6 @@ mod post {
                                         &*filesystem,
                                         metadata,
                                         head.get_slice(..head_len)?,
-                                        &handle,
                                     )?;
                                     directory_entry.name = match entry.path.strip_prefix(&*root) {
                                         Ok(path) => path.to_string_lossy().into(),
@@ -727,7 +723,6 @@ mod post {
                                 }
                             })),
                             DirectoryWalkFn::from({
-                                let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
                                 let results_count = Arc::clone(&results_count);
                                 let results = Arc::clone(&results);
@@ -855,7 +850,6 @@ mod post {
                                         &*filesystem,
                                         metadata,
                                         buffer,
-                                        &handle,
                                     )?;
                                     directory_entry.name = match entry.path.strip_prefix(&*root) {
                                         Ok(path) => path.to_string_lossy().into(),

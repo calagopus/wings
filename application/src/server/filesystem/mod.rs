@@ -1922,6 +1922,42 @@ impl Filesystem {
         )
     }
 
+    pub fn to_api_entry_buffer_blocking(
+        &self,
+        path: PathBuf,
+        metadata: &Metadata,
+        options: DirectoryEntryOptions,
+        buffer: Option<&[u8]>,
+        symlink_destination: Option<PathBuf>,
+        symlink_destination_metadata: Option<Metadata>,
+    ) -> crate::models::DirectoryEntry {
+        let real_metadata = symlink_destination_metadata.as_ref().unwrap_or(metadata);
+        let real_path = symlink_destination.as_ref().unwrap_or(&path);
+
+        let (size, size_physical) = if real_metadata.is_dir() {
+            self.directory_entry_space_blocking(real_path, options)
+        } else {
+            (real_metadata.size_logical(), real_metadata.size_physical())
+        };
+
+        let detected_mime = if real_metadata.is_dir() {
+            MimeCacheValue::directory()
+        } else if real_metadata.is_symlink() {
+            MimeCacheValue::symlink()
+        } else {
+            crate::utils::detect_mime_type(real_path, buffer)
+        };
+
+        Self::assemble_api_entry(
+            path,
+            metadata,
+            real_metadata,
+            options,
+            (size, size_physical),
+            detected_mime,
+        )
+    }
+
     /// Synchronous counterpart of [`Self::to_api_entry_buffer`] for entries that are
     /// not directories, whose size never needs a walk.
     pub fn to_api_file_entry_buffer(

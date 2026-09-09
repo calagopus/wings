@@ -361,7 +361,7 @@ impl S3Backup {
             }
         };
 
-        let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -399,7 +399,7 @@ impl S3Backup {
 
             async move {
                 let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-                let writer = tokio_util::io::SyncIoBridge::new(archive_writer);
+                let writer = archive_writer.into_sync();
                 let writer = LimitedWriter::new_with_bytes_per_second(
                     writer,
                     server
@@ -502,7 +502,7 @@ impl S3Backup {
             .open(&file_name)
             .await?;
 
-        let (mut checksum_reader, checksum_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (mut checksum_reader, checksum_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
         let checksum_task = async {
             let mut hasher = sha2::Sha256::new();
@@ -553,7 +553,7 @@ impl S3Backup {
 
         let archive_task = async {
             let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-            let writer = tokio_util::io::SyncIoBridge::new(checksum_writer);
+            let writer = checksum_writer.into_sync();
             let writer = LimitedWriter::new_with_bytes_per_second(
                 writer,
                 server
@@ -816,11 +816,11 @@ impl BackupStreamCreateExt for S3Backup {
         let write_limit = config.system.backups.write_limit.as_bytes();
         drop(config);
 
-        let (compressed_reader, compressed_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (compressed_reader, compressed_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
         let compress_task = tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
             let writer = LimitedWriter::new_with_bytes_per_second(
-                tokio_util::io::SyncIoBridge::new(compressed_writer),
+                compressed_writer.into_sync(),
                 write_limit,
             );
             let mut writer =

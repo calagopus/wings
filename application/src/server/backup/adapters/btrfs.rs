@@ -205,7 +205,7 @@ impl BtrfsBackup {
         state: &crate::routes::State,
         archive_format: StreamableArchiveFormat,
         compression_level: crate::io::compression::CompressionLevel,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
 
         if tokio::fs::metadata(&subvolume_path).await.is_err() {
@@ -221,11 +221,11 @@ impl BtrfsBackup {
         let ignore = Self::get_ignore(&state.config, self.uuid).await?;
         let threads = state.config.load().api.file_compression_threads;
 
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn(async move {
-            let writer = tokio_util::io::SyncIoBridge::new(writer);
+            let writer = writer.into_sync();
 
             let result = match archive_format {
                 StreamableArchiveFormat::Zip => {

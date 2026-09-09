@@ -625,7 +625,8 @@ impl BackupExt for KopiaBackup {
     ) -> Result<ApiResponse, anyhow::Error> {
         let compression_level = state.config.load().system.backups.compression_level;
         let file_compression_threads = state.config.load().api.file_compression_threads;
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
 
         let spawn_restore = || {
             tokio::task::block_in_place(|| {
@@ -645,8 +646,8 @@ impl BackupExt for KopiaBackup {
             StreamableArchiveFormat::Zip => {
                 let child = spawn_restore()?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let writer = writer.into_sync();
                     let mut archive = zip::ZipWriter::new_stream(writer);
 
                     let stdout = child
@@ -708,9 +709,9 @@ impl BackupExt for KopiaBackup {
             f if f.is_tar() => {
                 let child = spawn_restore()?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         file_compression_threads,
@@ -1385,6 +1386,19 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let entry = self.lookup_entry(path).await?;
         Ok(Self::directory_entry(path, &entry, None))
     }
+
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        let path = path.as_ref();
+        if path == Path::new("") || path == Path::new("/") {
+            return Ok(Self::directory_entry(path, &self.root_entry(), None));
+        }
+        let entry = self.lookup_entry_blocking(path)?;
+        Ok(Self::directory_entry(path, &entry, Some(buffer)))
+    }
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1581,8 +1595,6 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
 
             crate::spawn_handled(async move {
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let runtime = tokio::runtime::Handle::current();
-
                     let child = KopiaBackup::get_std_command(&config_file, &remote)
                         .arg("restore")
                         .arg(base_oid.as_ref())
@@ -1618,18 +1630,26 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                             continue;
                         };
 
-                        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
                         entry_channel_tx.blocking_send(Ok((
                             file_type,
                             entry_path,
                             Box::new(reader) as AsyncReadableFileStream,
                         )))?;
 
-                        let mut writer = tokio_util::io::SyncIoBridge::new(writer);
+                        let mut writer = writer.into_sync();
                         crate::io::copy(&mut entry, &mut writer)?;
                         writer.shutdown()?;
 
-                        runtime.block_on(entry_wanted_notifier.notified());
+                        if !futures::executor::block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = entry_channel_tx.closed() => false,
+                                _ = entry_wanted_notifier.notified() => true,
+                            }
+                        }) {
+                            return Ok(());
+                        }
                     }
 
                     entry_wanted_notifier.notify_one();
@@ -1742,7 +1762,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let base_oid = match self.resolve_dir_oid(&base_path).await {
             Ok(oid) => oid,
@@ -1758,7 +1778,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
             .file_compression_threads;
         let config_file = self.config_file.clone();
         let remote = Arc::clone(&self.remote);
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let spawn_restore = move || -> Result<std::process::ChildStdout, anyhow::Error> {
@@ -1781,7 +1801,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let stdout = spawn_restore()?;
 
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     let mut subtar = tar::Archive::new(stdout);
@@ -1868,7 +1888,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                     let stdout = spawn_restore()?;
 
                     let writer = CompressionWriter::new(
-                        tokio_util::io::SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         threads,

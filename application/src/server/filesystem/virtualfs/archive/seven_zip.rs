@@ -1,6 +1,6 @@
 use crate::{
     io::{
-        SafeAsyncWriteExt, SafeSliceExt, SafeWriteExt, UninterruptedReadExt,
+        SafeSliceExt, SafeWriteExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
     },
     models::{DirectoryEntry, DirectorySortingMode},
@@ -27,7 +27,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::io::AsyncWriteExt;
 
 pub trait CmpSortExt {
     fn cmp_sort(
@@ -427,54 +426,55 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         Ok(entry)
     }
 
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        let path = path.as_ref();
+
+        let found = self
+            .archive
+            .files
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| Path::new(entry.name()) == path);
+
+        let (entry_index, entry) = match found {
+            Some(v) => v,
+            None => {
+                if Self::is_virtual_directory(&self.sizes, path) {
+                    return Ok(Self::virtual_directory_entry(
+                        &self.archive_created,
+                        path,
+                        &self.sizes,
+                    ));
+                }
+                return Err(anyhow::anyhow!("Entry not found"));
+            }
+        };
+
+        Ok(Self::seven_zip_entry_to_directory_entry(
+            &self.archive_created,
+            path,
+            entry_index,
+            &self.mime_cache,
+            &self.sizes,
+            Some(buffer),
+            entry,
+            &mut std::io::empty(),
+        ))
+    }
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let archive = self.archive.clone();
-        let archive_created = self.archive_created;
-        let mime_cache = self.mime_cache.clone();
-        let sizes = self.sizes.clone();
+        let this = self.clone();
         let path = path.as_ref().to_path_buf();
         let buffer = buffer.to_owned();
 
-        let entry =
-            tokio::task::spawn_blocking(move || -> Result<DirectoryEntry, anyhow::Error> {
-                let found = archive
-                    .files
-                    .iter()
-                    .enumerate()
-                    .find(|(_, entry)| Path::new(entry.name()) == path);
-
-                let (entry_index, entry) = match found {
-                    Some(v) => v,
-                    None => {
-                        if Self::is_virtual_directory(&sizes, &path) {
-                            return Ok(Self::virtual_directory_entry(
-                                &archive_created,
-                                &path,
-                                &sizes,
-                            ));
-                        }
-                        return Err(anyhow::anyhow!("Entry not found"));
-                    }
-                };
-
-                Ok(Self::seven_zip_entry_to_directory_entry(
-                    &archive_created,
-                    &path,
-                    entry_index,
-                    &mime_cache,
-                    &sizes,
-                    Some(&buffer),
-                    entry,
-                    &mut std::io::empty(),
-                ))
-            })
-            .await??;
-
-        Ok(entry)
+        tokio::task::spawn_blocking(move || this.directory_entry_buffer(&path, &buffer)).await?
     }
 
     async fn async_read_dir(
@@ -847,15 +847,13 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 }
             }
 
-            let runtime = tokio::runtime::Handle::current();
-
             while let Some((name, ft)) = loose_files.pop_front() {
                 let res = Ok((
                     ft,
                     PathBuf::from(name),
                     Box::new(tokio::io::empty()) as AsyncReadableFileStream,
                 ));
-                if runtime.block_on(tx.send(res)).is_err() {
+                if tx.blocking_send(res).is_err() {
                     return;
                 }
             }
@@ -864,6 +862,10 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             sorted_blocks.sort_unstable();
 
             for block_index in sorted_blocks {
+                if tx.is_closed() {
+                    return;
+                }
+
                 let Some(targets) = &target_files_by_block.get(&block_index) else {
                     continue;
                 };
@@ -879,38 +881,38 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                 if let Err(err) = folder.for_each_entries(&mut |entry, entry_reader| {
                     if targets.contains(entry.name()) {
-                        let (simplex_reader, mut simplex_writer) =
-                            tokio::io::simplex(crate::BUFFER_SIZE);
+                        let (pipe_reader, pipe_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+                        let (pipe_reader, signal) =
+                            crate::io::fallible_reader::FallibleReader::new_with_eof(pipe_reader);
+                        let mut pipe_writer = pipe_writer.into_sync();
 
-                        let send_result = runtime.block_on(tx.send(Ok((
+                        let send_result = tx.blocking_send(Ok((
                             FileType::File,
                             PathBuf::from(entry.name()),
-                            Box::new(simplex_reader),
-                        ))));
+                            Box::new(pipe_reader),
+                        )));
 
                         if send_result.is_err() {
                             return Ok(false);
                         }
 
-                        let mut buffer = vec![0; crate::BUFFER_SIZE];
-                        loop {
-                            match entry_reader.read_uninterrupted(&mut buffer) {
-                                Ok(0) => break,
-                                Ok(bytes_read) => {
-                                    if runtime
-                                        .block_on(
-                                            simplex_writer.safe_write_all(&buffer, bytes_read),
-                                        )
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
+                        match crate::io::pipe::copy_and_shutdown(entry_reader, &mut pipe_writer) {
+                            Ok(true) => signal.succeed(),
+                            Ok(false) => {
+                                if tx.is_closed() {
+                                    return Ok(false);
                                 }
-                                Err(err) => return Err(err.into()),
+
+                                std::io::copy(entry_reader, &mut std::io::sink())?;
+
+                                return Ok(true);
+                            }
+                            Err(err) => {
+                                signal.fail(&err);
+
+                                return Err(err.into());
                             }
                         }
-
-                        runtime.block_on(simplex_writer.shutdown()).ok();
                     } else {
                         std::io::copy(entry_reader, &mut std::io::sink())?;
                     }
@@ -1027,11 +1029,12 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             None => return Err(anyhow::anyhow!("7z archive entry not found")),
         };
 
-        let (simplex_reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (pipe_reader, signal) =
+            crate::io::fallible_reader::FallibleReader::new_with_eof(pipe_reader);
+        let mut writer = writer.into_sync();
 
-        tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Handle::current();
-
+        crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
             if let Some(Some(block_index)) = archive.stream_map.file_block_index.get(entry_index) {
                 let password = sevenz_rust2::Password::empty();
                 let folder = sevenz_rust2::BlockDecoder::new(
@@ -1042,44 +1045,26 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     &mut reader,
                 );
 
-                let _ = folder.for_each_entries(&mut |entry, reader| {
+                folder.for_each_entries(&mut |entry, reader| {
                     let entry_path = Path::new(entry.name());
                     if entry_path != path {
                         std::io::copy(reader, &mut std::io::sink())?;
+
                         return Ok(true);
                     }
 
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
-                    loop {
-                        match reader.read_uninterrupted(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(bytes_read) => {
-                                if runtime
-                                    .block_on(writer.safe_write_all(&buffer, bytes_read))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                tracing::error!("error reading from 7z entry: {:#?}", err);
-                                break;
-                            }
-                        }
-                    }
+                    Ok(crate::io::pipe::copy_and_shutdown(reader, &mut writer)?)
+                })?;
+            }
 
-                    Ok(true)
-                });
-
-                runtime.block_on(writer.shutdown()).ok();
-            };
+            Ok(())
         });
 
         Ok(AsyncFileRead {
             size,
             total_size: size,
             reader_range: None,
-            reader: Box::new(simplex_reader),
+            reader: Box::new(pipe_reader),
         })
     }
 
@@ -1103,19 +1088,18 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let archive = self.archive.clone();
         let mut reader = self.reader.clone();
         let path = path.as_ref().to_path_buf();
 
-        let (simplex_reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-        let (simplex_reader, signal) =
-            crate::io::fallible_reader::FallibleReader::new(simplex_reader);
+        let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (pipe_reader, signal) = crate::io::fallible_reader::FallibleReader::new(pipe_reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
@@ -1210,7 +1194,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             }
             f if f.is_tar() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1305,7 +1289,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             }
             f if f.is_itaf() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1472,10 +1456,93 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             }
         }
 
-        Ok(simplex_reader)
+        Ok(pipe_reader)
     }
 
     async fn close(&self) -> Result<(), anyhow::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn solid_walker_drains_dropped_entries_before_continuing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("creating solid archive test runtime failed");
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let temp = tempfile::tempdir()?;
+                let state = crate::routes::AppState::mock();
+                state
+                    .config
+                    .mutate_in_place_for_testing()
+                    .system
+                    .data_directory =
+                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+                let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+                server.filesystem.disk_checker.abort();
+
+                let first = vec![b'a'; crate::BUFFER_SIZE * 4];
+                let second = vec![b'b'; crate::BUFFER_SIZE * 4];
+                let entries = ["first.txt", "second.txt"]
+                    .into_iter()
+                    .map(|name| sevenz_rust2::ArchiveEntry {
+                        name: name.into(),
+                        has_stream: true,
+                        ..Default::default()
+                    })
+                    .collect();
+                let mut writer = sevenz_rust2::ArchiveWriter::new(tempfile::tempfile()?)?;
+                writer.push_archive_entries(
+                    entries,
+                    vec![
+                        sevenz_rust2::SourceReader::new(first.as_slice()),
+                        sevenz_rust2::SourceReader::new(second.as_slice()),
+                    ],
+                )?;
+                let mut reader = MultiReader::new(Arc::new(writer.finish()?))?;
+                let archive =
+                    sevenz_rust2::Archive::read(&mut reader, &sevenz_rust2::Password::empty())?;
+                assert!(archive.is_solid);
+                assert_eq!(archive.blocks.len(), 1);
+
+                let filesystem = VirtualSevenZipArchive::new(
+                    server,
+                    Arc::new(archive),
+                    Default::default(),
+                    reader,
+                );
+                let mut walker = filesystem
+                    .async_walk_dir_stream(&"", IsIgnoredFn::default())
+                    .await?;
+                let (_, name, mut stream) = walker.next_entry().await.expect("first entry")?;
+                assert_eq!(name, Path::new("first.txt"));
+                stream.read_exact(&mut [0]).await?;
+                drop(stream);
+
+                let (_, name, mut stream) = walker.next_entry().await.expect("second entry")?;
+                assert_eq!(name, Path::new("second.txt"));
+                let mut contents = Vec::new();
+                stream.read_to_end(&mut contents).await?;
+                assert_eq!(contents, second);
+                assert!(walker.next_entry().await.is_none());
+
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+        result
+            .expect("solid archive walker stalled after reader drop")
+            .expect("solid archive continuation failed");
     }
 }

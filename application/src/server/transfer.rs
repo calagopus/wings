@@ -360,15 +360,15 @@ impl OutgoingServerTransfer {
             let (files_sender, files_receiver) = async_channel::bounded(512 * (1 + multiplex_streams));
 
             let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
-            let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
-            let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
+            let (mut checksummed_reader, checksummed_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
+            let (reader, mut writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
             fn get_tar_archive_task(
                 files_receiver: async_channel::Receiver<PathBuf>,
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
-                writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
+                writer: crate::io::pipe::SyncPipeWriter,
                 options: crate::server::filesystem::archive::create::CreateTarOptions
             ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
                 Box::pin(async move {
@@ -393,7 +393,7 @@ impl OutgoingServerTransfer {
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
-                writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
+                writer: crate::io::pipe::SyncPipeWriter,
                 options: crate::server::filesystem::archive::create::CreateItafOptions
             ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
                 Box::pin(async move {
@@ -413,7 +413,7 @@ impl OutgoingServerTransfer {
                 })
             }
 
-            let get_archive_task = |writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>| {
+            let get_archive_task = |writer: crate::io::pipe::SyncPipeWriter| {
                 if archive_format.is_tar() {
                     get_tar_archive_task(
                         files_receiver.clone(),
@@ -444,7 +444,7 @@ impl OutgoingServerTransfer {
                 }
             };
 
-            let archive_task = get_archive_task(tokio_util::io::SyncIoBridge::new(checksummed_writer));
+            let archive_task = get_archive_task(checksummed_writer.into_sync());
 
             let checksum_task = Box::pin({
                 let bytes_sent = Arc::clone(&bytes_sent);
@@ -796,10 +796,10 @@ impl OutgoingServerTransfer {
 
             for i in 0..multiplex_streams {
                 let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
-                let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
-                let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
+                let (mut checksummed_reader, checksummed_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
+                let (reader, mut writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
-                let archive_task = get_archive_task(tokio_util::io::SyncIoBridge::new(checksummed_writer));
+                let archive_task = get_archive_task(checksummed_writer.into_sync());
 
                 let checksum_task = Box::pin({
                     let bytes_sent = Arc::clone(&bytes_sent);

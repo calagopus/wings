@@ -1,6 +1,6 @@
 use crate::{
     io::{
-        SafeAsyncWriteExt, UninterruptedReadExt,
+        UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
         fixed_reader::FixedReader,
     },
@@ -28,7 +28,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::io::AsyncWriteExt;
 
 trait EntryReaderExt {
     fn entry_reader(
@@ -463,11 +462,7 @@ impl VirtualDdupBakArchive {
     fn zip_convert_entries(
         entry: &Entry,
         repository: &Option<Arc<ddup_bak::repository::Repository>>,
-        zip: &mut zip::ZipWriter<
-            zip::write::StreamWriter<
-                tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
-            >,
-        >,
+        zip: &mut zip::ZipWriter<zip::write::StreamWriter<crate::io::pipe::SyncPipeWriter>>,
         compression_level: CompressionLevel,
         parent_path: &Path,
         progress: &crate::server::filesystem::archive::create::ArchiveProgress,
@@ -632,36 +627,39 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         .await?
     }
 
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        let path = path.as_ref();
+
+        let entry = self.archive.find_archive_entry(path).ok_or_else(|| {
+            anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
+            ))
+        })?;
+
+        Ok(Self::ddup_bak_entry_to_directory_entry(
+            &self.archive_created,
+            path,
+            entry,
+            &self.repository,
+            &self.mime_cache,
+            Some(buffer),
+        ))
+    }
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let archive = self.archive.clone();
-        let archive_created = self.archive_created;
-        let repository = self.repository.clone();
-        let mime_cache = self.mime_cache.clone();
+        let this = self.clone();
         let path = path.as_ref().to_path_buf();
         let buffer = buffer.to_owned();
 
-        tokio::task::spawn_blocking(move || -> Result<DirectoryEntry, anyhow::Error> {
-            let entry = archive.find_archive_entry(&path).ok_or_else(|| {
-                anyhow::anyhow!(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "File not found"
-                ))
-            })?;
-
-            Ok(Self::ddup_bak_entry_to_directory_entry(
-                &archive_created,
-                &path,
-                entry,
-                &repository,
-                &mime_cache,
-                Some(&buffer),
-            ))
-        })
-        .await?
+        tokio::task::spawn_blocking(move || this.directory_entry_buffer(&path, &buffer)).await?
     }
 
     async fn async_read_dir(
@@ -892,30 +890,14 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         };
 
         let mut entry_reader = self.repository.entry_reader(entry.clone())?;
-        let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
+        let mut writer = writer.into_sync();
 
-        tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Handle::current();
-            let mut buffer = vec![0; crate::BUFFER_SIZE];
-            loop {
-                match entry_reader.read_uninterrupted(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        if runtime
-                            .block_on(writer.safe_write_all(&buffer, bytes_read))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!("error reading from ddup_bak entry: {:?}", err);
-                        break;
-                    }
-                }
-            }
+        crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+            crate::io::pipe::copy_and_shutdown(&mut entry_reader, &mut writer)?;
 
-            runtime.block_on(writer.shutdown()).ok();
+            Ok(())
         });
 
         Ok(AsyncFileRead {
@@ -954,19 +936,18 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
         let repository = self.repository.clone();
 
-        let (simplex_reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-        let (simplex_reader, signal) =
-            crate::io::fallible_reader::FallibleReader::new(simplex_reader);
+        let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (pipe_reader, signal) = crate::io::fallible_reader::FallibleReader::new(pipe_reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     match archive.find_archive_entry(&path) {
@@ -1019,7 +1000,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             }
             f if f.is_tar() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1083,7 +1064,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             }
             f if f.is_itaf() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     self.server
@@ -1157,7 +1138,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             }
         }
 
-        Ok(simplex_reader)
+        Ok(pipe_reader)
     }
 
     fn walk_dir<'a>(
@@ -1316,35 +1297,23 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                     let stream: AsyncReadableFileStream = if entry.is_file() {
                         match self.repository.entry_reader(entry) {
                             Ok(mut entry_reader) => {
-                                let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-                                tokio::task::spawn_blocking(move || {
-                                    let runtime = tokio::runtime::Handle::current();
-                                    let mut buffer = vec![0; crate::BUFFER_SIZE];
-                                    loop {
-                                        match entry_reader.read_uninterrupted(&mut buffer) {
-                                            Ok(0) => break,
-                                            Ok(bytes_read) => {
-                                                if runtime
-                                                    .block_on(
-                                                        writer.safe_write_all(&buffer, bytes_read),
-                                                    )
-                                                    .is_err()
-                                                {
-                                                    break;
-                                                }
-                                            }
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    "error reading from ddup_bak entry: {:?}",
-                                                    err
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
+                                let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+                                let (reader, signal) =
+                                    crate::io::fallible_reader::FallibleReader::new_with_eof(
+                                        reader,
+                                    );
+                                let mut writer = writer.into_sync();
+                                crate::spawn_blocking_signalled(
+                                    signal,
+                                    move || -> Result<(), anyhow::Error> {
+                                        crate::io::pipe::copy_and_shutdown(
+                                            &mut entry_reader,
+                                            &mut writer,
+                                        )?;
 
-                                    runtime.block_on(writer.shutdown()).ok();
-                                });
+                                        Ok(())
+                                    },
+                                );
                                 Box::new(reader)
                             }
                             Err(err) => return Some(Err(err)),

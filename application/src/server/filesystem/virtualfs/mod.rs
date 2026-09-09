@@ -601,6 +601,11 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error>;
+    fn directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error>;
     async fn async_directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -701,7 +706,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         compression_level: CompressionLevel,
         progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error>;
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error>;
     async fn async_read_dir_files_archive(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -710,7 +715,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         compression_level: CompressionLevel,
         progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let root_path = path.as_ref().to_path_buf();
         let is_ignored = move |file_type, path: PathBuf| {
             let stripped_path = path.strip_prefix(&root_path).unwrap_or(&path);

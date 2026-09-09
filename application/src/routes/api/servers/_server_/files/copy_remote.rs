@@ -436,8 +436,8 @@ mod post {
                             let (checksum_sender, checksum_receiver) =
                                 tokio::sync::oneshot::channel();
                             let (mut checksummed_reader, mut checksummed_writer) =
-                                tokio::io::simplex(crate::BUFFER_SIZE);
-                            let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                                crate::io::pipe::pipe(crate::BUFFER_SIZE);
+                            let (reader, mut writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
                             let archive_task = async {
                                 let is_ignored = if filesystem.is_primary_server_fs() {

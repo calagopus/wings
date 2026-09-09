@@ -14,6 +14,7 @@ pub mod hash_reader;
 pub mod limited_reader;
 pub mod limited_writer;
 pub mod line_buffer;
+pub mod pipe;
 pub mod range_reader;
 pub mod tail;
 

@@ -138,7 +138,7 @@ impl BackupCreateExt for PbsBackup {
 
         let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
 
-        let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -175,7 +175,7 @@ impl BackupCreateExt for PbsBackup {
             async move {
                 let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
                 let writer = LimitedWriter::new_with_bytes_per_second(
-                    SyncIoBridge::new(archive_writer),
+                    archive_writer.into_sync(),
                     server
                         .app_state
                         .config
@@ -410,7 +410,7 @@ impl BackupStreamExt for PbsBackup {
             }
         }
 
-        let (dump_reader, mut dump_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (dump_reader, mut dump_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (dump_reader, signal) =
             crate::io::fallible_reader::FallibleReader::new_with_eof(dump_reader);
         let download_concurrency = state.config.load().system.backups.pbs.download_concurrency;
@@ -469,8 +469,9 @@ impl BackupExt for PbsBackup {
         let session =
             PbsBackupReader::connect(&self.config, &self.backup_id, self.backup_time).await?;
 
-        let (pxar_reader, mut pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (pxar_reader, mut pxar_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
 
         let download_concurrency = state.config.load().system.backups.pbs.download_concurrency;
         tokio::spawn(async move {
@@ -488,8 +489,8 @@ impl BackupExt for PbsBackup {
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
-                    let mut zip = zip::ZipWriter::new_stream(SyncIoBridge::new(writer));
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let mut zip = zip::ZipWriter::new_stream(writer.into_sync());
                     let mut decoder = Decoder::from_std(SyncIoBridge::new(pxar_reader))?;
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
 
@@ -551,9 +552,9 @@ impl BackupExt for PbsBackup {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         threads,
@@ -612,9 +613,9 @@ impl BackupExt for PbsBackup {
                 });
             }
             f if f.is_itaf() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         threads,
@@ -760,7 +761,7 @@ impl BackupExt for PbsBackup {
             }
         }
 
-        let (pxar_reader, pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (pxar_reader, pxar_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
         let fetch_task = async {
             let mut pxar_writer = pxar_writer;
@@ -1325,7 +1326,8 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             "File not found"
         )))
     }
-    async fn async_directory_entry_buffer(
+
+    fn directory_entry_buffer(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
@@ -1345,6 +1347,13 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             std::io::ErrorKind::NotFound,
             "File not found"
         )))
+    }
+    async fn async_directory_entry_buffer(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        buffer: &[u8],
+    ) -> Result<DirectoryEntry, anyhow::Error> {
+        self.directory_entry_buffer(path, buffer)
     }
 
     async fn async_read_dir(
@@ -1739,7 +1748,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let node = match self.tree.lookup_dir(&base_path) {
             Some(node) => node,
@@ -1762,13 +1771,13 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             .load()
             .api
             .file_compression_threads;
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-                    let writer = SyncIoBridge::new(writer);
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     for entry in entries {
@@ -1828,7 +1837,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             f if f.is_tar() => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         threads,
@@ -1881,7 +1890,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             f if f.is_itaf() => {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
-                        SyncIoBridge::new(writer),
+                        writer.into_sync(),
                         f.compression_format(),
                         compression_level,
                         threads,

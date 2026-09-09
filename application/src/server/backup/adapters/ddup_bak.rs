@@ -170,11 +170,7 @@ impl DdupBakBackup {
     fn zip_convert_entries(
         entry: &Entry,
         repository: &ddup_bak::repository::Repository,
-        zip: &mut zip::ZipWriter<
-            zip::write::StreamWriter<
-                tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
-            >,
-        >,
+        zip: &mut zip::ZipWriter<zip::write::StreamWriter<crate::io::pipe::SyncPipeWriter>>,
         compression_level: CompressionLevel,
         parent_path: &Path,
     ) -> Result<(), anyhow::Error> {
@@ -655,12 +651,13 @@ impl BackupExt for DdupBakBackup {
 
         let archive = self.archive.clone();
         let compression_level = state.config.load().system.backups.compression_level;
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new_with_eof(reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
-                    let writer = tokio_util::io::SyncIoBridge::new(writer);
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     for entry in archive.entries.iter() {
@@ -682,13 +679,13 @@ impl BackupExt for DdupBakBackup {
             }
             f if f.is_tar() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     state.config.load().api.file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut tar = tar::Builder::new(writer);
                     tar.mode(tar::HeaderMode::Complete);
 
@@ -711,13 +708,13 @@ impl BackupExt for DdupBakBackup {
             }
             f if f.is_itaf() => {
                 let writer = CompressionWriter::new(
-                    tokio_util::io::SyncIoBridge::new(writer),
+                    writer.into_sync(),
                     f.compression_format(),
                     compression_level,
                     state.config.load().api.file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut itaf_enc = ItafEncoder::new(
                         writer,
                         EncoderOptions {
