@@ -2194,13 +2194,10 @@ impl Filesystem {
                 tokio::task::spawn_blocking({
                     let filesystem = filesystem.clone();
                     let mime_cache = self.app_state.mime_cache.clone();
-                    let runtime = tokio::runtime::Handle::current();
 
                     move || {
-                        let detected_mime =
-                            prepared.cached_mime_type_blocking(&mime_cache, &runtime, || {
-                                prepared.open(&filesystem)
-                            });
+                        let detected_mime = prepared
+                            .cached_mime_type_blocking(&mime_cache, || prepared.open(&filesystem));
 
                         (prepared, detected_mime)
                     }
@@ -2233,12 +2230,9 @@ impl Filesystem {
         filesystem: &cap::CapFilesystem,
         prepared: PreparedDirectoryEntry,
         options: DirectoryEntryOptions,
-        runtime: &tokio::runtime::Handle,
     ) -> crate::models::DirectoryEntry {
-        let detected_mime =
-            prepared.cached_mime_type_blocking(&self.app_state.mime_cache, runtime, || {
-                prepared.open(filesystem)
-            });
+        let detected_mime = prepared
+            .cached_mime_type_blocking(&self.app_state.mime_cache, || prepared.open(filesystem));
 
         let PreparedDirectoryEntry {
             path,
@@ -2319,12 +2313,11 @@ impl PreparedDirectoryEntry {
     fn cached_mime_type_blocking(
         &self,
         mime_cache: &moka::future::Cache<MimeCacheKey, MimeCacheValue>,
-        runtime: &tokio::runtime::Handle,
         open: impl FnOnce() -> std::io::Result<std::fs::File>,
     ) -> MimeCacheValue {
         let mime_key = MimeCacheKey::from(&self.metadata);
 
-        runtime.block_on(async {
+        futures::executor::block_on(async {
             if let Some(detected_mime) = mime_cache.get(&mime_key).await {
                 detected_mime
             } else if self.is_empty_file() {
@@ -2431,20 +2424,13 @@ mod tests {
                     directory_entry: None,
                 };
 
-                let (cache, start, opens, release, started, filesystem, runtime) = (
-                    &cache,
-                    &start,
-                    &opens,
-                    &release,
-                    &started,
-                    &filesystem,
-                    &runtime,
-                );
+                let (cache, start, opens, release, started, filesystem) =
+                    (&cache, &start, &opens, &release, &started, &filesystem);
 
                 workers.push(scope.spawn(move || {
                     start.wait();
 
-                    prepared.cached_mime_type_blocking(cache, runtime.handle(), || {
+                    prepared.cached_mime_type_blocking(cache, || {
                         if opens.fetch_add(1, Ordering::Relaxed) == 0 {
                             started.send(()).expect("notifying first MIME open failed");
                             while !release.load(Ordering::Acquire) {

@@ -266,7 +266,6 @@ impl VirtualCapFilesystem {
     fn finish_prepared_entries(
         &self,
         prepared: Vec<PreparedDirectoryEntry>,
-        runtime: &tokio::runtime::Handle,
         listener: &AbortListener,
     ) -> Result<Vec<DirectoryEntry>, anyhow::Error> {
         let options = DirectoryEntryOptions::server_fs(self.is_primary_server_fs);
@@ -279,7 +278,6 @@ impl VirtualCapFilesystem {
                 &self.inner,
                 prepared,
                 options,
-                runtime,
             ));
         }
 
@@ -290,7 +288,6 @@ impl VirtualCapFilesystem {
         &self,
         total_entries: usize,
         prepared: Vec<PreparedDirectoryEntry>,
-        runtime: &tokio::runtime::Handle,
         listener: &AbortListener,
     ) -> Result<ListingResult<PreparedDirectoryEntry>, anyhow::Error> {
         if prepared.len() > ListingWork::SMALL_LIMIT {
@@ -302,7 +299,7 @@ impl VirtualCapFilesystem {
 
         Ok(ListingResult::Complete(DirectoryListing {
             total_entries,
-            entries: self.finish_prepared_entries(prepared, runtime, listener)?,
+            entries: self.finish_prepared_entries(prepared, listener)?,
         }))
     }
 }
@@ -449,13 +446,11 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             None => is_ignored,
         };
         let work = Arc::clone(&self.server.filesystem.app_state.listing_work);
-        let runtime = tokio::runtime::Handle::current();
 
         let initial = work
             .run({
                 let this = self.clone();
                 let path = path.clone();
-                let runtime = runtime.clone();
 
                 move |listener| {
                     use crate::models::DirectorySortingMode::*;
@@ -566,7 +561,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
                     Ok(ListingResult::Complete(DirectoryListing {
                         total_entries,
-                        entries: this.finish_prepared_entries(prepared, &runtime, listener)?,
+                        entries: this.finish_prepared_entries(prepared, listener)?,
                     }))
                 }
             })
@@ -593,7 +588,6 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let selected = work
             .run({
                 let this = self.clone();
-                let runtime = runtime.clone();
 
                 move |listener| {
                     let mut prepared = Vec::with_capacity(statted.len());
@@ -609,7 +603,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
                     let prepared =
                         this.select_prepared_entries(prepared, sort, per_page, page, listener)?;
-                    this.finish_small_listing(total_entries, prepared, &runtime, listener)
+                    this.finish_small_listing(total_entries, prepared, listener)
                 }
             })
             .await?;
@@ -632,7 +626,6 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         &this.inner,
                         prepared,
                         options,
-                        &runtime,
                     )
                 }
             })
