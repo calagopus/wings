@@ -134,10 +134,7 @@ mod get {
                 .ok();
         }
 
-        let reader = AsyncCompressionReader::new(
-            tokio_util::io::SyncIoBridge::new(reader),
-            compression_type,
-        );
+        let reader = AsyncCompressionReader::new_with_async_reader(reader, compression_type);
 
         let mut headers = HeaderMap::new();
 

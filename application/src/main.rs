@@ -514,7 +514,8 @@ async fn main_rt() {
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
             Arc::clone(&config),
         )),
-        mime_cache: moka::future::Cache::new(20480),
+        mime_cache: moka::future::Cache::new(32768),
+        listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
         #[cfg(unix)]
         tundra,
     });

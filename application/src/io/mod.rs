@@ -17,6 +17,8 @@ pub mod line_buffer;
 pub mod range_reader;
 pub mod tail;
 
+const KERNEL_COPY_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
 pub fn copy(
     reader: &mut (impl ?Sized + Read),
     writer: &mut (impl ?Sized + Write),
@@ -64,7 +66,7 @@ pub fn copy_file_progress(
             None,
             writer.as_fd(),
             None,
-            crate::BUFFER_SIZE,
+            KERNEL_COPY_BUFFER_SIZE,
         );
         #[cfg(not(target_os = "linux"))]
         let result = Err(std::io::Error::new(

@@ -107,7 +107,7 @@ impl AsyncReadDir {
     }
 
     pub async fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        Some(self.next().await?.map(name_and_type))
+        Some(self.next().await?.map(|entry| name_and_type(&entry)))
     }
 }
 
@@ -119,11 +119,11 @@ impl ReadDir {
     }
 
     pub fn next_entry(&mut self) -> Option<std::io::Result<(FileType, String)>> {
-        Some(self.next()?.map(name_and_type))
+        Some(self.next()?.map(|entry| name_and_type(&entry)))
     }
 }
 
-fn name_and_type(entry: cap_std::fs::DirEntry) -> (FileType, String) {
+pub fn name_and_type(entry: &cap_std::fs::DirEntry) -> (FileType, String) {
     (
         entry.file_type().map_or(FileType::Unknown, FileType::from),
         entry.file_name().to_string_lossy().to_string(),

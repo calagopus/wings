@@ -1,5 +1,5 @@
 use crate::{
-    routes::MimeCacheValue,
+    routes::{MimeCacheKey, MimeCacheValue},
     server::{
         filesystem::virtualfs::{
             AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
@@ -23,7 +23,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     sync::{RwLock, RwLockReadGuard},
 };
 
@@ -33,6 +33,7 @@ pub mod disk_checker;
 pub mod file;
 pub mod inotify;
 pub mod limiter;
+pub mod listing;
 pub mod operations;
 pub mod pull;
 pub mod sqlite;
@@ -1861,6 +1862,30 @@ impl Filesystem {
             .map_or((0, 0), |space| (space.get_logical(), space.get_physical()))
     }
 
+    fn directory_entry_space_blocking(
+        &self,
+        real_path: &Path,
+        options: DirectoryEntryOptions,
+    ) -> (u64, u64) {
+        if !options.directory_size || self.config.load().api.disable_directory_size {
+            return (0, 0);
+        }
+
+        if let Some(space) = self.disk_usage.blocking_read().get_size(real_path) {
+            return (space.get_logical(), space.get_physical());
+        }
+
+        let canonical = match self.canonicalize(real_path) {
+            Ok(canonical) if canonical != real_path => canonical,
+            _ => return (0, 0),
+        };
+
+        self.disk_usage
+            .blocking_read()
+            .get_size(&canonical)
+            .map_or((0, 0), |space| (space.get_logical(), space.get_physical()))
+    }
+
     pub async fn to_api_entry_buffer(
         &self,
         path: PathBuf,
@@ -2060,7 +2085,7 @@ impl Filesystem {
         path: PathBuf,
         metadata: Metadata,
         options: DirectoryEntryOptions,
-    ) -> crate::models::DirectoryEntry {
+    ) -> Result<crate::models::DirectoryEntry, anyhow::Error> {
         let prepared = self.prepare_api_entry_cap(filesystem, path, metadata).await;
         self.finish_api_entry_cap(filesystem, prepared, options)
             .await
@@ -2096,10 +2121,42 @@ impl Filesystem {
             metadata,
             symlink_destination,
             symlink_destination_metadata,
+            directory_entry: None,
         }
     }
 
-    pub async fn prepared_entry_sort_size(
+    pub fn prepare_api_entry_cap_blocking(
+        &self,
+        filesystem: &cap::CapFilesystem,
+        path: PathBuf,
+        metadata: Metadata,
+    ) -> PreparedDirectoryEntry {
+        let symlink_destination = if metadata.is_symlink() {
+            match filesystem.read_link(&path) {
+                Ok(link) => filesystem.canonicalize(link).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let symlink_destination_metadata =
+            if let Some(symlink_destination) = symlink_destination.clone() {
+                filesystem.symlink_metadata(&symlink_destination).ok()
+            } else {
+                None
+            };
+
+        PreparedDirectoryEntry {
+            path,
+            metadata,
+            symlink_destination,
+            symlink_destination_metadata,
+            directory_entry: None,
+        }
+    }
+
+    pub fn prepared_entry_sort_size_blocking(
         &self,
         prepared: &PreparedDirectoryEntry,
         options: DirectoryEntryOptions,
@@ -2114,7 +2171,7 @@ impl Filesystem {
             .unwrap_or(&prepared.path);
 
         if real_metadata.is_dir() {
-            self.directory_entry_space(real_path, options).await
+            self.directory_entry_space_blocking(real_path, options)
         } else {
             (real_metadata.size_logical(), real_metadata.size_physical())
         }
@@ -2125,70 +2182,97 @@ impl Filesystem {
         filesystem: &cap::CapFilesystem,
         prepared: PreparedDirectoryEntry,
         options: DirectoryEntryOptions,
-    ) -> crate::models::DirectoryEntry {
+    ) -> Result<crate::models::DirectoryEntry, anyhow::Error> {
+        let mime_key = MimeCacheKey::from(&prepared.metadata);
+
+        let (prepared, detected_mime) =
+            if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
+                (prepared, detected_mime)
+            } else if prepared.is_empty_file() {
+                (prepared, MimeCacheValue::text())
+            } else {
+                tokio::task::spawn_blocking({
+                    let filesystem = filesystem.clone();
+                    let mime_cache = self.app_state.mime_cache.clone();
+                    let runtime = tokio::runtime::Handle::current();
+
+                    move || {
+                        let detected_mime =
+                            prepared.cached_mime_type_blocking(&mime_cache, &runtime, || {
+                                prepared.open(&filesystem)
+                            });
+
+                        (prepared, detected_mime)
+                    }
+                })
+                .await?
+            };
+
         let PreparedDirectoryEntry {
             path,
             metadata,
             symlink_destination,
             symlink_destination_metadata,
+            ..
         } = prepared;
 
-        let mime_key = crate::routes::MimeCacheKey::from(&metadata);
+        Ok(self
+            .to_api_entry_mime_type(
+                path,
+                &metadata,
+                options,
+                Some(detected_mime),
+                symlink_destination,
+                symlink_destination_metadata,
+            )
+            .await)
+    }
+
+    pub fn finish_api_entry_cap_blocking(
+        &self,
+        filesystem: &cap::CapFilesystem,
+        prepared: PreparedDirectoryEntry,
+        options: DirectoryEntryOptions,
+        runtime: &tokio::runtime::Handle,
+    ) -> crate::models::DirectoryEntry {
         let detected_mime =
-            if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
-                detected_mime
-            } else if (metadata.is_file() && metadata.len() == 0)
-                || (symlink_destination.is_some()
-                    && symlink_destination_metadata
-                        .as_ref()
-                        .is_some_and(|m| m.is_file() && m.len() == 0))
-            {
-                crate::routes::MimeCacheValue::text()
-            } else {
-                let mut buffer = [0; 64];
-                let buffer = if metadata.is_file()
-                    || (symlink_destination.is_some()
-                        && symlink_destination_metadata
-                            .as_ref()
-                            .is_some_and(|m| m.is_file()))
-                {
-                    match filesystem
-                        .async_open(symlink_destination.as_ref().unwrap_or(&path))
-                        .await
-                    {
-                        Ok(mut file) => {
-                            let bytes_read = file.read(&mut buffer).await.unwrap_or(0);
+            prepared.cached_mime_type_blocking(&self.app_state.mime_cache, runtime, || {
+                prepared.open(filesystem)
+            });
 
-                            buffer.get(..bytes_read)
-                        }
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                let detected_mime = crate::utils::detect_mime_type(
-                    symlink_destination.as_ref().unwrap_or(&path),
-                    buffer,
-                );
-
-                self.app_state
-                    .mime_cache
-                    .insert(mime_key, detected_mime)
-                    .await;
-
-                detected_mime
-            };
-
-        self.to_api_entry_mime_type(
+        let PreparedDirectoryEntry {
             path,
-            &metadata,
-            options,
-            Some(detected_mime),
+            metadata,
             symlink_destination,
             symlink_destination_metadata,
+            ..
+        } = prepared;
+
+        let real_metadata = symlink_destination_metadata.as_ref().unwrap_or(&metadata);
+        let real_path = symlink_destination.as_ref().unwrap_or(&path);
+
+        let (size, size_physical) = if real_metadata.is_dir() {
+            self.directory_entry_space_blocking(real_path, options)
+        } else {
+            (real_metadata.size_logical(), real_metadata.size_physical())
+        };
+
+        let detected_mime = if real_metadata.is_dir() {
+            MimeCacheValue::directory()
+        } else if real_metadata.is_symlink() {
+            MimeCacheValue::symlink()
+        } else {
+            detected_mime
+        };
+
+        Self::assemble_api_entry(
+            path,
+            &metadata,
+            real_metadata,
+            options,
+            (size, size_physical),
+            detected_mime,
         )
-        .await
     }
 }
 
@@ -2212,9 +2296,76 @@ pub struct PreparedDirectoryEntry {
     pub metadata: Metadata,
     pub symlink_destination: Option<PathBuf>,
     pub symlink_destination_metadata: Option<Metadata>,
+    directory_entry: Option<cap_std::fs::DirEntry>,
 }
 
 impl PreparedDirectoryEntry {
+    fn open(&self, filesystem: &cap::CapFilesystem) -> std::io::Result<std::fs::File> {
+        match &self.directory_entry {
+            Some(entry) => entry.open().map(cap_std::fs::File::into_std),
+            None => filesystem.open(self.symlink_destination.as_ref().unwrap_or(&self.path)),
+        }
+    }
+
+    fn is_empty_file(&self) -> bool {
+        (self.metadata.is_file() && self.metadata.len() == 0)
+            || (self.symlink_destination.is_some()
+                && self
+                    .symlink_destination_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.is_file() && metadata.len() == 0))
+    }
+
+    fn cached_mime_type_blocking(
+        &self,
+        mime_cache: &moka::future::Cache<MimeCacheKey, MimeCacheValue>,
+        runtime: &tokio::runtime::Handle,
+        open: impl FnOnce() -> std::io::Result<std::fs::File>,
+    ) -> MimeCacheValue {
+        let mime_key = MimeCacheKey::from(&self.metadata);
+
+        runtime.block_on(async {
+            if let Some(detected_mime) = mime_cache.get(&mime_key).await {
+                detected_mime
+            } else if self.is_empty_file() {
+                MimeCacheValue::text()
+            } else {
+                mime_cache
+                    .get_with_by_ref(&mime_key, async {
+                        let path = self.symlink_destination.as_ref().unwrap_or(&self.path);
+
+                        let mut buffer = [0; 64];
+                        let buffer = if self.metadata.is_file()
+                            || (self.symlink_destination.is_some()
+                                && self
+                                    .symlink_destination_metadata
+                                    .as_ref()
+                                    .is_some_and(|metadata| metadata.is_file()))
+                        {
+                            match open() {
+                                Ok(mut file) => {
+                                    #[cfg(target_os = "linux")]
+                                    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random)
+                                        .ok();
+
+                                    let bytes_read =
+                                        std::io::Read::read(&mut file, &mut buffer).unwrap_or(0);
+
+                                    buffer.get(..bytes_read)
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        crate::utils::detect_mime_type(path, buffer)
+                    })
+                    .await
+            }
+        })
+    }
+
     pub fn modified_secs(&self) -> i64 {
         self.metadata
             .modified()
@@ -2252,6 +2403,79 @@ impl Deref for Filesystem {
 mod tests {
     use super::*;
     use cap::FileType;
+
+    #[test]
+    fn concurrent_mime_misses_open_once() -> Result<(), anyhow::Error> {
+        use std::sync::{Barrier, atomic::AtomicUsize, mpsc};
+
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("data.bin"), b"shared MIME read")?;
+        let filesystem = runtime.block_on(cap::CapFilesystem::new(temp.path()))?;
+        let metadata = filesystem.symlink_metadata("data.bin")?;
+        let cache = moka::future::Cache::new(16);
+        let start = Barrier::new(9);
+        let opens = AtomicUsize::new(0);
+        let release = AtomicBool::new(false);
+        let (started, first_open) = mpsc::channel();
+
+        let opened = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+
+            for _ in 0..8 {
+                let prepared = PreparedDirectoryEntry {
+                    path: PathBuf::from("data.bin"),
+                    metadata: metadata.clone(),
+                    symlink_destination: None,
+                    symlink_destination_metadata: None,
+                    directory_entry: None,
+                };
+
+                let (cache, start, opens, release, started, filesystem, runtime) = (
+                    &cache,
+                    &start,
+                    &opens,
+                    &release,
+                    &started,
+                    &filesystem,
+                    &runtime,
+                );
+
+                workers.push(scope.spawn(move || {
+                    start.wait();
+
+                    prepared.cached_mime_type_blocking(cache, runtime.handle(), || {
+                        if opens.fetch_add(1, Ordering::Relaxed) == 0 {
+                            started.send(()).expect("notifying first MIME open failed");
+                            while !release.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
+
+                        filesystem.open("data.bin")
+                    })
+                }));
+            }
+
+            start.wait();
+
+            let opened = first_open.recv_timeout(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            release.store(true, Ordering::Release);
+
+            for worker in workers {
+                let value = worker.join().expect("MIME worker panicked");
+                assert_eq!(value.mime, "application/octet-stream");
+                assert!(value.valid_utf8);
+            }
+
+            opened
+        });
+
+        opened?;
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
 
     #[test]
     fn root_is_never_ignored() {

@@ -18,7 +18,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod utils;
-pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ReadDir, WalkDir, WalkEntry};
+pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ReadDir, WalkDir, WalkEntry, name_and_type};
 
 #[derive(Debug, Clone)]
 pub struct CapFilesystem {

@@ -912,8 +912,8 @@ impl BackupStreamExt for S3Backup {
                 file_name,
             },
             compression => BackupStream {
-                reader: Box::new(AsyncCompressionReader::new(
-                    tokio_util::io::SyncIoBridge::new(reader),
+                reader: Box::new(AsyncCompressionReader::new_with_async_reader(
+                    reader,
                     compression,
                 )),
                 size: None,
