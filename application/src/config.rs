@@ -110,6 +110,9 @@ fn api_file_search_context_max_response_size() -> u64 {
 fn api_file_copy_threads() -> usize {
     4
 }
+fn api_file_delete_threads() -> usize {
+    2
+}
 fn api_file_decompression_threads() -> usize {
     2
 }
@@ -777,6 +780,8 @@ nestify::nest! {
             },
             #[serde(default = "api_file_copy_threads")]
             pub file_copy_threads: usize,
+            #[serde(default = "api_file_delete_threads")]
+            pub file_delete_threads: usize,
             #[serde(default = "api_file_decompression_threads")]
             pub file_decompression_threads: usize,
             #[serde(default = "api_file_compression_threads")]

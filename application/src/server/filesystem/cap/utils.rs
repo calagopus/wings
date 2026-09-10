@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinSet};
 
 #[derive(Clone, Copy, Debug)]
 pub enum FileType {
@@ -171,6 +171,18 @@ impl WalkEntry {
         }
     }
 
+    /// Unlinks the entry through the handle of the directory it was listed from,
+    pub(super) fn remove(&self) -> Result<(), std::io::Error> {
+        match &self.source {
+            StatSource::Entry(entry) if self.file_type.is_dir() => entry.remove_dir(),
+            StatSource::Entry(entry) => entry.remove_file(),
+            StatSource::Path(cap_filesystem) if self.file_type.is_dir() => {
+                cap_filesystem.get_inner()?.remove_dir(&self.path)
+            }
+            StatSource::Path(cap_filesystem) => cap_filesystem.remove_file(&self.path),
+        }
+    }
+
     pub async fn async_metadata(&self) -> Result<cap_std::fs::Metadata, std::io::Error> {
         match &self.source {
             StatSource::Entry(entry) => entry.metadata(),
@@ -208,6 +220,8 @@ impl AsyncWalkDir {
         self
     }
 
+    /// Yields descendants before their directories. Multithreaded walks also wait
+    /// for descendant callbacks to finish before invoking a directory callback.
     #[allow(dead_code)]
     pub fn reversed(mut self) -> Self {
         self.reversed = true;
@@ -269,45 +283,98 @@ impl AsyncWalkDir {
         threads: usize,
         func: Arc<F>,
     ) -> Result<(), anyhow::Error> {
+        let threads = crate::utils::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
+        let pending = Arc::new(Semaphore::new(if self.reversed {
+            crate::utils::WALK_IN_FLIGHT_LIMIT
+        } else {
+            threads
+        }));
         let error = Arc::new(RwLock::new(None));
+        let mut tasks = vec![JoinSet::new()];
 
         while let Some(entry) = self.next_entry().await {
-            match entry {
-                Ok(entry) => {
-                    let semaphore = Arc::clone(&semaphore);
-                    let error = Arc::clone(&error);
-                    let func = Arc::clone(&func);
-
-                    if crate::unlikely(error.read().is_some()) {
-                        break;
-                    }
-
-                    let permit = match semaphore.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
-                    };
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        match func(entry).await {
-                            Ok(_) => {}
-                            Err(err) => {
-                                *error.write() = Some(err);
-                            }
-                        }
-                    });
-                }
-                Err(err) => return Err(err.into()),
+            if crate::unlikely(error.read().is_some()) {
+                break;
             }
+
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    error.write().get_or_insert_with(|| err.into());
+                    break;
+                }
+            };
+
+            let directory = self.reversed && entry.file_type.is_dir();
+            if self.reversed {
+                // a reversed directory entry has already been popped by next_entry
+                let depth = self.stack.len() + usize::from(directory);
+
+                while tasks.len() < depth {
+                    tasks.push(JoinSet::new());
+                }
+            }
+
+            let children = if directory {
+                tasks.pop().expect("completed directory has a task frame")
+            } else {
+                JoinSet::new()
+            };
+
+            let parent = tasks.last_mut().expect("walk root has a task frame");
+            while let Some(result) = parent.try_join_next() {
+                if let Err(err) = result {
+                    error.write().get_or_insert_with(|| err.into());
+                }
+            }
+
+            let permit = match Arc::clone(&pending).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let semaphore = Arc::clone(&semaphore);
+            let error = Arc::clone(&error);
+            let func = Arc::clone(&func);
+
+            parent.spawn(async move {
+                let _pending = permit;
+
+                finish_walk_tasks(children, &error).await;
+                if crate::unlikely(error.read().is_some()) {
+                    return;
+                }
+
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                if crate::unlikely(error.read().is_some()) {
+                    return;
+                }
+
+                if let Err(err) = func(entry).await {
+                    error.write().get_or_insert(err);
+                }
+            });
         }
 
-        semaphore.acquire_many(threads as u32).await.ok();
+        for tasks in tasks.into_iter().rev() {
+            finish_walk_tasks(tasks, &error).await;
+        }
 
         if let Some(err) = error.write().take() {
             return Err(err);
         }
 
         Ok(())
+    }
+}
+
+async fn finish_walk_tasks(mut tasks: JoinSet<()>, error: &RwLock<Option<anyhow::Error>>) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(err) = result {
+            error.write().get_or_insert_with(|| err.into());
+        }
     }
 }
 
@@ -338,6 +405,8 @@ impl WalkDir {
         self
     }
 
+    /// Yields descendants before their directories. Multithreaded walks also wait
+    /// for descendant callbacks to finish before invoking a directory callback.
     pub fn reversed(mut self) -> Self {
         self.reversed = true;
         self
@@ -409,6 +478,19 @@ impl WalkDir {
         filter: Option<DirectoryWalkFilterFn>,
         func: Arc<F>,
     ) -> Result<(), anyhow::Error> {
+        self.run_multithreaded_with_error_handler(threads, filter, func, |err| Err(err.into()))
+    }
+
+    pub(super) fn run_multithreaded_with_error_handler<
+        F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
+        E: FnMut(std::io::Error) -> Result<(), anyhow::Error>,
+    >(
+        &mut self,
+        threads: usize,
+        filter: Option<DirectoryWalkFilterFn>,
+        func: Arc<F>,
+        mut on_error: E,
+    ) -> Result<(), anyhow::Error> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()?;
@@ -417,69 +499,86 @@ impl WalkDir {
             crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE,
         );
 
-        pool.in_place_scope(|scope| {
-            let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+        loop {
+            let directory = pool.in_place_scope(|scope| {
+                let mut directory = None;
+                let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
 
-            while let Some(entry) = self.next_entry() {
-                match entry {
-                    Ok(entry) => {
-                        if crate::unlikely(error.read().is_some()) {
-                            break;
-                        }
+                while let Some(entry) = self.next_entry() {
+                    match entry {
+                        Ok(entry) => {
+                            if crate::unlikely(error.read().is_some()) {
+                                break;
+                            }
 
-                        if let Some(filter) = &filter
-                            && !filter(entry.file_type, &entry.path)
-                        {
-                            continue;
-                        }
-
-                        batch.push(entry);
-                        if batch.len() < crate::utils::WALK_BATCH_SIZE {
-                            continue;
-                        }
-
-                        let batch = std::mem::replace(
-                            &mut batch,
-                            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
-                        );
-                        let permit = in_flight.acquire();
-
-                        crate::utils::spawn_walk_batch(
-                            scope,
-                            Arc::clone(&error),
+                            if let Some(filter) = &filter
+                                && !filter(entry.file_type, &entry.path)
                             {
-                                let func = Arc::clone(&func);
-                                move |entry| func(entry)
-                            },
-                            permit,
-                            batch,
-                        );
-                    }
-                    Err(err) => {
-                        *error.write() = Some(err.into());
-                        break;
+                                continue;
+                            }
+
+                            if self.reversed && entry.file_type.is_dir() {
+                                directory = Some(entry);
+                                break;
+                            }
+
+                            batch.push(entry);
+                            if batch.len() < crate::utils::WALK_BATCH_SIZE {
+                                continue;
+                            }
+
+                            let batch = std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+                            );
+                            let permit = in_flight.acquire();
+
+                            crate::utils::spawn_walk_batch(
+                                scope,
+                                Arc::clone(&error),
+                                {
+                                    let func = Arc::clone(&func);
+                                    move |entry| func(entry)
+                                },
+                                permit,
+                                batch,
+                            );
+                        }
+                        Err(err) => {
+                            if let Err(err) = on_error(err) {
+                                error.write().get_or_insert(err);
+                                break;
+                            }
+                        }
                     }
                 }
+
+                if !batch.is_empty() {
+                    let permit = in_flight.acquire();
+
+                    crate::utils::spawn_walk_batch(
+                        scope,
+                        Arc::clone(&error),
+                        {
+                            let func = Arc::clone(&func);
+                            move |entry| func(entry)
+                        },
+                        permit,
+                        batch,
+                    );
+                }
+
+                directory
+            });
+
+            if let Some(err) = error.write().take() {
+                return Err(err);
             }
 
-            if !batch.is_empty() {
-                let permit = in_flight.acquire();
-
-                crate::utils::spawn_walk_batch(
-                    scope,
-                    Arc::clone(&error),
-                    {
-                        let func = Arc::clone(&func);
-                        move |entry| func(entry)
-                    },
-                    permit,
-                    batch,
-                );
+            match directory {
+                Some(entry) => func(entry)?,
+                None => break,
             }
-        });
-
-        if let Some(err) = error.write().take() {
-            return Err(err);
         }
 
         Ok(())
@@ -544,10 +643,7 @@ impl<F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static> Para
     fn fail(&self, err: anyhow::Error) {
         self.stopped.store(true, Ordering::Relaxed);
 
-        let mut error = self.error.write();
-        if error.is_none() {
-            *error = Some(err);
-        }
+        self.error.write().get_or_insert(err);
     }
 
     fn process_batch(&self, batch: Vec<WalkEntry>) {

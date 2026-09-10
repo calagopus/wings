@@ -896,7 +896,8 @@ impl Filesystem {
         let metadata = self.async_symlink_metadata(&path).await?;
 
         if metadata.is_dir() {
-            self.async_remove_dir_all(&path).await?;
+            let threads = self.config.load().api.file_delete_threads;
+            self.async_remove_dir_all(&path, threads).await?;
 
             let mut disk_usage = self.disk_usage.write().await;
             if let Some(removed) = disk_usage.remove_path(&path) {
@@ -1366,7 +1367,8 @@ impl Filesystem {
         self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
         self.resource_usage.publish_disk_usage(0);
 
-        self.async_remove_dir_all(Path::new("")).await
+        let threads = self.config.load().api.file_delete_threads;
+        self.async_remove_dir_all(Path::new(""), threads).await
     }
 
     fn chown_impl(

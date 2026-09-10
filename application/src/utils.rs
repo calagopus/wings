@@ -860,21 +860,7 @@ mod tests {
     }
 }
 
-/// A blocking counting semaphore, used to put backpressure on a rayon producer.
-///
-/// `rayon::Scope::spawn` queues work without any bound, so a producer that
-/// outruns its workers keeps allocating boxed jobs - and holds whatever those
-/// jobs captured - until they eventually run. A directory walk feeding one task
-/// per entry can queue millions.
-/// How many entries a directory walk may keep queued on a rayon pool.
-///
-/// High enough that the workers never starve when they keep up - at which point
-/// the limit is simply never reached - and low enough that a producer which does
-/// outrun them cannot grow the queue without bound.
 pub const WALK_IN_FLIGHT_LIMIT: usize = 4096;
-/// Entries handed to one rayon task by the multithreaded walkers. One task per
-/// entry made the walk thread spend most of its time on job allocation and
-/// permit wake-ups rather than on reading directories.
 pub const WALK_BATCH_SIZE: usize = 32;
 
 /// Runs `func` over `batch` on the pool, stopping at the first error or as soon
@@ -898,13 +884,14 @@ pub fn spawn_walk_batch<'scope, T, F>(
             }
 
             if let Err(err) = func(entry) {
-                *error.write() = Some(err);
+                error.write().get_or_insert(err);
                 return;
             }
         }
     });
 }
 
+/// A blocking counting semaphore, used to put backpressure on a rayon producer.
 pub struct InFlightLimit {
     limit: usize,
     count: parking_lot::Mutex<usize>,
@@ -942,5 +929,14 @@ impl Drop for InFlightPermit {
     fn drop(&mut self) {
         *self.0.count.lock() -= 1;
         self.0.released.notify_one();
+    }
+}
+
+/// Resolves a configured thread count, treating 0 as every available core.
+pub fn resolve_threads(threads: usize) -> usize {
+    if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism().map_or(1, |threads| threads.get())
     }
 }

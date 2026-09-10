@@ -31,8 +31,9 @@ pub trait DiskLimiterExt: Send + Sync {
 pub(crate) async fn remove_volume(
     filesystem: &crate::server::filesystem::Filesystem,
 ) -> Result<(), std::io::Error> {
+    let threads = filesystem.config.load().api.file_delete_threads;
     filesystem
-        .async_remove_dir_all(std::path::Path::new(""))
+        .async_remove_dir_all(std::path::Path::new(""), threads)
         .await?;
 
     tokio::fs::remove_dir(&filesystem.base_path).await

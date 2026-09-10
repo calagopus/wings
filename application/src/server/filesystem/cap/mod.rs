@@ -188,60 +188,82 @@ impl CapFilesystem {
         Ok(())
     }
 
-    pub async fn async_remove_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    pub async fn async_remove_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        threads: usize,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
         let self_clone = self.clone();
-        tokio::task::spawn_blocking(move || self_clone.remove_dir_all(path)).await??;
+        tokio::task::spawn_blocking(move || self_clone.remove_dir_all(path, threads)).await??;
 
         Ok(())
     }
 
-    pub fn remove_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    pub fn remove_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        threads: usize,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
-        let inner = self.get_inner()?;
 
-        let mut first_error = None;
-        let mut failed: u64 = 0;
-        let mut record = |err: std::io::Error| {
-            failed += 1;
-            if first_error.is_none() {
-                first_error = Some(err);
-            }
-        };
+        let inner = self.get_inner()?;
+        let state = Arc::new(parking_lot::Mutex::new(RemoveDirAllState::default()));
 
         let mut walker = WalkDir::new(self.clone(), path.clone())?.reversed();
-        let mut cleared_parent: Option<PathBuf> = None;
-
-        while let Some(entry) = walker.next_entry() {
-            match entry {
-                Ok(entry) => {
-                    if let Err(err) = Self::remove_entry(
-                        &inner,
-                        &entry.path,
-                        entry.file_type(),
-                        &mut cleared_parent,
-                    ) {
-                        record(err);
+        walker
+            .run_multithreaded_with_error_handler(
+                threads,
+                None,
+                Arc::new({
+                    let inner = Arc::clone(&inner);
+                    let state = Arc::clone(&state);
+                    move |entry: WalkEntry| {
+                        if let Err(err) = entry.remove() {
+                            let mut state = state.lock();
+                            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                                if let Err(err) = Self::remove_entry(
+                                    &inner,
+                                    &entry.path,
+                                    entry.file_type(),
+                                    &mut state.cleared_parent,
+                                ) {
+                                    state.record(err);
+                                }
+                            } else {
+                                state.record(err);
+                            }
+                        }
+                        Ok(())
                     }
-                }
-                Err(err) => record(err),
-            }
-        }
+                }),
+                {
+                    let state = Arc::clone(&state);
+                    move |err| {
+                        state.lock().record(err);
+                        Ok(())
+                    }
+                },
+            )
+            .map_err(std::io::Error::other)?;
+
+        let mut state = state.lock();
 
         if !path.as_os_str().is_empty()
-            && let Err(err) = Self::remove_entry(&inner, &path, FileType::Dir, &mut cleared_parent)
+            && let Err(err) =
+                Self::remove_entry(&inner, &path, FileType::Dir, &mut state.cleared_parent)
         {
-            record(err);
+            state.record(err);
         }
 
-        match first_error {
+        match state.first_error.take() {
             Some(err) => {
                 tracing::warn!(
                     path = %path.display(),
                     "failed to remove {} entr{} while removing directory: {:#?}",
-                    failed,
-                    if failed == 1 { "y" } else { "ies" },
+                    state.failed,
+                    if state.failed == 1 { "y" } else { "ies" },
                     err
                 );
 
@@ -1201,9 +1223,25 @@ impl CapFilesystem {
     }
 }
 
+#[derive(Default)]
+struct RemoveDirAllState {
+    first_error: Option<std::io::Error>,
+    failed: u64,
+    cleared_parent: Option<PathBuf>,
+}
+
+impl RemoveDirAllState {
+    fn record(&mut self, err: std::io::Error) {
+        self.failed += 1;
+        self.first_error.get_or_insert(err);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::filesystem::virtualfs::{DirectoryWalkFilterFn, IsIgnoredFn};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     // resolve_path
 
@@ -1359,6 +1397,438 @@ mod tests {
     }
 
     #[test]
+    fn walk_dir_reversed_completes_children_before_removing_parents() {
+        for threads in [1, 4] {
+            for parallel in [false, true] {
+                for filtered in [false, true] {
+                    let (dir, filesystem) = temp_filesystem();
+                    std::fs::create_dir_all(dir.path().join("a/b/empty")).unwrap();
+                    std::fs::create_dir(dir.path().join("skip")).unwrap();
+                    for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                        std::fs::write(dir.path().join(format!("a/b/{index}")), "x").unwrap();
+                    }
+                    std::fs::write(dir.path().join("a/shallow"), "x").unwrap();
+
+                    let remove = Arc::new({
+                        let filesystem = filesystem.clone();
+                        move |entry: WalkEntry| -> Result<(), anyhow::Error> {
+                            if entry.file_type().is_dir() {
+                                filesystem.get_inner()?.remove_dir(&entry.path)?;
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                filesystem.get_inner()?.remove_file(&entry.path)?;
+                            }
+                            Ok(())
+                        }
+                    });
+                    let filter = filtered.then(|| {
+                        DirectoryWalkFilterFn::from(|_, path: &Path| path != Path::new("skip"))
+                    });
+
+                    let mut walker = filesystem.walk_dir("").unwrap().reversed();
+                    if parallel {
+                        walker.run_parallel(threads, filter, remove)
+                    } else {
+                        walker.run_multithreaded_filtered(threads, filter, remove)
+                    }
+                    .unwrap();
+
+                    assert!(!dir.path().join("a").exists());
+                    assert_eq!(dir.path().join("skip").exists(), filtered);
+                    assert!(dir.path().is_dir());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn walk_dir_reversed_stops_before_parents_on_callback_error() {
+        for fail_directory in [false, true] {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+            std::fs::write(dir.path().join("a/b/file"), "x").unwrap();
+
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let result = filesystem
+                .walk_dir("")
+                .unwrap()
+                .reversed()
+                .run_multithreaded(
+                    2,
+                    Arc::new({
+                        let seen = Arc::clone(&seen);
+                        move |entry: WalkEntry| {
+                            seen.lock().push(entry.path.clone());
+                            if entry.file_type().is_dir() == fail_directory {
+                                anyhow::bail!("callback failed");
+                            }
+                            Ok(())
+                        }
+                    }),
+                );
+
+            assert_eq!(result.unwrap_err().to_string(), "callback failed");
+            let expected = if fail_directory {
+                vec![PathBuf::from("a/b/file"), PathBuf::from("a/b")]
+            } else {
+                vec![PathBuf::from("a/b/file")]
+            };
+            assert_eq!(*seen.lock(), expected);
+        }
+    }
+
+    #[test]
+    fn walk_dir_reversed_can_continue_after_directory_read_error() {
+        let (dir, filesystem) = temp_filesystem();
+        for parent in ["tree/a", "tree/b", "tree/c"] {
+            std::fs::create_dir_all(dir.path().join(parent)).unwrap();
+            std::fs::write(dir.path().join(parent).join("file"), "x").unwrap();
+        }
+
+        let skipped = Arc::new(parking_lot::Mutex::new(None));
+        let mut walker = filesystem
+            .walk_dir("tree")
+            .unwrap()
+            .reversed()
+            .with_is_ignored(IsIgnoredFn::from({
+                let skipped = Arc::clone(&skipped);
+                move |file_type: FileType, path: PathBuf| {
+                    if file_type.is_dir() {
+                        let mut skipped = skipped.lock();
+                        if skipped.is_none() {
+                            *skipped = Some(path);
+                            return Some(PathBuf::from("tree/missing"));
+                        }
+                    }
+                    Some(path)
+                }
+            }));
+
+        let mut errors = Vec::new();
+        walker
+            .run_multithreaded_with_error_handler(
+                2,
+                None,
+                Arc::new(|entry: WalkEntry| Ok(entry.remove()?)),
+                |err| {
+                    errors.push(err);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), std::io::ErrorKind::NotFound);
+        let skipped = skipped.lock().clone().unwrap();
+        assert!(dir.path().join(skipped).join("file").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tree")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_completes_children_before_removing_parents() {
+        tokio_test::block_on(async {
+            for threads in [0, 1, 4] {
+                let (dir, filesystem) = temp_filesystem();
+                std::fs::create_dir_all(dir.path().join("a/b/empty")).unwrap();
+                for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                    std::fs::write(dir.path().join(format!("a/b/{index}")), "x").unwrap();
+                }
+                std::fs::write(dir.path().join("a/shallow"), "x").unwrap();
+
+                let mut walker = filesystem.async_walk_dir("").await.unwrap().reversed();
+                let remove = Arc::new({
+                    let filesystem = filesystem.clone();
+                    move |entry: WalkEntry| {
+                        let filesystem = filesystem.clone();
+                        async move {
+                            if entry.file_type().is_dir() {
+                                filesystem.get_inner()?.remove_dir(&entry.path)?;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                filesystem.get_inner()?.remove_file(&entry.path)?;
+                            }
+                            Ok(())
+                        }
+                    }
+                });
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    walker.run_multithreaded(threads, remove),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+                assert!(dir.path().is_dir());
+                assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_stops_before_parents_on_callback_error() {
+        tokio_test::block_on(async {
+            for fail_directory in [false, true] {
+                let (dir, filesystem) = temp_filesystem();
+                std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+                std::fs::write(dir.path().join("a/b/file"), "x").unwrap();
+
+                let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let result = filesystem
+                    .async_walk_dir("")
+                    .await
+                    .unwrap()
+                    .reversed()
+                    .run_multithreaded(
+                        2,
+                        Arc::new({
+                            let seen = Arc::clone(&seen);
+                            move |entry: WalkEntry| {
+                                let seen = Arc::clone(&seen);
+                                async move {
+                                    tokio::task::yield_now().await;
+                                    seen.lock().push(entry.path.clone());
+                                    if entry.file_type().is_dir() == fail_directory {
+                                        anyhow::bail!("callback failed");
+                                    }
+                                    Ok(())
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+
+                assert_eq!(result.unwrap_err().to_string(), "callback failed");
+                let expected = if fail_directory {
+                    vec![PathBuf::from("a/b/file"), PathBuf::from("a/b")]
+                } else {
+                    vec![PathBuf::from("a/b/file")]
+                };
+                assert_eq!(*seen.lock(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_allows_sibling_subtrees_to_progress() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            for name in ["a", "b"] {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+                std::fs::write(dir.path().join(name).join("file"), "x").unwrap();
+            }
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut walker = filesystem.async_walk_dir("").await.unwrap().reversed();
+            let remove = Arc::new(move |entry: WalkEntry| {
+                let filesystem = filesystem.clone();
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    if entry.file_type().is_dir() {
+                        filesystem.get_inner()?.remove_dir(&entry.path)?;
+                    } else {
+                        barrier.wait().await;
+                        filesystem.get_inner()?.remove_file(&entry.path)?;
+                    }
+                    Ok(())
+                }
+            });
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                walker.run_multithreaded(2, remove),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_stops_before_parents_on_callback_panic() {
+        tokio_test::block_on(async {
+            for panic_before_future in [false, true] {
+                let (dir, filesystem) = temp_filesystem();
+                std::fs::create_dir(dir.path().join("a")).unwrap();
+                std::fs::write(dir.path().join("a/file"), "x").unwrap();
+
+                let directories = Arc::new(AtomicUsize::new(0));
+                let result = filesystem
+                    .async_walk_dir("")
+                    .await
+                    .unwrap()
+                    .reversed()
+                    .run_multithreaded(
+                        1,
+                        Arc::new({
+                            let directories = Arc::clone(&directories);
+                            move |entry: WalkEntry| {
+                                assert!(!panic_before_future || entry.file_type().is_dir());
+                                let directories = Arc::clone(&directories);
+                                async move {
+                                    assert!(entry.file_type().is_dir());
+                                    directories.fetch_add(1, Ordering::Relaxed);
+                                    Ok(())
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<tokio::task::JoinError>()
+                        .unwrap()
+                        .is_panic()
+                );
+                assert_eq!(directories.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_drains_more_than_the_pending_limit() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::create_dir(dir.path().join("a")).unwrap();
+            for index in 0..crate::utils::WALK_IN_FLIGHT_LIMIT + 1 {
+                std::fs::create_dir(dir.path().join(format!("a/{index}"))).unwrap();
+            }
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut walker = filesystem.async_walk_dir("").await.unwrap().reversed();
+            let visit = Arc::new({
+                let count = Arc::clone(&count);
+                move |_| {
+                    let count = Arc::clone(&count);
+                    async move {
+                        tokio::task::yield_now().await;
+                        count.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }
+            });
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                walker.run_multithreaded(1, visit),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                crate::utils::WALK_IN_FLIGHT_LIMIT + 2
+            );
+        });
+    }
+
+    #[test]
+    fn async_walk_dir_reversed_drains_callbacks_after_read_error() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            for name in ["a", "b"] {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+                std::fs::write(dir.path().join(name).join("file"), "x").unwrap();
+            }
+
+            let directories = Arc::new(AtomicUsize::new(0));
+            let mut walker = filesystem
+                .async_walk_dir("")
+                .await
+                .unwrap()
+                .reversed()
+                .with_is_ignored(IsIgnoredFn::new(|_, path| Some(path), {
+                    let directories = Arc::clone(&directories);
+                    move |file_type: FileType, path| {
+                        let directories = Arc::clone(&directories);
+                        async move {
+                            // the first directory is walked so its file callback is in flight
+                            // by the time the second one fails to open
+                            if file_type.is_dir()
+                                && directories.fetch_add(1, Ordering::Relaxed) == 1
+                            {
+                                return Some(PathBuf::from("missing"));
+                            }
+                            Some(path)
+                        }
+                    }
+                }));
+
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicBool::new(false));
+            let walk = walker.run_multithreaded(
+                2,
+                Arc::new({
+                    let release = Arc::clone(&release);
+                    let completed = Arc::clone(&completed);
+                    move |entry: WalkEntry| {
+                        let release = Arc::clone(&release);
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            if entry.file_type().is_dir() {
+                                return Ok(());
+                            }
+
+                            release.notified().await;
+                            completed.store(true, Ordering::Relaxed);
+                            Ok(())
+                        }
+                    }
+                }),
+            );
+            tokio::pin!(walk);
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut walk)
+                    .await
+                    .is_err()
+            );
+            assert!(!completed.load(Ordering::Relaxed));
+
+            release.notify_one();
+            let err = walk.await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(completed.load(Ordering::Relaxed));
+        });
+    }
+
+    #[test]
+    fn walk_entry_remove_uses_the_original_parent_handle() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("original")).unwrap();
+        std::fs::write(dir.path().join("original/file"), "old").unwrap();
+        let entry = filesystem
+            .walk_dir("original")
+            .unwrap()
+            .next_entry()
+            .unwrap()
+            .unwrap();
+        std::fs::rename(dir.path().join("original"), dir.path().join("moved")).unwrap();
+        std::fs::create_dir(dir.path().join("original")).unwrap();
+        std::fs::write(dir.path().join("original/file"), "keep").unwrap();
+
+        entry.remove().unwrap();
+
+        assert!(!dir.path().join("moved/file").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("original/file")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
     fn symlink_contents_are_written_verbatim() {
         tokio_test::block_on(async {
             let (dir, filesystem) = temp_filesystem();
@@ -1435,10 +1905,41 @@ mod tests {
         std::fs::write(dir.path().join("tree/nested/file.txt"), "x").unwrap();
         std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
 
-        filesystem.remove_dir_all("tree").unwrap();
+        filesystem.remove_dir_all("tree", 2).unwrap();
 
         assert!(!dir.path().join("tree").exists());
         assert!(dir.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn remove_dir_all_handles_multiple_batches_in_nested_directories() {
+        tokio_test::block_on(async {
+            for threads in [0, 1, 2, 4] {
+                for asynchronous in [false, true] {
+                    let (dir, filesystem) = temp_filesystem();
+                    for parent in ["tree/a", "tree/a/b", "tree/c"] {
+                        std::fs::create_dir_all(dir.path().join(parent).join("empty")).unwrap();
+                        for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                            std::fs::write(dir.path().join(parent).join(index.to_string()), "x")
+                                .unwrap();
+                        }
+                    }
+                    std::fs::write(dir.path().join("keep"), "x").unwrap();
+
+                    if asynchronous {
+                        filesystem
+                            .async_remove_dir_all("tree", threads)
+                            .await
+                            .unwrap();
+                    } else {
+                        filesystem.remove_dir_all("tree", threads).unwrap();
+                    }
+
+                    assert!(!dir.path().join("tree").exists());
+                    assert!(dir.path().join("keep").exists());
+                }
+            }
+        });
     }
 
     #[test]
@@ -1448,7 +1949,7 @@ mod tests {
         std::fs::write(dir.path().join("a/b/file.txt"), "x").unwrap();
         std::fs::write(dir.path().join("top.txt"), "x").unwrap();
 
-        filesystem.remove_dir_all("").unwrap();
+        filesystem.remove_dir_all("", 2).unwrap();
 
         assert!(dir.path().exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -1462,7 +1963,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("tree")).unwrap();
         std::os::unix::fs::symlink("../outside", dir.path().join("tree/link")).unwrap();
 
-        filesystem.remove_dir_all("tree").unwrap();
+        filesystem.remove_dir_all("tree", 2).unwrap();
 
         assert!(!dir.path().join("tree").exists());
         assert!(dir.path().join("outside/keep.txt").exists());
@@ -1494,7 +1995,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied
         );
 
-        let result = filesystem.remove_dir_all("tree");
+        let result = filesystem.remove_dir_all("tree", 2);
 
         if result.is_err() {
             std::process::Command::new("chattr")

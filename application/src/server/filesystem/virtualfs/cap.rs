@@ -1000,10 +1000,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::Dir, path.as_ref())?;
 
-        self.inner.remove_dir_all(path)?;
+        let file_delete_threads = self.server.app_state.config.load().api.file_delete_threads;
+        self.inner.remove_dir_all(path, file_delete_threads)?;
 
         Ok(())
     }
+
     async fn async_remove_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1013,7 +1015,10 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             .async_check_ignored(FileType::Dir, path.as_ref())
             .await?;
 
-        self.inner.async_remove_dir_all(path).await?;
+        let file_delete_threads = self.server.app_state.config.load().api.file_delete_threads;
+        self.inner
+            .async_remove_dir_all(path, file_delete_threads)
+            .await?;
 
         Ok(())
     }

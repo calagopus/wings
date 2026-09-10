@@ -393,7 +393,7 @@ pub trait DirectoryWalk {
                         );
                     }
                     Err(err) => {
-                        *error.write() = Some(err);
+                        error.write().get_or_insert(err);
                         break;
                     }
                 }
@@ -449,6 +449,7 @@ pub trait AsyncDirectoryWalk {
         threads: usize,
         func: AsyncDirectoryWalkFn,
     ) -> Result<(), anyhow::Error> {
+        let threads = crate::utils::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
         let error = Arc::new(RwLock::new(None));
 
@@ -472,7 +473,7 @@ pub trait AsyncDirectoryWalk {
                         match func(entry).await {
                             Ok(_) => {}
                             Err(err) => {
-                                *error.write() = Some(err);
+                                error.write().get_or_insert(err);
                             }
                         }
                     });
@@ -517,6 +518,7 @@ pub trait AsyncDirectoryStreamWalk {
         threads: usize,
         func: AsyncDirectoryStreamWalkFn,
     ) -> Result<(), anyhow::Error> {
+        let threads = crate::utils::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
         let error = Arc::new(RwLock::new(None));
 
@@ -541,7 +543,7 @@ pub trait AsyncDirectoryStreamWalk {
                             match func(entry, stream).await {
                                 Ok(_) => {}
                                 Err(err) => {
-                                    *error.write() = Some(err);
+                                    error.write().get_or_insert(err);
                                 }
                             }
                         });

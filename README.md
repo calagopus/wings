@@ -62,8 +62,10 @@ api:
     # maximum total bytes of preview content per response
     max_response_size: 8388608
 
-  # how many threads to use when copying directories
+  # how many threads to use when copying directories, 0 means all available cores
   file_copy_threads: 4
+  # how many threads to use when deleting directories, 0 means all available cores
+  file_delete_threads: 2
   # how many threads to use when decompressing .zip/.7z/.ddup
   file_decompression_threads: 2
   # how many threads to use when compressing .gz/.xz/.7z
