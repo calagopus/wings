@@ -34,6 +34,8 @@ jobs:
   dist:
     name: Dist
     runs-on: ${{ matrix.os }}
+    env:
+      CROSS_BUILD_PRE_BUILD: apt-get update && apt-get install --assume-yes --no-install-recommends unzip
     strategy:
       fail-fast: false
       matrix:
