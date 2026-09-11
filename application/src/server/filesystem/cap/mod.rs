@@ -478,9 +478,20 @@ impl CapFilesystem {
         Ok(metadata)
     }
 
+    /// Stats a path relative to `inner`, keeping the birth time on every target.
+    ///
     /// `cap-primitives` only reaches its `statx` fast path for a single-component
-    /// no-follow stat, anything deeper falls back to `O_PATH` + `File::metadata`,
-    /// which carries no birth time outside `target_env = "gnu"`.
+    /// no-follow stat; anything deeper falls back to `O_PATH` + `File::metadata`.
+    /// On glibc that still carries a birth time, so the stat goes straight
+    /// through. `std` only implements `statx` for `target_env = "gnu"`, so on
+    /// musl the deeper path loses `created` entirely, and opening the parent
+    /// first is what keeps the fast path reachable.
+    #[cfg(target_env = "gnu")]
+    fn stat_beneath(inner: &cap_std::fs::Dir, path: &Path) -> Result<Metadata, std::io::Error> {
+        inner.symlink_metadata(path)
+    }
+
+    #[cfg(not(target_env = "gnu"))]
     fn stat_beneath(inner: &cap_std::fs::Dir, path: &Path) -> Result<Metadata, std::io::Error> {
         match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
@@ -1356,6 +1367,45 @@ mod tests {
         );
     }
 
+    // stat_beneath
+
+    #[test]
+    fn nested_stats_keep_their_birth_time() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            // `created` only goes missing for paths below the root, so check a
+            // nested stat against a single-component one rather than just
+            // asserting it is present
+            let temp = tempfile::tempdir()?;
+            std::fs::create_dir_all(temp.path().join("plugins/nested"))?;
+            std::fs::write(temp.path().join("plugins/nested/config.yml"), b"a: 1")?;
+            std::fs::write(temp.path().join("root.yml"), b"a: 1")?;
+
+            let filesystem = CapFilesystem::new(temp.path()).await?;
+
+            let shallow = filesystem.symlink_metadata("root.yml")?;
+            let nested = filesystem.symlink_metadata("plugins/nested/config.yml")?;
+
+            assert!(
+                shallow.created().is_ok(),
+                "single-component stat lost its birth time"
+            );
+            assert!(
+                nested.created().is_ok(),
+                "nested stat lost its birth time: the statx path was missed"
+            );
+
+            let nested = filesystem
+                .async_symlink_metadata("plugins/nested/config.yml")
+                .await?;
+            assert!(
+                nested.created().is_ok(),
+                "nested async stat lost its birth time"
+            );
+
+            Ok(())
+        })
+    }
+
     // reversed walk + remove_dir_all
 
     fn temp_filesystem() -> (tempfile::TempDir, CapFilesystem) {
@@ -1404,7 +1454,7 @@ mod tests {
                     let (dir, filesystem) = temp_filesystem();
                     std::fs::create_dir_all(dir.path().join("a/b/empty")).unwrap();
                     std::fs::create_dir(dir.path().join("skip")).unwrap();
-                    for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                    for index in 0..crate::threading::WALK_BATCH_SIZE * 2 + 1 {
                         std::fs::write(dir.path().join(format!("a/b/{index}")), "x").unwrap();
                     }
                     std::fs::write(dir.path().join("a/shallow"), "x").unwrap();
@@ -1533,7 +1583,7 @@ mod tests {
             for threads in [0, 1, 4] {
                 let (dir, filesystem) = temp_filesystem();
                 std::fs::create_dir_all(dir.path().join("a/b/empty")).unwrap();
-                for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                for index in 0..crate::threading::WALK_BATCH_SIZE * 2 + 1 {
                     std::fs::write(dir.path().join(format!("a/b/{index}")), "x").unwrap();
                 }
                 std::fs::write(dir.path().join("a/shallow"), "x").unwrap();
@@ -1698,7 +1748,7 @@ mod tests {
         tokio_test::block_on(async {
             let (dir, filesystem) = temp_filesystem();
             std::fs::create_dir(dir.path().join("a")).unwrap();
-            for index in 0..crate::utils::WALK_IN_FLIGHT_LIMIT + 1 {
+            for index in 0..crate::threading::WALK_IN_FLIGHT_LIMIT + 1 {
                 std::fs::create_dir(dir.path().join(format!("a/{index}"))).unwrap();
             }
 
@@ -1726,7 +1776,7 @@ mod tests {
 
             assert_eq!(
                 count.load(Ordering::Relaxed),
-                crate::utils::WALK_IN_FLIGHT_LIMIT + 2
+                crate::threading::WALK_IN_FLIGHT_LIMIT + 2
             );
         });
     }
@@ -1741,6 +1791,7 @@ mod tests {
             }
 
             let directories = Arc::new(AtomicUsize::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
             let mut walker = filesystem
                 .async_walk_dir("")
                 .await
@@ -1748,14 +1799,19 @@ mod tests {
                 .reversed()
                 .with_is_ignored(IsIgnoredFn::new(|_, path| Some(path), {
                     let directories = Arc::clone(&directories);
+                    let started = Arc::clone(&started);
                     move |file_type: FileType, path| {
                         let directories = Arc::clone(&directories);
+                        let started = Arc::clone(&started);
                         async move {
-                            // the first directory is walked so its file callback is in flight
-                            // by the time the second one fails to open
                             if file_type.is_dir()
                                 && directories.fetch_add(1, Ordering::Relaxed) == 1
                             {
+                                // a spawned callback gives up if an error is already
+                                // recorded, so the first directory's file has to be
+                                // inside its callback before this one fails to open
+                                started.notified().await;
+
                                 return Some(PathBuf::from("missing"));
                             }
                             Some(path)
@@ -1768,9 +1824,11 @@ mod tests {
             let walk = walker.run_multithreaded(
                 2,
                 Arc::new({
+                    let started = Arc::clone(&started);
                     let release = Arc::clone(&release);
                     let completed = Arc::clone(&completed);
                     move |entry: WalkEntry| {
+                        let started = Arc::clone(&started);
                         let release = Arc::clone(&release);
                         let completed = Arc::clone(&completed);
                         async move {
@@ -1778,6 +1836,7 @@ mod tests {
                                 return Ok(());
                             }
 
+                            started.notify_one();
                             release.notified().await;
                             completed.store(true, Ordering::Relaxed);
                             Ok(())
@@ -1919,7 +1978,7 @@ mod tests {
                     let (dir, filesystem) = temp_filesystem();
                     for parent in ["tree/a", "tree/a/b", "tree/c"] {
                         std::fs::create_dir_all(dir.path().join(parent).join("empty")).unwrap();
-                        for index in 0..crate::utils::WALK_BATCH_SIZE * 2 + 1 {
+                        for index in 0..crate::threading::WALK_BATCH_SIZE * 2 + 1 {
                             std::fs::write(dir.path().join(parent).join(index.to_string()), "x")
                                 .unwrap();
                         }

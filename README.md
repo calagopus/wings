@@ -66,9 +66,9 @@ api:
   file_copy_threads: 4
   # how many threads to use when deleting directories, 0 means all available cores
   file_delete_threads: 2
-  # how many threads to use when decompressing .zip/.7z/.ddup
-  file_decompression_threads: 2
-  # how many threads to use when compressing .gz/.xz/.7z
+  # how many threads to use when decompressing .zip/.7z/.ddup/.tar.*, 0 means all available cores
+  file_decompression_threads: 4
+  # how many threads to use when compressing .gz/.xz/.7z/.zip, 0 means all available cores
   file_compression_threads: 2
   # how often a jwt can be used to download a file/backup until expiry, 0 means unlimited (2 minimum recommended)
   max_jwt_uses: 5

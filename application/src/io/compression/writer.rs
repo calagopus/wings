@@ -1,10 +1,12 @@
-use super::{CompressionLevel, CompressionType};
+use super::{CompressionLevel, CompressionType, gzip::StoredFallbackGzip};
 use gzp::ZWriter;
 use std::io::Write;
 
+const GZ_BLOCK_SIZE: usize = 1024 * 1024;
+
 pub enum CompressionWriter<'a, W: Write + Send + 'static> {
     None(W),
-    Gz(gzp::par::compress::ParCompress<'a, gzp::deflate::Gzip, W>),
+    Gz(gzp::par::compress::ParCompress<'a, StoredFallbackGzip, W>),
     Xz(usize, Box<lzma_rust2::XzWriterMt<W>>),
     Lzip(usize, Box<lzma_rust2::LzipWriterMt<W>>),
     Bz2(bzip2::write::BzEncoder<W>),
@@ -19,11 +21,15 @@ impl<'a, W: Write + Send + 'static> CompressionWriter<'a, W> {
         compression_level: CompressionLevel,
         threads: usize,
     ) -> std::io::Result<Self> {
+        let threads = crate::threading::resolve_threads(threads);
+
         Ok(match compression_type {
             CompressionType::None => CompressionWriter::None(writer),
             CompressionType::Gz => CompressionWriter::Gz(
                 gzp::par::compress::ParCompressBuilder::new()
                     .num_threads(threads)
+                    .map_err(std::io::Error::other)?
+                    .buffer_size(GZ_BLOCK_SIZE)
                     .map_err(std::io::Error::other)?
                     .compression_level(gzp::Compression::new(compression_level.to_deflate_level()))
                     .from_writer(writer),

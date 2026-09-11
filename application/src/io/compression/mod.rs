@@ -1,8 +1,56 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub mod gzip;
 pub mod reader;
 pub mod writer;
+
+const PROBE_RUNS: usize = 64;
+const PROBE_RUN_SIZE: usize = 256;
+const INCOMPRESSIBLE_ENTROPY: f64 = 7.9;
+
+pub fn looks_incompressible(sample: &[u8]) -> bool {
+    let mut histogram = [0u32; 256];
+    let mut sampled = 0usize;
+
+    let mut count_bytes = |run: &[u8]| {
+        for &byte in run {
+            if let Some(slot) = histogram.get_mut(byte as usize) {
+                *slot += 1;
+            }
+        }
+    };
+
+    if sample.len() <= PROBE_RUNS * PROBE_RUN_SIZE {
+        count_bytes(sample);
+        sampled = sample.len();
+    } else {
+        let stride = sample.len() / PROBE_RUNS;
+
+        for index in 0..PROBE_RUNS {
+            let start = index * stride;
+            if let Some(run) = sample.get(start..start + PROBE_RUN_SIZE) {
+                count_bytes(run);
+                sampled += PROBE_RUN_SIZE;
+            }
+        }
+    }
+
+    if sampled == 0 {
+        return false;
+    }
+
+    let total = sampled as f64;
+    let entropy = histogram
+        .iter()
+        .filter(|&&count| count > 0)
+        .fold(0.0f64, |entropy, &count| {
+            let probability = f64::from(count) / total;
+            entropy - probability * probability.log2()
+        });
+
+    entropy > INCOMPRESSIBLE_ENTROPY
+}
 
 #[derive(Debug, Clone, Copy, ToSchema, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]

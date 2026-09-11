@@ -5,11 +5,12 @@ use crate::{
         counting_writer::CountingWriter,
     },
     server::filesystem::cap::FileType,
+    threading::InFlightPermit,
     utils::PortablePermissions,
 };
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -25,6 +26,105 @@ use utoipa::ToSchema;
 
 pub mod create;
 pub mod multi_reader;
+
+const TAR_CHUNK_BYTES: usize = 1024 * 1024;
+const TAR_IN_FLIGHT_CHUNKS: usize = 64;
+
+enum TarContent {
+    Whole(Vec<u8>, InFlightPermit),
+    Chunks(async_channel::Receiver<(Vec<u8>, InFlightPermit)>),
+}
+
+enum TarJob {
+    File {
+        path: PathBuf,
+        content: TarContent,
+        permissions: Option<PortablePermissions>,
+        modified_time: Option<std::time::SystemTime>,
+    },
+    Symlink {
+        path: PathBuf,
+        link: PathBuf,
+        modified_time: Option<std::time::SystemTime>,
+    },
+}
+
+fn tar_shard(path: &Path, shards: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+
+    (hasher.finish() % shards.max(1) as u64) as usize
+}
+
+fn apply_tar_job(
+    destination_filesystem: &Arc<dyn super::virtualfs::VirtualWritableFilesystem>,
+    progress: &create::ArchiveProgress,
+    job: TarJob,
+) -> Result<(), anyhow::Error> {
+    match job {
+        TarJob::File {
+            path,
+            content,
+            permissions,
+            modified_time,
+        } => {
+            let run = || -> Result<(), anyhow::Error> {
+                let mut writer = destination_filesystem.create_file(&path)?;
+
+                match content {
+                    TarContent::Whole(data, _permit) => writer.write_all(&data)?,
+                    TarContent::Chunks(chunks) => {
+                        while let Ok((chunk, _permit)) = chunks.recv_blocking() {
+                            writer.write_all(&chunk)?;
+                        }
+                    }
+                }
+
+                writer.flush()?;
+                drop(writer);
+
+                if let Some(permissions) = permissions {
+                    destination_filesystem.set_permissions(&path, FileType::File, permissions)?;
+                }
+
+                if let Some(modified_time) = modified_time {
+                    destination_filesystem.set_times(&path, FileType::File, modified_time, None)?;
+                }
+
+                progress.increment_files();
+
+                Ok(())
+            };
+
+            if let Err(err) = run() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "failed to extract file from archive: {:#?}",
+                    err
+                );
+
+                return Err(err);
+            }
+        }
+        TarJob::Symlink {
+            path,
+            link,
+            modified_time,
+        } => {
+            if let Err(err) = destination_filesystem.create_symlink(&link, &path) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "failed to create symlink from archive: {:#?}",
+                    err
+                );
+            } else if let Some(modified_time) = modified_time {
+                destination_filesystem.set_times(&path, FileType::Symlink, modified_time, None)?;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn resolve_entry_path(destination: &Path, path: &Path) -> Option<PathBuf> {
     if path.components().any(|component| {
@@ -526,7 +626,7 @@ impl Archive {
                             .api
                             .file_decompression_threads,
                     )?;
-                    let reader = AbortReader::new(reader, listener);
+                    let reader = AbortReader::new(reader, listener.clone());
 
                     if let Some(total) = total
                         && let Ok(metadata) = self.server.filesystem.metadata(&self.path)
@@ -539,117 +639,210 @@ impl Archive {
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
                     let entries = archive.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                    let mut last_parent = None;
-                    for entry in entries {
-                        let mut entry = entry?;
-                        let path = entry.path()?;
+                    let threads = crate::threading::resolve_threads(
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
+                    );
+                    let limit = crate::threading::InFlightLimit::new(TAR_IN_FLIGHT_CHUNKS);
+                    let error = Arc::new(crate::threading::SharedError::new());
 
-                        let Some(destination_path) =
-                            resolve_entry_path(&destination, path.as_ref())
-                        else {
-                            continue;
-                        };
-                        let header = entry.header();
+                    std::thread::scope(|scope| -> Result<(), anyhow::Error> {
+                        let mut senders = Vec::with_capacity(threads);
 
-                        if destination_filesystem.is_primary_server_fs()
-                            && self.server.filesystem.is_ignored(
-                                &destination_path,
-                                FileType::from_is_dir(header.entry_type().is_dir()),
-                            )
-                        {
-                            continue;
+                        for _ in 0..threads {
+                            let (sender, receiver) = async_channel::bounded::<TarJob>(4);
+                            senders.push(sender);
+
+                            let destination_filesystem = Arc::clone(&destination_filesystem);
+                            let progress = progress.clone();
+                            let error = Arc::clone(&error);
+                            let listener = listener.clone();
+
+                            scope.spawn(move || {
+                                while let Ok(job) = receiver.recv_blocking() {
+                                    if listener.is_aborted() || error.stopped() {
+                                        receiver.close();
+                                        continue;
+                                    }
+
+                                    if let Err(err) =
+                                        apply_tar_job(&destination_filesystem, &progress, job)
+                                    {
+                                        error.fail(err);
+                                    }
+                                }
+                            });
                         }
 
-                        match header.entry_type() {
-                            tar::EntryType::Directory => {
-                                destination_filesystem.create_dir_all(&destination_path)?;
-                                if let Ok(permissions) =
-                                    header.mode().map(PortablePermissions::from_mode_dir)
-                                {
-                                    destination_filesystem.set_permissions(
-                                        &destination_path,
-                                        FileType::Dir,
-                                        permissions,
-                                    )?;
-                                }
-
-                                if let Ok(modified_time) = header.mtime()
-                                    && directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES
-                                    && std::time::UNIX_EPOCH
-                                        .checked_add(std::time::Duration::from_secs(modified_time))
-                                        .is_some()
-                                {
-                                    directory_entries.push((destination_path, modified_time));
-                                }
+                        let mut last_parent = None;
+                        for entry in entries {
+                            if error.stopped() {
+                                break;
                             }
-                            tar::EntryType::Regular => {
-                                let permissions =
-                                    header.mode().map(PortablePermissions::from_mode_file).ok();
-                                let modified_time = header.mtime().ok().and_then(|t| {
-                                    std::time::UNIX_EPOCH
-                                        .checked_add(std::time::Duration::from_secs(t))
-                                });
 
-                                if let Some(parent) = destination_path.parent()
-                                    && last_parent.as_deref() != Some(parent)
-                                {
-                                    destination_filesystem.create_dir_all(&parent)?;
-                                    last_parent = Some(parent.to_path_buf());
-                                }
+                            let mut entry = entry?;
+                            let path = entry.path()?;
 
-                                let mut writer =
-                                    destination_filesystem.create_file(&destination_path)?;
+                            let Some(destination_path) =
+                                resolve_entry_path(&destination, path.as_ref())
+                            else {
+                                continue;
+                            };
+                            let header = entry.header();
 
-                                crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
-                                writer.flush()?;
-                                drop(writer);
-
-                                if let Some(permissions) = permissions {
-                                    destination_filesystem.set_permissions(
-                                        &destination_path,
-                                        FileType::File,
-                                        permissions,
-                                    )?;
-                                }
-                                if let Some(modified_time) = modified_time {
-                                    destination_filesystem.set_times(
-                                        &destination_path,
-                                        FileType::File,
-                                        modified_time,
-                                        None,
-                                    )?;
-                                }
-
-                                progress.increment_files();
+                            if destination_filesystem.is_primary_server_fs()
+                                && self.server.filesystem.is_ignored(
+                                    &destination_path,
+                                    FileType::from_is_dir(header.entry_type().is_dir()),
+                                )
+                            {
+                                continue;
                             }
-                            tar::EntryType::Symlink => {
-                                let link =
-                                    entry.link_name().unwrap_or_default().unwrap_or_default();
 
-                                if let Err(err) =
-                                    destination_filesystem.create_symlink(&link, &destination_path)
-                                {
-                                    tracing::debug!(
-                                        path = %path.display(),
-                                        "failed to create symlink from archive: {:#?}",
-                                        err
-                                    );
-                                } else if let Ok(modified_time) = header.mtime() {
-                                    destination_filesystem.set_times(
-                                        &destination_path,
-                                        FileType::Symlink,
-                                        std::time::UNIX_EPOCH
+                            match header.entry_type() {
+                                tar::EntryType::Directory => {
+                                    destination_filesystem.create_dir_all(&destination_path)?;
+                                    if let Ok(permissions) =
+                                        header.mode().map(PortablePermissions::from_mode_dir)
+                                    {
+                                        destination_filesystem.set_permissions(
+                                            &destination_path,
+                                            FileType::Dir,
+                                            permissions,
+                                        )?;
+                                    }
+
+                                    if let Ok(modified_time) = header.mtime()
+                                        && directory_entries.len()
+                                            < Self::MAX_DIRECTORY_MTIME_ENTRIES
+                                        && std::time::UNIX_EPOCH
                                             .checked_add(std::time::Duration::from_secs(
                                                 modified_time,
                                             ))
-                                            .unwrap_or_else(std::time::SystemTime::now),
-                                        None,
-                                    )?;
+                                            .is_some()
+                                    {
+                                        directory_entries.push((destination_path, modified_time));
+                                    }
                                 }
+                                tar::EntryType::Regular => {
+                                    let Some(sender) =
+                                        senders.get(tar_shard(&destination_path, threads))
+                                    else {
+                                        continue;
+                                    };
+
+                                    let permissions =
+                                        header.mode().map(PortablePermissions::from_mode_file).ok();
+                                    let modified_time =
+                                        header.mtime().ok().and_then(|modified_time| {
+                                            std::time::UNIX_EPOCH.checked_add(
+                                                std::time::Duration::from_secs(modified_time),
+                                            )
+                                        });
+                                    let size = entry.size();
+
+                                    if let Some(parent) = destination_path.parent()
+                                        && last_parent.as_deref() != Some(parent)
+                                    {
+                                        destination_filesystem.create_dir_all(&parent)?;
+                                        last_parent = Some(parent.to_path_buf());
+                                    }
+
+                                    if size <= TAR_CHUNK_BYTES as u64 {
+                                        let permit = limit.acquire();
+                                        let mut data = Vec::with_capacity(size as usize);
+                                        entry.read_to_end(&mut data)?;
+
+                                        if sender
+                                            .send_blocking(TarJob::File {
+                                                path: destination_path,
+                                                content: TarContent::Whole(data, permit),
+                                                permissions,
+                                                modified_time,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    } else {
+                                        let (chunks, receiver) = async_channel::bounded(2);
+
+                                        if sender
+                                            .send_blocking(TarJob::File {
+                                                path: destination_path,
+                                                content: TarContent::Chunks(receiver),
+                                                permissions,
+                                                modified_time,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+
+                                        loop {
+                                            let permit = limit.acquire();
+                                            let mut chunk = Vec::with_capacity(TAR_CHUNK_BYTES);
+
+                                            if entry
+                                                .by_ref()
+                                                .take(TAR_CHUNK_BYTES as u64)
+                                                .read_to_end(&mut chunk)?
+                                                == 0
+                                            {
+                                                break;
+                                            }
+
+                                            if chunks.send_blocking((chunk, permit)).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                tar::EntryType::Symlink => {
+                                    let Some(sender) =
+                                        senders.get(tar_shard(&destination_path, threads))
+                                    else {
+                                        continue;
+                                    };
+
+                                    let link = entry
+                                        .link_name()
+                                        .unwrap_or_default()
+                                        .unwrap_or_default()
+                                        .into_owned();
+                                    let modified_time =
+                                        header.mtime().ok().and_then(|modified_time| {
+                                            std::time::UNIX_EPOCH.checked_add(
+                                                std::time::Duration::from_secs(modified_time),
+                                            )
+                                        });
+
+                                    if sender
+                                        .send_blocking(TarJob::Symlink {
+                                            path: destination_path,
+                                            link,
+                                            modified_time,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
+
+                        drop(senders);
+
+                        Ok(())
+                    })?;
+
+                    if let Some(err) = error.take() {
+                        return Err(err);
                     }
 
                     for (destination_path, modified_time) in directory_entries {
@@ -689,18 +882,16 @@ impl Archive {
                         total.store(entry_total, Ordering::Relaxed);
                     }
 
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            self.server
-                                .app_state
-                                .config
-                                .load()
-                                .api
-                                .file_decompression_threads,
-                        )
-                        .build()?;
+                    let pool = crate::threading::build_pool(
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
+                    )?;
 
-                    let error = Arc::new(RwLock::new(None));
+                    let error = Arc::new(crate::threading::SharedError::new());
 
                     pool.in_place_scope(|scope| {
                         let archive = archive.clone();
@@ -723,7 +914,7 @@ impl Archive {
                                 let mut last_parent = None;
 
                                 loop {
-                                    if error_clone2.read().is_some() {
+                                    if error_clone2.stopped() {
                                         return Ok(());
                                     }
 
@@ -837,12 +1028,12 @@ impl Archive {
                             };
 
                             if let Err(err) = run() {
-                                error_clone.write().replace(err);
+                                error_clone.fail(err);
                             }
                         });
                     });
 
-                    if let Some(err) = error.write().take() {
+                    if let Some(err) = error.take() {
                         Err(err)
                     } else {
                         for i in 0..archive.len() {
@@ -1052,18 +1243,16 @@ impl Archive {
                         );
                     }
 
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            self.server
-                                .app_state
-                                .config
-                                .load()
-                                .api
-                                .file_decompression_threads,
-                        )
-                        .build()?;
+                    let pool = crate::threading::build_pool(
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
+                    )?;
 
-                    let error = Arc::new(RwLock::new(None));
+                    let error = Arc::new(crate::threading::SharedError::new());
 
                     pool.in_place_scope(|scope| {
                         for block_index in 0..archive.blocks.len() {
@@ -1076,7 +1265,7 @@ impl Archive {
                             let error_clone = Arc::clone(&error);
 
                             scope.spawn(move |_| {
-                                if error_clone.read().is_some() {
+                                if error_clone.stopped() {
                                     return;
                                 }
 
@@ -1173,13 +1362,13 @@ impl Archive {
 
                                     Ok(true)
                                 }) {
-                                    error_clone.write().replace(err);
+                                    error_clone.fail(err);
                                 }
                             });
                         }
                     });
 
-                    if let Some(err) = error.write().take() {
+                    if let Some(err) = error.take() {
                         Err(err.into())
                     } else {
                         for entry in archive.files {
@@ -1245,23 +1434,21 @@ impl Archive {
                         );
                     }
 
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            self.server
-                                .app_state
-                                .config
-                                .load()
-                                .api
-                                .file_decompression_threads,
-                        )
-                        .build()?;
+                    let pool = crate::threading::build_pool(
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
+                    )?;
 
                     #[allow(clippy::too_many_arguments)]
                     fn recursive_traverse(
                         scope: &rayon::Scope,
                         listener: &AbortListener,
                         progress: &create::ArchiveProgress,
-                        error: &Arc<RwLock<Option<std::io::Error>>>,
+                        error: &Arc<crate::threading::SharedError<std::io::Error>>,
                         server: &crate::server::Server,
                         destination_filesystem: &Arc<
                             dyn crate::server::filesystem::virtualfs::VirtualWritableFilesystem,
@@ -1269,7 +1456,7 @@ impl Archive {
                         destination: &Path,
                         entry: ddup_bak::archive::entries::Entry,
                     ) -> Result<(), anyhow::Error> {
-                        if error.read().is_some() {
+                        if error.stopped() {
                             return Ok(());
                         }
 
@@ -1369,7 +1556,7 @@ impl Archive {
                                             err
                                         );
 
-                                        error.write().replace(err);
+                                        error.fail(err);
                                     }
                                 });
                             }
@@ -1396,7 +1583,7 @@ impl Archive {
                         Ok(())
                     }
 
-                    let error = Arc::new(RwLock::new(None));
+                    let error = Arc::new(crate::threading::SharedError::new());
 
                     pool.in_place_scope(|scope| -> Result<(), anyhow::Error> {
                         for entry in archive.into_entries() {
@@ -1415,7 +1602,7 @@ impl Archive {
                         Ok(())
                     })?;
 
-                    if let Some(err) = error.write().take() {
+                    if let Some(err) = error.take() {
                         return Err(err.into());
                     }
 
@@ -1583,6 +1770,347 @@ impl Archive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{routes::AppState, server::Server};
+
+    // tar_shard
+
+    #[test]
+    fn tar_shard_is_stable_per_path() {
+        for shards in [1usize, 2, 3, 4, 8] {
+            for path in [
+                "world/region/r.0.0.mca",
+                "plugins/config.yml",
+                "server.properties",
+                "a",
+                "nested/deep/deeper/file.bin",
+            ] {
+                let shard = tar_shard(Path::new(path), shards);
+
+                assert_eq!(
+                    shard,
+                    tar_shard(Path::new(path), shards),
+                    "{path} moved between writers"
+                );
+                assert!(shard < shards, "{path} picked a writer that does not exist");
+            }
+        }
+    }
+
+    #[test]
+    fn tar_shard_spreads_a_realistic_tree_across_writers() {
+        let mut paths = Vec::new();
+        for i in 0..200 {
+            paths.push(format!("world/region/r.{}.{}.mca", i / 32, i % 32));
+            paths.push(format!("plugins/plugin-{i:03}/config.yml"));
+            paths.push(format!("libraries/library-{i}.jar"));
+        }
+
+        for shards in [2usize, 4, 8] {
+            let mut counts = vec![0usize; shards];
+
+            for path in &paths {
+                if let Some(count) = counts.get_mut(tar_shard(Path::new(path), shards)) {
+                    *count += 1;
+                }
+            }
+
+            // half of an even share, far looser than the measured spread
+            let floor = paths.len() / shards / 2;
+
+            assert!(
+                counts.iter().all(|&count| count > floor),
+                "uneven spread at {shards} shards: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_shard_survives_a_zero_thread_count() {
+        assert_eq!(tar_shard(Path::new("a.txt"), 0), 0);
+    }
+
+    // tar extraction
+
+    struct ExtractFixture {
+        server: Server,
+        root: PathBuf,
+
+        _temp: tempfile::TempDir,
+    }
+
+    impl ExtractFixture {
+        async fn new(threads: usize) -> Result<Self, anyhow::Error> {
+            let temp = tempfile::tempdir()?;
+            let state = AppState::mock();
+            {
+                let config = state.config.mutate_in_place_for_testing();
+                config.system.data_directory =
+                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+                config.api.file_decompression_threads = threads;
+            }
+
+            let server = Server::mock(uuid::Uuid::new_v4(), Arc::clone(&state));
+            server.filesystem.disk_checker.abort();
+
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(&root)?;
+
+            let cap = crate::server::filesystem::cap::CapFilesystem::new(&root).await?;
+            server.filesystem.inner.store(Some(cap.get_inner()?));
+
+            Ok(Self {
+                server,
+                root,
+                _temp: temp,
+            })
+        }
+
+        fn build(
+            &self,
+            entries: impl FnOnce(&mut tar::Builder<std::fs::File>),
+        ) -> Result<(), anyhow::Error> {
+            let file = std::fs::File::create(self.root.join("input.tar"))?;
+            let mut builder = tar::Builder::new(file);
+            entries(&mut builder);
+            builder.finish()?;
+
+            Ok(())
+        }
+
+        async fn extract(&self) -> Result<PathBuf, anyhow::Error> {
+            let archive = Archive::open(self.server.clone(), PathBuf::from("input.tar")).await?;
+            let (destination, filesystem) = self
+                .server
+                .filesystem
+                .resolve_writable_fs(&self.server, "out")
+                .await;
+
+            archive
+                .extract(
+                    destination,
+                    filesystem,
+                    create::ArchiveProgress::default(),
+                    None,
+                )
+                .await?;
+
+            Ok(self.root.join("out"))
+        }
+    }
+
+    fn file_header(size: u64, mode: u32, mtime: u64) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(mode);
+        header.set_mtime(mtime);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+
+        header
+    }
+
+    fn add_file(builder: &mut tar::Builder<std::fs::File>, name: &str, data: &[u8]) {
+        let mut header = file_header(data.len() as u64, 0o644, 1_700_000_000);
+        builder
+            .append_data(&mut header, name, data)
+            .expect("append file");
+    }
+
+    fn random(len: usize) -> Vec<u8> {
+        let mut state = 0x51edu64;
+
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extracted_tree_matches_the_archive_at_every_thread_count() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            for threads in [1, 2, 4] {
+                let fixture = ExtractFixture::new(threads).await?;
+                let big = random(5 * 1024 * 1024 + 13);
+                let small = random(4096);
+
+                fixture.build(|builder| {
+                    let mut directory = tar::Header::new_gnu();
+                    directory.set_size(0);
+                    directory.set_mode(0o755);
+                    directory.set_mtime(1_700_000_000);
+                    directory.set_entry_type(tar::EntryType::Directory);
+                    directory.set_cksum();
+                    builder
+                        .append_data(&mut directory, "plugins/", std::io::empty())
+                        .expect("append dir");
+
+                    for i in 0..50 {
+                        add_file(builder, &format!("plugins/config-{i:02}.yml"), &small);
+                    }
+                    add_file(builder, "world.mca", &big);
+                    add_file(builder, "server.properties", b"motd=hello");
+                })?;
+
+                let out = fixture.extract().await?;
+
+                assert_eq!(
+                    std::fs::read(out.join("world.mca"))?,
+                    big,
+                    "multi-chunk entry differs with {threads} threads"
+                );
+                assert_eq!(std::fs::read(out.join("server.properties"))?, b"motd=hello");
+
+                for i in 0..50 {
+                    assert_eq!(
+                        std::fs::read(out.join(format!("plugins/config-{i:02}.yml")))?,
+                        small,
+                        "config-{i:02} differs with {threads} threads"
+                    );
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn duplicate_entries_keep_the_last_write() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let fixture = ExtractFixture::new(4).await?;
+
+            fixture.build(|builder| {
+                for i in 0..32 {
+                    add_file(builder, &format!("dupe-{i:02}.txt"), b"first");
+                    add_file(builder, &format!("dupe-{i:02}.txt"), b"second");
+                }
+            })?;
+
+            let out = fixture.extract().await?;
+
+            for i in 0..32 {
+                assert_eq!(
+                    std::fs::read(out.join(format!("dupe-{i:02}.txt")))?,
+                    b"second",
+                    "dupe-{i:02} did not keep the last write"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_symlink_replacing_a_file_is_not_racy() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            // symlinks shard on the path they occupy, so this cannot be
+            // reordered against the file it replaces
+            let fixture = ExtractFixture::new(4).await?;
+
+            fixture.build(|builder| {
+                add_file(builder, "target.txt", b"target");
+
+                for i in 0..16 {
+                    add_file(builder, &format!("link-{i:02}"), b"replaced");
+
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_mode(0o777);
+                    header.set_mtime(1_700_000_000);
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    builder
+                        .append_link(&mut header, format!("link-{i:02}"), "target.txt")
+                        .expect("append symlink");
+                }
+            })?;
+
+            let out = fixture.extract().await?;
+
+            for i in 0..16 {
+                let path = out.join(format!("link-{i:02}"));
+                let metadata = std::fs::symlink_metadata(&path)?;
+
+                assert!(
+                    metadata.file_type().is_symlink() || std::fs::read(&path)? == b"replaced",
+                    "link-{i:02} is neither the symlink nor the file it replaced"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn directory_mtimes_survive_the_writers() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let fixture = ExtractFixture::new(4).await?;
+            let mtime = 1_600_000_000;
+
+            fixture.build(|builder| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_mtime(mtime);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "world/", std::io::empty())
+                    .expect("append dir");
+
+                for i in 0..64 {
+                    add_file(builder, &format!("world/r.{i}.mca"), b"region");
+                }
+            })?;
+
+            let out = fixture.extract().await?;
+            let modified = std::fs::metadata(out.join("world"))?.modified()?;
+            let seconds = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("directory mtime before the epoch")
+                .as_secs();
+
+            assert_eq!(
+                seconds, mtime,
+                "directory mtime was clobbered by the files written into it"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn file_modes_and_mtimes_are_preserved() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fixture = ExtractFixture::new(2).await?;
+
+            fixture.build(|builder| {
+                let mut header = file_header(5, 0o600, 1_500_000_000);
+                builder
+                    .append_data(&mut header, "private.key", b"hello".as_slice())
+                    .expect("append file");
+            })?;
+
+            let out = fixture.extract().await?;
+            let metadata = std::fs::metadata(out.join("private.key"))?;
+
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("mtime before the epoch")
+                    .as_secs(),
+                1_500_000_000
+            );
+
+            Ok(())
+        })
+    }
 
     // resolve_entry_path
 

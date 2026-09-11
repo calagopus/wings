@@ -1,12 +1,11 @@
 use crate::server::filesystem::virtualfs::{DirectoryWalkFilterFn, IsIgnoredFn};
-use parking_lot::RwLock;
 use std::{
     borrow::Cow,
     collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -283,25 +282,25 @@ impl AsyncWalkDir {
         threads: usize,
         func: Arc<F>,
     ) -> Result<(), anyhow::Error> {
-        let threads = crate::utils::resolve_threads(threads);
+        let threads = crate::threading::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
         let pending = Arc::new(Semaphore::new(if self.reversed {
-            crate::utils::WALK_IN_FLIGHT_LIMIT
+            crate::threading::WALK_IN_FLIGHT_LIMIT
         } else {
             threads
         }));
-        let error = Arc::new(RwLock::new(None));
+        let error = Arc::new(crate::threading::SharedError::new());
         let mut tasks = vec![JoinSet::new()];
 
         while let Some(entry) = self.next_entry().await {
-            if crate::unlikely(error.read().is_some()) {
+            if crate::unlikely(error.stopped()) {
                 break;
             }
 
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    error.write().get_or_insert_with(|| err.into());
+                    error.fail(err.into());
                     break;
                 }
             };
@@ -325,7 +324,7 @@ impl AsyncWalkDir {
             let parent = tasks.last_mut().expect("walk root has a task frame");
             while let Some(result) = parent.try_join_next() {
                 if let Err(err) = result {
-                    error.write().get_or_insert_with(|| err.into());
+                    error.fail(err.into());
                 }
             }
 
@@ -341,19 +340,19 @@ impl AsyncWalkDir {
                 let _pending = permit;
 
                 finish_walk_tasks(children, &error).await;
-                if crate::unlikely(error.read().is_some()) {
+                if crate::unlikely(error.stopped()) {
                     return;
                 }
 
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return;
                 };
-                if crate::unlikely(error.read().is_some()) {
+                if crate::unlikely(error.stopped()) {
                     return;
                 }
 
                 if let Err(err) = func(entry).await {
-                    error.write().get_or_insert(err);
+                    error.fail(err);
                 }
             });
         }
@@ -362,7 +361,7 @@ impl AsyncWalkDir {
             finish_walk_tasks(tasks, &error).await;
         }
 
-        if let Some(err) = error.write().take() {
+        if let Some(err) = error.take() {
             return Err(err);
         }
 
@@ -370,10 +369,13 @@ impl AsyncWalkDir {
     }
 }
 
-async fn finish_walk_tasks(mut tasks: JoinSet<()>, error: &RwLock<Option<anyhow::Error>>) {
+async fn finish_walk_tasks(
+    mut tasks: JoinSet<()>,
+    error: &crate::threading::SharedError<anyhow::Error>,
+) {
     while let Some(result) = tasks.join_next().await {
         if let Err(err) = result {
-            error.write().get_or_insert_with(|| err.into());
+            error.fail(err.into());
         }
     }
 }
@@ -491,23 +493,20 @@ impl WalkDir {
         func: Arc<F>,
         mut on_error: E,
     ) -> Result<(), anyhow::Error> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
-        let error = Arc::new(RwLock::new(None));
-        let in_flight = crate::utils::InFlightLimit::new(
-            crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE,
-        );
+        let pool = crate::threading::build_pool(threads)?;
+        let error = Arc::new(crate::threading::SharedError::new());
+        let in_flight =
+            crate::threading::InFlightLimit::new(crate::threading::WALK_BATCHES_IN_FLIGHT);
 
         loop {
             let directory = pool.in_place_scope(|scope| {
                 let mut directory = None;
-                let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+                let mut batch = Vec::with_capacity(crate::threading::WALK_BATCH_SIZE);
 
                 while let Some(entry) = self.next_entry() {
                     match entry {
                         Ok(entry) => {
-                            if crate::unlikely(error.read().is_some()) {
+                            if crate::unlikely(error.stopped()) {
                                 break;
                             }
 
@@ -523,17 +522,17 @@ impl WalkDir {
                             }
 
                             batch.push(entry);
-                            if batch.len() < crate::utils::WALK_BATCH_SIZE {
+                            if batch.len() < crate::threading::WALK_BATCH_SIZE {
                                 continue;
                             }
 
                             let batch = std::mem::replace(
                                 &mut batch,
-                                Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+                                Vec::with_capacity(crate::threading::WALK_BATCH_SIZE),
                             );
                             let permit = in_flight.acquire();
 
-                            crate::utils::spawn_walk_batch(
+                            crate::threading::spawn_walk_batch(
                                 scope,
                                 Arc::clone(&error),
                                 {
@@ -546,7 +545,7 @@ impl WalkDir {
                         }
                         Err(err) => {
                             if let Err(err) = on_error(err) {
-                                error.write().get_or_insert(err);
+                                error.fail(err);
                                 break;
                             }
                         }
@@ -556,7 +555,7 @@ impl WalkDir {
                 if !batch.is_empty() {
                     let permit = in_flight.acquire();
 
-                    crate::utils::spawn_walk_batch(
+                    crate::threading::spawn_walk_batch(
                         scope,
                         Arc::clone(&error),
                         {
@@ -571,7 +570,7 @@ impl WalkDir {
                 directory
             });
 
-            if let Some(err) = error.write().take() {
+            if let Some(err) = error.take() {
                 return Err(err);
             }
 
@@ -599,16 +598,13 @@ impl WalkDir {
         }
 
         let (root, root_read_dir) = self.stack.pop().expect("stack holds the root");
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
+        let pool = crate::threading::build_pool(threads)?;
         let context = ParallelWalkContext {
             cap_filesystem: self.cap_filesystem.clone(),
             is_ignored: self.is_ignored.clone(),
             filter,
             func,
-            error: RwLock::new(None),
-            stopped: AtomicBool::new(false),
+            error: crate::threading::SharedError::new(),
             queued: AtomicUsize::new(0),
         };
 
@@ -616,7 +612,7 @@ impl WalkDir {
             parallel_walk_visit(scope, &context, root, Some(root_read_dir));
         });
 
-        if let Some(err) = context.error.write().take() {
+        if let Some(err) = context.error.take() {
             return Err(err);
         }
 
@@ -629,31 +625,19 @@ struct ParallelWalkContext<F> {
     is_ignored: IsIgnoredFn,
     filter: Option<DirectoryWalkFilterFn>,
     func: Arc<F>,
-    error: RwLock<Option<anyhow::Error>>,
-    stopped: AtomicBool,
+    error: crate::threading::SharedError<anyhow::Error>,
     queued: AtomicUsize,
 }
 
 impl<F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static> ParallelWalkContext<F> {
-    #[inline]
-    fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
-    }
-
-    fn fail(&self, err: anyhow::Error) {
-        self.stopped.store(true, Ordering::Relaxed);
-
-        self.error.write().get_or_insert(err);
-    }
-
     fn process_batch(&self, batch: Vec<WalkEntry>) {
         for entry in batch {
-            if crate::unlikely(self.stopped()) {
+            if crate::unlikely(self.error.stopped()) {
                 return;
             }
 
             if let Err(err) = (self.func)(entry) {
-                self.fail(err);
+                self.error.fail(err);
                 return;
             }
         }
@@ -668,7 +652,7 @@ fn parallel_walk_visit<'scope, F>(
 ) where
     F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
 {
-    if context.stopped() {
+    if context.error.stopped() {
         return;
     }
 
@@ -676,20 +660,20 @@ fn parallel_walk_visit<'scope, F>(
         Some(read_dir) => read_dir,
         None => match context.cap_filesystem.read_dir(&path) {
             Ok(read_dir) => read_dir,
-            Err(err) => return context.fail(err.into()),
+            Err(err) => return context.error.fail(err.into()),
         },
     };
-    let queue_limit = crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE;
-    let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+    let queue_limit = crate::threading::WALK_BATCHES_IN_FLIGHT;
+    let mut batch = Vec::with_capacity(crate::threading::WALK_BATCH_SIZE);
 
     while let Some(entry) = read_dir.next() {
-        if context.stopped() {
+        if context.error.stopped() {
             return;
         }
 
         let entry = match entry {
             Ok(entry) => entry,
-            Err(err) => return context.fail(err.into()),
+            Err(err) => return context.error.fail(err.into()),
         };
         let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
         let full_path = path.join(entry.file_name());
@@ -714,13 +698,13 @@ fn parallel_walk_visit<'scope, F>(
             file_type,
             source: StatSource::Entry(entry),
         });
-        if batch.len() < crate::utils::WALK_BATCH_SIZE {
+        if batch.len() < crate::threading::WALK_BATCH_SIZE {
             continue;
         }
 
         let batch = std::mem::replace(
             &mut batch,
-            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+            Vec::with_capacity(crate::threading::WALK_BATCH_SIZE),
         );
         if context.queued.load(Ordering::Relaxed) < queue_limit {
             context.queued.fetch_add(1, Ordering::Relaxed);

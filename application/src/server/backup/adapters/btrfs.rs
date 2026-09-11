@@ -238,6 +238,7 @@ impl BtrfsBackup {
                         ignore.into(),
                         crate::server::filesystem::archive::create::CreateZipOptions {
                             compression_level,
+                            threads,
                         },
                     )
                     .await

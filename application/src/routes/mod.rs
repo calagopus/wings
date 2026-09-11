@@ -65,7 +65,8 @@ impl MimeCacheValue {
 pub struct MimeCacheKey {
     pub ino: u64,
     pub dev: u64,
-    pub modified: u64,
+    pub modified: u128,
+    pub size: u64,
 }
 
 #[cfg(unix)]
@@ -80,7 +81,8 @@ impl From<&std::fs::Metadata> for MimeCacheKey {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs()),
+                .map_or(0, |duration| duration.as_nanos()),
+            size: metadata.size(),
         }
     }
 }
@@ -97,7 +99,8 @@ impl From<&cap_std::fs::Metadata> for MimeCacheKey {
                 .modified()
                 .ok()
                 .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs()),
+                .map_or(0, |duration| duration.as_nanos()),
+            size: metadata.size(),
         }
     }
 }
@@ -112,7 +115,8 @@ impl From<&std::fs::Metadata> for MimeCacheKey {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs()),
+                .map_or(0, |duration| duration.as_nanos()),
+            size: metadata.len(),
         }
     }
 }
@@ -127,9 +131,19 @@ impl From<&cap_std::fs::Metadata> for MimeCacheKey {
                 .modified()
                 .ok()
                 .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs()),
+                .map_or(0, |duration| duration.as_nanos()),
+            size: metadata.len(),
         }
     }
+}
+
+pub fn mime_cache_capacity(directory_entry_limit: usize) -> u64 {
+    const MIN: u64 = 32 * 1024;
+    const MAX: u64 = 256 * 1024;
+
+    (directory_entry_limit as u64)
+        .saturating_mul(2)
+        .clamp(MIN, MAX)
 }
 
 pub struct AppState {
@@ -144,7 +158,7 @@ pub struct AppState {
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
-    pub mime_cache: moka::future::Cache<MimeCacheKey, MimeCacheValue>,
+    pub mime_cache: moka::sync::Cache<MimeCacheKey, MimeCacheValue>,
     pub listing_work: Arc<crate::server::filesystem::listing::ListingWork>,
 
     #[cfg(unix)]
@@ -170,7 +184,7 @@ impl AppState {
             websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
                 Arc::new(crate::config::Config::mock()),
             )),
-            mime_cache: moka::future::Cache::builder().build(),
+            mime_cache: moka::sync::Cache::builder().build(),
             listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
             #[cfg(unix)]
             tundra: None,

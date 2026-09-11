@@ -40,6 +40,13 @@ opt-level = 3
 [profile.release.package.aho-corasick]
 opt-level = 3
 
+# build bundled c compressors for speed instead of minsizerel
+[profile.release.package.libz-ng-sys]
+opt-level = 3
+
+[profile.release.package.zstd-sys]
+opt-level = 3
+
 [profile.release]
 opt-level = "s"
 lto = "fat"

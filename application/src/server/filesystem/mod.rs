@@ -2224,7 +2224,7 @@ impl Filesystem {
         let mime_key = MimeCacheKey::from(&prepared.metadata);
 
         let (prepared, detected_mime) =
-            if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
+            if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key) {
                 (prepared, detected_mime)
             } else if prepared.is_empty_file() {
                 (prepared, MimeCacheValue::text())
@@ -2350,51 +2350,46 @@ impl PreparedDirectoryEntry {
 
     fn cached_mime_type_blocking(
         &self,
-        mime_cache: &moka::future::Cache<MimeCacheKey, MimeCacheValue>,
+        mime_cache: &moka::sync::Cache<MimeCacheKey, MimeCacheValue>,
         open: impl FnOnce() -> std::io::Result<std::fs::File>,
     ) -> MimeCacheValue {
         let mime_key = MimeCacheKey::from(&self.metadata);
 
-        futures::executor::block_on(async {
-            if let Some(detected_mime) = mime_cache.get(&mime_key).await {
-                detected_mime
-            } else if self.is_empty_file() {
-                MimeCacheValue::text()
-            } else {
-                mime_cache
-                    .get_with_by_ref(&mime_key, async {
-                        let path = self.symlink_destination.as_ref().unwrap_or(&self.path);
+        if let Some(detected_mime) = mime_cache.get(&mime_key) {
+            detected_mime
+        } else if self.is_empty_file() {
+            MimeCacheValue::text()
+        } else {
+            mime_cache.get_with_by_ref(&mime_key, || {
+                let path = self.symlink_destination.as_ref().unwrap_or(&self.path);
 
-                        let mut buffer = [0; 64];
-                        let buffer = if self.metadata.is_file()
-                            || (self.symlink_destination.is_some()
-                                && self
-                                    .symlink_destination_metadata
-                                    .as_ref()
-                                    .is_some_and(|metadata| metadata.is_file()))
-                        {
-                            match open() {
-                                Ok(mut file) => {
-                                    #[cfg(target_os = "linux")]
-                                    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random)
-                                        .ok();
+                let mut buffer = [0; 64];
+                let buffer = if self.metadata.is_file()
+                    || (self.symlink_destination.is_some()
+                        && self
+                            .symlink_destination_metadata
+                            .as_ref()
+                            .is_some_and(|metadata| metadata.is_file()))
+                {
+                    match open() {
+                        Ok(mut file) => {
+                            #[cfg(target_os = "linux")]
+                            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random).ok();
 
-                                    let bytes_read =
-                                        std::io::Read::read(&mut file, &mut buffer).unwrap_or(0);
+                            let bytes_read =
+                                std::io::Read::read(&mut file, &mut buffer).unwrap_or(0);
 
-                                    buffer.get(..bytes_read)
-                                }
-                                Err(_) => None,
-                            }
-                        } else {
-                            None
-                        };
+                            buffer.get(..bytes_read)
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
 
-                        crate::utils::detect_mime_type(path, buffer)
-                    })
-                    .await
-            }
-        })
+                crate::utils::detect_mime_type(path, buffer)
+            })
+        }
     }
 
     pub fn modified_secs(&self) -> i64 {
@@ -2444,7 +2439,7 @@ mod tests {
         std::fs::write(temp.path().join("data.bin"), b"shared MIME read")?;
         let filesystem = runtime.block_on(cap::CapFilesystem::new(temp.path()))?;
         let metadata = filesystem.symlink_metadata("data.bin")?;
-        let cache = moka::future::Cache::new(16);
+        let cache = moka::sync::Cache::new(16);
         let start = Barrier::new(9);
         let opens = AtomicUsize::new(0);
         let release = AtomicBool::new(false);

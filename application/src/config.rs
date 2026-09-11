@@ -114,7 +114,7 @@ fn api_file_delete_threads() -> usize {
     2
 }
 fn api_file_decompression_threads() -> usize {
-    2
+    4
 }
 fn api_file_compression_threads() -> usize {
     2

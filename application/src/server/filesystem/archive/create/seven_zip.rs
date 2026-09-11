@@ -41,7 +41,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
             EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(
                 Lzma2Options::from_level_mt(
                     options.compression_level.to_lzma2_level(),
-                    options.threads as u32,
+                    crate::threading::resolve_threads(options.threads) as u32,
                     16 * 1024,
                 ),
             )),

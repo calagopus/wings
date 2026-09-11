@@ -1944,6 +1944,7 @@ impl ScheduleAction {
                                                     .system
                                                     .backups
                                                     .compression_level,
+                                                threads: state.config.load().api.file_compression_threads,
                                             },
                                         )
                                         .await

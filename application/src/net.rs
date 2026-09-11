@@ -5,7 +5,11 @@ use hickory_resolver::{
     lookup_ip::{LookupIp, LookupIpIter},
 };
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+};
 
 pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
     let host = host
@@ -22,6 +26,22 @@ pub fn is_blocked_ip(cidrs: &[cidr::IpCidr], ip: &std::net::IpAddr) -> bool {
     cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 
+fn build_resolver() -> TokioResolver {
+    let mut builder =
+        TokioResolver::builder_tokio().expect("failed to create TokioResolver builder");
+    builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+
+    builder.build().expect("failed to build TokioResolver")
+}
+
+pub async fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, anyhow::Error> {
+    static RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
+
+    let lookup = RESOLVER.get_or_init(build_resolver).lookup_ip(host).await?;
+
+    Ok(lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect())
+}
+
 #[derive(Clone)]
 pub struct BlockedIpResolver {
     config: Arc<crate::config::Config>,
@@ -36,15 +56,11 @@ impl BlockedIpResolver {
         selector: fn(&crate::config::InnerConfig) -> &Vec<cidr::IpCidr>,
         context: &'static str,
     ) -> Self {
-        let mut builder =
-            TokioResolver::builder_tokio().expect("failed to create TokioResolver builder");
-        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-
         Self {
             config: Arc::clone(config),
             selector,
             context,
-            state: Arc::new(builder.build().expect("failed to build TokioResolver")),
+            state: Arc::new(build_resolver()),
         }
     }
 }
@@ -252,20 +268,33 @@ impl CongestionControlProxy {
             }
         };
 
-        let mut upstream =
-            match tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await {
-                Ok(upstream) => upstream,
-                Err(err) => {
-                    tracing::debug!(
-                        host = %target_host,
-                        port = target_port,
-                        "congestion control proxy failed to reach the target: {}",
-                        err
-                    );
+        let upstream_addrs = match lookup_host(&target_host, target_port).await {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                tracing::debug!(
+                    host = %target_host,
+                    port = target_port,
+                    "congestion control proxy failed to resolve the target: {}",
+                    err
+                );
 
-                    return;
-                }
-            };
+                return;
+            }
+        };
+
+        let mut upstream = match tokio::net::TcpStream::connect(upstream_addrs.as_slice()).await {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                tracing::debug!(
+                    host = %target_host,
+                    port = target_port,
+                    "congestion control proxy failed to reach the target: {}",
+                    err
+                );
+
+                return;
+            }
+        };
         apply_socket_congestion_control(&upstream, &config);
         upstream.set_nodelay(true).ok();
 

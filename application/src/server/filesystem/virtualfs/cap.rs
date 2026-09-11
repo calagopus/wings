@@ -862,6 +862,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             is_ignored,
                             crate::server::filesystem::archive::create::CreateZipOptions {
                                 compression_level,
+                                threads: file_compression_threads,
                             },
                         )
                         .await

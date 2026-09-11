@@ -14,7 +14,6 @@ pub use functions::{
     AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, DirectoryWalkFilterFn, DirectoryWalkFn,
     IsIgnoredFn,
 };
-use parking_lot::RwLock;
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
@@ -346,21 +345,18 @@ pub trait DirectoryWalk {
         filter: Option<DirectoryWalkFilterFn>,
         func: DirectoryWalkFn,
     ) -> Result<(), anyhow::Error> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
-        let error = Arc::new(RwLock::new(None));
-        let in_flight = crate::utils::InFlightLimit::new(
-            crate::utils::WALK_IN_FLIGHT_LIMIT / crate::utils::WALK_BATCH_SIZE,
-        );
+        let pool = crate::threading::build_pool(threads)?;
+        let error = Arc::new(crate::threading::SharedError::new());
+        let in_flight =
+            crate::threading::InFlightLimit::new(crate::threading::WALK_BATCHES_IN_FLIGHT);
 
         pool.in_place_scope(|scope| {
-            let mut batch = Vec::with_capacity(crate::utils::WALK_BATCH_SIZE);
+            let mut batch = Vec::with_capacity(crate::threading::WALK_BATCH_SIZE);
 
             while let Some(entry) = self.next_walk_entry() {
                 match entry {
                     Ok(entry) => {
-                        if crate::unlikely(error.read().is_some()) {
+                        if crate::unlikely(error.stopped()) {
                             break;
                         }
 
@@ -371,17 +367,17 @@ pub trait DirectoryWalk {
                         }
 
                         batch.push(entry);
-                        if batch.len() < crate::utils::WALK_BATCH_SIZE {
+                        if batch.len() < crate::threading::WALK_BATCH_SIZE {
                             continue;
                         }
 
                         let batch = std::mem::replace(
                             &mut batch,
-                            Vec::with_capacity(crate::utils::WALK_BATCH_SIZE),
+                            Vec::with_capacity(crate::threading::WALK_BATCH_SIZE),
                         );
                         let permit = in_flight.acquire();
 
-                        crate::utils::spawn_walk_batch(
+                        crate::threading::spawn_walk_batch(
                             scope,
                             Arc::clone(&error),
                             {
@@ -393,7 +389,7 @@ pub trait DirectoryWalk {
                         );
                     }
                     Err(err) => {
-                        error.write().get_or_insert(err);
+                        error.fail(err);
                         break;
                     }
                 }
@@ -402,7 +398,7 @@ pub trait DirectoryWalk {
             if !batch.is_empty() {
                 let permit = in_flight.acquire();
 
-                crate::utils::spawn_walk_batch(
+                crate::threading::spawn_walk_batch(
                     scope,
                     Arc::clone(&error),
                     {
@@ -415,7 +411,7 @@ pub trait DirectoryWalk {
             }
         });
 
-        if let Some(err) = error.write().take() {
+        if let Some(err) = error.take() {
             return Err(err);
         }
 
@@ -449,14 +445,14 @@ pub trait AsyncDirectoryWalk {
         threads: usize,
         func: AsyncDirectoryWalkFn,
     ) -> Result<(), anyhow::Error> {
-        let threads = crate::utils::resolve_threads(threads);
+        let threads = crate::threading::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
-        let error = Arc::new(RwLock::new(None));
+        let error = Arc::new(crate::threading::SharedError::new());
 
         while let Some(entry) = self.next_walk_entry().await {
             match entry {
                 Ok(entry) => {
-                    if crate::unlikely(error.read().is_some()) {
+                    if crate::unlikely(error.stopped()) {
                         break;
                     }
 
@@ -473,7 +469,7 @@ pub trait AsyncDirectoryWalk {
                         match func(entry).await {
                             Ok(_) => {}
                             Err(err) => {
-                                error.write().get_or_insert(err);
+                                error.fail(err);
                             }
                         }
                     });
@@ -484,7 +480,7 @@ pub trait AsyncDirectoryWalk {
 
         semaphore.acquire_many(threads as u32).await.ok();
 
-        if let Some(err) = error.write().take() {
+        if let Some(err) = error.take() {
             return Err(err);
         }
 
@@ -518,9 +514,9 @@ pub trait AsyncDirectoryStreamWalk {
         threads: usize,
         func: AsyncDirectoryStreamWalkFn,
     ) -> Result<(), anyhow::Error> {
-        let threads = crate::utils::resolve_threads(threads);
+        let threads = crate::threading::resolve_threads(threads);
         let semaphore = Arc::new(Semaphore::new(threads));
-        let error = Arc::new(RwLock::new(None));
+        let error = Arc::new(crate::threading::SharedError::new());
 
         while let Some(entry) = self.next_walk_entry().await {
             match entry {
@@ -529,7 +525,7 @@ pub trait AsyncDirectoryStreamWalk {
                     let error = Arc::clone(&error);
                     let func = func.clone();
 
-                    if crate::unlikely(error.read().is_some()) {
+                    if crate::unlikely(error.stopped()) {
                         break;
                     }
 
@@ -543,7 +539,7 @@ pub trait AsyncDirectoryStreamWalk {
                             match func(entry, stream).await {
                                 Ok(_) => {}
                                 Err(err) => {
-                                    error.write().get_or_insert(err);
+                                    error.fail(err);
                                 }
                             }
                         });
@@ -560,7 +556,7 @@ pub trait AsyncDirectoryStreamWalk {
 
         semaphore.acquire_many(threads as u32).await.ok();
 
-        if let Some(err) = error.write().take() {
+        if let Some(err) = error.take() {
             return Err(err);
         }
 

@@ -315,6 +315,7 @@ impl BackupExt for ZfsBackup {
                             ignore.into(),
                             crate::server::filesystem::archive::create::CreateZipOptions {
                                 compression_level: config.load().system.backups.compression_level,
+                                threads: config.load().api.file_compression_threads,
                             },
                         )
                         .await

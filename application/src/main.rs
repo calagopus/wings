@@ -34,6 +34,7 @@ mod routes;
 mod server;
 mod ssh;
 mod stats;
+mod threading;
 mod tls;
 #[cfg(unix)]
 mod tundra;
@@ -162,6 +163,16 @@ macro_rules! exit_error {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MALLOC_CONF: &std::ffi::CStr = c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4,tcache_nslots_small_max:20,tcache_max:4096";
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF_PTR: Option<&'static std::ffi::c_char> =
+    // SAFETY: MALLOC_CONF is a 'static nul-terminated C string, which is what
+    // jemalloc reads this symbol as during its initialization.
+    Some(unsafe { &*MALLOC_CONF.as_ptr() });
 
 fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
     let details = if let Some(s) = err.downcast_ref::<String>() {
@@ -343,7 +354,7 @@ async fn main_rt() {
         let socket = sntpc_net_tokio::UdpSocketWrapper::from(socket);
         let context = sntpc::NtpContext::new(sntpc::StdTimestampGen::default());
 
-        let pool_ntp_addrs = tokio::net::lookup_host(("pool.ntp.org", 123))
+        let pool_ntp_addrs = crate::net::lookup_host("pool.ntp.org", 123)
             .await
             .context("failed to resolve pool.ntp.org")?;
 
@@ -514,7 +525,9 @@ async fn main_rt() {
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
             Arc::clone(&config),
         )),
-        mime_cache: moka::future::Cache::new(32768),
+        mime_cache: moka::sync::Cache::new(crate::routes::mime_cache_capacity(
+            config.load().api.directory_entry_limit,
+        )),
         listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
         #[cfg(unix)]
         tundra,
@@ -973,4 +986,31 @@ fn main() {
         .build()
         .expect("failed to build Tokio runtime")
         .block_on(main_rt());
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn malloc_conf_is_applied() {
+        use tikv_jemalloc_ctl::raw;
+
+        // SAFETY: opt.narenas is a read-only unsigned int option.
+        let narenas: std::ffi::c_uint =
+            unsafe { raw::read(b"opt.narenas\0") }.expect("read opt.narenas");
+        assert_eq!(narenas, 4, "narenas from MALLOC_CONF was not applied");
+
+        // SAFETY: opt.background_thread is a read-only bool option.
+        let background: bool =
+            unsafe { raw::read(b"opt.background_thread\0") }.expect("read opt.background_thread");
+        assert!(
+            background,
+            "background_thread from MALLOC_CONF was not applied"
+        );
+
+        // SAFETY: opt.dirty_decay_ms is a read-only ssize_t option.
+        let dirty_decay: isize =
+            unsafe { raw::read(b"opt.dirty_decay_ms\0") }.expect("read opt.dirty_decay_ms");
+        assert_eq!(dirty_decay, 1000, "dirty_decay_ms was not applied");
+    }
 }

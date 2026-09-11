@@ -1,16 +1,70 @@
 use notify::Watcher;
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-type ServerNotifiers = Arc<Mutex<HashMap<uuid::Uuid, InotifyServerNotifier>>>;
+type ServerNotifiers = Arc<Mutex<Notifiers>>;
 type FirewallFiles = Arc<Mutex<Option<(Vec<PathBuf>, Arc<tokio::sync::Notify>)>>>;
+
+#[derive(Default)]
+struct Notifiers {
+    by_path: HashMap<PathBuf, InotifyServerNotifier>,
+    by_uuid: HashMap<uuid::Uuid, PathBuf>,
+    /// How many roots sit at each component count
+    depths: BTreeMap<usize, usize>,
+}
+
+impl Notifiers {
+    fn insert(&mut self, uuid: uuid::Uuid, notifier: InotifyServerNotifier) {
+        self.remove(&uuid);
+
+        let path = notifier.path.clone();
+
+        if self.by_path.insert(path.clone(), notifier).is_none() {
+            *self.depths.entry(path.components().count()).or_insert(0) += 1;
+        }
+
+        self.by_uuid.insert(uuid, path);
+    }
+
+    fn remove(&mut self, uuid: &uuid::Uuid) -> Option<InotifyServerNotifier> {
+        let path = self.by_uuid.remove(uuid)?;
+        let notifier = self.by_path.remove(&path)?;
+
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            self.depths.entry(path.components().count())
+        {
+            let remaining = entry.get_mut();
+            *remaining -= 1;
+
+            if *remaining == 0 {
+                entry.remove();
+            }
+        }
+
+        Some(notifier)
+    }
+
+    fn find(&self, path: &Path) -> Option<&InotifyServerNotifier> {
+        let depth = path.components().count();
+
+        self.depths
+            .keys()
+            .rev()
+            .filter(|&&root_depth| root_depth <= depth)
+            .find_map(|&root_depth| self.by_path.get(path.ancestors().nth(depth - root_depth)?))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &InotifyServerNotifier> {
+        self.by_path.values()
+    }
+}
 
 pub struct InotifyManager {
     watcher: Arc<Mutex<notify::RecommendedWatcher>>,
@@ -19,7 +73,7 @@ pub struct InotifyManager {
 
 impl InotifyManager {
     pub fn new() -> Result<Self, notify::Error> {
-        let server_notifiers: ServerNotifiers = Arc::new(Mutex::new(HashMap::new()));
+        let server_notifiers = ServerNotifiers::default();
 
         let watcher = notify::RecommendedWatcher::new(
             {
@@ -32,13 +86,8 @@ impl InotifyManager {
                         }
 
                         for path in event.paths {
-                            let notifier = {
-                                let notifiers = server_notifiers.lock();
-                                notifiers
-                                    .values()
-                                    .find(|n| path.starts_with(&n.path))
-                                    .cloned()
-                            };
+                            let notifier = server_notifiers.lock().find(&path).cloned();
+
                             if let Some(notifier) = notifier {
                                 notifier.add_path(path);
                             }
@@ -176,5 +225,148 @@ impl InotifyServerNotifier {
     pub fn take_modified_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.modified_paths.lock();
         crate::utils::deduplicate_paths(std::mem::take(&mut *paths))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notifier(path: &str) -> InotifyServerNotifier {
+        InotifyServerNotifier::new(
+            PathBuf::from(path),
+            [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+        )
+    }
+
+    fn registered(paths: &[&str]) -> (Notifiers, Vec<uuid::Uuid>) {
+        let mut notifiers = Notifiers::default();
+        let uuids: Vec<_> = paths.iter().map(|_| uuid::Uuid::new_v4()).collect();
+
+        for (uuid, path) in uuids.iter().zip(paths) {
+            notifiers.insert(*uuid, notifier(path));
+        }
+
+        (notifiers, uuids)
+    }
+
+    #[test]
+    fn finds_the_server_an_event_path_belongs_to() {
+        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a", "/var/lib/wings/volumes/b"]);
+
+        let found = notifiers
+            .find(Path::new("/var/lib/wings/volumes/b/world/region/r.0.0.mca"))
+            .expect("event path should resolve to a server");
+
+        assert_eq!(found.path, PathBuf::from("/var/lib/wings/volumes/b"));
+    }
+
+    #[test]
+    fn finds_the_root_itself() {
+        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a"]);
+
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/a"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ignores_paths_outside_every_root() {
+        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a"]);
+
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/z/x.yml"))
+                .is_none()
+        );
+        assert!(notifiers.find(Path::new("/var/lib/wings")).is_none());
+        assert!(notifiers.find(Path::new("/etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn prefers_the_deepest_matching_root() {
+        let (notifiers, _) = registered(&[
+            "/var/lib/wings/volumes/a",
+            "/var/lib/wings/volumes/a/mounts/shared",
+        ]);
+
+        let found = notifiers
+            .find(Path::new("/var/lib/wings/volumes/a/mounts/shared/pack.zip"))
+            .expect("event path should resolve to a server");
+
+        assert_eq!(
+            found.path,
+            PathBuf::from("/var/lib/wings/volumes/a/mounts/shared")
+        );
+    }
+
+    #[test]
+    fn removal_stops_lookups_and_drops_the_depth() {
+        let (mut notifiers, uuids) =
+            registered(&["/var/lib/wings/volumes/a", "/var/lib/wings/volumes/b"]);
+
+        let removed = uuids.first().expect("uuid");
+        assert!(notifiers.remove(removed).is_some());
+        assert!(notifiers.remove(removed).is_none());
+
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
+                .is_none()
+        );
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/b/x.yml"))
+                .is_some()
+        );
+
+        let last = uuids.get(1).expect("uuid");
+        assert!(notifiers.remove(last).is_some());
+        assert!(
+            notifiers.depths.is_empty(),
+            "depth index should be empty once every root is gone"
+        );
+    }
+
+    #[test]
+    fn re_registering_a_server_does_not_double_count_its_depth() {
+        let mut notifiers = Notifiers::default();
+        let uuid = uuid::Uuid::new_v4();
+
+        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
+        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
+        assert!(notifiers.remove(&uuid).is_some());
+
+        assert!(notifiers.depths.is_empty(), "depth index leaked an entry");
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn re_registering_a_server_elsewhere_drops_its_old_path() {
+        let mut notifiers = Notifiers::default();
+        let uuid = uuid::Uuid::new_v4();
+
+        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
+        notifiers.insert(uuid, notifier("/srv/volumes/a"));
+
+        assert!(
+            notifiers
+                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
+                .is_none(),
+            "the old root still matches events"
+        );
+        assert!(notifiers.find(Path::new("/srv/volumes/a/x.yml")).is_some());
+
+        assert!(notifiers.remove(&uuid).is_some());
+        assert!(notifiers.depths.is_empty(), "depth index leaked an entry");
     }
 }

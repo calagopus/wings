@@ -81,6 +81,8 @@ impl<'a, R: Read + Seek> CompressionReaderMt<'a, R> {
         compression_type: CompressionType,
         threads: usize,
     ) -> std::io::Result<Self> {
+        let threads = crate::threading::resolve_threads(threads);
+
         Ok(match compression_type {
             CompressionType::None => CompressionReaderMt::None(reader),
             CompressionType::Gz => {

@@ -32,7 +32,6 @@ use crate::{
     utils::PortablePermissions,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use parking_lot::RwLock;
 use sha2::Digest;
 use std::{
     io::Write,
@@ -501,6 +500,14 @@ impl BackupCreateExt for WingsBackup {
                                     .system
                                     .backups
                                     .compression_level,
+                                threads: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .wings
+                                    .create_threads,
                             },
                         )
                         .await
@@ -825,11 +832,11 @@ impl BackupExt for WingsBackup {
                         total.fetch_add(entry.size(), Ordering::SeqCst);
                     }
 
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(server.app_state.config.load().system.backups.wings.restore_threads)
-                        .build()?;
+                    let pool = crate::threading::build_pool(
+                        server.app_state.config.load().system.backups.wings.restore_threads,
+                    )?;
 
-                    let error = Arc::new(RwLock::new(None));
+                    let error = Arc::new(crate::threading::SharedError::new());
 
                     pool.in_place_scope(|scope| {
                         let archive = archive.clone();
@@ -847,7 +854,7 @@ impl BackupExt for WingsBackup {
                                 let mut read_buffer = vec![0; crate::BUFFER_SIZE];
 
                                 loop {
-                                    if error_clone2.read().is_some() {
+                                    if error_clone2.stopped() {
                                         return Ok(());
                                     }
 
@@ -924,7 +931,7 @@ impl BackupExt for WingsBackup {
                             };
 
                             if let Err(err) = run() {
-                                error_clone.write().replace(err);
+                                error_clone.fail(err);
                             }
                         });
                     });
@@ -955,7 +962,7 @@ impl BackupExt for WingsBackup {
                         }
                     }
 
-                    if let Some(err) = error.write().take() {
+                    if let Some(err) = error.take() {
                         Err(err)
                     } else {
                         Ok(())
@@ -976,20 +983,18 @@ impl BackupExt for WingsBackup {
                         Ordering::Relaxed,
                     );
 
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .wings
-                                .restore_threads,
-                        )
-                        .build()?;
+                    let pool = crate::threading::build_pool(
+                        server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .wings
+                            .restore_threads,
+                    )?;
 
-                    let error = Arc::new(RwLock::new(None));
+                    let error = Arc::new(crate::threading::SharedError::new());
 
                     pool.in_place_scope(|scope| {
                         for block_index in 0..archive.blocks.len() {
@@ -1000,7 +1005,7 @@ impl BackupExt for WingsBackup {
                             let error_clone = Arc::clone(&error);
 
                             scope.spawn(move |_| {
-                                if error_clone.read().is_some() {
+                                if error_clone.stopped() {
                                     return;
                                 }
 
@@ -1078,13 +1083,13 @@ impl BackupExt for WingsBackup {
 
                                     Ok(true)
                                 }) {
-                                    error_clone.write().replace(err);
+                                    error_clone.fail(err);
                                 }
                             });
                         }
                     });
 
-                    if let Some(err) = error.write().take() {
+                    if let Some(err) = error.take() {
                         Err(err.into())
                     } else {
                         for entry in archive.files {
