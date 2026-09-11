@@ -867,7 +867,9 @@ async fn main_rt() {
 
                 match ktls_ciphers {
                     Some(ciphers) => match axum_server::from_tcp(listener) {
-                        Ok(server) => {
+                        Ok(mut server) => {
+                            server.http_builder().http2().adaptive_window(true);
+
                             server
                                 .acceptor(crate::tls::KtlsAcceptor::new(rustls_config, ciphers))
                                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
@@ -877,7 +879,9 @@ async fn main_rt() {
                     },
                     None => match axum_server::tls_rustls::from_tcp_rustls(listener, rustls_config)
                     {
-                        Ok(server) => {
+                        Ok(mut server) => {
+                            server.http_builder().http2().adaptive_window(true);
+
                             server
                                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                                 .await
@@ -888,9 +892,14 @@ async fn main_rt() {
             };
 
             #[cfg(not(target_os = "linux"))]
-            let result = axum_server::bind_rustls(address, rustls_config)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await;
+            let result = {
+                let mut server = axum_server::bind_rustls(address, rustls_config);
+                server.http_builder().http2().adaptive_window(true);
+
+                server
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            };
 
             match result {
                 Ok(_) => {}

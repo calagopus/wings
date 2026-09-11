@@ -512,6 +512,7 @@ mod post {
                             let response = reqwest::Client::builder()
                                 .connect_timeout(std::time::Duration::from_secs(15))
                                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                                .http1_only()
                                 .build()?
                                 .post(&data.url)
                                 .header("Authorization", &data.token)

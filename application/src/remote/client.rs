@@ -56,6 +56,7 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(config.remote_query.timeout))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .tls_danger_accept_invalid_certs(ignore_certificate_errors)
+            .http1_only()
             .default_headers(headers)
             .build()
             .expect("failed to build streaming HTTP client");

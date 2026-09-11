@@ -267,7 +267,8 @@ impl OutgoingServerTransfer {
     fn destination_client(proxy: Option<&crate::net::CongestionControlProxy>) -> reqwest::Client {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
-            .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .http1_only();
 
         if let Some(proxy) = proxy {
             match reqwest::Proxy::all(proxy.url()) {
