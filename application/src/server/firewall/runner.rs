@@ -214,6 +214,12 @@ impl DockerHelper {
         self.create_helper().await
     }
 
+    pub async fn remove(&self) -> Result<(), anyhow::Error> {
+        let _guard = self.ensure_lock.lock().await;
+
+        self.remove_helper(HELPER_CONTAINER_NAME).await
+    }
+
     async fn remove_helper(&self, id: &str) -> Result<(), anyhow::Error> {
         match self
             .docker

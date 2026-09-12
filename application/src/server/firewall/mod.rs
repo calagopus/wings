@@ -487,6 +487,11 @@ async fn container_helper(
         .image
         .clone()
         .ok_or_else(|| anyhow::anyhow!("own container inspect carries no image id"))?;
+    let image_name = inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.image.clone())
+        .unwrap_or_else(|| image.clone());
 
     let helper =
         runner::DockerHelper::new(Arc::clone(docker), image, config.load().app_name.clone());
@@ -501,10 +506,28 @@ async fn container_helper(
         )
         .await
     {
-        return Err(err.context("nftables is not usable inside the firewall helper container"));
+        if let CommandRunner::Docker(helper) = &runner
+            && let Err(err) = helper.remove().await
+        {
+            tracing::debug!("failed to remove the unusable firewall helper container: {err}");
+        }
+
+        return Err(if is_missing_binary(&err) {
+            err.context(format!(
+                "the nft binary is missing from {image_name}, the image the firewall helper container runs"
+            ))
+        } else {
+            err.context("nftables is not usable inside the firewall helper container")
+        });
     }
 
     Ok(runner)
+}
+
+fn is_missing_binary(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+
+    message.contains("No such file or directory") || message.contains("executable file not found")
 }
 
 async fn shares_host_netns(
@@ -637,16 +660,12 @@ pub(crate) async fn flush_denied_conntrack(runner: &CommandRunner, rules: &[Conc
             match runner.run("conntrack", &args, None).await {
                 Ok(_) => {}
                 Err(err) => {
-                    let message = err.to_string();
-                    if (message.contains("No such file or directory")
-                        || message.contains("executable file not found"))
-                        && CONNTRACK_MISSING_WARNED.set(()).is_ok()
-                    {
+                    if is_missing_binary(&err) && CONNTRACK_MISSING_WARNED.set(()).is_ok() {
                         tracing::warn!(
                             "the conntrack tool is not installed, denied sources with active connections keep their flows until they expire"
                         );
                     } else {
-                        tracing::debug!("conntrack flush: {message}");
+                        tracing::debug!("conntrack flush: {err}");
                     }
                 }
             }
