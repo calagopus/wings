@@ -98,9 +98,6 @@ fn api_directory_entry_limit() -> usize {
 fn api_file_search_threads() -> usize {
     4
 }
-fn api_file_search_context_max_search_size() -> u64 {
-    8 * 1024 * 1024
-}
 fn api_file_search_context_max_matches() -> usize {
     100
 }
@@ -771,8 +768,6 @@ nestify::nest! {
             #[serde(default)]
             #[schema(inline)]
             pub file_search_context: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiFileSearchContext {
-                #[serde(default = "api_file_search_context_max_search_size")]
-                pub max_search_size: u64,
                 #[serde(default = "api_file_search_context_max_matches")]
                 pub max_matches: usize,
                 #[serde(default = "api_file_search_context_max_response_size")]

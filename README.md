@@ -55,8 +55,6 @@ api:
   file_search_threads: 4
 
   file_search_context:
-    # maximum scanned bytes per file when returning match context
-    max_search_size: 8388608
     # maximum matches returned per file
     max_matches: 100
     # maximum total bytes of preview content per response
