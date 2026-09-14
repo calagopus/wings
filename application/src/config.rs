@@ -8,7 +8,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::BufRead,
+    io::{BufRead, BufWriter, IsTerminal},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -121,6 +121,9 @@ fn api_upload_limit() -> MiB {
 }
 fn api_max_jwt_uses() -> usize {
     5
+}
+fn api_request_log_limit() -> usize {
+    250
 }
 
 fn system_root_directory() -> SystemPath {
@@ -785,6 +788,8 @@ nestify::nest! {
             pub upload_limit: MiB,
             #[serde(default = "api_max_jwt_uses")]
             pub max_jwt_uses: usize,
+            #[serde(default = "api_request_log_limit")]
+            pub request_log_limit: usize,
             #[serde(default)]
             #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
@@ -1561,7 +1566,8 @@ impl Config {
 
         Self::ensure_directories(&inner)?;
 
-        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+        let (stdout_writer, stdout_guard) =
+            tracing_appender::non_blocking(BufWriter::new(std::io::stdout()));
 
         let latest_log_path = inner.system.log_directory.as_path(&inner).join("wings.log");
         let latest_file = std::fs::OpenOptions::new()
@@ -1578,9 +1584,8 @@ impl Config {
             .build(inner.system.log_directory.as_path(&inner))
             .context("failed to create rolling log file appender")?;
 
-        let (file_appender, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .buffered_lines_limit(50)
-            .finish(latest_file.and(rolling_appender));
+        let (file_appender, guard) =
+            tracing_appender::non_blocking(BufWriter::new(latest_file.and(rolling_appender)));
 
         #[cfg(unix)]
         {
@@ -1604,6 +1609,7 @@ impl Config {
                 "%Y-%m-%d %H:%M:%S %z".to_string(),
             ))
             .with_writer(stdout_writer.and(file_appender))
+            .with_ansi(std::io::stdout().is_terminal())
             .with_target(false)
             .with_level(true)
             .with_file(true)

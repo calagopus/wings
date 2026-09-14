@@ -70,6 +70,8 @@ api:
   file_compression_threads: 2
   # how often a jwt can be used to download a file/backup until expiry, 0 means unlimited (2 minimum recommended)
   max_jwt_uses: 5
+  # how many http requests per second are written to the log before the rest are counted and summarized, 0 means unlimited
+  request_log_limit: 250
 
 system:
   # path for temporary mountpoints for servers

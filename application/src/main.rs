@@ -12,7 +12,10 @@ use russh::server::Server;
 use std::{
     fmt::Debug,
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
@@ -190,13 +193,73 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> 
         .into_response()
 }
 
-async fn handle_request(req: Request<Body>, next: Next) -> Result<Response<Body>, StatusCode> {
-    tracing::info!(
-        path = req.uri().path(),
-        query = %crate::utils::redact_query(req.uri().query().unwrap_or_default()),
-        "http {}",
-        req.method().to_string().to_lowercase(),
-    );
+struct RequestLogBudget {
+    second: AtomicU64,
+    logged: AtomicUsize,
+    suppressed: AtomicU64,
+}
+
+impl RequestLogBudget {
+    fn take(&self, limit: usize) -> (bool, u64) {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+        let now = START.elapsed().as_secs();
+        let second = self.second.load(Ordering::Relaxed);
+        let suppressed = if second != now
+            && self
+                .second
+                .compare_exchange(second, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.logged.store(0, Ordering::Relaxed);
+            self.suppressed.swap(0, Ordering::Relaxed)
+        } else {
+            0
+        };
+
+        if self.logged.fetch_add(1, Ordering::Relaxed) < limit {
+            (true, suppressed)
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            (false, suppressed)
+        }
+    }
+}
+
+static REQUEST_LOG_BUDGET: RequestLogBudget = RequestLogBudget {
+    second: AtomicU64::new(0),
+    logged: AtomicUsize::new(0),
+    suppressed: AtomicU64::new(0),
+};
+
+async fn handle_request(
+    state: GetState,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let limit = state.config.load().api.request_log_limit;
+    let (log, suppressed) = if limit == 0 {
+        (true, 0)
+    } else {
+        REQUEST_LOG_BUDGET.take(limit)
+    };
+
+    if suppressed > 0 {
+        tracing::info!(
+            "suppressed {} http request log lines (api.request_log_limit = {})",
+            suppressed,
+            limit
+        );
+    }
+
+    if log {
+        tracing::info!(
+            path = req.uri().path(),
+            query = %crate::utils::redact_query(req.uri().query().unwrap_or_default()),
+            "http {}",
+            req.method().to_string().to_lowercase(),
+        );
+    }
 
     Ok(crate::response::ACCEPT_HEADER
         .scope(crate::response::accept_from_headers(req.headers()), async {
@@ -575,7 +638,10 @@ async fn main_rt() {
             state.clone(),
             handle_cors,
         ))
-        .layer(axum::middleware::from_fn(handle_request))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handle_request,
+        ))
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             handle_panic,
         ))
