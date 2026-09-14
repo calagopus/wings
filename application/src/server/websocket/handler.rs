@@ -244,6 +244,13 @@ pub async fn handle_ws(
                                                 return Ok(());
                                             }
 
+                                            let message = match message.event {
+                                                websocket::WebsocketEvent::ServerFileUploads => {
+                                                    websocket_handler.filter_upload_entries(message).await?
+                                                }
+                                                _ => message,
+                                            };
+
                                             websocket_handler.send_message(message).await;
 
                                             Ok(())

@@ -8,7 +8,7 @@ mod get {
         io::fixed_reader::AsyncFixedReader,
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::virtualfs::ByteRange,
+        server::filesystem::{uploads::ignore_match_path, virtualfs::ByteRange},
     };
     use axum::{
         extract::Query,
@@ -149,7 +149,7 @@ mod get {
         if filesystem.is_primary_server_fs()
             && ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(&path, false).is_ignore())
+                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)

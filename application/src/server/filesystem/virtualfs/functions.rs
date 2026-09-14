@@ -1,4 +1,5 @@
 use super::{AsyncReadableFileStream, FileType, VirtualWalkEntry};
+use crate::server::filesystem::uploads::ignore_match_path;
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
@@ -113,11 +114,11 @@ impl Deref for IsIgnoredFn {
 impl From<ignore::gitignore::Gitignore> for IsIgnoredFn {
     fn from(gi: ignore::gitignore::Gitignore) -> Self {
         Self::from_sync(Arc::new(move |file_type, path| {
-            if gi.matched(&path, file_type.is_dir()).is_ignore() {
-                None
-            } else {
-                Some(path)
-            }
+            let ignored = gi
+                .matched(ignore_match_path(&path), file_type.is_dir())
+                .is_ignore();
+
+            if ignored { None } else { Some(path) }
         }))
     }
 }
@@ -125,12 +126,12 @@ impl From<ignore::gitignore::Gitignore> for IsIgnoredFn {
 impl From<Vec<ignore::gitignore::Gitignore>> for IsIgnoredFn {
     fn from(gis: Vec<ignore::gitignore::Gitignore>) -> Self {
         Self::from_sync(Arc::new(move |file_type, path| {
-            for gi in &gis {
-                if gi.matched(&path, file_type.is_dir()).is_ignore() {
-                    return None;
-                }
-            }
-            Some(path)
+            let match_path = ignore_match_path(&path);
+            let ignored = gis
+                .iter()
+                .any(|gi| gi.matched(&match_path, file_type.is_dir()).is_ignore());
+
+            if ignored { None } else { Some(path) }
         }))
     }
 }

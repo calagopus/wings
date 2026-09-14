@@ -37,6 +37,7 @@ pub mod listing;
 pub mod operations;
 pub mod pull;
 pub mod sqlite;
+pub mod uploads;
 pub mod usage;
 pub mod virtualfs;
 
@@ -174,6 +175,7 @@ pub struct Filesystem {
     pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
     pub pulls: RwLock<HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>>,
     pub operations: operations::OperationManager,
+    pub uploads: uploads::UploadManager,
 }
 
 impl Filesystem {
@@ -253,7 +255,8 @@ impl Filesystem {
                 .time_to_idle(std::time::Duration::from_mins(1))
                 .build(),
             pulls: RwLock::new(HashMap::new()),
-            operations: operations::OperationManager::new(sender),
+            operations: operations::OperationManager::new(sender.clone()),
+            uploads: uploads::UploadManager::new(sender),
         }
     }
 
@@ -367,7 +370,7 @@ impl Filesystem {
 
         self.disk_ignored
             .load()
-            .matched(path, file_type.is_dir())
+            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
             .is_ignore()
     }
 
@@ -386,7 +389,7 @@ impl Filesystem {
 
         self.disk_ignored
             .load()
-            .matched(path, file_type.is_dir())
+            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
             .is_ignore()
     }
 
@@ -407,7 +410,9 @@ impl Filesystem {
             return false;
         }
 
-        matcher.matched(path, file_type.is_dir()).is_ignore()
+        matcher
+            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
+            .is_ignore()
     }
 
     pub async fn async_is_subuser_ignored(
@@ -428,7 +433,9 @@ impl Filesystem {
             return false;
         }
 
-        matcher.matched(path, file_type.is_dir()).is_ignore()
+        matcher
+            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
+            .is_ignore()
     }
 
     pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
@@ -919,6 +926,8 @@ impl Filesystem {
             }
         }
 
+        self.uploads.forget(&path, &self.cap_filesystem).await;
+
         Ok(())
     }
 
@@ -1019,6 +1028,8 @@ impl Filesystem {
                 self.async_allocate_in_path(&new_parent, size, true).await;
             }
         }
+
+        self.uploads.forget(&old_path, &self.cap_filesystem).await;
 
         Ok(())
     }

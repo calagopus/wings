@@ -137,6 +137,8 @@ pub enum WebsocketEvent {
     ServerOperationCompleted,
     #[serde(rename = "operation aborted")]
     ServerOperationAborted,
+    #[serde(rename = "file uploads")]
+    ServerFileUploads,
 
     #[serde(rename = "file collab subscribe")]
     FileCollabSubscribe,
@@ -213,7 +215,8 @@ impl WebsocketEvent {
             Self::ServerOperationProgress
             | Self::ServerOperationError
             | Self::ServerOperationCompleted
-            | Self::ServerOperationAborted => BroadcastPermission::Required(Permission::FileRead),
+            | Self::ServerOperationAborted
+            | Self::ServerFileUploads => BroadcastPermission::Required(Permission::FileRead),
 
             Self::AuthenticationSuccess
             | Self::TokenExpiring
@@ -482,6 +485,37 @@ impl ServerWebsocketHandler {
         Ok(server
             .user_permissions
             .has_calagopus_permission_or(user_uuid, permission, default))
+    }
+
+    async fn filter_upload_entries(
+        &self,
+        message: WebsocketMessage,
+    ) -> Result<WebsocketMessage, anyhow::Error> {
+        let (user_uuid, server) = self.get_server().await?;
+
+        if !server.user_permissions.has_ignored_files(user_uuid) {
+            return Ok(message);
+        }
+
+        let entries: Vec<_> = server
+            .filesystem
+            .uploads
+            .entries(&server.filesystem)
+            .await
+            .into_iter()
+            .filter(|entry| {
+                !server.user_permissions.is_ignored(
+                    &server,
+                    user_uuid,
+                    std::path::Path::new(entry.directory.as_str()).join(entry.target_name.as_str()),
+                    crate::server::filesystem::cap::FileType::File,
+                )
+            })
+            .collect();
+
+        Ok(WebsocketMessage::builder(message.event)
+            .structured_arg(&entries)
+            .build())
     }
 
     async fn close(&self, reason: &str) {

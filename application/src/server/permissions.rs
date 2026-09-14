@@ -1,4 +1,4 @@
-use crate::server::filesystem::cap::FileType;
+use crate::server::filesystem::{cap::FileType, uploads::ignore_match_path};
 use parking_lot::Mutex;
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -140,7 +140,9 @@ impl IgnoredFiles {
     fn matches(&self, path: std::path::PathBuf, is_dir: bool) -> bool {
         match self {
             Self::Unrestricted => false,
-            Self::Matcher(overrides) => overrides.matched(path, is_dir).is_whitelist(),
+            Self::Matcher(overrides) => overrides
+                .matched(ignore_match_path(&path), is_dir)
+                .is_whitelist(),
             Self::Unusable => true,
         }
     }
@@ -220,6 +222,17 @@ impl UserPermissionsMap {
             permissions.has_calagopus_permission_or(permission, default)
         } else {
             default
+        }
+    }
+
+    pub fn has_ignored_files(&self, user_uuid: uuid::Uuid) -> bool {
+        let mut map = self.map.lock();
+        if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
+            *last_access = std::time::Instant::now();
+
+            !matches!(ignored, IgnoredFiles::Unrestricted)
+        } else {
+            false
         }
     }
 
@@ -610,6 +623,33 @@ mod tests {
                 &server,
                 uuid::Uuid::new_v4(),
                 "server.log",
+                FileType::File
+            ));
+        });
+    }
+
+    /// A staging file inherits the visibility of the file it will become, or a deny rule is
+    /// dodged by reaching for `server.log.upload-part` over SFTP instead.
+    #[test]
+    fn map_is_ignored_matches_a_staging_file_as_its_target() {
+        tokio_test::block_on(async {
+            let state = crate::routes::AppState::mock();
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let ignored: &[&str] = &["*.log"];
+            permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
+
+            assert!(permissions.is_ignored(
+                &server,
+                user,
+                "server.log.upload-part",
+                FileType::File
+            ));
+            assert!(!permissions.is_ignored(
+                &server,
+                user,
+                "server.txt.upload-part",
                 FileType::File
             ));
         });

@@ -15,6 +15,8 @@ pub struct FileJwtPayload {
 
     pub server_uuid: uuid::Uuid,
     pub user_uuid: uuid::Uuid,
+    #[serde(default)]
+    pub user_name: Option<compact_str::CompactString>,
     pub unique_id: compact_str::CompactString,
 
     #[serde(default)]
@@ -48,7 +50,10 @@ mod post {
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::cap::FileType,
+            filesystem::{
+                cap::FileType,
+                uploads::{NewUpload, ignore_match_path, part_path},
+            },
         },
     };
     use axum::{
@@ -188,14 +193,14 @@ mod post {
 
         while let Some(mut field) = multipart.next_field().await? {
             let filename = match field.file_name() {
-                Some(name) => name,
+                Some(name) => name.to_string(),
                 None => {
                     return ApiResponse::error("file name not found")
                         .with_status(StatusCode::EXPECTATION_FAILED)
                         .ok();
                 }
             };
-            let path = directory.join(filename);
+            let path = directory.join(&filename);
             let parent = match path.parent() {
                 Some(parent) => parent,
                 None => {
@@ -236,7 +241,7 @@ mod post {
             if filesystem.is_primary_server_fs()
                 && (ignored
                     .as_ref()
-                    .is_some_and(|o| o.matched(&path, false).is_ignore())
+                    .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
                     || server
                         .filesystem
                         .async_is_ignored(&path, FileType::File)
@@ -249,20 +254,43 @@ mod post {
 
             filesystem.async_create_dir_all(&root).await?;
 
-            let mut written_size = 0;
-            let mut writer = filesystem.async_create_file(&path).await?;
+            let part = match part_path(&path) {
+                Some(part) => part,
+                None => {
+                    return ApiResponse::error("file name too long")
+                        .with_status(StatusCode::EXPECTATION_FAILED)
+                        .ok();
+                }
+            };
 
-            server.activity.log_activity(Activity {
-                event: ActivityEvent::FileUploaded,
-                user: Some(payload.user_uuid),
-                ip: user_ip,
-                metadata: Some(json!({
-                    "files": [filename],
-                    "directory": server.filesystem.relative_path(&directory),
-                })),
-                schedule: None,
-                timestamp: chrono::Utc::now(),
-            });
+            let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+            let _lock_guard = lock.lock().await;
+
+            let mut written_size = 0;
+            let mut writer = filesystem.async_create_file(&part).await?;
+
+            let guard = if filesystem.is_primary_server_fs() {
+                Some(
+                    server
+                        .filesystem
+                        .uploads
+                        .register(
+                            NewUpload {
+                                target: &path,
+                                part: &part,
+                                user: payload.user_uuid,
+                                user_name: payload.user_name.clone(),
+                                total: None,
+                                uploaded: 0,
+                                resumable: false,
+                            },
+                            &server.filesystem,
+                        )
+                        .await,
+                )
+            } else {
+                None
+            };
 
             while let Some(chunk) = field.chunk().await? {
                 let config = state.config.load();
@@ -281,9 +309,33 @@ mod post {
 
                 writer.write_all(&chunk).await?;
                 written_size += chunk.len() as u64;
+                if let Some(guard) = &guard {
+                    guard.set_progress(written_size);
+                }
             }
 
             writer.shutdown().await?;
+            drop(writer);
+
+            filesystem
+                .async_rename(&part, &path, FileType::File)
+                .await?;
+
+            if let Some(guard) = guard {
+                guard.complete().await;
+            }
+
+            server.activity.log_activity(Activity {
+                event: ActivityEvent::FileUploaded,
+                user: Some(payload.user_uuid),
+                ip: user_ip,
+                metadata: Some(json!({
+                    "files": [filename],
+                    "directory": server.filesystem.relative_path(&directory),
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
         }
 
         ApiResponse::new_serialized(Response {}).ok()
@@ -294,7 +346,10 @@ mod head {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::cap::FileType,
+        server::filesystem::{
+            cap::FileType,
+            uploads::{ignore_match_path, part_path},
+        },
     };
     use axum::{body::Body, extract::Query, http::StatusCode};
     use serde::Deserialize;
@@ -402,7 +457,7 @@ mod head {
         if filesystem.is_primary_server_fs()
             && (ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(&path, false).is_ignore())
+                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
                 || server
                     .filesystem
                     .async_is_ignored(&path, FileType::File)
@@ -413,10 +468,18 @@ mod head {
                 .ok();
         }
 
-        let offset = match filesystem.async_metadata(&path).await {
+        let part = match part_path(&path) {
+            Some(part) => part,
+            None => {
+                return ApiResponse::error("file name too long")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+        let offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
                 if !metadata.file_type.is_file() {
-                    return ApiResponse::error("target is not a file")
+                    return ApiResponse::error("staging path is not a file")
                         .with_status(StatusCode::EXPECTATION_FAILED)
                         .ok();
                 }
@@ -438,7 +501,10 @@ mod patch {
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::cap::FileType,
+            filesystem::{
+                cap::FileType,
+                uploads::{NewUpload, ignore_match_path, part_path},
+            },
         },
     };
     use axum::{
@@ -611,7 +677,7 @@ mod patch {
         if filesystem.is_primary_server_fs()
             && (ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(&path, false).is_ignore())
+                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
                 || server
                     .filesystem
                     .async_is_ignored(&path, FileType::File)
@@ -622,15 +688,24 @@ mod patch {
                 .ok();
         }
 
-        let lock = super::upload_lock((payload.server_uuid, path.clone())).await;
-        let _guard = lock.lock().await;
+        let part = match part_path(&path) {
+            Some(part) => part,
+            None => {
+                return ApiResponse::error("file name too long")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+
+        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let _lock_guard = lock.lock().await;
 
         filesystem.async_create_dir_all(&root).await?;
 
-        let disk_offset = match filesystem.async_metadata(&path).await {
+        let disk_offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
                 if !metadata.file_type.is_file() {
-                    return ApiResponse::error("target is not a file")
+                    return ApiResponse::error("staging path is not a file")
                         .with_status(StatusCode::EXPECTATION_FAILED)
                         .ok();
                 }
@@ -650,8 +725,31 @@ mod patch {
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).append(true).create(true);
         let mut file = filesystem
-            .async_open_file_with_options(&path, options)
+            .async_open_file_with_options(&part, options)
             .await?;
+
+        let guard = if filesystem.is_primary_server_fs() {
+            Some(
+                server
+                    .filesystem
+                    .uploads
+                    .register(
+                        NewUpload {
+                            target: &path,
+                            part: &part,
+                            user: payload.user_uuid,
+                            user_name: payload.user_name.clone(),
+                            total: upload_length,
+                            uploaded: disk_offset,
+                            resumable: true,
+                        },
+                        &server.filesystem,
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
 
         let mut written_size = disk_offset;
         let mut stream = body.into_data_stream();
@@ -676,9 +774,13 @@ mod patch {
 
             file.write_all(&chunk).await?;
             written_size += chunk.len() as u64;
+            if let Some(guard) = &guard {
+                guard.set_progress(written_size);
+            }
         }
 
         file.shutdown().await?;
+        drop(file);
 
         if upload_complete {
             if let Some(total_size) = upload_length
@@ -689,6 +791,14 @@ mod patch {
                 ))
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
+            }
+
+            filesystem
+                .async_rename(&part, &path, FileType::File)
+                .await?;
+
+            if let Some(guard) = guard {
+                guard.complete().await;
             }
 
             let user_ip = Some(state.config.find_ip(&headers, connect_info));
@@ -712,10 +822,183 @@ mod patch {
     }
 }
 
+mod delete {
+    use crate::{
+        response::{ApiResponse, ApiResponseResult},
+        routes::{ApiError, GetState},
+        server::filesystem::{
+            cap::FileType,
+            uploads::{ignore_match_path, part_path},
+        },
+    };
+    use axum::{extract::Query, http::StatusCode};
+    use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
+    use utoipa::ToSchema;
+
+    #[derive(ToSchema, Deserialize)]
+    pub struct Params {
+        token: String,
+        #[serde(default)]
+        directory: compact_str::CompactString,
+        file: compact_str::CompactString,
+    }
+
+    #[derive(ToSchema, Serialize)]
+    struct Response {}
+
+    #[utoipa::path(delete, path = "/", responses(
+        (status = OK, body = inline(Response)),
+        (status = UNAUTHORIZED, body = ApiError),
+        (status = NOT_FOUND, body = ApiError),
+        (status = EXPECTATION_FAILED, body = ApiError),
+    ), params(
+        ("token" = String, Query, description = "The JWT token to use for authentication"),
+        ("directory" = String, Query, description = "The directory the file lives in"),
+        ("file" = String, Query, description = "The file name (may include a sub-path) within the directory"),
+    ))]
+    pub async fn route(state: GetState, Query(params): Query<Params>) -> ApiResponseResult {
+        let payload: super::FileJwtPayload = match state.config.jwt.verify(&params.token) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return ApiResponse::error("invalid token")
+                    .with_status(StatusCode::UNAUTHORIZED)
+                    .ok();
+            }
+        };
+
+        if let Err(err) = payload
+            .base
+            .validate(&state.config.jwt, Some("file-upload"))
+        {
+            return ApiResponse::error(&format!("invalid token: {err}"))
+                .with_status(StatusCode::UNAUTHORIZED)
+                .ok();
+        }
+
+        let server = match state.server_manager.get_server(payload.server_uuid).await {
+            Some(server) => server,
+            None => {
+                return ApiResponse::error("server not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
+        let ignored = match payload.ignored() {
+            Ok(ignored) => ignored,
+            Err(err) => {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to compile subuser ignored files, denying discard: {:#?}",
+                    err
+                );
+
+                return ApiResponse::error("file not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
+        let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
+        let parent = match relative.parent() {
+            Some(parent) => parent,
+            None => {
+                return ApiResponse::error("file has no parent")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+        let file_name = match relative.file_name() {
+            Some(name) => name,
+            None => {
+                return ApiResponse::error("invalid file name")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+
+        if ignored
+            .as_ref()
+            .is_some_and(|o| o.matched(parent, true).is_ignore())
+            || server
+                .filesystem
+                .async_is_ignored(parent, FileType::Dir)
+                .await
+        {
+            return ApiResponse::error("file not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_writable_fs(&server, &parent)
+            .await;
+        let path = root.join(file_name);
+
+        if filesystem.is_primary_server_fs()
+            && (ignored
+                .as_ref()
+                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
+                || server
+                    .filesystem
+                    .async_is_ignored(&path, FileType::File)
+                    .await)
+        {
+            return ApiResponse::error("file not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
+        let part = match part_path(&path) {
+            Some(part) => part,
+            None => {
+                return ApiResponse::error("file name too long")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+
+        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let _lock_guard = lock.lock().await;
+
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .uploads
+                .owner(&part, &server.filesystem)
+                .await
+                .is_some_and(|user| user != payload.user_uuid)
+        {
+            return ApiResponse::error("file not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
+        if let Ok(metadata) = filesystem.async_metadata(&part).await
+            && metadata.file_type.is_file()
+        {
+            filesystem.async_remove_file(&part).await?;
+        }
+
+        if filesystem.is_primary_server_fs() {
+            server
+                .filesystem
+                .uploads
+                .forget(&part, &server.filesystem)
+                .await;
+        }
+
+        ApiResponse::new_serialized(Response {}).ok()
+    }
+}
+
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .routes(routes!(post::route).layer(DefaultBodyLimit::disable()))
         .routes(routes!(head::route))
         .routes(routes!(patch::route).layer(DefaultBodyLimit::disable()))
+        .routes(routes!(delete::route))
         .with_state(state.clone())
 }

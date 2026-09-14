@@ -5,6 +5,7 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::uploads::ignore_match_path,
     };
     use axum::http::StatusCode;
     use axum_extra::extract::Query;
@@ -78,7 +79,7 @@ mod get {
         let is_path_ignored = |path: &Path, is_dir: bool| {
             is_ignored
                 .iter()
-                .any(|gi| gi.matched(path, is_dir).is_ignore())
+                .any(|gi| gi.matched(ignore_match_path(path), is_dir).is_ignore())
         };
 
         let root = server

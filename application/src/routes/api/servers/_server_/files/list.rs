@@ -7,6 +7,11 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
+        server::filesystem::{
+            cap::FileType,
+            uploads::{UploadEntry, target_name},
+            virtualfs::IsIgnoredFn,
+        },
     };
     use axum::http::StatusCode;
     use axum_extra::extract::Query;
@@ -36,6 +41,46 @@ mod get {
         filesystem_fast: bool,
 
         entries: Vec<crate::models::DirectoryEntry>,
+        uploads: Vec<UploadEntry>,
+    }
+
+    async fn upload_entries(
+        server: &crate::server::Server,
+        root: &Path,
+        entries: &[crate::models::DirectoryEntry],
+        is_ignored: &IsIgnoredFn,
+    ) -> Vec<UploadEntry> {
+        let tracked = server
+            .filesystem
+            .uploads
+            .in_directory(root, &server.filesystem)
+            .await;
+        let directory = server.filesystem.relative_path(root);
+        let directory = directory.to_string_lossy();
+
+        let mut uploads = Vec::with_capacity(tracked.len());
+        for upload in tracked {
+            if is_ignored
+                .call_async(FileType::File, root.join(upload.target_name.as_str()))
+                .await
+                .is_some()
+            {
+                uploads.push(upload);
+            }
+        }
+
+        for entry in entries {
+            if !entry.file
+                || target_name(&entry.name).is_none()
+                || uploads.iter().any(|upload| upload.name == entry.name)
+            {
+                continue;
+            }
+
+            uploads.push(UploadEntry::orphan(&entry.name, &directory, entry.size));
+        }
+
+        uploads
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -120,7 +165,7 @@ mod get {
                 .ok();
         }
 
-        let is_ignored = if filesystem.is_primary_server_fs()
+        let is_ignored: IsIgnoredFn = if filesystem.is_primary_server_fs()
             && let Some(ignore) = ignore
         {
             vec![server.filesystem.get_ignored(), ignore].into()
@@ -131,8 +176,14 @@ mod get {
         };
 
         let entries = filesystem
-            .async_read_dir(&root, per_page, page, is_ignored, data.sort)
+            .async_read_dir(&root, per_page, page, is_ignored.clone(), data.sort)
             .await?;
+
+        let uploads = if filesystem.is_primary_server_fs() {
+            upload_entries(&server, &root, &entries.entries, &is_ignored).await
+        } else {
+            Vec::new()
+        };
 
         ApiResponse::new_serialized(Response {
             total: entries.total_entries,
@@ -140,6 +191,7 @@ mod get {
             filesystem_writable: filesystem.is_writable(),
             filesystem_fast: filesystem.is_fast(),
             entries: entries.entries,
+            uploads,
         })
         .ok()
     }
