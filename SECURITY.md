@@ -6,8 +6,9 @@ The following versions of Calagopus wings are currently receiving security updat
 
 | Version | Supported              |
 |---------|------------------------|
+| 1.2.x   | :white_check_mark: Yes |
 | 1.1.x   | :white_check_mark: Yes |
-| 1.0.x   | :white_check_mark: Yes |
+| 1.0.x   | :x: No                 |
 | < 1.0.0 | :x: No                 |
 
 > **Note:** If a reported vulnerability cannot be reproduced on the oldest supported version, it may not be considered valid. However, depending on the nature and impact of the issue, we may still publish a security advisory to inform users of older versions.
