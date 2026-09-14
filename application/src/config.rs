@@ -1504,6 +1504,8 @@ pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
 type ReloadHandle =
     tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
 
+const LOG_CHANNEL_LINES: usize = 4096;
+
 fn log_filter(debug: bool) -> Targets {
     let crate_level = if debug {
         LevelFilter::DEBUG
@@ -1567,7 +1569,9 @@ impl Config {
         Self::ensure_directories(&inner)?;
 
         let (stdout_writer, stdout_guard) =
-            tracing_appender::non_blocking(BufWriter::new(std::io::stdout()));
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(LOG_CHANNEL_LINES)
+                .finish(BufWriter::new(std::io::stdout()));
 
         let latest_log_path = inner.system.log_directory.as_path(&inner).join("wings.log");
         let latest_file = std::fs::OpenOptions::new()
@@ -1584,8 +1588,9 @@ impl Config {
             .build(inner.system.log_directory.as_path(&inner))
             .context("failed to create rolling log file appender")?;
 
-        let (file_appender, guard) =
-            tracing_appender::non_blocking(BufWriter::new(latest_file.and(rolling_appender)));
+        let (file_appender, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(LOG_CHANNEL_LINES)
+            .finish(BufWriter::new(latest_file.and(rolling_appender)));
 
         #[cfg(unix)]
         {

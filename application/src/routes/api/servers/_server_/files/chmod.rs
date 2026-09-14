@@ -89,25 +89,29 @@ mod post {
                 continue;
             }
 
-            let metadata = match filesystem.async_symlink_metadata(&source).await {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-
             let mode = match u32::from_str_radix(&file.mode, 8) {
                 Ok(mode) => mode,
                 Err(_) => continue,
             };
 
-            if filesystem
-                .async_set_permissions(
-                    &source,
-                    metadata.file_type,
-                    PortablePermissions::from_mode_file(mode),
-                )
+            let applied = {
+                let filesystem = filesystem.clone();
+                let source = source.clone();
+
+                tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+                    let metadata = filesystem.symlink_metadata(&source)?;
+                    filesystem.set_permissions(
+                        &source,
+                        metadata.file_type,
+                        PortablePermissions::from_mode_file(mode),
+                    )?;
+
+                    Ok(metadata)
+                })
                 .await
-                .is_ok()
-            {
+            };
+
+            if let Ok(Ok(metadata)) = applied {
                 updated_count += 1;
 
                 if metadata.file_type.is_dir() && file.recursive {

@@ -128,8 +128,7 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                         crate::server::backup::manager::BackupManager::default(),
                     ),
                     inotify_manager: Arc::new(
-                        crate::server::filesystem::inotify::InotifyManager::new()
-                            .expect("failed to initialize inotify manager"),
+                        crate::server::filesystem::inotify::InotifyManager::new(),
                     ),
                     websocket_limiter: Arc::new(
                         crate::server::websocket::limiter::WebsocketLimiter::new(Arc::clone(

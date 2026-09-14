@@ -1,119 +1,368 @@
-use notify::Watcher;
 use parking_lot::Mutex;
+use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{HashMap, HashSet},
+    ffi::OsStr,
+    mem::MaybeUninit,
+    os::{fd::OwnedFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
-type ServerNotifiers = Arc<Mutex<Notifiers>>;
 type FirewallFiles = Arc<Mutex<Option<(Vec<PathBuf>, Arc<tokio::sync::Notify>)>>>;
+type WatchTable = Arc<Mutex<Watches>>;
 
-#[derive(Default)]
-struct Notifiers {
-    by_path: HashMap<PathBuf, InotifyServerNotifier>,
-    by_uuid: HashMap<uuid::Uuid, PathBuf>,
-    /// How many roots sit at each component count
-    depths: BTreeMap<usize, usize>,
+const EVENT_BUFFER_SIZE: usize = 64 * 1024;
+const EVENT_COALESCE_DELAY: Duration = Duration::from_millis(2);
+const WATCH_FLAGS: WatchFlags = WatchFlags::ATTRIB
+    .union(WatchFlags::CREATE)
+    .union(WatchFlags::DELETE)
+    .union(WatchFlags::DELETE_SELF)
+    .union(WatchFlags::MODIFY)
+    .union(WatchFlags::MOVED_FROM)
+    .union(WatchFlags::MOVED_TO)
+    .union(WatchFlags::MOVE_SELF)
+    .union(WatchFlags::ONLYDIR)
+    .union(WatchFlags::DONT_FOLLOW)
+    .union(WatchFlags::EXCL_UNLINK);
+
+struct WatchedDir {
+    uuid: uuid::Uuid,
+    path: PathBuf,
+    notifier: InotifyServerNotifier,
 }
 
-impl Notifiers {
-    fn insert(&mut self, uuid: uuid::Uuid, notifier: InotifyServerNotifier) {
-        self.remove(&uuid);
+struct ServerWatch {
+    notifier: InotifyServerNotifier,
+    descriptors: HashSet<i32>,
+}
 
-        let path = notifier.path.clone();
+#[derive(Default)]
+struct Watches {
+    dirs: HashMap<i32, WatchedDir>,
+    servers: HashMap<uuid::Uuid, ServerWatch>,
+    closed: bool,
+}
 
-        if self.by_path.insert(path.clone(), notifier).is_none() {
-            *self.depths.entry(path.components().count()).or_insert(0) += 1;
-        }
+impl Watches {
+    fn insert_dir(&mut self, wd: i32, uuid: uuid::Uuid, path: PathBuf) {
+        let Some(notifier) = self
+            .servers
+            .get(&uuid)
+            .map(|server| server.notifier.clone())
+        else {
+            return;
+        };
 
-        self.by_uuid.insert(uuid, path);
-    }
-
-    fn remove(&mut self, uuid: &uuid::Uuid) -> Option<InotifyServerNotifier> {
-        let path = self.by_uuid.remove(uuid)?;
-        let notifier = self.by_path.remove(&path)?;
-
-        if let std::collections::btree_map::Entry::Occupied(mut entry) =
-            self.depths.entry(path.components().count())
+        if let Some(existing) = self.dirs.get(&wd)
+            && existing.uuid != uuid
+            && existing.notifier.path.components().count() > notifier.path.components().count()
         {
-            let remaining = entry.get_mut();
-            *remaining -= 1;
-
-            if *remaining == 0 {
-                entry.remove();
-            }
+            return;
         }
 
-        Some(notifier)
+        if let Some(existing) = self.dirs.insert(
+            wd,
+            WatchedDir {
+                uuid,
+                path,
+                notifier,
+            },
+        ) && existing.uuid != uuid
+            && let Some(server) = self.servers.get_mut(&existing.uuid)
+        {
+            server.descriptors.remove(&wd);
+        }
+
+        if let Some(server) = self.servers.get_mut(&uuid) {
+            server.descriptors.insert(wd);
+        }
     }
 
-    fn find(&self, path: &Path) -> Option<&InotifyServerNotifier> {
-        let depth = path.components().count();
+    fn remove_dir(&mut self, wd: i32) -> Option<WatchedDir> {
+        let dir = self.dirs.remove(&wd)?;
 
-        self.depths
-            .keys()
-            .rev()
-            .filter(|&&root_depth| root_depth <= depth)
-            .find_map(|&root_depth| self.by_path.get(path.ancestors().nth(depth - root_depth)?))
+        if let Some(server) = self.servers.get_mut(&dir.uuid) {
+            server.descriptors.remove(&wd);
+        }
+
+        Some(dir)
     }
 
-    fn values(&self) -> impl Iterator<Item = &InotifyServerNotifier> {
-        self.by_path.values()
+    fn descriptors_under(&self, path: &Path) -> Vec<i32> {
+        self.dirs
+            .iter()
+            .filter(|(_, dir)| dir.path.starts_with(path))
+            .map(|(wd, _)| *wd)
+            .collect()
     }
+
+    fn overlapping_servers(&self, root: &Path) -> Vec<InotifyServerNotifier> {
+        self.servers
+            .values()
+            .filter(|server| {
+                server.notifier.path != root
+                    && (server.notifier.path.starts_with(root)
+                        || root.starts_with(&server.notifier.path))
+            })
+            .map(|server| server.notifier.clone())
+            .collect()
+    }
+}
+
+struct Inner {
+    fd: Arc<OwnedFd>,
+    table: WatchTable,
 }
 
 pub struct InotifyManager {
-    watcher: Arc<Mutex<notify::RecommendedWatcher>>,
-    server_notifiers: ServerNotifiers,
+    inner: Option<Inner>,
+}
+
+impl Default for InotifyManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InotifyManager {
-    pub fn new() -> Result<Self, notify::Error> {
-        let server_notifiers = ServerNotifiers::default();
+    pub fn new() -> Self {
+        let inner = match Self::start() {
+            Ok(inner) => Some(inner),
+            Err(err) => {
+                tracing::error!(
+                    "failed to initialize inotify, disk usage tracking falls back to full scans: {}",
+                    err
+                );
 
-        let watcher = notify::RecommendedWatcher::new(
+                None
+            }
+        };
+
+        Self { inner }
+    }
+
+    fn start() -> Result<Inner, std::io::Error> {
+        let fd = Arc::new(inotify::init(CreateFlags::CLOEXEC)?);
+        let table = WatchTable::default();
+
+        std::thread::Builder::new()
+            .name("wings inotify".to_string())
+            .spawn({
+                let fd = Arc::clone(&fd);
+                let table = Arc::clone(&table);
+
+                move || Self::event_loop(&fd, &table)
+            })?;
+
+        Ok(Inner { fd, table })
+    }
+
+    fn event_loop(fd: &Arc<OwnedFd>, table: &WatchTable) {
+        let mut buffer = vec![MaybeUninit::<u8>::uninit(); EVENT_BUFFER_SIZE];
+        let mut reader = inotify::Reader::new(&**fd, &mut buffer);
+        let mut touched: HashSet<i32> = HashSet::new();
+        let mut new_dirs: Vec<(uuid::Uuid, PathBuf)> = Vec::new();
+        let mut stale_dirs: Vec<PathBuf> = Vec::new();
+
+        loop {
             {
-                let server_notifiers = Arc::clone(&server_notifiers);
-
-                move |res: Result<notify::Event, notify::Error>| match res {
-                    Ok(event) => {
-                        if event.kind.is_access() || event.kind.is_other() {
-                            return;
-                        }
-
-                        for path in event.paths {
-                            let notifier = server_notifiers.lock().find(&path).cloned();
-
-                            if let Some(notifier) = notifier {
-                                notifier.add_path(path);
-                            }
-                        }
-                    }
+                let event = match reader.next() {
+                    Ok(event) => event,
+                    Err(rustix::io::Errno::INTR) => continue,
                     Err(err) => {
-                        if matches!(err.kind, notify::ErrorKind::MaxFilesWatch) {
-                            tracing::error!(
-                                "os file watch limit reached, inotify sender unsure of state, falling back: {}",
-                                err
-                            );
+                        tracing::error!(
+                            "inotify reader failed, disk usage tracking falls back to full scans: {}",
+                            err
+                        );
 
-                            for notifier in server_notifiers.lock().values() {
-                                notifier.is_trusted.store(false, Ordering::Relaxed);
-                            }
+                        let mut table = table.lock();
+                        table.closed = true;
+                        for server in table.servers.values() {
+                            server.notifier.is_trusted.store(false, Ordering::Relaxed);
                         }
-                    }
-                }
-            },
-            notify::Config::default().with_follow_symlinks(false),
-        )?;
 
-        Ok(Self {
-            watcher: Arc::new(parking_lot::Mutex::new(watcher)),
-            server_notifiers,
-        })
+                        return;
+                    }
+                };
+
+                let flags = event.events();
+                let wd = event.wd();
+                let name = event
+                    .file_name()
+                    .map(|name| OsStr::from_bytes(name.to_bytes()));
+                let mut table = table.lock();
+
+                if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
+                    tracing::warn!(
+                        "inotify event queue overflowed, rescanning every server on the next disk check"
+                    );
+
+                    for server in table.servers.values() {
+                        server.notifier.add_path(server.notifier.path.clone());
+                    }
+                } else if flags.contains(ReadFlags::IGNORED) {
+                    table.remove_dir(wd);
+                } else if let Some(dir) = table.dirs.get(&wd) {
+                    Self::handle_event(
+                        dir,
+                        wd,
+                        flags,
+                        name,
+                        &mut touched,
+                        &mut new_dirs,
+                        &mut stale_dirs,
+                    );
+                }
+            }
+
+            if reader.is_buffer_empty() {
+                touched.clear();
+
+                for path in stale_dirs.drain(..) {
+                    Self::unwatch_tree(fd, table, &path);
+                }
+                for (uuid, path) in new_dirs.drain(..) {
+                    let _ = Self::watch_tree(fd, table, uuid, &path);
+                }
+
+                std::thread::sleep(EVENT_COALESCE_DELAY);
+            }
+        }
+    }
+
+    fn handle_event(
+        dir: &WatchedDir,
+        wd: i32,
+        flags: ReadFlags,
+        name: Option<&OsStr>,
+        touched: &mut HashSet<i32>,
+        new_dirs: &mut Vec<(uuid::Uuid, PathBuf)>,
+        stale_dirs: &mut Vec<PathBuf>,
+    ) {
+        let notifier = &dir.notifier;
+
+        if flags.contains(ReadFlags::UNMOUNT) {
+            tracing::error!(
+                path = %dir.path.display(),
+                "watched directory was unmounted, inotify sender unsure of state, falling back"
+            );
+            notifier.is_trusted.store(false, Ordering::Relaxed);
+
+            return;
+        }
+
+        if flags.intersects(ReadFlags::DELETE_SELF | ReadFlags::MOVE_SELF) {
+            if dir.path == notifier.path {
+                tracing::error!(
+                    path = %dir.path.display(),
+                    "server root was deleted or moved, inotify sender unsure of state, falling back"
+                );
+                notifier.is_trusted.store(false, Ordering::Relaxed);
+            }
+
+            notifier.add_path(dir.path.clone());
+
+            return;
+        }
+
+        if flags.contains(ReadFlags::ISDIR)
+            && let Some(name) = name
+        {
+            if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
+                new_dirs.push((dir.uuid, dir.path.join(name)));
+            } else if flags.contains(ReadFlags::MOVED_FROM) {
+                stale_dirs.push(dir.path.join(name));
+            }
+        }
+
+        if notifier.has_firewall_files() {
+            notifier.add_path(match name {
+                Some(name) => dir.path.join(name),
+                None => dir.path.clone(),
+            });
+        } else if touched.insert(wd) {
+            notifier.add_path(dir.path.clone());
+        }
+    }
+
+    fn watch_tree(
+        fd: &Arc<OwnedFd>,
+        table: &WatchTable,
+        uuid: uuid::Uuid,
+        root: &Path,
+    ) -> Result<(), std::io::Error> {
+        let mut stack = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            {
+                let mut table = table.lock();
+                let Some(server) = table.servers.get(&uuid) else {
+                    return Ok(());
+                };
+
+                match inotify::add_watch(fd, dir.as_path(), WATCH_FLAGS) {
+                    Ok(wd) => table.insert_dir(wd, uuid, dir.clone()),
+                    Err(rustix::io::Errno::NOSPC) => {
+                        tracing::error!(
+                            "os file watch limit reached, inotify sender unsure of state, falling back: {}",
+                            rustix::io::Errno::NOSPC
+                        );
+                        server.notifier.is_trusted.store(false, Ordering::Relaxed);
+
+                        return Err(rustix::io::Errno::NOSPC.into());
+                    }
+                    Err(err) if dir == root => return Err(err.into()),
+                    Err(_) => continue,
+                }
+            }
+
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn unwatch_tree(fd: &Arc<OwnedFd>, table: &WatchTable, path: &Path) {
+        let mut table = table.lock();
+
+        for wd in table.descriptors_under(path) {
+            table.remove_dir(wd);
+            let _ = inotify::remove_watch(fd, wd);
+        }
+    }
+
+    fn unregister_inner(fd: &Arc<OwnedFd>, table: &WatchTable, uuid: uuid::Uuid) {
+        let mut table = table.lock();
+        let Some(server) = table.servers.remove(&uuid) else {
+            return;
+        };
+        let overlapping = table.overlapping_servers(&server.notifier.path);
+
+        for wd in server.descriptors {
+            let Some(dir) = table.dirs.remove(&wd) else {
+                continue;
+            };
+            let _ = inotify::remove_watch(fd, wd);
+
+            for other in &overlapping {
+                if dir.path.starts_with(&other.path) {
+                    other.is_trusted.store(false, Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     pub async fn register_server_with_notifier(
@@ -121,36 +370,59 @@ impl InotifyManager {
         notifier: InotifyServerNotifier,
         uuid: uuid::Uuid,
     ) -> Result<bool, anyhow::Error> {
-        if notify::RecommendedWatcher::kind() == notify::WatcherKind::PollWatcher {
+        let Some(inner) = &self.inner else {
             return Ok(false);
-        }
+        };
 
-        let base_path = notifier.path.clone();
-        let watcher = Arc::clone(&self.watcher);
-        let server_notifiers = Arc::clone(&self.server_notifiers);
+        let fd = Arc::clone(&inner.fd);
+        let table = Arc::clone(&inner.table);
 
-        tokio::task::spawn_blocking(move || {
-            watcher
-                .lock()
-                .watch(&base_path, notify::RecursiveMode::Recursive)?;
-            server_notifiers.lock().insert(uuid, notifier);
+        let watching = tokio::task::spawn_blocking(move || {
+            Self::unregister_inner(&fd, &table, uuid);
 
-            Ok::<_, anyhow::Error>(())
+            {
+                let mut table = table.lock();
+                if table.closed {
+                    return Ok(false);
+                }
+
+                table.servers.insert(
+                    uuid,
+                    ServerWatch {
+                        notifier: notifier.clone(),
+                        descriptors: HashSet::new(),
+                    },
+                );
+            }
+
+            if let Err(err) = Self::watch_tree(&fd, &table, uuid, &notifier.path) {
+                Self::unregister_inner(&fd, &table, uuid);
+
+                return Err(err);
+            }
+
+            Ok(true)
         })
         .await??;
 
-        Ok(true)
+        Ok(watching)
     }
 
     pub async fn unregister_server(&self, uuid: uuid::Uuid) {
-        if let Some(notifier) = self.server_notifiers.lock().remove(&uuid) {
-            crate::spawn_blocking_handled({
-                let path = notifier.path.clone();
-                let watcher = Arc::clone(&self.watcher);
+        let Some(inner) = &self.inner else {
+            return;
+        };
 
-                move || watcher.lock().unwatch(&path)
-            });
-        }
+        crate::spawn_blocking_handled({
+            let fd = Arc::clone(&inner.fd);
+            let table = Arc::clone(&inner.table);
+
+            move || {
+                Self::unregister_inner(&fd, &table, uuid);
+
+                Ok::<_, std::io::Error>(())
+            }
+        });
     }
 }
 
@@ -180,6 +452,11 @@ impl InotifyServerNotifier {
         } else {
             Some((paths, changed))
         };
+    }
+
+    #[inline]
+    fn has_firewall_files(&self) -> bool {
+        self.firewall_files.lock().is_some()
     }
 
     fn add_path(&self, path: PathBuf) {
@@ -232,141 +509,251 @@ impl InotifyServerNotifier {
 mod tests {
     use super::*;
 
-    fn notifier(path: &str) -> InotifyServerNotifier {
-        InotifyServerNotifier::new(
-            PathBuf::from(path),
+    struct Harness {
+        runtime: tokio::runtime::Runtime,
+        manager: InotifyManager,
+        root: tempfile::TempDir,
+        notifier: InotifyServerNotifier,
+        uuid: uuid::Uuid,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let root = tempfile::tempdir().expect("tempdir");
+            let notifier = InotifyServerNotifier::new(
+                root.path().to_path_buf(),
+                [
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ],
+            );
+
+            Self {
+                runtime,
+                manager: InotifyManager::new(),
+                root,
+                notifier,
+                uuid: uuid::Uuid::new_v4(),
+            }
+        }
+
+        fn register(&self) -> bool {
+            let watching = self
+                .runtime
+                .block_on(
+                    self.manager
+                        .register_server_with_notifier(self.notifier.clone(), self.uuid),
+                )
+                .expect("register");
+            self.notifier.clear_modified_paths();
+
+            watching
+        }
+
+        fn watched_dirs(&self) -> Vec<PathBuf> {
+            let inner = self.manager.inner.as_ref().expect("inotify available");
+            let mut dirs: Vec<PathBuf> = inner
+                .table
+                .lock()
+                .dirs
+                .values()
+                .map(|dir| dir.path.clone())
+                .collect();
+            dirs.sort();
+
+            dirs
+        }
+
+        fn wait_until(&self, mut condition: impl FnMut(&Self) -> bool) -> bool {
+            for _ in 0..200 {
+                if condition(self) {
+                    return true;
+                }
+
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            condition(self)
+        }
+
+        fn wait_for_modified(&self, path: &Path) -> bool {
+            let mut seen = Vec::new();
+
+            self.wait_until(|harness| {
+                seen.extend(harness.notifier.take_modified_paths());
+                seen.iter().any(|modified| modified == path)
+            })
+        }
+    }
+
+    #[test]
+    fn watches_the_whole_tree_at_registration() {
+        let harness = Harness::new();
+        let nested = harness.root.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+
+        assert!(harness.register());
+        assert_eq!(
+            harness.watched_dirs(),
+            vec![
+                harness.root.path().to_path_buf(),
+                harness.root.path().join("a"),
+                harness.root.path().join("a/b"),
+                nested,
+            ]
+        );
+    }
+
+    #[test]
+    fn new_directories_are_watched_and_their_contents_tracked() {
+        let harness = Harness::new();
+        assert!(harness.register());
+
+        let sub = harness.root.path().join("world");
+        std::fs::create_dir(&sub).expect("create dir");
+        assert!(harness.wait_for_modified(harness.root.path()));
+        assert!(harness.wait_until(|harness| harness.watched_dirs().len() == 2));
+
+        std::fs::write(sub.join("level.dat"), b"x").expect("write file");
+        assert!(harness.wait_for_modified(&sub));
+        assert!(
+            harness
+                .notifier
+                .dirty_flags
+                .iter()
+                .all(|flag| flag.load(Ordering::Relaxed))
+        );
+    }
+
+    #[test]
+    fn deleting_a_subtree_drops_its_watches() {
+        let harness = Harness::new();
+        let sub = harness.root.path().join("a/b");
+        std::fs::create_dir_all(&sub).expect("create nested dirs");
+        assert!(harness.register());
+        assert_eq!(harness.watched_dirs().len(), 3);
+
+        std::fs::remove_dir_all(harness.root.path().join("a")).expect("remove tree");
+        assert!(harness.wait_until(|harness| harness.watched_dirs().len() == 1));
+        assert!(harness.wait_for_modified(harness.root.path()));
+        assert!(harness.notifier.is_trusted());
+    }
+
+    #[test]
+    fn renamed_directories_are_rewatched_under_their_new_name() {
+        let harness = Harness::new();
+        let old = harness.root.path().join("old");
+        let new = harness.root.path().join("new");
+        std::fs::create_dir_all(old.join("inner")).expect("create dirs");
+        assert!(harness.register());
+
+        std::fs::rename(&old, &new).expect("rename");
+        assert!(harness.wait_until(|harness| {
+            harness.watched_dirs()
+                == vec![
+                    harness.root.path().to_path_buf(),
+                    new.clone(),
+                    new.join("inner"),
+                ]
+        }));
+
+        std::fs::write(new.join("inner/file"), b"x").expect("write file");
+        assert!(harness.wait_for_modified(&new.join("inner")));
+    }
+
+    #[test]
+    fn unregistering_removes_every_watch() {
+        let harness = Harness::new();
+        std::fs::create_dir_all(harness.root.path().join("a/b")).expect("create dirs");
+        assert!(harness.register());
+        assert_eq!(harness.watched_dirs().len(), 3);
+
+        harness
+            .runtime
+            .block_on(harness.manager.unregister_server(harness.uuid));
+        assert!(harness.wait_until(|harness| harness.watched_dirs().is_empty()));
+
+        std::fs::write(harness.root.path().join("a/b/file"), b"x").expect("write file");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(harness.notifier.take_modified_paths().is_empty());
+    }
+
+    #[test]
+    fn removing_the_root_marks_the_server_untrusted() {
+        let harness = Harness::new();
+        let root = harness.root.path().join("server");
+        std::fs::create_dir(&root).expect("create root");
+        let notifier = InotifyServerNotifier::new(
+            root.clone(),
             [
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             ],
-        )
-    }
-
-    fn registered(paths: &[&str]) -> (Notifiers, Vec<uuid::Uuid>) {
-        let mut notifiers = Notifiers::default();
-        let uuids: Vec<_> = paths.iter().map(|_| uuid::Uuid::new_v4()).collect();
-
-        for (uuid, path) in uuids.iter().zip(paths) {
-            notifiers.insert(*uuid, notifier(path));
-        }
-
-        (notifiers, uuids)
-    }
-
-    #[test]
-    fn finds_the_server_an_event_path_belongs_to() {
-        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a", "/var/lib/wings/volumes/b"]);
-
-        let found = notifiers
-            .find(Path::new("/var/lib/wings/volumes/b/world/region/r.0.0.mca"))
-            .expect("event path should resolve to a server");
-
-        assert_eq!(found.path, PathBuf::from("/var/lib/wings/volumes/b"));
-    }
-
-    #[test]
-    fn finds_the_root_itself() {
-        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a"]);
-
-        assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/a"))
-                .is_some()
         );
-    }
-
-    #[test]
-    fn ignores_paths_outside_every_root() {
-        let (notifiers, _) = registered(&["/var/lib/wings/volumes/a"]);
-
-        assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/z/x.yml"))
-                .is_none()
-        );
-        assert!(notifiers.find(Path::new("/var/lib/wings")).is_none());
-        assert!(notifiers.find(Path::new("/etc/passwd")).is_none());
-    }
-
-    #[test]
-    fn prefers_the_deepest_matching_root() {
-        let (notifiers, _) = registered(&[
-            "/var/lib/wings/volumes/a",
-            "/var/lib/wings/volumes/a/mounts/shared",
-        ]);
-
-        let found = notifiers
-            .find(Path::new("/var/lib/wings/volumes/a/mounts/shared/pack.zip"))
-            .expect("event path should resolve to a server");
-
-        assert_eq!(
-            found.path,
-            PathBuf::from("/var/lib/wings/volumes/a/mounts/shared")
-        );
-    }
-
-    #[test]
-    fn removal_stops_lookups_and_drops_the_depth() {
-        let (mut notifiers, uuids) =
-            registered(&["/var/lib/wings/volumes/a", "/var/lib/wings/volumes/b"]);
-
-        let removed = uuids.first().expect("uuid");
-        assert!(notifiers.remove(removed).is_some());
-        assert!(notifiers.remove(removed).is_none());
-
-        assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
-                .is_none()
-        );
-        assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/b/x.yml"))
-                .is_some()
-        );
-
-        let last = uuids.get(1).expect("uuid");
-        assert!(notifiers.remove(last).is_some());
-        assert!(
-            notifiers.depths.is_empty(),
-            "depth index should be empty once every root is gone"
-        );
-    }
-
-    #[test]
-    fn re_registering_a_server_does_not_double_count_its_depth() {
-        let mut notifiers = Notifiers::default();
         let uuid = uuid::Uuid::new_v4();
-
-        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
-        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
-        assert!(notifiers.remove(&uuid).is_some());
-
-        assert!(notifiers.depths.is_empty(), "depth index leaked an entry");
         assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
-                .is_none()
+            harness
+                .runtime
+                .block_on(
+                    harness
+                        .manager
+                        .register_server_with_notifier(notifier.clone(), uuid)
+                )
+                .expect("register")
         );
+
+        std::fs::remove_dir(&root).expect("remove root");
+        assert!(harness.wait_until(|_| !notifier.is_trusted()));
     }
 
     #[test]
-    fn re_registering_a_server_elsewhere_drops_its_old_path() {
-        let mut notifiers = Notifiers::default();
-        let uuid = uuid::Uuid::new_v4();
-
-        notifiers.insert(uuid, notifier("/var/lib/wings/volumes/a"));
-        notifiers.insert(uuid, notifier("/srv/volumes/a"));
+    fn registering_a_missing_root_fails() {
+        let harness = Harness::new();
+        let notifier = InotifyServerNotifier::new(
+            harness.root.path().join("missing"),
+            [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+        );
 
         assert!(
-            notifiers
-                .find(Path::new("/var/lib/wings/volumes/a/x.yml"))
-                .is_none(),
-            "the old root still matches events"
+            harness
+                .runtime
+                .block_on(
+                    harness
+                        .manager
+                        .register_server_with_notifier(notifier, uuid::Uuid::new_v4())
+                )
+                .is_err()
         );
-        assert!(notifiers.find(Path::new("/srv/volumes/a/x.yml")).is_some());
+        assert!(harness.watched_dirs().is_empty());
+    }
 
-        assert!(notifiers.remove(&uuid).is_some());
-        assert!(notifiers.depths.is_empty(), "depth index leaked an entry");
+    #[test]
+    fn firewall_files_are_reported_by_exact_path() {
+        let harness = Harness::new();
+        assert!(harness.register());
+
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let watched = harness.root.path().join("firewall.txt");
+        harness
+            .notifier
+            .watch_firewall_files(vec![watched.clone()], Arc::clone(&changed));
+
+        std::fs::write(harness.root.path().join("other.txt"), b"x").expect("write other");
+        assert!(harness.wait_for_modified(&harness.root.path().join("other.txt")));
+
+        std::fs::write(&watched, b"x").expect("write watched");
+        harness.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), changed.notified())
+                .await
+                .expect("firewall file change should be signalled");
+        });
     }
 }

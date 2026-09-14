@@ -581,10 +581,7 @@ async fn main_rt() {
         stats_manager: Arc::new(crate::stats::StatsManager::default()),
         server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
         backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
-        inotify_manager: Arc::new(
-            crate::server::filesystem::inotify::InotifyManager::new()
-                .expect("failed to initialize inotify manager"),
-        ),
+        inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
             Arc::clone(&config),
         )),
