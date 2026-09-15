@@ -775,6 +775,12 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     ) -> Result<WritableFileStream, anyhow::Error> {
         Ok(self.create_seekable_file(path)? as WritableFileStream)
     }
+    fn create_file_with_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<WritableFileStream, anyhow::Error>;
     async fn async_create_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),

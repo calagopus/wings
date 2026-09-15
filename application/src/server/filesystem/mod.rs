@@ -112,6 +112,20 @@ pub enum RenameParents {
 }
 
 #[inline]
+fn raw_mode(metadata: &Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+
+        metadata.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        PortablePermissions::from(metadata.permissions()).mode() as u32
+    }
+}
+
+#[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     let mut mode_str = compact_str::CompactString::default();
 
@@ -1453,6 +1467,29 @@ impl Filesystem {
 
         self.absorb_chown_refusal(Self::chown_impl(&self.config, &self.cap_filesystem, path))
     }
+
+    pub fn chown_file(&self, file: &std::fs::File) -> Result<(), std::io::Error> {
+        if self.chown_refused.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            let cfg = self.config.load();
+            let owner_uid = rustix::fs::Uid::from_raw_unchecked(cfg.system.user.uid);
+            let owner_gid = rustix::fs::Gid::from_raw_unchecked(cfg.system.user.gid);
+            drop(cfg);
+
+            self.absorb_chown_refusal(
+                rustix::fs::fchown(file, Some(owner_uid), Some(owner_gid)).map_err(Into::into),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(())
+        }
+    }
     pub async fn async_chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         if self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
@@ -2010,7 +2047,7 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode() as u32),
+            mode: encode_mode(raw_mode(metadata)),
             mode_bits: compact_str::format_compact!(
                 "{:o}",
                 PortablePermissions::from(metadata.permissions()).mode()
@@ -2085,7 +2122,7 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode() as u32),
+            mode: encode_mode(raw_mode(metadata)),
             mode_bits: compact_str::format_compact!(
                 "{:o}",
                 PortablePermissions::from(metadata.permissions()).mode()

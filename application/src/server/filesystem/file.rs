@@ -1,4 +1,4 @@
-use crate::utils::PortablePermissions;
+use crate::utils::{PortablePermissions, PortablePermissionsApplier};
 use positioned_io::{ReadAt, WriteAt};
 use std::{
     future::Future,
@@ -55,12 +55,10 @@ impl ServerFile {
         }
 
         if let Some(permissions) = permissions {
-            server
-                .filesystem
-                .set_permissions(destination, permissions)?;
+            file.apply_permissions(permissions)?;
         }
 
-        server.filesystem.chown_path(destination)?;
+        server.filesystem.chown_file(&file)?;
 
         Ok(Self {
             server,

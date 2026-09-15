@@ -29,19 +29,37 @@ pub fn copy(
     copy_shared(&mut buffer, reader, writer)
 }
 
+/// Fills `buffer` before every write, so a reader that hands out small pieces (one
+/// inflate step at a time) does not turn into one write syscall per piece.
 pub fn copy_shared(
     buffer: &mut [u8],
     reader: &mut (impl ?Sized + Read),
     writer: &mut (impl ?Sized + Write),
 ) -> std::io::Result<()> {
     loop {
-        let bytes_read = reader.read_uninterrupted(buffer)?;
+        let mut filled = 0;
+        let mut finished = false;
 
-        if crate::unlikely(bytes_read == 0) {
+        while filled < buffer.len() {
+            let bytes_read = reader.read_uninterrupted(buffer.get_slice_mut(filled..)?)?;
+
+            if crate::unlikely(bytes_read == 0) {
+                finished = true;
+                break;
+            }
+
+            filled += bytes_read;
+        }
+
+        if filled == 0 {
             break;
         }
 
-        writer.safe_write_all(buffer, bytes_read)?;
+        writer.safe_write_all(buffer, filled)?;
+
+        if finished {
+            break;
+        }
     }
 
     Ok(())

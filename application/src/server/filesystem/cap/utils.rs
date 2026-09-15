@@ -170,18 +170,6 @@ impl WalkEntry {
         }
     }
 
-    /// Unlinks the entry through the handle of the directory it was listed from,
-    pub(super) fn remove(&self) -> Result<(), std::io::Error> {
-        match &self.source {
-            StatSource::Entry(entry) if self.file_type.is_dir() => entry.remove_dir(),
-            StatSource::Entry(entry) => entry.remove_file(),
-            StatSource::Path(cap_filesystem) if self.file_type.is_dir() => {
-                cap_filesystem.get_inner()?.remove_dir(&self.path)
-            }
-            StatSource::Path(cap_filesystem) => cap_filesystem.remove_file(&self.path),
-        }
-    }
-
     pub async fn async_metadata(&self) -> Result<cap_std::fs::Metadata, std::io::Error> {
         match &self.source {
             StatSource::Entry(entry) => entry.metadata(),
@@ -409,6 +397,8 @@ impl WalkDir {
 
     /// Yields descendants before their directories. Multithreaded walks also wait
     /// for descendant callbacks to finish before invoking a directory callback.
+    /// Only the walker tests use it since `remove_dir_all` stopped walking.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reversed(mut self) -> Self {
         self.reversed = true;
         self

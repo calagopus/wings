@@ -1,5 +1,6 @@
 use crate::{
     io::{
+        SafeSliceExt,
         abort::{AbortGuard, AbortListener, AbortReader, AbortWriter},
         compression::{CompressionType, reader::CompressionReaderMt},
         counting_writer::CountingWriter,
@@ -29,6 +30,19 @@ pub mod multi_reader;
 
 const TAR_CHUNK_BYTES: usize = 1024 * 1024;
 const TAR_IN_FLIGHT_CHUNKS: usize = 64;
+/// Jobs queued per tar writer. Queued content is already bounded by the in-flight
+/// chunk permits, so this only has to be deep enough that the reader can move on
+/// to the next directory while a writer drains the previous one.
+const TAR_WRITER_QUEUE_JOBS: usize = TAR_IN_FLIGHT_CHUNKS;
+/// Bytes a zip worker collects before writing, so an inflate step of a few KiB
+/// does not become a write syscall of its own.
+const ZIP_COPY_BUFFER: usize = 256 * 1024;
+/// Entries of one directory handed to a zip worker at a time; larger directories
+/// are split so a single huge one still spreads across the workers.
+const ZIP_GROUP_MAX_ENTRIES: usize = 512;
+/// Bytes of one directory handed to a zip worker at a time, so a directory of a
+/// few large files is still shared between workers instead of extracted by one.
+const ZIP_GROUP_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 enum TarContent {
     Whole(Vec<u8>, InFlightPermit),
@@ -49,9 +63,12 @@ enum TarJob {
     },
 }
 
+/// Picks the writer for an entry by its parent directory, so every file of a
+/// directory is created by the same thread and writers do not serialize on the
+/// directory's inode lock.
 fn tar_shard(path: &Path, shards: usize) -> usize {
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    path.parent().unwrap_or(path).hash(&mut hasher);
 
     (hasher.finish() % shards.max(1) as u64) as usize
 }
@@ -69,7 +86,11 @@ fn apply_tar_job(
             modified_time,
         } => {
             let run = || -> Result<(), anyhow::Error> {
-                let mut writer = destination_filesystem.create_file(&path)?;
+                let mut writer = destination_filesystem.create_file_with_metadata(
+                    &path,
+                    permissions,
+                    modified_time,
+                )?;
 
                 match content {
                     TarContent::Whole(data, _permit) => writer.write_all(&data)?,
@@ -82,14 +103,6 @@ fn apply_tar_job(
 
                 writer.flush()?;
                 drop(writer);
-
-                if let Some(permissions) = permissions {
-                    destination_filesystem.set_permissions(&path, FileType::File, permissions)?;
-                }
-
-                if let Some(modified_time) = modified_time {
-                    destination_filesystem.set_times(&path, FileType::File, modified_time, None)?;
-                }
 
                 progress.increment_files();
 
@@ -124,6 +137,58 @@ fn apply_tar_job(
     }
 
     Ok(())
+}
+
+enum ZipEntryKind {
+    File,
+    Symlink,
+}
+
+struct ZipEntryPlan {
+    index: usize,
+    kind: ZipEntryKind,
+    path: PathBuf,
+    size: u64,
+    permissions: Option<PortablePermissions>,
+    modified_time: Option<std::time::SystemTime>,
+}
+
+struct ZipDirectory {
+    path: PathBuf,
+    mode: u32,
+    modified_time: Option<std::time::SystemTime>,
+}
+
+/// Splits a plan sorted by parent directory into runs a single worker extracts,
+/// so no two workers create files in the same directory at the same time.
+fn zip_entry_groups(plan: &[ZipEntryPlan]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+
+    for (index, entry) in plan.iter().enumerate() {
+        let same_parent = plan
+            .get(start)
+            .is_some_and(|first| first.path.parent() == entry.path.parent());
+
+        if index > start
+            && (!same_parent
+                || index - start >= ZIP_GROUP_MAX_ENTRIES
+                || bytes >= ZIP_GROUP_MAX_BYTES)
+        {
+            groups.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+
+        bytes += entry.size;
+    }
+
+    if start < plan.len() {
+        groups.push(start..plan.len());
+    }
+
+    groups
 }
 
 fn resolve_entry_path(destination: &Path, path: &Path) -> Option<PathBuf> {
@@ -582,25 +647,15 @@ impl Archive {
                     )?;
                     let mut reader = AbortReader::new(reader, listener);
 
-                    let mut writer = destination_filesystem.create_file(&file_name)?;
+                    let mut writer = destination_filesystem.create_file_with_metadata(
+                        &file_name,
+                        Some(metadata.permissions().into()),
+                        metadata.modified().ok().map(|modified| modified.into_std()),
+                    )?;
 
                     crate::io::copy(&mut reader, &mut writer)?;
                     writer.flush()?;
                     drop(writer);
-
-                    destination_filesystem.set_permissions(
-                        &file_name,
-                        FileType::File,
-                        metadata.permissions().into(),
-                    )?;
-                    if let Ok(modified) = metadata.modified() {
-                        destination_filesystem.set_times(
-                            &file_name,
-                            FileType::File,
-                            modified.into_std(),
-                            None,
-                        )?;
-                    }
 
                     progress.increment_files();
 
@@ -654,7 +709,8 @@ impl Archive {
                         let mut senders = Vec::with_capacity(threads);
 
                         for _ in 0..threads {
-                            let (sender, receiver) = async_channel::bounded::<TarJob>(4);
+                            let (sender, receiver) =
+                                async_channel::bounded::<TarJob>(TAR_WRITER_QUEUE_JOBS);
                             senders.push(sender);
 
                             let destination_filesystem = Arc::clone(&destination_filesystem);
@@ -870,16 +926,86 @@ impl Archive {
                     let reader = multi_reader::MultiReader::new(file)?;
                     let reader = AbortReader::new(reader, listener);
                     let mut archive = zip::ZipArchive::new(reader)?;
-                    let entry_index = Arc::new(AtomicUsize::new(0));
 
-                    if let Some(total) = total {
-                        let mut entry_total = 0;
-                        for i in 0..archive.len() {
-                            let entry = archive.by_index(i)?;
-                            entry_total += entry.size();
+                    let mut plan = Vec::with_capacity(archive.len());
+                    let mut directories = Vec::new();
+                    let mut entry_total = 0;
+
+                    for index in 0..archive.len() {
+                        let entry = archive.by_index(index)?;
+                        let Some(path) = entry.enclosed_name() else {
+                            continue;
+                        };
+                        let Some(destination_path) = resolve_entry_path(&destination, &path)
+                        else {
+                            continue;
+                        };
+
+                        if destination_filesystem.is_primary_server_fs()
+                            && self.server.filesystem.is_ignored(
+                                &destination_path,
+                                FileType::from_is_dir(entry.is_dir()),
+                            )
+                        {
+                            continue;
                         }
 
+                        if entry.is_dir() {
+                            directories.push(ZipDirectory {
+                                path: destination_path,
+                                mode: entry.unix_mode().unwrap_or(0o755),
+                                modified_time: zip_entry_get_modified_time(&entry),
+                            });
+                        } else if entry.is_file() {
+                            entry_total += entry.size();
+                            plan.push(ZipEntryPlan {
+                                index,
+                                kind: ZipEntryKind::File,
+                                path: destination_path,
+                                size: entry.size(),
+                                permissions: entry
+                                    .unix_mode()
+                                    .map(PortablePermissions::from_mode_file),
+                                modified_time: zip_entry_get_modified_time(&entry),
+                            });
+                        } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
+                            entry_total += entry.size();
+                            plan.push(ZipEntryPlan {
+                                index,
+                                kind: ZipEntryKind::Symlink,
+                                path: destination_path,
+                                size: entry.size(),
+                                permissions: None,
+                                modified_time: zip_entry_get_modified_time(&entry),
+                            });
+                        }
+                    }
+
+                    if let Some(total) = total {
                         total.store(entry_total, Ordering::Relaxed);
+                    }
+
+                    for directory in &directories {
+                        destination_filesystem.create_dir_all(&directory.path)?;
+                        destination_filesystem.set_permissions(
+                            &directory.path,
+                            FileType::Dir,
+                            PortablePermissions::from_mode_dir(directory.mode),
+                        )?;
+                    }
+
+                    plan.sort_by(|a, b| a.path.parent().cmp(&b.path.parent()));
+                    let groups = zip_entry_groups(&plan);
+
+                    let mut last_parent = None;
+                    for group in &groups {
+                        if let Some(entry) = plan.get(group.start)
+                            && let Some(parent) = entry.path.parent()
+                            && last_parent != Some(parent)
+                        {
+                            destination_filesystem.create_dir_all(&parent)?;
+                            last_parent = Some(parent);
+                        }
                     }
 
                     let pool = crate::threading::build_pool(
@@ -892,187 +1018,113 @@ impl Archive {
                     )?;
 
                     let error = Arc::new(crate::threading::SharedError::new());
+                    let group_index = AtomicUsize::new(0);
 
                     pool.in_place_scope(|scope| {
-                        let archive = archive.clone();
-                        let destination = destination.clone();
-                        let server = self.server.clone();
-                        let destination_filesystem = destination_filesystem.clone();
-                        let error_clone = Arc::clone(&error);
+                        let plan = &plan;
+                        let groups = &groups;
+                        let group_index = &group_index;
+                        let archive = &archive;
+                        let progress = &progress;
+                        let destination_filesystem = &destination_filesystem;
+                        let error = &error;
 
                         scope.spawn_broadcast(move |_, _| {
                             let mut archive = archive.clone();
-                            let progress = progress.clone();
-                            let entry_index = Arc::clone(&entry_index);
-                            let error_clone2 = Arc::clone(&error_clone);
-                            let destination = destination.clone();
-                            let server = server.clone();
-                            let destination_filesystem = destination_filesystem.clone();
+                            let mut buffer = vec![0; ZIP_COPY_BUFFER];
 
-                            let mut run = move || -> Result<(), anyhow::Error> {
-                                let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                                let mut last_parent = None;
-
+                            let mut run = || -> Result<(), anyhow::Error> {
                                 loop {
-                                    if error_clone2.stopped() {
+                                    if error.stopped() {
                                         return Ok(());
                                     }
 
-                                    let i = entry_index.fetch_add(1, Ordering::SeqCst);
-                                    if i >= archive.len() {
+                                    let group = group_index.fetch_add(1, Ordering::SeqCst);
+                                    let Some(range) = groups.get(group) else {
                                         return Ok(());
-                                    }
-
-                                    let mut entry = archive.by_index(i)?;
-                                    let path = match entry.enclosed_name() {
-                                        Some(path) => path,
-                                        None => continue,
                                     };
 
-                                    let Some(destination_path) =
-                                        resolve_entry_path(&destination, &path)
-                                    else {
-                                        continue;
-                                    };
-
-                                    if destination_filesystem.is_primary_server_fs()
-                                        && server.filesystem.is_ignored(
-                                            &destination_path,
-                                            FileType::from_is_dir(entry.is_dir()),
-                                        )
-                                    {
-                                        continue;
-                                    }
-
-                                    if entry.is_dir() {
-                                        destination_filesystem.create_dir_all(&destination_path)?;
-                                        destination_filesystem.set_permissions(
-                                            &destination_path,
-                                            FileType::Dir,
-                                            PortablePermissions::from_mode_dir(
-                                                entry.unix_mode().unwrap_or(0o755),
-                                            ),
-                                        )?;
-                                    } else if entry.is_file() {
-                                        if let Some(parent) = destination_path.parent()
-                                            && last_parent.as_deref() != Some(parent)
-                                        {
-                                            destination_filesystem.create_dir_all(&parent)?;
-                                            last_parent = Some(parent.to_path_buf());
+                                    for entry in plan.get_slice(range.clone())? {
+                                        if error.stopped() {
+                                            return Ok(());
                                         }
 
-                                        let permissions = entry
-                                            .unix_mode()
-                                            .map(PortablePermissions::from_mode_file);
-                                        let modified_time = zip_entry_get_modified_time(&entry);
+                                        match entry.kind {
+                                            ZipEntryKind::File => {
+                                                let zip_entry = archive.by_index(entry.index)?;
+                                                let mut writer = destination_filesystem
+                                                    .create_file_with_metadata(
+                                                        &entry.path,
+                                                        entry.permissions,
+                                                        entry.modified_time,
+                                                    )?;
+                                                let mut reader =
+                                                    progress.counting_reader(zip_entry);
 
-                                        let mut writer = destination_filesystem
-                                            .create_file(&destination_path)?;
+                                                crate::io::copy_shared(
+                                                    &mut buffer,
+                                                    &mut reader,
+                                                    &mut writer,
+                                                )?;
+                                                writer.flush()?;
+                                                drop(writer);
 
-                                        let mut reader: Box<dyn Read> =
-                                            Box::new(progress.counting_reader(entry));
+                                                progress.increment_files();
+                                            }
+                                            ZipEntryKind::Symlink => {
+                                                let mut zip_entry =
+                                                    archive.by_index(entry.index)?;
+                                                let link = std::io::read_to_string(&mut zip_entry)
+                                                    .unwrap_or_default();
 
-                                        crate::io::copy_shared(
-                                            &mut read_buffer,
-                                            &mut reader,
-                                            &mut writer,
-                                        )?;
-                                        writer.flush()?;
-                                        drop(writer);
+                                                if let Err(err) = destination_filesystem
+                                                    .create_symlink(&link, &entry.path)
+                                                {
+                                                    tracing::debug!(
+                                                        path = %entry.path.display(),
+                                                        "failed to create symlink from archive: {:#?}",
+                                                        err
+                                                    );
+                                                } else if let Some(modified_time) =
+                                                    entry.modified_time
+                                                {
+                                                    destination_filesystem.set_times(
+                                                        &entry.path,
+                                                        FileType::Symlink,
+                                                        modified_time,
+                                                        None,
+                                                    )?;
+                                                }
 
-                                        if let Some(permissions) = permissions {
-                                            destination_filesystem.set_permissions(
-                                                &destination_path,
-                                                FileType::File,
-                                                permissions,
-                                            )?;
+                                                progress.increment_bytes(zip_entry.size());
+                                            }
                                         }
-                                        if let Some(modified_time) = modified_time {
-                                            destination_filesystem.set_times(
-                                                &destination_path,
-                                                FileType::File,
-                                                modified_time,
-                                                None,
-                                            )?;
-                                        }
-
-                                        progress.increment_files();
-                                    } else if entry.is_symlink()
-                                        && (1..=2048).contains(&entry.size())
-                                    {
-                                        let link =
-                                            std::io::read_to_string(&mut entry).unwrap_or_default();
-
-                                        if let Err(err) = destination_filesystem
-                                            .create_symlink(&link, &destination_path)
-                                        {
-                                            tracing::debug!(
-                                                path = %destination_path.display(),
-                                                "failed to create symlink from archive: {:#?}",
-                                                err
-                                            );
-                                        } else if let Some(modified_time) =
-                                            zip_entry_get_modified_time(&entry)
-                                        {
-                                            destination_filesystem.set_times(
-                                                &destination_path,
-                                                FileType::Symlink,
-                                                modified_time,
-                                                None,
-                                            )?;
-                                        }
-
-                                        progress.increment_bytes(entry.size());
                                     }
                                 }
                             };
 
                             if let Err(err) = run() {
-                                error_clone.fail(err);
+                                error.fail(err);
                             }
                         });
                     });
 
                     if let Some(err) = error.take() {
-                        Err(err)
-                    } else {
-                        for i in 0..archive.len() {
-                            let entry = archive.by_index(i)?;
-
-                            if entry.is_dir() {
-                                let path = match entry.enclosed_name() {
-                                    Some(path) => path,
-                                    None => continue,
-                                };
-
-                                let Some(destination_path) =
-                                    resolve_entry_path(&destination, &path)
-                                else {
-                                    continue;
-                                };
-
-                                if destination_filesystem.is_primary_server_fs()
-                                    && self.server.filesystem.is_ignored(
-                                        &destination_path,
-                                        FileType::from_is_dir(entry.is_dir()),
-                                    )
-                                {
-                                    continue;
-                                }
-
-                                if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
-                                    destination_filesystem.set_times(
-                                        &destination_path,
-                                        FileType::from_is_dir(entry.is_dir()),
-                                        modified_time,
-                                        None,
-                                    )?;
-                                }
-                            }
-                        }
-
-                        Ok(())
+                        return Err(err);
                     }
+
+                    for directory in directories {
+                        if let Some(modified_time) = directory.modified_time {
+                            destination_filesystem.set_times(
+                                &directory.path,
+                                FileType::Dir,
+                                modified_time,
+                                None,
+                            )?;
+                        }
+                    }
+
+                    Ok(())
                 })
                 .await??;
 
@@ -1797,12 +1849,29 @@ mod tests {
     }
 
     #[test]
-    fn tar_shard_spreads_a_realistic_tree_across_writers() {
+    fn tar_shard_keeps_a_directory_on_one_writer() {
+        for shards in [2usize, 4, 8] {
+            let writer = tar_shard(Path::new("world/region/r.0.0.mca"), shards);
+
+            for i in 0..64 {
+                let path = format!("world/region/r.{}.{}.mca", i / 8, i % 8);
+
+                assert_eq!(
+                    tar_shard(Path::new(&path), shards),
+                    writer,
+                    "{path} left its directory's writer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tar_shard_spreads_directories_across_writers() {
         let mut paths = Vec::new();
         for i in 0..200 {
-            paths.push(format!("world/region/r.{}.{}.mca", i / 32, i % 32));
+            paths.push(format!("world/region-{i}/r.0.0.mca"));
             paths.push(format!("plugins/plugin-{i:03}/config.yml"));
-            paths.push(format!("libraries/library-{i}.jar"));
+            paths.push(format!("libraries/library-{i}/library.jar"));
         }
 
         for shards in [2usize, 4, 8] {
@@ -1827,6 +1896,75 @@ mod tests {
     #[test]
     fn tar_shard_survives_a_zero_thread_count() {
         assert_eq!(tar_shard(Path::new("a.txt"), 0), 0);
+    }
+
+    // zip_entry_groups
+
+    fn plan_entry(index: usize, path: &str) -> ZipEntryPlan {
+        sized_plan_entry(index, path, 0)
+    }
+
+    fn sized_plan_entry(index: usize, path: &str, size: u64) -> ZipEntryPlan {
+        ZipEntryPlan {
+            index,
+            kind: ZipEntryKind::File,
+            path: PathBuf::from(path),
+            size,
+            permissions: None,
+            modified_time: None,
+        }
+    }
+
+    #[test]
+    fn zip_entry_groups_splits_on_parent_directory() {
+        let plan = [
+            plan_entry(0, "a/one"),
+            plan_entry(1, "a/two"),
+            plan_entry(2, "b/one"),
+            plan_entry(3, "c/d/one"),
+            plan_entry(4, "c/d/two"),
+            plan_entry(5, "c/d/three"),
+        ];
+
+        assert_eq!(zip_entry_groups(&plan), vec![0..2, 2..3, 3..6]);
+        assert!(zip_entry_groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn zip_entry_groups_caps_a_huge_directory() {
+        let plan: Vec<_> = (0..ZIP_GROUP_MAX_ENTRIES * 2 + 5)
+            .map(|i| plan_entry(i, &format!("big/file-{i}")))
+            .collect();
+
+        let groups = zip_entry_groups(&plan);
+
+        assert_eq!(groups.len(), 3);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.len() <= ZIP_GROUP_MAX_ENTRIES)
+        );
+        assert_eq!(
+            groups.iter().map(|group| group.len()).sum::<usize>(),
+            plan.len()
+        );
+        assert_eq!(groups.first().map(|group| group.start), Some(0));
+    }
+
+    #[test]
+    fn zip_entry_groups_caps_bytes_per_group() {
+        let plan: Vec<_> = (0..6)
+            .map(|i| sized_plan_entry(i, &format!("region/r.{i}.mca"), ZIP_GROUP_MAX_BYTES / 2))
+            .collect();
+
+        assert_eq!(zip_entry_groups(&plan), vec![0..2, 2..4, 4..6]);
+
+        let huge = [
+            sized_plan_entry(0, "libraries/one.jar", ZIP_GROUP_MAX_BYTES * 3),
+            sized_plan_entry(1, "libraries/two.jar", 10),
+        ];
+
+        assert_eq!(zip_entry_groups(&huge), vec![0..1, 1..2]);
     }
 
     // tar extraction

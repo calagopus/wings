@@ -210,43 +210,15 @@ impl CapFilesystem {
 
         let inner = self.get_inner()?;
         let state = Arc::new(parking_lot::Mutex::new(RemoveDirAllState::default()));
+        let pool = crate::threading::build_pool(threads).map_err(std::io::Error::other)?;
 
-        let mut walker = WalkDir::new(self.clone(), path.clone())?.reversed();
-        walker
-            .run_multithreaded_with_error_handler(
-                threads,
-                None,
-                Arc::new({
-                    let inner = Arc::clone(&inner);
-                    let state = Arc::clone(&state);
-                    move |entry: WalkEntry| {
-                        if let Err(err) = entry.remove() {
-                            let mut state = state.lock();
-                            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                                if let Err(err) = Self::remove_entry(
-                                    &inner,
-                                    &entry.path,
-                                    entry.file_type(),
-                                    &mut state.cleared_parent,
-                                ) {
-                                    state.record(err);
-                                }
-                            } else {
-                                state.record(err);
-                            }
-                        }
-                        Ok(())
-                    }
-                }),
-                {
-                    let state = Arc::clone(&state);
-                    move |err| {
-                        state.lock().record(err);
-                        Ok(())
-                    }
-                },
-            )
-            .map_err(std::io::Error::other)?;
+        let dir = if path.as_os_str().is_empty() {
+            inner.try_clone()?
+        } else {
+            inner.open_dir(&path)?
+        };
+
+        pool.in_place_scope(|scope| Self::remove_dir_contents(scope, dir, &state));
 
         let mut state = state.lock();
 
@@ -270,6 +242,114 @@ impl CapFilesystem {
                 Err(err)
             }
             None => Ok(()),
+        }
+    }
+
+    /// Removes everything inside `dir`. One task owns one directory and unlinks
+    /// through that directory's own handle, so no two threads work on the same
+    /// directory and nothing is resolved from the sandbox root again; a directory
+    /// is removed once the tasks for its subdirectories are done.
+    fn remove_dir_contents<'scope>(
+        scope: &rayon::Scope<'scope>,
+        dir: cap_std::fs::Dir,
+        state: &'scope Arc<parking_lot::Mutex<RemoveDirAllState>>,
+    ) {
+        let entries = match dir.entries() {
+            Ok(entries) => entries,
+            Err(err) => {
+                state.lock().record(err);
+                return;
+            }
+        };
+
+        let mut cleared_dir = false;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    state.lock().record(err);
+                    continue;
+                }
+            };
+
+            let mut file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
+            if matches!(file_type, FileType::Unknown) {
+                file_type = entry
+                    .metadata()
+                    .map_or(FileType::Unknown, |metadata| metadata.file_type().into());
+            }
+
+            if file_type.is_dir() {
+                let sub = match entry.open_dir() {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        state.lock().record(err);
+                        continue;
+                    }
+                };
+                let parent = match dir.try_clone() {
+                    Ok(parent) => parent,
+                    Err(err) => {
+                        state.lock().record(err);
+                        continue;
+                    }
+                };
+
+                scope.spawn(move |_| {
+                    rayon::scope(|scope| Self::remove_dir_contents(scope, sub, state));
+
+                    if let Err(err) = entry.remove_dir()
+                        && !(err.kind() == std::io::ErrorKind::PermissionDenied
+                            && Self::remove_dir_after_clearing_flags(&parent, &entry.file_name()))
+                    {
+                        state.lock().record(err);
+                    }
+                });
+
+                continue;
+            }
+
+            if let Err(err) = entry.remove_file() {
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    let name = entry.file_name();
+
+                    #[cfg(target_os = "linux")]
+                    if Self::clear_inode_flags(&dir, Path::new(&name), file_type).is_ok()
+                        && dir.remove_file(&name).is_ok()
+                    {
+                        continue;
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if !cleared_dir {
+                        cleared_dir = true;
+
+                        if Self::clear_flags_on_fd(&dir).is_ok() && dir.remove_file(&name).is_ok() {
+                            continue;
+                        }
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = (&name, &mut cleared_dir);
+                }
+
+                state.lock().record(err);
+            }
+        }
+    }
+
+    fn remove_dir_after_clearing_flags(parent: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            (Self::clear_inode_flags(parent, Path::new(name), FileType::Dir).is_ok()
+                && parent.remove_dir(name).is_ok())
+                || (Self::clear_flags_on_fd(parent).is_ok() && parent.remove_dir(name).is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (parent, name);
+            false
         }
     }
 
@@ -1559,7 +1639,17 @@ mod tests {
             .run_multithreaded_with_error_handler(
                 2,
                 None,
-                Arc::new(|entry: WalkEntry| Ok(entry.remove()?)),
+                Arc::new({
+                    let filesystem = filesystem.clone();
+                    move |entry: WalkEntry| -> Result<(), anyhow::Error> {
+                        if entry.file_type().is_dir() {
+                            filesystem.get_inner()?.remove_dir(&entry.path)?;
+                        } else {
+                            filesystem.get_inner()?.remove_file(&entry.path)?;
+                        }
+                        Ok(())
+                    }
+                }),
                 |err| {
                     errors.push(err);
                     Ok(())
@@ -1861,30 +1951,6 @@ mod tests {
             );
             assert!(completed.load(Ordering::Relaxed));
         });
-    }
-
-    #[test]
-    fn walk_entry_remove_uses_the_original_parent_handle() {
-        let (dir, filesystem) = temp_filesystem();
-        std::fs::create_dir(dir.path().join("original")).unwrap();
-        std::fs::write(dir.path().join("original/file"), "old").unwrap();
-        let entry = filesystem
-            .walk_dir("original")
-            .unwrap()
-            .next_entry()
-            .unwrap()
-            .unwrap();
-        std::fs::rename(dir.path().join("original"), dir.path().join("moved")).unwrap();
-        std::fs::create_dir(dir.path().join("original")).unwrap();
-        std::fs::write(dir.path().join("original/file"), "keep").unwrap();
-
-        entry.remove().unwrap();
-
-        assert!(!dir.path().join("moved/file").exists());
-        assert_eq!(
-            std::fs::read(dir.path().join("original/file")).unwrap(),
-            b"keep"
-        );
     }
 
     #[test]

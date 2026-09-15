@@ -17,7 +17,7 @@ use crate::{
             ReadableWritableSeekableFileStream,
         },
     },
-    utils::{CmpExt, PortablePermissions},
+    utils::{CmpExt, PortablePermissions, PortablePermissionsApplier},
 };
 use std::{
     cmp::Ordering,
@@ -56,6 +56,33 @@ struct StattedDirectoryEntry {
     path: PathBuf,
     entry: Option<cap_std::fs::DirEntry>,
     metadata: cap_std::fs::Metadata,
+}
+
+/// A plain file whose modification time is stamped once the last write is done,
+/// mirroring what `ServerFile` does for the primary server filesystem.
+struct ModifiedOnClose {
+    file: std::fs::File,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl std::io::Write for ModifiedOnClose {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.file, buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
+    }
+}
+
+impl Drop for ModifiedOnClose {
+    fn drop(&mut self) {
+        if let Some(modified) = self.modified {
+            self.file.set_modified(modified).ok();
+        }
+    }
 }
 
 enum ListingResult<T> {
@@ -169,13 +196,25 @@ impl VirtualCapFilesystem {
         &self,
         statted: StattedDirectoryEntry,
     ) -> Result<PreparedDirectoryEntry, anyhow::Error> {
+        let checked_path =
+            self.check_ignored(statted.metadata.file_type().into(), &statted.path)?;
+
+        Ok(self.prepare_filtered_statted_directory_entry(statted, checked_path))
+    }
+
+    /// For entries the listing scan loop already passed through the merged ignore
+    /// filter, so the per-entry path resolution does not run a second time.
+    fn prepare_filtered_statted_directory_entry(
+        &self,
+        statted: StattedDirectoryEntry,
+        checked_path: PathBuf,
+    ) -> PreparedDirectoryEntry {
         let StattedDirectoryEntry {
             path,
             entry,
             metadata,
         } = statted;
 
-        let checked_path = self.check_ignored(metadata.file_type().into(), &path)?;
         let mut prepared = self.server.filesystem.prepare_api_entry_cap_blocking(
             &self.inner,
             checked_path,
@@ -186,7 +225,7 @@ impl VirtualCapFilesystem {
             prepared.directory_entry = entry;
         }
 
-        Ok(prepared)
+        prepared
     }
 
     fn prepare_directory_entry(
@@ -555,8 +594,15 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                     for (directory, name, entry) in candidates {
                         check_aborted(listener)?;
 
-                        if let Ok(entry) = this.prepare_directory_entry(path.join(name), entry) {
-                            prepared.push((directory, entry));
+                        if let Ok(statted) = this.stat_directory_entry(path.join(name), entry) {
+                            let checked_path = statted.path.clone();
+                            prepared.push((
+                                directory,
+                                this.prepare_filtered_statted_directory_entry(
+                                    statted,
+                                    checked_path,
+                                ),
+                            ));
                         }
                     }
 
@@ -600,9 +646,11 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         check_aborted(listener)?;
 
                         let Ok(statted) = statted else { continue };
-                        if let Ok(entry) = this.prepare_statted_directory_entry(statted) {
-                            prepared.push((directory, entry));
-                        }
+                        let checked_path = statted.path.clone();
+                        prepared.push((
+                            directory,
+                            this.prepare_filtered_statted_directory_entry(statted, checked_path),
+                        ));
                     }
 
                     let prepared =
@@ -1123,6 +1171,33 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             let file = self.inner.create(path)?;
 
             Ok(Box::new(file))
+        }
+    }
+    fn create_file_with_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<super::WritableFileStream, anyhow::Error> {
+        self.check_writable()?;
+        let path = self.check_ignored(FileType::File, path.as_ref())?;
+
+        if self.is_primary_server_fs {
+            let file = crate::server::filesystem::file::ServerFile::new(
+                self.server.clone(),
+                &path,
+                permissions,
+                modified,
+            )?;
+
+            Ok(Box::new(file))
+        } else {
+            let file = self.inner.create(path)?;
+            if let Some(permissions) = permissions {
+                file.apply_permissions(permissions)?;
+            }
+
+            Ok(Box::new(ModifiedOnClose { file, modified }))
         }
     }
     async fn async_create_seekable_file(
@@ -1749,14 +1824,7 @@ mod tests {
             );
 
             let calls = calls.lock().unwrap();
-            assert_eq!(
-                calls.iter().take(100).cloned().collect::<Vec<_>>(),
-                enumeration
-            );
-            assert_eq!(
-                calls.iter().skip(100).cloned().collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(*calls, enumeration);
 
             Ok(())
         })

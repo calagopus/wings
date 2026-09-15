@@ -36,7 +36,7 @@ tokio-util = { version = "0.7.15", features = ["io-util"] }
 uuid = { workspace = true }
 rand = "0.10.0"
 tar = { workspace = true }
-zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate", "zstd", "lzma", "xz"] }
+zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-ng", "zstd", "lzma", "xz"] }
 sevenz-rust2 = { version = "0.22.2", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
 flate2 = { version = "1.1.1", default-features = false, features = ["zlib-ng"] }
 sha2 = { workspace = true }
