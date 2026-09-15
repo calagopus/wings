@@ -525,6 +525,29 @@ impl CmpExt for Path {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn process_memory_usage() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("RssAnon:"))
+        .and_then(|value| {
+            value
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kib| kib * 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_memory_usage() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,18 +58,25 @@ mod get {
         let mut sys = System::new_all();
         sys.refresh_cpu_all();
 
-        let mut used_bytes_process = 0;
-        if let Ok(current_pid) = sysinfo::get_current_pid() {
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&[current_pid]),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_memory(),
-            );
+        let used_bytes_process = match crate::utils::process_memory_usage() {
+            Some(used_bytes_process) => used_bytes_process,
+            None => {
+                let mut used_bytes_process = 0;
+                if let Ok(current_pid) = sysinfo::get_current_pid() {
+                    sys.refresh_processes_specifics(
+                        sysinfo::ProcessesToUpdate::Some(&[current_pid]),
+                        false,
+                        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                    );
 
-            if let Some(process) = sys.process(current_pid) {
-                used_bytes_process = process.memory();
+                    if let Some(process) = sys.process(current_pid) {
+                        used_bytes_process = process.memory();
+                    }
+                }
+
+                used_bytes_process
             }
-        }
+        };
 
         let Some(cpu) = sys.cpus().first() else {
             return ApiResponse::error("failed to retrieve cpu information").ok();

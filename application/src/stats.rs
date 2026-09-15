@@ -94,18 +94,25 @@ impl Default for StatsManager {
                         }
                     }
 
-                    let mut used_memory_process = 0;
-                    if let Ok(current_pid) = sysinfo::get_current_pid() {
-                        sys.refresh_processes_specifics(
-                            sysinfo::ProcessesToUpdate::Some(&[current_pid]),
-                            false,
-                            sysinfo::ProcessRefreshKind::nothing().with_memory(),
-                        );
+                    let used_memory_process = match crate::utils::process_memory_usage() {
+                        Some(used_memory_process) => used_memory_process,
+                        None => {
+                            let mut used_memory_process = 0;
+                            if let Ok(current_pid) = sysinfo::get_current_pid() {
+                                sys.refresh_processes_specifics(
+                                    sysinfo::ProcessesToUpdate::Some(&[current_pid]),
+                                    false,
+                                    sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                                );
 
-                        if let Some(process) = sys.process(current_pid) {
-                            used_memory_process = process.memory();
+                                if let Some(process) = sys.process(current_pid) {
+                                    used_memory_process = process.memory();
+                                }
+                            }
+
+                            used_memory_process
                         }
-                    }
+                    };
 
                     let total_memory = sys.total_memory();
                     let used_memory = sys.used_memory();
