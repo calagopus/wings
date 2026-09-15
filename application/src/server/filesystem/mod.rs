@@ -12,9 +12,9 @@ use crate::{
 use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt::Debug,
-    hint::unreachable_unchecked,
     ops::Deref,
     path::{Path, PathBuf},
     sync::{
@@ -127,36 +127,37 @@ fn raw_mode(metadata: &Metadata) -> u32 {
 
 #[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
-    let mut mode_str = compact_str::CompactString::default();
-
     #[cfg(unix)]
-    mode_str.push(match rustix::fs::FileType::from_raw_mode(mode) {
-        rustix::fs::FileType::RegularFile => '-',
-        rustix::fs::FileType::Directory => 'd',
-        rustix::fs::FileType::Symlink => 'l',
-        rustix::fs::FileType::BlockDevice => 'b',
-        rustix::fs::FileType::CharacterDevice => 'c',
-        rustix::fs::FileType::Socket => 's',
-        rustix::fs::FileType::Fifo => 'p',
-        rustix::fs::FileType::Unknown => '?',
-    });
+    let file_type = match rustix::fs::FileType::from_raw_mode(mode) {
+        rustix::fs::FileType::RegularFile => b'-',
+        rustix::fs::FileType::Directory => b'd',
+        rustix::fs::FileType::Symlink => b'l',
+        rustix::fs::FileType::BlockDevice => b'b',
+        rustix::fs::FileType::CharacterDevice => b'c',
+        rustix::fs::FileType::Socket => b's',
+        rustix::fs::FileType::Fifo => b'p',
+        rustix::fs::FileType::Unknown => b'?',
+    };
     #[cfg(not(unix))]
-    mode_str.push('?');
+    let file_type = b'?';
 
-    for i in 0u8..9 {
+    let mut buffer = [
+        file_type, b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+    ];
+    for (i, slot) in buffer.iter_mut().skip(1).enumerate() {
         if mode & (1 << (8 - i)) != 0 {
-            mode_str.push(match i.rem_euclid(3) {
-                0 => 'r',
-                1 => 'w',
-                2 => 'x',
-                _ => unsafe { unreachable_unchecked() },
-            });
-        } else {
-            mode_str.push('-');
+            *slot = match i % 3 {
+                0 => b'r',
+                1 => b'w',
+                _ => b'x',
+            };
         }
     }
 
-    mode_str
+    match std::str::from_utf8(&buffer) {
+        Ok(mode_str) => compact_str::CompactString::from(mode_str),
+        Err(_) => compact_str::CompactString::const_new("?---------"),
+    }
 }
 
 pub struct Filesystem {
@@ -371,40 +372,22 @@ impl Filesystem {
     }
 
     pub fn is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
-        let path = if file_type.is_symlink() {
-            self.canonicalize(path)
-                .unwrap_or_else(|_| self.relative_path(path))
-        } else {
-            self.relative_path(path)
-        };
-
-        if path.as_os_str().is_empty() {
+        let disk_ignored = self.disk_ignored.load();
+        if disk_ignored.is_empty() {
             return false;
         }
 
-        self.disk_ignored
-            .load()
-            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
-            .is_ignore()
+        Self::matches_ignore(&disk_ignored, &self.ignore_path(path, file_type), file_type)
     }
 
     pub async fn async_is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
-        let path = if file_type.is_symlink() {
-            self.async_canonicalize(path)
-                .await
-                .unwrap_or_else(|_| self.relative_path(path))
-        } else {
-            self.relative_path(path)
-        };
-
-        if path.as_os_str().is_empty() {
+        if self.disk_ignored.load().is_empty() {
             return false;
         }
 
-        self.disk_ignored
-            .load()
-            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
-            .is_ignore()
+        let path = self.async_ignore_path(path, file_type).await;
+
+        Self::matches_ignore(&self.disk_ignored.load(), &path, file_type)
     }
 
     pub fn is_subuser_ignored(
@@ -413,20 +396,7 @@ impl Filesystem {
         path: &Path,
         file_type: cap::FileType,
     ) -> bool {
-        let path = if file_type.is_symlink() {
-            self.canonicalize(path)
-                .unwrap_or_else(|_| self.relative_path(path))
-        } else {
-            self.relative_path(path)
-        };
-
-        if path.as_os_str().is_empty() {
-            return false;
-        }
-
-        matcher
-            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
-            .is_ignore()
+        Self::matches_ignore(matcher, &self.ignore_path(path, file_type), file_type)
     }
 
     pub async fn async_is_subuser_ignored(
@@ -435,25 +405,72 @@ impl Filesystem {
         path: &Path,
         file_type: cap::FileType,
     ) -> bool {
-        let path = if file_type.is_symlink() {
-            self.async_canonicalize(path)
-                .await
-                .unwrap_or_else(|_| self.relative_path(path))
-        } else {
-            self.relative_path(path)
-        };
+        Self::matches_ignore(
+            matcher,
+            &self.async_ignore_path(path, file_type).await,
+            file_type,
+        )
+    }
 
+    fn ignore_path<'a>(&self, path: &'a Path, file_type: cap::FileType) -> Cow<'a, Path> {
+        if file_type.is_symlink() {
+            Cow::Owned(
+                self.canonicalize(path)
+                    .unwrap_or_else(|_| self.relative_path(path)),
+            )
+        } else {
+            self.relative_path_cow(path)
+        }
+    }
+
+    async fn async_ignore_path<'a>(
+        &self,
+        path: &'a Path,
+        file_type: cap::FileType,
+    ) -> Cow<'a, Path> {
+        if file_type.is_symlink() {
+            Cow::Owned(
+                self.async_canonicalize(path)
+                    .await
+                    .unwrap_or_else(|_| self.relative_path(path)),
+            )
+        } else {
+            self.relative_path_cow(path)
+        }
+    }
+
+    fn matches_ignore(
+        matcher: &ignore::gitignore::Gitignore,
+        path: &Path,
+        file_type: cap::FileType,
+    ) -> bool {
         if path.as_os_str().is_empty() {
             return false;
         }
 
         matcher
-            .matched(uploads::ignore_match_path(&path), file_type.is_dir())
+            .matched(uploads::ignore_match_path(path), file_type.is_dir())
             .is_ignore()
     }
 
     pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
         (**self.disk_ignored.load()).clone()
+    }
+
+    pub fn symlink_name_filter(&self) -> IsIgnoredFn {
+        let matcher = self.disk_ignored.load_full();
+
+        IsIgnoredFn::from(move |file_type: cap::FileType, path: PathBuf| {
+            if !file_type.is_symlink() {
+                return Some(path);
+            }
+
+            let ignored = matcher
+                .matched(uploads::ignore_match_path(&path), file_type.is_dir())
+                .is_ignore();
+
+            if ignored { None } else { Some(path) }
+        })
     }
 
     pub async fn diff_key(&self, path: &Path) -> PathBuf {
@@ -1067,14 +1084,8 @@ impl Filesystem {
                         &path,
                         &destination_path,
                         server,
+                        Some(metadata.permissions),
                         progress.clone_bytes().as_ref(),
-                    )
-                    .await?;
-                destination_filesystem
-                    .async_set_permissions(
-                        &destination_path,
-                        metadata.file_type,
-                        metadata.permissions,
                     )
                     .await?;
             } else {
@@ -1088,13 +1099,9 @@ impl Filesystem {
                 }
 
                 let mut writer = destination_filesystem
-                    .async_create_file(&destination_path)
-                    .await?;
-                destination_filesystem
-                    .async_set_permissions(
+                    .async_create_file_with_permissions(
                         &destination_path,
-                        metadata.file_type,
-                        metadata.permissions,
+                        Some(metadata.permissions),
                     )
                     .await?;
 
@@ -1181,20 +1188,15 @@ impl Filesystem {
                                                 &path,
                                                 &destination_path,
                                                 &server,
+                                                Some(metadata.permissions),
                                                 progress.clone_bytes().as_ref(),
                                             )
-                                            .await?;
-                                        destination_filesystem
-                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                             .await?;
                                     } else {
                                         let mut reader = progress.async_counting_reader(stream);
 
                                         let mut writer = destination_filesystem
-                                            .async_create_file(&destination_path)
-                                            .await?;
-                                        destination_filesystem
-                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
+                                            .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
                                             .await?;
 
                                         tokio::io::copy(&mut reader, &mut writer).await?;
@@ -2398,7 +2400,7 @@ impl PreparedDirectoryEntry {
 
     fn cached_mime_type_blocking(
         &self,
-        mime_cache: &moka::sync::Cache<MimeCacheKey, MimeCacheValue>,
+        mime_cache: &crate::routes::MimeCache,
         open: impl FnOnce() -> std::io::Result<std::fs::File>,
     ) -> MimeCacheValue {
         let mime_key = MimeCacheKey::from(&self.metadata);
@@ -2487,7 +2489,7 @@ mod tests {
         std::fs::write(temp.path().join("data.bin"), b"shared MIME read")?;
         let filesystem = runtime.block_on(cap::CapFilesystem::new(temp.path()))?;
         let metadata = filesystem.symlink_metadata("data.bin")?;
-        let cache = moka::sync::Cache::new(16);
+        let cache = crate::routes::MimeCache::new(16);
         let start = Barrier::new(9);
         let opens = AtomicUsize::new(0);
         let release = AtomicBool::new(false);
@@ -2594,5 +2596,240 @@ mod tests {
             assert!(!server.filesystem.has_headroom(513));
             assert!(server.filesystem.has_headroom(-4096));
         });
+    }
+
+    struct CopyFixture {
+        server: crate::server::Server,
+        root: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    impl CopyFixture {
+        async fn new() -> Result<Self, anyhow::Error> {
+            let temp = tempfile::tempdir()?;
+            let state = crate::routes::AppState::mock();
+            state
+                .config
+                .mutate_in_place_for_testing()
+                .system
+                .data_directory =
+                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+            server.filesystem.disk_checker.abort();
+
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(&root)?;
+
+            let cap = cap::CapFilesystem::new(&root).await?;
+            server.filesystem.inner.store(Some(cap.get_inner()?));
+
+            Ok(Self {
+                server,
+                root,
+                _temp: temp,
+            })
+        }
+
+        fn write_source(&self) -> Result<(), anyhow::Error> {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir_all(self.root.join("src/nested"))?;
+            std::fs::write(self.root.join("src/a.txt"), b"alpha")?;
+            std::fs::write(self.root.join("src/nested/b.bin"), b"\x00\x01\x02beta")?;
+            std::os::unix::fs::symlink("a.txt", self.root.join("src/link"))?;
+
+            for (path, mode) in [("src/a.txt", 0o640), ("src/nested/b.bin", 0o755)] {
+                let file = std::fs::File::open(self.root.join(path))?;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                file.set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+                )?;
+            }
+
+            Ok(())
+        }
+
+        async fn copy(
+            &self,
+            source: &str,
+            destination: &str,
+            destination_filesystem: Option<Arc<dyn VirtualWritableFilesystem>>,
+        ) -> Result<(), anyhow::Error> {
+            let (path, filesystem) = self
+                .server
+                .filesystem
+                .resolve_readable_fs(&self.server, Path::new(source))
+                .await;
+            let metadata = filesystem.async_metadata(&path).await?;
+            let (destination_path, writable) = match destination_filesystem {
+                Some(writable) => (PathBuf::from(destination), writable),
+                None => {
+                    self.server
+                        .filesystem
+                        .resolve_writable_fs(&self.server, destination)
+                        .await
+                }
+            };
+
+            self.server
+                .filesystem
+                .copy_path(
+                    archive::create::ArchiveProgress::default(),
+                    &self.server,
+                    metadata,
+                    path,
+                    filesystem,
+                    destination_path,
+                    writable,
+                )
+                .await
+        }
+    }
+
+    fn assert_copied_file(
+        path: &Path,
+        contents: &[u8],
+        mode: u32,
+        copied_after: std::time::SystemTime,
+    ) -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        assert!(
+            metadata.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+        assert_eq!(std::fs::read(path)?, contents, "{}", path.display());
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            mode,
+            "{} mode",
+            path.display()
+        );
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert!(
+            metadata.modified()? >= copied_after,
+            "{} keeps the copy time, not the source mtime",
+            path.display()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copy_path_applies_mode_and_owner_on_the_open_file() -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio_test::block_on(async {
+            let fixture = CopyFixture::new().await?;
+            fixture.write_source()?;
+            let started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+
+            fixture.copy("src/a.txt", "copied.txt", None).await?;
+            assert_copied_file(&fixture.root.join("copied.txt"), b"alpha", 0o640, started)?;
+
+            fixture.copy("src", "tree", None).await?;
+            assert_copied_file(&fixture.root.join("tree/a.txt"), b"alpha", 0o640, started)?;
+            assert_copied_file(
+                &fixture.root.join("tree/nested/b.bin"),
+                b"\x00\x01\x02beta",
+                0o755,
+                started,
+            )?;
+            assert!(std::fs::symlink_metadata(fixture.root.join("tree/link"))?.is_symlink());
+
+            std::fs::write(
+                fixture.root.join("existing.txt"),
+                b"a much longer previous body",
+            )?;
+            std::fs::set_permissions(
+                fixture.root.join("existing.txt"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+            fixture.copy("src/a.txt", "existing.txt", None).await?;
+            assert_copied_file(&fixture.root.join("existing.txt"), b"alpha", 0o640, started)?;
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn copy_path_across_filesystems_applies_mode_on_the_open_file() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let fixture = CopyFixture::new().await?;
+            fixture.write_source()?;
+            let started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+
+            let other = tempfile::tempdir()?;
+            let other_cap = cap::CapFilesystem::new(other.path()).await?;
+            let mut destination = other_cap.get_virtual(fixture.server.clone());
+            destination.is_writable = true;
+            let destination: Arc<dyn VirtualWritableFilesystem> = Arc::new(destination);
+
+            fixture
+                .copy("src/a.txt", "copied.txt", Some(destination.clone()))
+                .await?;
+            assert_copied_file(&other.path().join("copied.txt"), b"alpha", 0o640, started)?;
+
+            fixture.copy("src", "tree", Some(destination)).await?;
+            assert_copied_file(&other.path().join("tree/a.txt"), b"alpha", 0o640, started)?;
+            assert_copied_file(
+                &other.path().join("tree/nested/b.bin"),
+                b"\x00\x01\x02beta",
+                0o755,
+                started,
+            )?;
+            assert!(std::fs::symlink_metadata(other.path().join("tree/link"))?.is_symlink());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "timing and syscall probe for copy_path, run with --ignored under strace"]
+    fn copy_path_many_files_probe() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let fixture = CopyFixture::new().await?;
+            let files: usize = std::env::var("COPY_PROBE_FILES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2000);
+
+            std::fs::create_dir_all(fixture.root.join("src/nested"))?;
+            for index in 0..files {
+                let directory = if index % 2 == 0 { "src" } else { "src/nested" };
+                std::fs::write(
+                    fixture
+                        .root
+                        .join(directory)
+                        .join(format!("file-{index:05}.bin")),
+                    b"0123456789abcdef",
+                )?;
+            }
+
+            let other = tempfile::tempdir()?;
+            let destination = if std::env::var_os("COPY_PROBE_CROSS").is_some() {
+                let mut destination = cap::CapFilesystem::new(other.path())
+                    .await?
+                    .get_virtual(fixture.server.clone());
+                destination.is_writable = true;
+
+                Some(Arc::new(destination) as Arc<dyn VirtualWritableFilesystem>)
+            } else {
+                None
+            };
+
+            let started = std::time::Instant::now();
+            fixture.copy("src", "tree", destination).await?;
+            eprintln!(
+                "copy_path probe: {files} files in {:?} ({:.1} us/file)",
+                started.elapsed(),
+                started.elapsed().as_secs_f64() * 1e6 / files as f64
+            );
+
+            Ok(())
+        })
     }
 }

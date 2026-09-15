@@ -45,6 +45,10 @@ impl ApiResponse {
     }
 
     pub fn new_serialized(body: impl serde::Serialize) -> Self {
+        Self::new_serialized_with_capacity(body, 128)
+    }
+
+    pub fn new_serialized_with_capacity(body: impl serde::Serialize, capacity: usize) -> Self {
         let accept_header = ACCEPT_HEADER.try_with(|h| h.clone()).ok().flatten();
 
         const AVAILABLE_SERIALIZERS: &[mime::Mime] =
@@ -79,10 +83,11 @@ impl ApiResponse {
                 }
             }
             _ => {
-                let bytes = serde_json::to_vec(&body).unwrap_or_else(|err| {
+                let mut bytes = Vec::with_capacity(capacity);
+                if let Err(err) = serde_json::to_writer(&mut bytes, &body) {
                     tracing::error!("failed to serialize response body to JSON: {:?}", err);
-                    b"{}".to_vec()
-                });
+                    bytes = b"{}".to_vec();
+                }
 
                 (
                     axum::http::HeaderValue::from_static("application/json"),

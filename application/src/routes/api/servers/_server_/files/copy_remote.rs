@@ -280,6 +280,7 @@ mod post {
                                                                     &source_path,
                                                                     &destination_path,
                                                                     &destination_server,
+                                                                    Some(metadata.permissions),
                                                                     Some(&bytes_processed),
                                                                 )
                                                                 .await?;
@@ -290,10 +291,7 @@ mod post {
                                                             );
 
                                                             let mut writer = destination_filesystem
-                                                                .async_create_file(&destination_path)
-                                                                .await?;
-                                                            destination_filesystem
-                                                                .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
+                                                                .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
                                                                 .await?;
 
                                                             tokio::io::copy(&mut reader, &mut writer).await?;

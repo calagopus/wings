@@ -9,7 +9,7 @@ pub struct ListingWork {
 impl Default for ListingWork {
     fn default() -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(Self::WORKER_LIMIT)),
+            permits: Arc::new(Semaphore::new(Self::worker_limit())),
         }
     }
 }
@@ -17,7 +17,16 @@ impl Default for ListingWork {
 impl ListingWork {
     pub const SMALL_LIMIT: usize = 64;
     const WORKER_LIMIT: usize = 32;
+    const MIN_WORKER_LIMIT: usize = 4;
+
+    fn worker_limit() -> usize {
+        std::thread::available_parallelism()
+            .map_or(Self::WORKER_LIMIT, |cpus| cpus.get().saturating_mul(2))
+            .clamp(Self::MIN_WORKER_LIMIT, Self::WORKER_LIMIT)
+    }
+
     const BATCH_SIZE: usize = 32;
+    const MAX_BATCH_SIZE: usize = 1024;
     const REQUEST_LIMIT: usize = 8;
 
     pub async fn run<
@@ -56,7 +65,7 @@ impl ListingWork {
         let batch_size = if count <= Self::SMALL_LIMIT {
             count
         } else {
-            Self::BATCH_SIZE
+            (count / (Self::REQUEST_LIMIT * 4)).clamp(Self::BATCH_SIZE, Self::MAX_BATCH_SIZE)
         };
 
         let (_guard, listener) = AbortGuard::new();
@@ -201,8 +210,11 @@ mod tests {
                 assert_eq!(result.unwrap().len(), 256);
             }
 
-            assert!((2..=ListingWork::WORKER_LIMIT).contains(&peak.load(Ordering::SeqCst)));
-            assert_eq!(work.permits.available_permits(), ListingWork::WORKER_LIMIT);
+            assert!((2..=ListingWork::worker_limit()).contains(&peak.load(Ordering::SeqCst)));
+            assert_eq!(
+                work.permits.available_permits(),
+                ListingWork::worker_limit()
+            );
         });
     }
 
@@ -254,7 +266,8 @@ mod tests {
 
             let permit = tokio::time::timeout(
                 Duration::from_secs(5),
-                work.permits.acquire_many(ListingWork::WORKER_LIMIT as u32),
+                work.permits
+                    .acquire_many(ListingWork::worker_limit() as u32),
             )
             .await
             .unwrap()
@@ -304,7 +317,7 @@ mod tests {
                 }
             });
             tokio::time::timeout(Duration::from_secs(5), async {
-                while work.permits.available_permits() == ListingWork::WORKER_LIMIT {
+                while work.permits.available_permits() == ListingWork::worker_limit() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -319,7 +332,8 @@ mod tests {
 
             let permit = tokio::time::timeout(
                 Duration::from_secs(5),
-                work.permits.acquire_many(ListingWork::WORKER_LIMIT as u32),
+                work.permits
+                    .acquire_many(ListingWork::worker_limit() as u32),
             )
             .await
             .unwrap()
@@ -339,7 +353,10 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(work.permits.available_permits(), ListingWork::WORKER_LIMIT);
+            assert_eq!(
+                work.permits.available_permits(),
+                ListingWork::worker_limit()
+            );
 
             assert!(
                 work.run::<(), _>(|_| {
@@ -348,7 +365,10 @@ mod tests {
                 .await
                 .is_err()
             );
-            assert_eq!(work.permits.available_permits(), ListingWork::WORKER_LIMIT);
+            assert_eq!(
+                work.permits.available_permits(),
+                ListingWork::worker_limit()
+            );
 
             assert_eq!(work.run(|_| Ok(7)).await.unwrap(), 7);
         });

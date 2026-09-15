@@ -137,6 +137,73 @@ impl From<&cap_std::fs::Metadata> for MimeCacheKey {
     }
 }
 
+const MIME_CACHE_SHARDS: usize = 64;
+
+#[derive(Clone)]
+pub struct MimeCache {
+    shards: Arc<[parking_lot::RwLock<std::collections::HashMap<MimeCacheKey, MimeCacheValue>>]>,
+    shard_capacity: usize,
+}
+
+impl MimeCache {
+    pub fn new(capacity: u64) -> Self {
+        Self {
+            shards: (0..MIME_CACHE_SHARDS)
+                .map(|_| parking_lot::RwLock::new(std::collections::HashMap::new()))
+                .collect(),
+            shard_capacity: (capacity as usize).div_ceil(MIME_CACHE_SHARDS).max(16),
+        }
+    }
+
+    #[inline]
+    fn shard(
+        &self,
+        key: &MimeCacheKey,
+    ) -> Option<&parking_lot::RwLock<std::collections::HashMap<MimeCacheKey, MimeCacheValue>>> {
+        let mixed = (key.ino ^ key.dev.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+        self.shards.get((mixed >> 32) as usize % self.shards.len())
+    }
+
+    pub fn get(&self, key: &MimeCacheKey) -> Option<MimeCacheValue> {
+        self.shard(key)?.read().get(key).copied()
+    }
+
+    pub fn get_with_by_ref(
+        &self,
+        key: &MimeCacheKey,
+        init: impl FnOnce() -> MimeCacheValue,
+    ) -> MimeCacheValue {
+        let Some(shard) = self.shard(key) else {
+            return init();
+        };
+
+        if let Some(value) = shard.read().get(key) {
+            return *value;
+        }
+
+        let mut shard = shard.write();
+        if let Some(value) = shard.get(key) {
+            return *value;
+        }
+
+        let value = init();
+        if shard.len() >= self.shard_capacity {
+            shard.clear();
+        }
+        shard.insert(*key, value);
+
+        value
+    }
+
+    #[cfg(test)]
+    pub fn invalidate_all(&self) {
+        for shard in self.shards.iter() {
+            shard.write().clear();
+        }
+    }
+}
+
 pub fn mime_cache_capacity(directory_entry_limit: usize) -> u64 {
     const MIN: u64 = 32 * 1024;
     const MAX: u64 = 256 * 1024;
@@ -158,7 +225,7 @@ pub struct AppState {
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
-    pub mime_cache: moka::sync::Cache<MimeCacheKey, MimeCacheValue>,
+    pub mime_cache: MimeCache,
     pub listing_work: Arc<crate::server::filesystem::listing::ListingWork>,
 
     #[cfg(unix)]
@@ -181,7 +248,7 @@ impl AppState {
             websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
                 Arc::new(crate::config::Config::mock()),
             )),
-            mime_cache: moka::sync::Cache::builder().build(),
+            mime_cache: MimeCache::new(mime_cache_capacity(0)),
             listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
             #[cfg(unix)]
             tundra: None,

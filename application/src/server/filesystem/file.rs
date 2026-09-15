@@ -23,6 +23,33 @@ pub struct ServerFile {
     highest_position: u64,
 }
 
+fn open_destination(
+    server: &crate::server::Server,
+    destination: &Path,
+    permissions: Option<PortablePermissions>,
+) -> Result<(std::fs::File, u64), anyhow::Error> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+
+    let file = server.filesystem.open_with(destination, options)?;
+    let previous_size = file
+        .metadata()
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map_or(0, |metadata| metadata.len());
+    if previous_size > 0 {
+        file.set_len(0)?;
+    }
+
+    if let Some(permissions) = permissions {
+        file.apply_permissions(permissions)?;
+    }
+
+    server.filesystem.chown_file(&file)?;
+
+    Ok((file, previous_size))
+}
+
 impl ServerFile {
     pub fn new(
         server: crate::server::Server,
@@ -41,24 +68,7 @@ impl ServerFile {
             .filesystem
             .path_to_components(&server.filesystem.relative_path(parent_path));
 
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(false);
-
-        let file = server.filesystem.open_with(destination, options)?;
-        let previous_size = file
-            .metadata()
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .map_or(0, |metadata| metadata.len());
-        if previous_size > 0 {
-            file.set_len(0)?;
-        }
-
-        if let Some(permissions) = permissions {
-            file.apply_permissions(permissions)?;
-        }
-
-        server.filesystem.chown_file(&file)?;
+        let (file, previous_size) = open_destination(&server, destination, permissions)?;
 
         Ok(Self {
             server,
@@ -310,31 +320,14 @@ impl AsyncServerFile {
             .filesystem
             .path_to_components(&server.filesystem.relative_path(parent_path));
 
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(false);
+        let (file, previous_size) = tokio::task::spawn_blocking({
+            let server = server.clone();
+            let destination = destination.to_path_buf();
 
-        let file = server
-            .filesystem
-            .async_open_with(destination, options)
-            .await?;
-        let previous_size = file
-            .metadata()
-            .await
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .map_or(0, |metadata| metadata.len());
-        if previous_size > 0 {
-            file.set_len(0).await?;
-        }
-
-        if let Some(permissions) = permissions {
-            server
-                .filesystem
-                .async_set_permissions(destination, permissions)
-                .await?;
-        }
-
-        server.filesystem.async_chown_path(destination).await?;
+            move || open_destination(&server, &destination, permissions)
+        })
+        .await??;
+        let file = tokio::fs::File::from_std(file);
 
         Ok(Self {
             server,

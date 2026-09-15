@@ -135,7 +135,7 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                             &config,
                         )),
                     ),
-                    mime_cache: moka::sync::Cache::new(crate::routes::mime_cache_capacity(
+                    mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
                         config.load().api.directory_entry_limit,
                     )),
                     listing_work: Arc::new(

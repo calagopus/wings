@@ -496,9 +496,16 @@ pub trait CmpExt {
 
 impl CmpExt for str {
     fn cmp_ascii_case_insensitive(&self, other: &Self) -> std::cmp::Ordering {
-        self.bytes()
-            .map(|b| b.to_ascii_lowercase())
-            .cmp(other.bytes().map(|b| b.to_ascii_lowercase()))
+        let (a, b) = (self.as_bytes(), other.as_bytes());
+
+        for (x, y) in a.iter().zip(b) {
+            let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+            if x != y {
+                return x.cmp(&y);
+            }
+        }
+
+        a.len().cmp(&b.len())
     }
 }
 

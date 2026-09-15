@@ -585,7 +585,7 @@ async fn main_rt() {
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
             Arc::clone(&config),
         )),
-        mime_cache: moka::sync::Cache::new(crate::routes::mime_cache_capacity(
+        mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
             config.load().api.directory_entry_limit,
         )),
         listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),

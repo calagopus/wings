@@ -490,7 +490,7 @@ impl BackupExt for ZfsBackup {
                                         server.filesystem.async_create_dir_all(parent).await?;
                                     }
 
-                                    filesystem.async_quota_copy(&path, &path, &server, progress.clone_bytes().as_ref()).await?;
+                                    filesystem.async_quota_copy(&path, &path, &server, None, progress.clone_bytes().as_ref()).await?;
                                     progress.increment_files();
                                 } else if metadata.is_dir() {
                                     server.filesystem.async_create_dir_all(&path).await?;

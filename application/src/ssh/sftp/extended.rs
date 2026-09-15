@@ -414,7 +414,13 @@ pub async fn handle_extended(
             sftp_session
                 .server
                 .filesystem
-                .async_quota_copy(&source_path, &destination_path, &sftp_session.server, None)
+                .async_quota_copy(
+                    &source_path,
+                    &destination_path,
+                    &sftp_session.server,
+                    None,
+                    None,
+                )
                 .await
                 .map_err(|_| StatusCode::NoSuchFile)?;
 

@@ -39,6 +39,11 @@ fn sort_window<T>(items: &mut [T], window: Range<usize>, cmp: impl Fn(&T, &T) ->
         return;
     }
 
+    if window.start == 0 && window.end == items.len() {
+        items.sort_unstable_by(&cmp);
+        return;
+    }
+
     items.select_nth_unstable_by(window.end - 1, &cmp);
     if window.start > 0
         && window.start + 1 < window.end
@@ -483,7 +488,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
-        let path = path.as_ref().to_path_buf();
+        let path = self.inner.relative_path(path.as_ref());
         let is_ignored = match &self.is_ignored {
             Some(existing) => existing.clone().merge(is_ignored),
             None => is_ignored,
@@ -1200,6 +1205,35 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             Ok(Box::new(ModifiedOnClose { file, modified }))
         }
     }
+    async fn async_create_file_with_permissions(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+    ) -> Result<super::AsyncWritableFileStream, anyhow::Error> {
+        self.check_writable()?;
+        let path = self
+            .async_check_ignored(FileType::File, path.as_ref())
+            .await?;
+
+        if self.is_primary_server_fs {
+            let file = crate::server::filesystem::file::AsyncServerFile::new(
+                self.server.clone(),
+                &path,
+                permissions,
+                None,
+            )
+            .await?;
+
+            Ok(Box::new(file))
+        } else {
+            let file = self
+                .inner
+                .async_create_with_permissions(path, permissions)
+                .await?;
+
+            Ok(Box::new(file))
+        }
+    }
     async fn async_create_seekable_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1486,8 +1520,20 @@ mod tests {
             page: usize,
             sort: crate::models::DirectorySortingMode,
         ) -> Result<DirectoryListing, anyhow::Error> {
+            self.read_dir_with(path, self.ignored.clone(), per_page, page, sort)
+                .await
+        }
+
+        async fn read_dir_with(
+            &self,
+            path: &str,
+            is_ignored: IsIgnoredFn,
+            per_page: Option<usize>,
+            page: usize,
+            sort: crate::models::DirectorySortingMode,
+        ) -> Result<DirectoryListing, anyhow::Error> {
             self.fs
-                .async_read_dir(&path, per_page, page, self.ignored.clone(), sort)
+                .async_read_dir(&path, per_page, page, is_ignored, sort)
                 .await
         }
     }
@@ -1603,6 +1649,123 @@ mod tests {
                     #[cfg(unix)]
                     for name in ["file-link", "dir-link", "broken-link"] {
                         assert!(names.contains(&name));
+                    }
+                }
+            }
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn deny_filters_apply_identically_to_nested_and_unnormalized_listings() {
+        with_one_blocking_worker(|| async {
+            let fixture = ListingFixture::new(0).await?;
+            let root = &fixture.server.filesystem.base_path;
+            std::fs::create_dir(root.join("hidden"))?;
+            std::fs::write(root.join("hidden/inside.txt"), b"hidden")?;
+            std::fs::write(root.join("nested/secret.log"), b"hidden")?;
+            #[cfg(unix)]
+            for (name, target) in [
+                ("nested/linked.log", "data.bin"),
+                ("nested/via-link", "secret.log"),
+            ] {
+                std::os::unix::fs::symlink(target, root.join(name))?;
+            }
+            fixture
+                .server
+                .filesystem
+                .update_ignored(&["denied.txt", "hidden", "hidden/**", "*.log"])
+                .await;
+
+            fn names(listing: &DirectoryListing) -> Vec<String> {
+                listing
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.to_string())
+                    .collect()
+            }
+
+            for sort in SORTS {
+                let root_listing = fixture.read_dir("", None, 1, sort).await?;
+                let root_names = names(&root_listing);
+                for denied in ["denied.txt", "hidden", "request-denied.txt"] {
+                    assert!(!root_names.iter().any(|name| name == denied), "{denied}");
+                }
+                #[cfg(unix)]
+                assert!(!root_names.iter().any(|name| name == "denied-link"));
+                assert!(root_names.iter().any(|name| name == "nested"));
+                assert!(root_names.iter().any(|name| name == "a.txt"));
+                assert_eq!(root_listing.total_entries, root_names.len());
+
+                let hidden = fixture.read_dir("hidden", None, 1, sort).await?;
+                assert!(hidden.entries.is_empty());
+                assert_eq!(hidden.total_entries, 0);
+
+                let nested = fixture.read_dir("nested", None, 1, sort).await?;
+                let nested_names = names(&nested);
+                assert!(nested_names.iter().any(|name| name == "data.bin"));
+                assert!(!nested_names.iter().any(|name| name == "secret.log"));
+                #[cfg(unix)]
+                {
+                    assert!(nested_names.iter().any(|name| name == "parent-link"));
+                    assert!(!nested_names.iter().any(|name| name == "denied-link"));
+                }
+                assert_eq!(nested.total_entries, nested_names.len());
+
+                for variant in [
+                    "nested/",
+                    "./nested",
+                    "/nested",
+                    "nested/../nested",
+                    "//nested/.",
+                ] {
+                    let listing = fixture.read_dir(variant, None, 1, sort).await?;
+
+                    assert_eq!(listing.total_entries, nested.total_entries, "{variant}");
+                    assert_eq!(
+                        serde_json::to_value(&listing.entries)?,
+                        serde_json::to_value(&nested.entries)?,
+                        "{variant}"
+                    );
+                }
+
+                // The listing routes add the server deny list on top of the filesystem's own
+                // deny filter; matching only symlinks by raw path must list exactly what the
+                // full second pass listed.
+                for directory in ["", "nested"] {
+                    let full: IsIgnoredFn = vec![
+                        fixture.server.filesystem.get_ignored(),
+                        crate::server::filesystem::build_gitignore_matcher(
+                            ["request-denied.txt"].iter(),
+                        )?,
+                    ]
+                    .into();
+                    let symlinks_only = fixture
+                        .server
+                        .filesystem
+                        .symlink_name_filter()
+                        .merge(fixture.ignored.clone());
+
+                    let expected = fixture
+                        .read_dir_with(directory, full, None, 1, sort)
+                        .await?;
+                    let listing = fixture
+                        .read_dir_with(directory, symlinks_only, None, 1, sort)
+                        .await?;
+
+                    assert_eq!(listing.total_entries, expected.total_entries, "{directory}");
+                    assert_eq!(
+                        serde_json::to_value(&listing.entries)?,
+                        serde_json::to_value(&expected.entries)?,
+                        "{directory}"
+                    );
+
+                    #[cfg(unix)]
+                    if directory == "nested" {
+                        let names = names(&listing);
+                        assert!(!names.iter().any(|name| name == "linked.log"));
+                        assert!(!names.iter().any(|name| name == "via-link"));
                     }
                 }
             }

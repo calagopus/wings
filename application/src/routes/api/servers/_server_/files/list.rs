@@ -168,9 +168,9 @@ mod get {
         let is_ignored: IsIgnoredFn = if filesystem.is_primary_server_fs()
             && let Some(ignore) = ignore
         {
-            vec![server.filesystem.get_ignored(), ignore].into()
+            server.filesystem.symlink_name_filter().merge(ignore.into())
         } else if filesystem.is_primary_server_fs() {
-            server.filesystem.get_ignored().into()
+            server.filesystem.symlink_name_filter()
         } else {
             Default::default()
         };

@@ -125,7 +125,10 @@ impl ReadDir {
 pub fn name_and_type(entry: &cap_std::fs::DirEntry) -> (FileType, String) {
     (
         entry.file_type().map_or(FileType::Unknown, FileType::from),
-        entry.file_name().to_string_lossy().to_string(),
+        entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|name| name.to_string_lossy().into_owned()),
     )
 }
 

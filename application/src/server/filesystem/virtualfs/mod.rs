@@ -787,6 +787,19 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     ) -> Result<AsyncWritableFileStream, anyhow::Error> {
         Ok(self.async_create_seekable_file(path).await? as AsyncWritableFileStream)
     }
+    async fn async_create_file_with_permissions(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+    ) -> Result<AsyncWritableFileStream, anyhow::Error> {
+        let file = self.async_create_file(path).await?;
+        if let Some(permissions) = permissions {
+            self.async_set_permissions(path, FileType::File, permissions)
+                .await?;
+        }
+
+        Ok(file)
+    }
     fn create_seekable_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),

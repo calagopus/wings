@@ -8,6 +8,7 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use cap_std::fs::{Metadata, OpenOptions};
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
@@ -104,15 +105,28 @@ impl CapFilesystem {
         result
     }
 
+    /// Borrows `path` when it is already relative and free of `.` / `..` components,
+    /// which is the case for every path the listing pipeline builds from a resolved root.
+    #[inline]
+    pub fn relative_path_cow<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
+        let path = path
+            .strip_prefix(&*self.base_path)
+            .or_else(|_| path.strip_prefix("/"))
+            .unwrap_or(path);
+
+        if path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            Cow::Borrowed(path)
+        } else {
+            Cow::Owned(Self::resolve_path(path))
+        }
+    }
+
     #[inline]
     pub fn relative_path(&self, path: &Path) -> PathBuf {
-        Self::resolve_path(if let Ok(path) = path.strip_prefix(&*self.base_path) {
-            path
-        } else if let Ok(path) = path.strip_prefix("/") {
-            path
-        } else {
-            path
-        })
+        self.relative_path_cow(path).into_owned()
     }
 
     pub fn resolve_symlink_contents(link: &Path, target: &Path) -> (PathBuf, PathBuf) {
@@ -763,6 +777,27 @@ impl CapFilesystem {
         Ok(tokio::fs::File::from_std(file.into_std()))
     }
 
+    pub async fn async_create_with_permissions(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<tokio::fs::File, std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+
+        let inner = self.get_inner()?;
+        let file = tokio::task::spawn_blocking(move || {
+            let file = inner.create(path)?;
+            if let Some(permissions) = permissions {
+                file.apply_permissions(permissions)?;
+            }
+
+            Ok::<_, std::io::Error>(file)
+        })
+        .await??;
+
+        Ok(tokio::fs::File::from_std(file.into_std()))
+    }
+
     pub fn create(&self, path: impl AsRef<Path>) -> Result<std::fs::File, std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
@@ -777,6 +812,7 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         destination_path: impl AsRef<Path>,
         destination_server: &crate::server::Server,
+        permissions: Option<PortablePermissions>,
         progress: Option<&Arc<AtomicU64>>,
     ) -> Result<u64, std::io::Error> {
         let (guard, listener) = AbortGuard::new();
@@ -793,6 +829,7 @@ impl CapFilesystem {
                     &path,
                     &destination_path,
                     &destination_server,
+                    permissions,
                     progress.as_ref(),
                     listener,
                 )
@@ -810,6 +847,7 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         destination_path: impl AsRef<Path>,
         destination_server: &crate::server::Server,
+        permissions: Option<PortablePermissions>,
         progress: Option<&Arc<AtomicU64>>,
         listener: AbortListener,
     ) -> Result<u64, std::io::Error> {
@@ -840,6 +878,10 @@ impl CapFilesystem {
 
         let mut reader = self.open(&path)?;
         let mut writer = destination_server.filesystem.create(&destination_path)?;
+        if let Some(permissions) = permissions {
+            writer.apply_permissions(permissions)?;
+        }
+        destination_server.filesystem.chown_file(&writer)?;
 
         if let Some(destination_metadata) = &destination_metadata {
             destination_server.filesystem.allocate_in_path(
@@ -1378,6 +1420,64 @@ mod tests {
             CapFilesystem::resolve_path(Path::new("plugins/config.yml")),
             PathBuf::from("plugins/config.yml")
         );
+    }
+
+    // relative_path_cow
+
+    #[test]
+    fn relative_path_cow_borrows_normalized_paths() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+
+            for (input, expected) in [
+                ("plugins/config.yml", "plugins/config.yml"),
+                ("/plugins/config.yml", "plugins/config.yml"),
+                ("", ""),
+                ("/", ""),
+            ] {
+                let resolved = fs.relative_path_cow(Path::new(input));
+
+                assert!(matches!(resolved, Cow::Borrowed(_)), "{input}");
+                assert_eq!(resolved.as_ref(), Path::new(expected), "{input}");
+            }
+
+            let inside = temp.path().join("plugins/config.yml");
+            let resolved = fs.relative_path_cow(&inside);
+            assert!(matches!(resolved, Cow::Borrowed(_)));
+            assert_eq!(resolved.as_ref(), Path::new("plugins/config.yml"));
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn relative_path_cow_resolves_dot_components() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+
+            for (input, expected) in [
+                ("./a/./b", "a/b"),
+                ("a/../b", "b"),
+                ("../../etc/passwd", "etc/passwd"),
+                ("//nested/.", "nested"),
+                ("nested/", "nested"),
+            ] {
+                let resolved = fs.relative_path_cow(Path::new(input));
+
+                assert_eq!(resolved.as_ref(), Path::new(expected), "{input}");
+                assert_eq!(
+                    resolved.as_ref(),
+                    fs.relative_path(Path::new(input)),
+                    "{input}"
+                );
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
     }
 
     // resolve_symlink_contents

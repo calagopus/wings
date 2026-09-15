@@ -60,7 +60,7 @@ mod get {
         }
 
         let is_ignored = if filesystem.is_primary_server_fs() {
-            server.filesystem.get_ignored().into()
+            server.filesystem.symlink_name_filter()
         } else {
             Default::default()
         };
@@ -75,7 +75,9 @@ mod get {
             )
             .await?;
 
-        ApiResponse::new_serialized(entries.entries).ok()
+        let capacity = entries.entries.len().saturating_mul(320).saturating_add(64);
+
+        ApiResponse::new_serialized_with_capacity(entries.entries, capacity).ok()
     }
 }
 
