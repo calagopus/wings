@@ -2719,6 +2719,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn copy_path_applies_mode_and_owner_on_the_open_file() -> Result<(), anyhow::Error> {
         use std::os::unix::fs::PermissionsExt;
 

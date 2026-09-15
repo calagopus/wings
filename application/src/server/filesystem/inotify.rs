@@ -28,7 +28,9 @@ const WATCH_FLAGS: WatchFlags = WatchFlags::ATTRIB
     .union(WatchFlags::MOVE_SELF)
     .union(WatchFlags::ONLYDIR)
     .union(WatchFlags::DONT_FOLLOW)
-    .union(WatchFlags::EXCL_UNLINK);
+    // rustix's libc backend (forced on powerpc64/s390x/mips) hardcodes EXCL_UNLINK to 1,
+    // which is IN_ACCESS, so subscribing by name turns every directory read into a modification.
+    .union(WatchFlags::from_bits_retain(0x0400_0000));
 
 struct WatchedDir {
     uuid: uuid::Uuid,
