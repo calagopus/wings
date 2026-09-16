@@ -1,0 +1,5 @@
+[build]
+pre-build = ["apt-get update && apt-get install --assume-yes --no-install-recommends unzip"]
+
+[target.aarch64-unknown-linux-musl]
+pre-build = ["apt-get update && apt-get install --assume-yes --no-install-recommends unzip lld && mkdir -p /opt/lld && ln -s /usr/bin/ld.lld /opt/lld/ld.lld"]

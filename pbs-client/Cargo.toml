@@ -24,10 +24,8 @@ crc32fast = { workspace = true }
 fastcdc = { version = "5.0.0", features = ["tokio"] }
 zstd = { workspace = true }
 hex = { workspace = true }
-tar = { workspace = true }
 siphasher = "1"
 compact_str = { workspace = true }
-positioned-io = { workspace = true }
 futures = { workspace = true }
 
 [lints.clippy]

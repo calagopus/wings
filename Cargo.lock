@@ -9,7 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d9100fb78aa3b854faf01fd9f65f7d1805c47f0f2720919a4120b0a4be0dd83"
 dependencies = [
  "http 0.2.12",
- "itertools 0.10.5",
+ "itertools",
  "mime",
  "snafu",
 ]
@@ -210,7 +210,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "synstructure",
+ "synstructure 0.13.2",
 ]
 
 [[package]]
@@ -1367,8 +1367,6 @@ checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
  "console",
  "shell-words",
- "tempfile",
- "zeroize",
 ]
 
 [[package]]
@@ -1918,7 +1916,6 @@ dependencies = [
  "core_affinity",
  "flate2",
  "flume",
- "libdeflater",
  "libz-ng-sys",
  "log",
  "num_cpus",
@@ -2542,15 +2539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2729,24 +2717,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libdeflate-sys"
-version = "1.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6949d73714ba8c32d2757405b89c94e427f64f078a4041debe07e1b8e9e850e9"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "libdeflater"
-version = "1.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b72b274104f747cb65358c918e38c6cd4a69937937a36c8ad3cfd516c9c471e"
-dependencies = [
- "libdeflate-sys",
-]
 
 [[package]]
 name = "libsqlite3-sys"
@@ -3400,7 +3370,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "positioned-io",
  "reqwest",
  "rustls",
  "rustls-platform-verifier",
@@ -3408,7 +3377,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "siphasher",
- "tar",
  "tokio",
  "tokio-rustls",
  "uuid",
@@ -3873,8 +3841,8 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
+ "aws-lc-rs",
  "pem 4.0.0",
- "ring",
  "rustls-pki-types",
  "time",
  "x509-parser",
@@ -4994,6 +4962,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "synstructure"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "901704edd0dfe137f1987838ee4f259e4e063c31371bdb423f7ae38ec6f77f02"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -6199,7 +6178,6 @@ dependencies = [
  "infer",
  "ini-roundtrip",
  "itaf",
- "itertools 0.15.0",
  "json-patch",
  "jsonwebtoken",
  "ktls",
@@ -6319,12 +6297,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser",
  "lazy_static",
  "nom",
  "oid-registry",
- "ring",
  "rusticata-macros",
  "thiserror",
  "time",
@@ -6385,14 +6363,14 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
+checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
- "synstructure",
+ "syn 3.0.5",
+ "synstructure 0.14.0",
 ]
 
 [[package]]
@@ -6444,14 +6422,14 @@ dependencies = [
 
 [[package]]
 name = "zerofrom-derive"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
+checksum = "f75b4683f6c7f45248d4d64056a24298c6281e0993356d7d1b4a1a962ef10d4a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
- "synstructure",
+ "syn 3.0.5",
+ "synstructure 0.14.0",
 ]
 
 [[package]]

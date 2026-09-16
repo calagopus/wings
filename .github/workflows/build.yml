@@ -15,8 +15,6 @@ jobs:
   dist:
     name: Dist
     runs-on: ${{ matrix.os }}
-    env:
-      CROSS_BUILD_PRE_BUILD: apt-get update && apt-get install --assume-yes --no-install-recommends unzip
     strategy:
       fail-fast: false
       matrix:
@@ -29,15 +27,19 @@ jobs:
           - build: x86_64-linux
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            link_flags: -C link-arg=-Wl,--icf=all -C link-arg=-Wl,-z,pack-relative-relocs
           - build: aarch64-linux
             os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
+            link_flags: -C link-arg=-fuse-ld=lld -C link-arg=-B/opt/lld -C link-arg=-Wl,--icf=all
           - build: riscv64-linux
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
+            link_flags: ""
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
+            link_flags: ""
 
     steps:
       - name: Checkout sources
@@ -58,7 +60,7 @@ jobs:
 
       - name: Build release binary
         run: |
-          RUSTFLAGS="-C target-feature=+crt-static" \
+          RUSTFLAGS="-C target-feature=+crt-static ${{ matrix.link_flags }}" \
           cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary with platform name
