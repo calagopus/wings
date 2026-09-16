@@ -11,6 +11,7 @@ reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", 
 tokio = { version = "1.43.0", features = ["fs", "net", "signal", "process"] }
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
+hickory-resolver = "0.26.0"
 bytes = "1"
 sha2 = "0.11.0"
 crc32fast = "1.4.2"

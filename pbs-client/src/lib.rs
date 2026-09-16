@@ -6,6 +6,7 @@ pub mod error;
 pub mod h2;
 pub mod manifest;
 pub mod naming;
+pub mod net;
 pub mod osstr;
 pub mod pxar;
 pub mod reader;

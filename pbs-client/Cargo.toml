@@ -27,6 +27,7 @@ hex = { workspace = true }
 siphasher = "1"
 compact_str = { workspace = true }
 futures = { workspace = true }
+hickory-resolver = { workspace = true }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

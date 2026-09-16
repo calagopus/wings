@@ -222,7 +222,8 @@ impl H2Transport {
             None
         };
 
-        let tcp = TcpStream::connect((target.host.as_str(), target.port))
+        let addresses = super::net::lookup_host(&target.host, target.port).await?;
+        let tcp = TcpStream::connect(addresses.as_slice())
             .await
             .map_err(transport)?;
         let stream = match tls {

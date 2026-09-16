@@ -60,7 +60,7 @@ crc32fast = { workspace = true }
 cap-std = "4.0.0"
 rustix = { version = "1.0.7", features = ["fs", "process", "net"] }
 cidr = { version = "0.3.1", features = ["serde"] }
-hickory-resolver = "0.26.0"
+hickory-resolver = { workspace = true }
 constant_time_eq = "0.6.0"
 new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
@@ -125,6 +125,9 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zstd = { workspace = true }
+
+[lints.rust]
+linker_messages = "allow"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

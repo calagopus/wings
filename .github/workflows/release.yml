@@ -72,7 +72,7 @@ jobs:
           cache-key: ${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 --locked
 
       - name: Run cargo test
         run: cross test --release --target ${{ matrix.target }}
