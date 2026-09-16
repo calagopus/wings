@@ -35,7 +35,6 @@ fn build_resolver() -> TokioResolver {
 }
 
 pub async fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, anyhow::Error> {
-    // Early return if the host is already a valid IP address
     if let Some(ip) = host_to_ip(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
