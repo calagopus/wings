@@ -35,6 +35,11 @@ fn build_resolver() -> TokioResolver {
 }
 
 pub async fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, anyhow::Error> {
+    // Early return if the host is already a valid IP address
+    if let Some(ip) = host_to_ip(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
     static RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
 
     let lookup = RESOLVER.get_or_init(build_resolver).lookup_ip(host).await?;
