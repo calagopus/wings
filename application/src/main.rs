@@ -588,6 +588,7 @@ async fn main_rt() {
         mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
             config.load().api.directory_entry_limit,
         )),
+        fingerprint_cache: crate::routes::FingerprintCache::default(),
         listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
         #[cfg(unix)]
         tundra,

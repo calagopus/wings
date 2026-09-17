@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Instant};
+use std::{ops::Deref, sync::Arc, time::Instant};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -204,6 +204,77 @@ impl MimeCache {
     }
 }
 
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+pub struct FingerprintCacheKey {
+    pub ino: u64,
+    pub dev: u64,
+    pub modified: u128,
+    pub changed: i128,
+    pub size: u64,
+    pub algorithm: u8,
+}
+
+#[cfg(unix)]
+impl FingerprintCacheKey {
+    pub fn new(metadata: &cap_std::fs::Metadata, algorithm: u8) -> Self {
+        use cap_std::fs::MetadataExt;
+
+        Self {
+            ino: metadata.ino(),
+            dev: metadata.dev(),
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos()),
+            changed: (metadata.ctime() as i128)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(metadata.ctime_nsec() as i128),
+            size: metadata.size(),
+            algorithm,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl FingerprintCacheKey {
+    pub fn new(metadata: &cap_std::fs::Metadata, algorithm: u8) -> Self {
+        Self {
+            ino: 0,
+            dev: 0,
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos()),
+            changed: 0,
+            size: metadata.len(),
+            algorithm,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct FingerprintCache(moka::future::Cache<FingerprintCacheKey, compact_str::CompactString>);
+
+impl Default for FingerprintCache {
+    fn default() -> Self {
+        Self(
+            moka::future::CacheBuilder::new(32 * 1024)
+                .time_to_live(std::time::Duration::from_mins(10))
+                .build(),
+        )
+    }
+}
+
+impl Deref for FingerprintCache {
+    type Target = moka::future::Cache<FingerprintCacheKey, compact_str::CompactString>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub fn mime_cache_capacity(directory_entry_limit: usize) -> u64 {
     const MIN: u64 = 32 * 1024;
     const MAX: u64 = 256 * 1024;
@@ -226,6 +297,7 @@ pub struct AppState {
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
     pub mime_cache: MimeCache,
+    pub fingerprint_cache: FingerprintCache,
     pub listing_work: Arc<crate::server::filesystem::listing::ListingWork>,
 
     #[cfg(unix)]
@@ -249,6 +321,7 @@ impl AppState {
                 Arc::new(crate::config::Config::mock()),
             )),
             mime_cache: MimeCache::new(mime_cache_capacity(0)),
+            fingerprint_cache: FingerprintCache::default(),
             listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
             #[cfg(unix)]
             tundra: None,

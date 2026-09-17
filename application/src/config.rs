@@ -116,6 +116,9 @@ fn api_file_decompression_threads() -> usize {
 fn api_file_compression_threads() -> usize {
     2
 }
+fn api_file_fingerprint_threads() -> usize {
+    4
+}
 fn api_upload_limit() -> MiB {
     100u64.into()
 }
@@ -784,6 +787,8 @@ nestify::nest! {
             pub file_decompression_threads: usize,
             #[serde(default = "api_file_compression_threads")]
             pub file_compression_threads: usize,
+            #[serde(default = "api_file_fingerprint_threads")]
+            pub file_fingerprint_threads: usize,
             #[serde(default = "api_upload_limit")]
             pub upload_limit: MiB,
             #[serde(default = "api_max_jwt_uses")]
