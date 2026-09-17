@@ -663,6 +663,7 @@ mod tests {
                     new.join("inner"),
                 ]
         }));
+        assert!(harness.wait_for_modified(harness.root.path()));
 
         std::fs::write(new.join("inner/file"), b"x").expect("write file");
         assert!(harness.wait_for_modified(&new.join("inner")));
