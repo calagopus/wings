@@ -202,7 +202,7 @@ fn system_backup_directory() -> SystemPath {
 fn system_tmp_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        SystemPath::new("/tmp/calagopus-wings")
+        SystemPath::new("{root_directory}/tmp")
     }
     #[cfg(windows)]
     {
@@ -1571,6 +1571,9 @@ impl Config {
         let mut inner: InnerConfig = serde_norway::from_reader(reader)
             .context(format!("failed to parse config file {path}"))?;
 
+        #[cfg(unix)]
+        let migrated_tmp_directory = Self::migrate_tmp_directory(&mut inner);
+
         Self::ensure_directories(&inner)?;
 
         let (stdout_writer, stdout_guard) =
@@ -1631,6 +1634,13 @@ impl Config {
             .with(fmt_layer)
             .try_init()
             .context("failed to install tracing subscriber")?;
+
+        #[cfg(unix)]
+        if let Some((old, new)) = migrated_tmp_directory {
+            tracing::warn!(
+                "migrated system.tmp_directory from {old} to {new}, {old} is no longer used and can be removed"
+            );
+        }
 
         let disk_check_concurrency_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
             inner.system.disk_check_concurrency,
@@ -1893,6 +1903,24 @@ impl Config {
         Ok(())
     }
 
+    /// Earlier versions defaulted the tmp directory to a path under the system `/tmp`, which is
+    /// the mount target itself in container installs. Once a cleaner on the host removes it, the
+    /// mount inside the container goes stale and wings can no longer create anything below it,
+    /// failing every installation until the container is recreated.
+    #[cfg(unix)]
+    fn migrate_tmp_directory(cfg: &mut InnerConfig) -> Option<(String, String)> {
+        const LEGACY_TMP_DIRECTORIES: [&str; 2] = ["/tmp/calagopus-wings", "/tmp/pterodactyl"];
+
+        let old = cfg.system.tmp_directory.as_str(cfg).into_owned();
+        if !LEGACY_TMP_DIRECTORIES.contains(&old.as_str()) {
+            return None;
+        }
+
+        cfg.system.tmp_directory = system_tmp_directory();
+
+        Some((old, cfg.system.tmp_directory.as_str(cfg).into_owned()))
+    }
+
     fn ensure_directories(cfg: &InnerConfig) -> std::io::Result<()> {
         let directories = vec![
             &cfg.system.root_directory,
@@ -2149,6 +2177,51 @@ impl Config {
     pub fn tmp_data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
         self.resolve_as_path(|cfg| &cfg.system.tmp_directory)
             .join(server_uuid.to_compact_string())
+    }
+
+    /// Removes leftovers of previous runs, being the staging directories of installations that
+    /// are not going to be restored and binaries extracted by other wings versions.
+    pub async fn cleanup_tmp_directory(&self) {
+        let installing: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(
+                self.resolve_as_path(|cfg| &cfg.system.root_directory)
+                    .join("installing.json"),
+            )
+            .await
+            .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+
+        let mut entries = match tokio::fs::read_dir(
+            self.resolve_as_path(|cfg| &cfg.system.tmp_directory),
+        )
+        .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| installing.get(name).is_some())
+            {
+                continue;
+            }
+
+            if entry
+                .file_type()
+                .await
+                .is_ok_and(|file_type| file_type.is_dir())
+            {
+                tokio::fs::remove_dir_all(&path).await.ok();
+            } else {
+                tokio::fs::remove_file(&path).await.ok();
+            }
+        }
     }
 
     pub fn daemon_prelude(&self) -> compact_str::CompactString {

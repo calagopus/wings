@@ -158,6 +158,11 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     "backup directory",
                     &config.system.backup_directory.as_str(&config),
                 )?;
+                write_line(
+                    &mut output,
+                    "tmp directory",
+                    &config.system.tmp_directory.as_str(&config),
+                )?;
                 writeln!(output)?;
                 write_line(&mut output, "username", &config.system.username)?;
                 write_line(

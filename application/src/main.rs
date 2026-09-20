@@ -523,6 +523,9 @@ async fn main_rt() {
         Err(err) => exit_error!("failed to reset remote state: {:?}", err),
     }
 
+    tracing::info!("cleaning up stale temporary files from previous runs");
+    config.cleanup_tmp_directory().await;
+
     if config.load().system.disk_limiter_mode
         == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
     {
