@@ -1443,7 +1443,6 @@ impl BackupExt for ResticBackup {
             .arg(&self.short_id)
             .arg("--group-by")
             .arg("tags")
-            .arg("--prune")
             .output()
             .await?;
 
