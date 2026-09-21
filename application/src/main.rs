@@ -52,6 +52,7 @@ const TARGET: &str = env!("CARGO_TARGET");
 
 /// 32 KiB - used for general IO
 const BUFFER_SIZE: usize = 32 * 1024;
+const FILE_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 /// 4 MiB - used for transfers
 const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// 4 KiB - used for WebSocket read buffer

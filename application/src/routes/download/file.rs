@@ -196,12 +196,14 @@ mod get {
             AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize);
 
         if file_read.reader_range.is_some() {
-            ApiResponse::new_stream(reader)
+            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
                 .with_headers(headers)
                 .with_status(StatusCode::PARTIAL_CONTENT)
                 .ok()
         } else {
-            ApiResponse::new_stream(reader).with_headers(headers).ok()
+            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
+                .with_headers(headers)
+                .ok()
         }
     }
 }

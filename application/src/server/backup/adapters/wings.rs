@@ -648,13 +648,14 @@ impl BackupExt for WingsBackup {
                 range.get_header_value(metadata.len()),
             );
 
-            ApiResponse::new_stream(reader)
+            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
                 .with_headers(headers)
                 .with_status(StatusCode::PARTIAL_CONTENT)
         } else {
             headers.insert(axum::http::header::CONTENT_LENGTH, metadata.len().into());
 
-            ApiResponse::new_stream(file).with_headers(headers)
+            ApiResponse::new_stream_with_capacity(file, crate::FILE_STREAM_BUFFER_SIZE)
+                .with_headers(headers)
         })
     }
 

@@ -193,6 +193,26 @@ mod ktls {
         }
 
         #[inline]
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Self::Ktls(stream) => Pin::new(stream.get_mut()).poll_write_vectored(cx, bufs),
+                Self::Rustls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
+            }
+        }
+
+        #[inline]
+        fn is_write_vectored(&self) -> bool {
+            match self {
+                Self::Ktls(stream) => stream.get_ref().is_write_vectored(),
+                Self::Rustls(stream) => stream.is_write_vectored(),
+            }
+        }
+
+        #[inline]
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.get_mut() {
                 Self::Ktls(stream) => Pin::new(stream).poll_flush(cx),

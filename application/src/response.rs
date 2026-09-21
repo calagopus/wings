@@ -34,10 +34,17 @@ impl ApiResponse {
 
     #[inline]
     pub fn new_stream(stream: impl tokio::io::AsyncRead + Send + 'static) -> Self {
+        Self::new_stream_with_capacity(stream, crate::BUFFER_SIZE)
+    }
+
+    #[inline]
+    pub fn new_stream_with_capacity(
+        stream: impl tokio::io::AsyncRead + Send + 'static,
+        capacity: usize,
+    ) -> Self {
         Self {
             body: axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-                stream,
-                crate::BUFFER_SIZE,
+                stream, capacity,
             )),
             status: axum::http::StatusCode::OK,
             headers: axum::http::HeaderMap::new(),

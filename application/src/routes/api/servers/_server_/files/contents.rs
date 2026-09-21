@@ -246,7 +246,9 @@ mod get {
             Box::new(reader)
         };
 
-        ApiResponse::new_stream(reader).with_headers(headers).ok()
+        ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
+            .with_headers(headers)
+            .ok()
     }
 }
 
