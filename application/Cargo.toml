@@ -104,10 +104,8 @@ croner = { version = "4.0.0", features = ["serde"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 time = "0.3.55"
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-tikv-jemallocator = "0.6.0"
-
 [target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6.0"
 ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26.4"
 
@@ -117,7 +115,7 @@ libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
 [dev-dependencies]
 tokio-test = "0.4.5"
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 tikv-jemalloc-ctl = "0.6.0"
 
 [build-dependencies]

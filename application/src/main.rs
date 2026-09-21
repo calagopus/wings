@@ -164,14 +164,14 @@ macro_rules! exit_error {
     };
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 const MALLOC_CONF: &std::ffi::CStr = c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4,tcache_nslots_small_max:20,tcache_max:4096";
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static MALLOC_CONF_PTR: Option<&'static std::ffi::c_char> =
     // SAFETY: MALLOC_CONF is a 'static nul-terminated C string, which is what
@@ -1067,7 +1067,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn malloc_conf_is_applied() {
         use tikv_jemalloc_ctl::raw;
