@@ -1,5 +1,9 @@
 [build]
 pre-build = ["apt-get update && apt-get install --assume-yes --no-install-recommends unzip"]
+# jemalloc bakes its page size in at configure time; the workflows set this per target
+# (16 = 64 KiB) so aarch64/ppc64le binaries also boot on 16K and 64K page kernels.
+[build.env]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE"]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = ["apt-get update && apt-get install --assume-yes --no-install-recommends unzip lld && mkdir -p /opt/lld && ln -s /usr/bin/ld.lld /opt/lld/ld.lld"]

@@ -27,18 +27,22 @@ jobs:
           - build: x86_64-linux
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            jemalloc_lg_page: 12
             link_flags: -C link-arg=-Wl,--icf=all -C link-arg=-Wl,-z,pack-relative-relocs
           - build: aarch64-linux
             os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
+            jemalloc_lg_page: 16
             link_flags: -C link-arg=-fuse-ld=lld -C link-arg=-B/opt/lld -C link-arg=-Wl,--icf=all
           - build: riscv64-linux
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
+            jemalloc_lg_page: 12
             link_flags: ""
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
+            jemalloc_lg_page: 16
             link_flags: ""
 
     steps:
@@ -57,11 +61,15 @@ jobs:
 
       - name: Run cargo test
         run: cross test --release --target ${{ matrix.target }}
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
 
       - name: Build release binary
         run: |
           RUSTFLAGS="-C target-feature=+crt-static ${{ matrix.link_flags }}" \
           cross build --release --target ${{ matrix.target }}
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
 
       - name: Prepare binary with platform name
         run: |
