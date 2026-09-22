@@ -18,6 +18,8 @@ mod post {
         truncate_directory: bool,
         #[serde(default)]
         installation_script: Option<InstallationScript>,
+        #[serde(default)]
+        start_on_completion: bool,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -42,6 +44,7 @@ mod post {
             Err(_) => Payload {
                 truncate_directory: false,
                 installation_script: None,
+                start_on_completion: false,
             },
         };
 
@@ -72,6 +75,7 @@ mod post {
             crate::server::installation::ServerInstaller::new(
                 &server,
                 true,
+                data.start_on_completion,
                 data.installation_script,
             )
             .await,

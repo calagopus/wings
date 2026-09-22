@@ -147,6 +147,7 @@ impl ServerManager {
                             super::installation::ServerInstaller::new(
                                 &server,
                                 reinstall,
+                                false,
                                 Some(container_script),
                             )
                             .await,
@@ -317,7 +318,8 @@ impl ServerManager {
 
                     async move {
                         let mut installer = Arc::new(
-                            super::installation::ServerInstaller::new(&server, false, None).await,
+                            super::installation::ServerInstaller::new(&server, false, false, None)
+                                .await,
                         );
 
                         if let Err(err) = installer.start(false).await {
@@ -338,7 +340,8 @@ impl ServerManager {
 
                     async move {
                         let installer =
-                            super::installation::ServerInstaller::new(&server, false, None).await;
+                            super::installation::ServerInstaller::new(&server, false, false, None)
+                                .await;
 
                         installer.unset_installing(true).await.ok();
                     }

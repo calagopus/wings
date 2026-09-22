@@ -30,6 +30,7 @@ const INSTALL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from
 
 pub struct ServerInstaller {
     pub reinstall: bool,
+    start_on_completion: bool,
     environment: Vec<String>,
     server: super::Server,
     installation_script: Option<Arc<InstallationScript>>,
@@ -44,10 +45,12 @@ impl ServerInstaller {
     pub async fn new(
         server: &super::Server,
         reinstall: bool,
+        start_on_completion: bool,
         installation_script: Option<InstallationScript>,
     ) -> Self {
         Self {
             reinstall,
+            start_on_completion,
             environment: server
                 .configuration
                 .read()
@@ -328,19 +331,20 @@ impl ServerInstaller {
         )?;
 
         if successful
-            && !self.reinstall
-            && self
-                .server
-                .configuration
-                .read()
-                .await
-                .start_on_completion
-                .is_some_and(|s| s)
+            && (self.start_on_completion
+                || (!self.reinstall
+                    && self
+                        .server
+                        .configuration
+                        .read()
+                        .await
+                        .start_on_completion
+                        .is_some_and(|s| s)))
             && let Err(err) = self.server.start(None, false).await
         {
             tracing::error!(
                 server = %self.server.uuid,
-                "failed to start server after initial install: {}",
+                "failed to start server after install: {}",
                 err
             );
         }
