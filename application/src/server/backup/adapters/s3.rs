@@ -338,7 +338,7 @@ impl S3Backup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         part_size: u64,
         initial_urls: Vec<String>,
     ) -> Result<RawServerBackup, anyhow::Error> {
@@ -491,7 +491,7 @@ impl S3Backup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let file_name = Self::get_file_name(&server.app_state.config, uuid);
         let mut file = tokio::fs::OpenOptions::new()
@@ -759,7 +759,7 @@ impl BackupCreateExt for S3Backup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         match server

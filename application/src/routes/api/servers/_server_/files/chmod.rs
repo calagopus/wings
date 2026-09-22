@@ -119,7 +119,7 @@ mod post {
 
                     let walker = async {
                         let mut walker = filesystem
-                            .async_walk_dir(&source, vec![server.filesystem.get_ignored()].into())
+                            .async_walk_dir(&source, server.filesystem.get_ignored().into())
                             .await?;
 
                         walker

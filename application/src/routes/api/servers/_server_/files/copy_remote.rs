@@ -119,7 +119,7 @@ mod post {
         if filesystem.is_primary_server_fs()
             && server
                 .filesystem
-                .async_is_ignored(&root, FileType::Dir)
+                .async_is_ignored_subtree(&root, FileType::Dir)
                 .await
         {
             return ApiResponse::error("path not found")
@@ -169,11 +169,8 @@ mod post {
 
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-            let ignored = vec![
-                server.filesystem.get_ignored(),
-                destination_server.filesystem.get_ignored(),
-            ];
-            let mut ignored = IsIgnoredFn::from(ignored);
+            let mut ignored = IsIgnoredFn::from(server.filesystem.get_ignored())
+                .merge(destination_server.filesystem.get_ignored().into());
             if let Some(source_ignored) = source_ignored.filter(&server) {
                 ignored = ignored.merge(source_ignored);
             }

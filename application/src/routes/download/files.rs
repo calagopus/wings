@@ -5,7 +5,10 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::archive::{StreamableArchiveFormat, generated_archive_name},
+        server::filesystem::{
+            archive::{StreamableArchiveFormat, generated_archive_name},
+            ignore_list::IgnoreList,
+        },
     };
     use axum::{
         extract::Query,
@@ -37,12 +40,12 @@ mod get {
     }
 
     impl FilesJwtPayload {
-        fn ignored(&self) -> Result<Option<ignore::gitignore::Gitignore>, ignore::Error> {
+        fn ignored(&self) -> Result<Option<IgnoreList>, ignore::Error> {
             if self.ignored_files.is_empty() {
                 return Ok(None);
             }
 
-            crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).map(Some)
+            IgnoreList::try_from_lines(self.ignored_files.iter()).map(Some)
         }
     }
 

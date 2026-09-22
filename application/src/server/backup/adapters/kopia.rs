@@ -40,6 +40,8 @@ use std::{
 use tokio::io::AsyncBufReadExt;
 
 const BACKUP_UUID_TAG: &str = "backup-uuid";
+/// Ignore rules per `policy set` call, well under the argument length limit.
+const KOPIA_IGNORE_BATCH: usize = 500;
 const MAX_TREE_DEPTH: usize = 1024;
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +113,18 @@ impl KopiaBackup {
         remote: &KopiaBackupConfiguration,
     ) -> PathBuf {
         Self::get_kopia_state_path(config).join(format!("{}.cache", Self::repository_slug(remote)))
+    }
+
+    async fn apply_policy(mut policy: tokio::process::Command, uuid: uuid::Uuid) {
+        if let Ok(output) = policy.output().await
+            && !output.status.success()
+        {
+            tracing::warn!(
+                "failed to apply ignore policy for Kopia backup {}: {}",
+                uuid,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     fn get_tokio_command(
@@ -330,7 +344,7 @@ impl BackupCreateExt for KopiaBackup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = server
@@ -375,27 +389,48 @@ impl BackupCreateExt for KopiaBackup {
             }
         };
 
-        let ignore_lines: Vec<&str> = ignore_raw
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
-        if !ignore_lines.is_empty() {
-            let mut policy = Self::get_tokio_command(&config_file, &remote);
-            policy.arg("policy").arg("set").arg(&source_path);
-            for line in &ignore_lines {
-                policy.arg("--add-ignore").arg(line);
-            }
-
-            if let Ok(output) = policy.output().await
-                && !output.status.success()
-            {
+        // kopia has no re-includes, so a list that needs them is handed the exact
+        // entries to leave out instead, anchored at the snapshot root
+        let ignore_lines: Vec<String> = if ignore.has_reincludes() {
+            let filesystem = server.filesystem.clone();
+            let ignore = ignore.clone();
+            let frontier =
+                tokio::task::spawn_blocking(move || ignore.exclusion_frontier(&filesystem))
+                    .await??;
+            if frontier.len() > super::EXCLUSION_FRONTIER_WARN {
                 tracing::warn!(
-                    "failed to apply ignore policy for Kopia backup {}: {}",
+                    server = %server.uuid,
+                    "kopia backup {} excludes {} entries one by one, expect a slow scan",
                     uuid,
-                    String::from_utf8_lossy(&output.stderr)
+                    frontier.len()
                 );
             }
+
+            frontier
+                .iter()
+                .map(|path| format!("/{}", super::glob_literal(path)))
+                .collect()
+        } else {
+            ignore_raw.lines().map(str::to_string).collect()
+        };
+
+        // the policy keeps the previous backup's rules, and clearing does not combine
+        // with adding in one call
+        let mut policy = Self::get_tokio_command(&config_file, &remote);
+        policy
+            .arg("policy")
+            .arg("set")
+            .arg(&source_path)
+            .arg("--clear-ignore");
+        Self::apply_policy(policy, uuid).await;
+
+        for batch in ignore_lines.chunks(KOPIA_IGNORE_BATCH) {
+            let mut policy = Self::get_tokio_command(&config_file, &remote);
+            policy.arg("policy").arg("set").arg(&source_path);
+            for line in batch {
+                policy.arg("--add-ignore").arg(line);
+            }
+            Self::apply_policy(policy, uuid).await;
         }
 
         let mut command = Self::get_tokio_command(&config_file, &remote);
@@ -1245,7 +1280,7 @@ impl VirtualKopiaBackup {
                     continue;
                 }
                 let child_path = rel.join(name.as_str());
-                if let Some(filtered) = (is_ignored)(entry.file_type, child_path) {
+                if let Some(filtered) = (is_ignored)(entry.file_type, child_path).keep() {
                     out.push((entry.file_type, filtered, entry.oid.clone()));
                 }
             }
@@ -1255,7 +1290,7 @@ impl VirtualKopiaBackup {
                     continue;
                 }
                 let child_path = rel.join(name.as_str());
-                if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                     out.push((FileType::Dir, filtered, String::new()));
                 }
                 self.flatten_walk(
@@ -1307,7 +1342,7 @@ impl VirtualKopiaBackup {
                 continue;
             }
             let child_path = rel.join(name.as_str());
-            if let Some(filtered) = (is_ignored)(entry.file_type, child_path) {
+            if let Some(filtered) = (is_ignored)(entry.file_type, child_path).keep() {
                 out.push((entry.file_type, filtered, entry.oid.clone()));
             }
         }
@@ -1317,7 +1352,7 @@ impl VirtualKopiaBackup {
                 continue;
             }
             let child_path = rel.join(name.as_str());
-            if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+            if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                 out.push((FileType::Dir, filtered, String::new()));
             }
             self.flatten_walk_blocking(
@@ -1440,6 +1475,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
             let child_path = match is_ignored
                 .call_async(entry.file_type, path.join(name.as_str()))
                 .await
+                .keep()
             {
                 Some(kept) => kept,
                 None => continue,
@@ -1626,7 +1662,8 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                             _ => continue,
                         };
 
-                        let Some(entry_path) = (is_ignored)(file_type, base.join(&relative)) else {
+                        let Some(entry_path) = (is_ignored)(file_type, base.join(&relative)).keep()
+                        else {
                             continue;
                         };
 
@@ -1824,7 +1861,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                         };
 
                         let absolute_path = base_path.join(&relative);
-                        if (is_ignored)(file_type, absolute_path).is_none() {
+                        if (is_ignored)(file_type, absolute_path).keep().is_none() {
                             continue;
                         }
 
@@ -1914,7 +1951,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                         };
 
                         let absolute_path = base_path.join(&relative);
-                        if (is_ignored)(file_type, absolute_path).is_none() {
+                        if (is_ignored)(file_type, absolute_path).keep().is_none() {
                             continue;
                         }
 

@@ -1,4 +1,4 @@
-use crate::server::filesystem::{cap::FileType, uploads::ignore_match_path};
+use crate::server::filesystem::{cap::FileType, ignore_list::IgnoreList};
 use parking_lot::Mutex;
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -101,7 +101,7 @@ impl Permission {
 /// path is hidden" hands the subuser exactly the files the list was written to hide.
 enum IgnoredFiles {
     Unrestricted,
-    Matcher(ignore::overrides::Override),
+    Matcher(IgnoreList),
     Unusable,
 }
 
@@ -111,21 +111,8 @@ impl IgnoredFiles {
             return Self::Unrestricted;
         }
 
-        let mut builder = ignore::overrides::OverrideBuilder::new("");
-        for pattern in patterns {
-            if let Err(err) = builder.add(pattern.as_ref()) {
-                tracing::error!(
-                    "rejecting subuser ignored files, {} is not a valid pattern: {:#?}",
-                    pattern.as_ref(),
-                    err
-                );
-
-                return Self::Unusable;
-            }
-        }
-
-        match builder.build() {
-            Ok(overrides) => Self::Matcher(overrides),
+        match IgnoreList::try_from_lines(patterns) {
+            Ok(list) => Self::Matcher(list),
             Err(err) => {
                 tracing::error!(
                     "rejecting subuser ignored files, cannot compile: {:#?}",
@@ -137,12 +124,10 @@ impl IgnoredFiles {
         }
     }
 
-    fn matches(&self, path: std::path::PathBuf, is_dir: bool) -> bool {
+    fn matches(&self, path: std::path::PathBuf, file_type: FileType) -> bool {
         match self {
             Self::Unrestricted => false,
-            Self::Matcher(overrides) => overrides
-                .matched(ignore_match_path(&path), is_dir)
-                .is_whitelist(),
+            Self::Matcher(list) => list.is_ignored(&path, file_type),
             Self::Unusable => true,
         }
     }
@@ -285,7 +270,7 @@ impl UserPermissionsMap {
         if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
             *last_access = std::time::Instant::now();
 
-            ignored.matches(path, file_type.is_dir())
+            ignored.matches(path, file_type)
         } else {
             false
         }

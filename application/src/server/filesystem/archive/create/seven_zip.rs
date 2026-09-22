@@ -5,7 +5,7 @@ use crate::{
         compression::CompressionLevel,
         fixed_reader::FixedReader,
     },
-    server::filesystem::{archive::Archive, virtualfs::IsIgnoredFn},
+    server::filesystem::{archive::Archive, cap::FileType, virtualfs::IsIgnoredFn},
 };
 use sevenz_rust2::{
     EncoderConfiguration, EncoderMethod, NtTime,
@@ -61,7 +61,10 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                 }
             };
 
-            let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
+            let file_type: FileType = source_metadata.file_type().into();
+            let verdict = (is_ignored)(file_type, source);
+            let kept = verdict.is_kept();
+            let Some(source) = verdict.reachable(file_type) else {
                 continue;
             };
 
@@ -73,10 +76,12 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                 .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
 
             if source_metadata.is_dir() {
-                if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                    directory_entries.push((relative.to_path_buf(), mtime, ctime));
+                if kept {
+                    if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
+                        directory_entries.push((relative.to_path_buf(), mtime, ctime));
+                    }
+                    progress.increment_bytes(source_metadata.len());
                 }
-                progress.increment_bytes(source_metadata.len());
 
                 let mut walker = filesystem
                     .walk_dir(source)?

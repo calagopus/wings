@@ -1,9 +1,12 @@
 use crate::{
     routes::{MimeCacheKey, MimeCacheValue},
     server::{
-        filesystem::virtualfs::{
-            AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
-            VirtualWritableFilesystem,
+        filesystem::{
+            ignore_list::IgnoreList,
+            virtualfs::{
+                AsyncDirectoryStreamWalkFn, IgnoreVerdict, IsIgnoredFn, VirtualReadableFilesystem,
+                VirtualWritableFilesystem,
+            },
         },
         resources::ResourceUsageWatchExt,
     },
@@ -31,6 +34,7 @@ pub mod archive;
 pub mod cap;
 pub mod disk_checker;
 pub mod file;
+pub mod ignore_list;
 pub mod inotify;
 pub mod limiter;
 pub mod listing;
@@ -41,39 +45,23 @@ pub mod uploads;
 pub mod usage;
 pub mod virtualfs;
 
-pub fn build_gitignore_matcher<S: AsRef<str>>(
-    lines: impl Iterator<Item = S>,
-) -> Result<ignore::gitignore::Gitignore, ignore::Error> {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new("");
-    for line in lines {
-        builder.add_line(None, line.as_ref()).ok();
-    }
-
-    builder.build()
-}
-
 /// A subuser deny-list carried on a single panel request.
 ///
 /// The panel checks the paths it was handed before calling, but it cannot see file
 /// types, symlink targets, or the entries inside a directory it names, so the list is
 /// applied again here.
 #[derive(Default, Clone)]
-pub struct RequestIgnored(Option<Arc<ignore::gitignore::Gitignore>>);
+pub struct RequestIgnored(Option<IgnoreList>);
 
 impl RequestIgnored {
-    /// Unlike [`build_gitignore_matcher`], an unusable pattern is an error rather than a
-    /// dropped line: a deny-list that compiles to nothing hides nothing.
+    /// Unlike [`IgnoreList::from_lines`], an unusable pattern is an error rather than
+    /// a dropped line: a deny-list that compiles to nothing hides nothing.
     pub fn compile<S: AsRef<str>>(patterns: &[S]) -> Result<Self, ignore::Error> {
         if patterns.is_empty() {
             return Ok(Self(None));
         }
 
-        let mut builder = ignore::gitignore::GitignoreBuilder::new("");
-        for pattern in patterns {
-            builder.add_line(None, pattern.as_ref())?;
-        }
-
-        Ok(Self(Some(Arc::new(builder.build()?))))
+        Ok(Self(Some(IgnoreList::try_from_lines(patterns)?)))
     }
 
     pub async fn is_ignored(
@@ -96,7 +84,7 @@ impl RequestIgnored {
     pub fn filter(&self, server: &crate::server::Server) -> Option<IsIgnoredFn> {
         self.0
             .as_ref()
-            .map(|matcher| Filesystem::subuser_deny_filter(server, Arc::clone(matcher)))
+            .map(|matcher| Filesystem::subuser_deny_filter(server, matcher.clone()))
     }
 }
 
@@ -185,7 +173,7 @@ pub struct Filesystem {
     pub disk_usage: Arc<RwLock<usage::DiskUsage>>,
     pub last_disk_check: Arc<AtomicU64>,
     pub disk_check_completed: Arc<tokio::sync::Notify>,
-    disk_ignored: arc_swap::ArcSwap<ignore::gitignore::Gitignore>,
+    disk_ignored: arc_swap::ArcSwap<IgnoreList>,
 
     pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
     pub pulls: RwLock<HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>>,
@@ -211,8 +199,8 @@ impl Filesystem {
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
         let disk_usage_cached_logical = Arc::new(AtomicU64::new(0));
         let disk_usage_cached_physical = Arc::new(AtomicU64::new(0));
-        let disk_ignored = build_gitignore_matcher(deny_list.iter())
-            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+        let disk_ignored =
+            IgnoreList::from_lines(deny_list.iter()).unwrap_or_else(|_| IgnoreList::empty());
 
         let cap_filesystem = cap::CapFilesystem::new_uninitialized(&base_path);
         let server_notifier = inotify::InotifyServerNotifier::new(
@@ -297,43 +285,29 @@ impl Filesystem {
     }
 
     pub async fn update_ignored(&self, deny_list: &[impl AsRef<str>]) {
-        if let Ok(disk_ignored) = build_gitignore_matcher(deny_list.iter()) {
+        if let Ok(disk_ignored) = IgnoreList::from_lines(deny_list.iter()) {
             self.disk_ignored.store(Arc::new(disk_ignored));
         }
     }
 
-    fn subuser_deny_filter(
-        server: &crate::server::Server,
-        matcher: Arc<ignore::gitignore::Gitignore>,
-    ) -> IsIgnoredFn {
+    fn subuser_deny_filter(server: &crate::server::Server, matcher: IgnoreList) -> IsIgnoredFn {
         let (sync_server, async_server) = (server.clone(), server.clone());
-        let async_matcher = Arc::clone(&matcher);
+        let async_matcher = matcher.clone();
 
         IsIgnoredFn::new(
             move |file_type, path: PathBuf| {
-                if sync_server
-                    .filesystem
-                    .is_subuser_ignored(&matcher, &path, file_type)
-                {
-                    None
-                } else {
-                    Some(path)
-                }
+                let match_path = sync_server.filesystem.rematched(&path, file_type);
+
+                Self::judge(&matcher, file_type, match_path, path)
             },
             move |file_type, path: PathBuf| {
                 let server = async_server.clone();
-                let matcher = Arc::clone(&async_matcher);
+                let matcher = async_matcher.clone();
 
                 async move {
-                    if server
-                        .filesystem
-                        .async_is_subuser_ignored(&matcher, &path, file_type)
-                        .await
-                    {
-                        None
-                    } else {
-                        Some(path)
-                    }
+                    let match_path = server.filesystem.async_rematched(&path, file_type).await;
+
+                    Self::judge(&matcher, file_type, match_path, path)
                 }
             },
         )
@@ -344,24 +318,52 @@ impl Filesystem {
 
         IsIgnoredFn::new(
             move |file_type, path: PathBuf| {
-                if sync_server.filesystem.is_ignored(&path, file_type) {
-                    None
-                } else {
-                    Some(path)
-                }
+                let matcher = sync_server.filesystem.disk_ignored.load();
+                let match_path = sync_server.filesystem.rematched(&path, file_type);
+
+                Self::judge(&matcher, file_type, match_path, path)
             },
             move |file_type, path: PathBuf| {
                 let server = async_server.clone();
 
                 async move {
-                    if server.filesystem.async_is_ignored(&path, file_type).await {
-                        None
-                    } else {
-                        Some(path)
-                    }
+                    let matcher = server.filesystem.disk_ignored.load();
+                    let match_path = server.filesystem.async_rematched(&path, file_type).await;
+
+                    Self::judge(&matcher, file_type, match_path, path)
                 }
             },
         )
+    }
+
+    /// The path an entry is matched as when that differs from the path itself: made
+    /// relative, or a symlink's resolved target.
+    fn rematched(&self, path: &Path, file_type: cap::FileType) -> Option<PathBuf> {
+        match self.ignore_path(path, file_type) {
+            Cow::Borrowed(same) if same == path => None,
+            Cow::Borrowed(other) => Some(other.to_path_buf()),
+            Cow::Owned(other) => Some(other),
+        }
+    }
+
+    async fn async_rematched(&self, path: &Path, file_type: cap::FileType) -> Option<PathBuf> {
+        match self.async_ignore_path(path, file_type).await {
+            Cow::Borrowed(same) if same == path => None,
+            Cow::Borrowed(other) => Some(other.to_path_buf()),
+            Cow::Owned(other) => Some(other),
+        }
+    }
+
+    fn judge(
+        matcher: &IgnoreList,
+        file_type: cap::FileType,
+        match_path: Option<PathBuf>,
+        path: PathBuf,
+    ) -> IgnoreVerdict {
+        match match_path {
+            Some(match_path) => matcher.verdict_as(file_type, &match_path, path),
+            None => matcher.verdict(file_type, path),
+        }
     }
 
     pub async fn probe_file_type(&self, path: impl AsRef<Path>) -> cap::FileType {
@@ -377,7 +379,7 @@ impl Filesystem {
             return false;
         }
 
-        Self::matches_ignore(&disk_ignored, &self.ignore_path(path, file_type), file_type)
+        disk_ignored.is_ignored(&self.ignore_path(path, file_type), file_type)
     }
 
     pub async fn async_is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
@@ -387,29 +389,31 @@ impl Filesystem {
 
         let path = self.async_ignore_path(path, file_type).await;
 
-        Self::matches_ignore(&self.disk_ignored.load(), &path, file_type)
+        self.disk_ignored.load().is_ignored(&path, file_type)
     }
 
-    pub fn is_subuser_ignored(
-        &self,
-        matcher: &ignore::gitignore::Gitignore,
-        path: &Path,
-        file_type: cap::FileType,
-    ) -> bool {
-        Self::matches_ignore(matcher, &self.ignore_path(path, file_type), file_type)
+    /// Like [`Self::async_is_ignored`], but false for a directory the denylist only
+    /// excludes while re-including something beneath it, so that a re-included
+    /// entry can still be created or reached through it.
+    pub async fn async_is_ignored_subtree(&self, path: &Path, file_type: cap::FileType) -> bool {
+        if self.disk_ignored.load().is_empty() {
+            return false;
+        }
+
+        let path = self.async_ignore_path(path, file_type).await;
+
+        self.disk_ignored
+            .load()
+            .is_ignored_subtree(&path, file_type)
     }
 
     pub async fn async_is_subuser_ignored(
         &self,
-        matcher: &ignore::gitignore::Gitignore,
+        matcher: &IgnoreList,
         path: &Path,
         file_type: cap::FileType,
     ) -> bool {
-        Self::matches_ignore(
-            matcher,
-            &self.async_ignore_path(path, file_type).await,
-            file_type,
-        )
+        matcher.is_ignored(&self.async_ignore_path(path, file_type).await, file_type)
     }
 
     fn ignore_path<'a>(&self, path: &'a Path, file_type: cap::FileType) -> Cow<'a, Path> {
@@ -439,21 +443,7 @@ impl Filesystem {
         }
     }
 
-    fn matches_ignore(
-        matcher: &ignore::gitignore::Gitignore,
-        path: &Path,
-        file_type: cap::FileType,
-    ) -> bool {
-        if path.as_os_str().is_empty() {
-            return false;
-        }
-
-        matcher
-            .matched(uploads::ignore_match_path(path), file_type.is_dir())
-            .is_ignore()
-    }
-
-    pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
+    pub fn get_ignored(&self) -> IgnoreList {
         (**self.disk_ignored.load()).clone()
     }
 
@@ -462,14 +452,10 @@ impl Filesystem {
 
         IsIgnoredFn::from(move |file_type: cap::FileType, path: PathBuf| {
             if !file_type.is_symlink() {
-                return Some(path);
+                return IgnoreVerdict::Keep(path);
             }
 
-            let ignored = matcher
-                .matched(uploads::ignore_match_path(&path), file_type.is_dir())
-                .is_ignore();
-
-            if ignored { None } else { Some(path) }
+            matcher.verdict(file_type, path)
         })
     }
 

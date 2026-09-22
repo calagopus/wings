@@ -66,15 +66,13 @@ impl ZfsBackup {
     pub async fn get_ignore(
         config: &crate::config::Config,
         uuid: uuid::Uuid,
-    ) -> Result<ignore::gitignore::Gitignore, anyhow::Error> {
+    ) -> Result<crate::server::filesystem::ignore_list::IgnoreList, anyhow::Error> {
         let ignored_path = Self::get_ignore_path(config, uuid);
         let ignore_content = tokio::fs::read_to_string(&ignored_path)
             .await
             .unwrap_or_default();
 
-        Ok(crate::server::filesystem::build_gitignore_matcher(
-            ignore_content.lines(),
-        )?)
+        Ok(crate::server::filesystem::ignore_list::IgnoreList::from_lines(ignore_content.lines())?)
     }
 
     async fn destroy_snapshot(target: &str) -> Result<(), anyhow::Error> {
@@ -163,7 +161,7 @@ impl BackupCreateExt for ZfsBackup {
         uuid: uuid::Uuid,
         _progress: crate::server::filesystem::archive::create::ArchiveProgress,
         _total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let backup_path = Self::get_backup_path(&server.app_state.config, uuid);

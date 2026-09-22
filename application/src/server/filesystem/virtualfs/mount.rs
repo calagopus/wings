@@ -297,7 +297,10 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
                 listing_path.join(&next_comp)
             };
 
-            if let Some(virtual_path) = is_ignored.call_async(FileType::Dir, virtual_path).await
+            if let Some(virtual_path) = is_ignored
+                .call_async(FileType::Dir, virtual_path)
+                .await
+                .keep()
                 && !self
                     .inner
                     .async_is_denied(FileType::Dir, &virtual_path)

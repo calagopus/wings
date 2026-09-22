@@ -12,7 +12,7 @@ use crate::{
 use axum::http::{HeaderMap, HeaderValue};
 pub use functions::{
     AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, DirectoryWalkFilterFn, DirectoryWalkFn,
-    IsIgnoredFn,
+    IgnoreVerdict, IsIgnoredFn,
 };
 use std::{
     ops::Bound,
@@ -648,7 +648,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
             if file_paths.iter().any(|p| stripped_path.starts_with(p)) {
                 is_ignored(file_type, path)
             } else {
-                None
+                IgnoreVerdict::Skip
             }
         };
         self.async_walk_dir(path, IsIgnoredFn::from(is_ignored))
@@ -671,7 +671,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
             if file_paths.iter().any(|p| stripped_path.starts_with(p)) {
                 is_ignored(file_type, path)
             } else {
-                None
+                IgnoreVerdict::Skip
             }
         };
         self.async_walk_dir_stream(path, IsIgnoredFn::from(is_ignored))
@@ -720,7 +720,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
             if file_paths.iter().any(|p| stripped_path.starts_with(p)) {
                 is_ignored(file_type, path)
             } else {
-                None
+                IgnoreVerdict::Skip
             }
         };
         self.async_read_dir_archive(

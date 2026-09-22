@@ -495,7 +495,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             (archive_created, archive_created)
                         };
 
-                        let Some(filtered_name) = (is_ignored)(FileType::Dir, child_path) else {
+                        let Some(filtered_name) = (is_ignored)(FileType::Dir, child_path).keep()
+                        else {
                             continue;
                         };
 
@@ -531,7 +532,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     }
 
                     let file_type = Self::zip_entry_to_file_type(&entry);
-                    let Some(filtered_name) = (is_ignored)(file_type, name) else {
+                    let Some(filtered_name) = (is_ignored)(file_type, name).keep() else {
                         continue;
                     };
 
@@ -650,7 +651,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()).keep() {
                         return Some(Ok((file_type, name)));
                     }
                 }
@@ -699,6 +700,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         .is_ignored
                         .call_async(file_type, name.to_path_buf())
                         .await
+                        .keep()
                     {
                         return Some(Ok((file_type, name)));
                     }
@@ -749,7 +751,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
 
-                    if let Some(name) = self.is_ignored.call_async(file_type, name).await {
+                    if let Some(name) = self.is_ignored.call_async(file_type, name).await.keep() {
                         if entry.is_file() {
                             let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
                             let (reader, signal) =
@@ -940,6 +942,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             VirtualZipArchive::zip_entry_to_file_type(&entry),
                             name.to_path_buf(),
                         )
+                        .keep()
                         .is_none()
                         {
                             continue;
@@ -999,6 +1002,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             VirtualZipArchive::zip_entry_to_file_type(&entry),
                             name.to_path_buf(),
                         )
+                        .keep()
                         .is_none()
                         {
                             continue;
@@ -1088,7 +1092,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             continue;
                         }
                         let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
-                        let Some(relative) = (is_ignored)(file_type, relative) else {
+                        let Some(relative) = (is_ignored)(file_type, relative).keep() else {
                             continue;
                         };
                         entries.push((relative, i));

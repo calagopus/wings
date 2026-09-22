@@ -120,7 +120,7 @@ impl BackupCreateExt for PbsBackup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = server
@@ -1205,7 +1205,7 @@ impl PbsVirtualFilesystem {
     ) {
         for (name, meta) in node.files.iter() {
             let archive_path = archive_dir.join(name.as_str());
-            let Some(archive_path) = (is_ignored)(meta.file_type, archive_path) else {
+            let Some(archive_path) = (is_ignored)(meta.file_type, archive_path).keep() else {
                 continue;
             };
             out.push(SubtreeEntry {
@@ -1221,7 +1221,7 @@ impl PbsVirtualFilesystem {
 
         for (name, child) in node.dirs.iter() {
             let archive_path = archive_dir.join(name.as_str());
-            let Some(archive_path) = (is_ignored)(FileType::Dir, archive_path) else {
+            let Some(archive_path) = (is_ignored)(FileType::Dir, archive_path).keep() else {
                 continue;
             };
             let relative = relative_dir.join(name.as_str());
@@ -1393,6 +1393,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             match is_ignored
                 .call_async(FileType::Dir, std::mem::take(&mut scratch))
                 .await
+                .keep()
             {
                 Some(kept) => scratch = kept,
                 None => continue,
@@ -1406,6 +1407,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             match is_ignored
                 .call_async(meta.file_type, std::mem::take(&mut scratch))
                 .await
+                .keep()
             {
                 Some(kept) => scratch = kept,
                 None => continue,
@@ -1486,13 +1488,13 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             ) {
                 for (name, meta) in node.files.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
                         out.push((meta.file_type, filtered));
                     }
                 }
                 for (name, child) in node.dirs.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                         out.push((FileType::Dir, filtered));
                     }
                     walk(child, &child_path, is_ignored, out);
@@ -1532,13 +1534,13 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             ) {
                 for (name, meta) in node.files.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
                         out.push((meta.file_type, filtered));
                     }
                 }
                 for (name, child) in node.dirs.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                         out.push((FileType::Dir, filtered));
                     }
                     walk(child, &child_path, is_ignored, out);
@@ -1601,13 +1603,13 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             ) {
                 for (name, meta) in node.files.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
                         out.push((meta.file_type, filtered));
                     }
                 }
                 for (name, child) in node.dirs.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                         out.push((FileType::Dir, filtered));
                     }
                     walk(child, &child_path, is_ignored, out);

@@ -1,4 +1,5 @@
 use super::State;
+use crate::server::filesystem::ignore_list::IgnoreList;
 use axum::extract::DefaultBodyLimit;
 use serde::Deserialize;
 use std::sync::{Arc, LazyLock};
@@ -24,12 +25,12 @@ pub struct FileJwtPayload {
 }
 
 impl FileJwtPayload {
-    fn ignored(&self) -> Result<Option<ignore::gitignore::Gitignore>, ignore::Error> {
+    fn ignored(&self) -> Result<Option<IgnoreList>, ignore::Error> {
         if self.ignored_files.is_empty() {
             return Ok(None);
         }
 
-        crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).map(Some)
+        IgnoreList::try_from_lines(self.ignored_files.iter()).map(Some)
     }
 }
 
@@ -52,7 +53,7 @@ mod post {
             activity::{Activity, ActivityEvent},
             filesystem::{
                 cap::FileType,
-                uploads::{NewUpload, ignore_match_path, part_path},
+                uploads::{NewUpload, part_path},
             },
         },
     };
@@ -212,10 +213,10 @@ mod post {
 
             if ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(parent, true).is_ignore())
+                .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
                 || server
                     .filesystem
-                    .async_is_ignored(parent, FileType::Dir)
+                    .async_is_ignored_subtree(parent, FileType::Dir)
                     .await
             {
                 return ApiResponse::error("file not found")
@@ -241,7 +242,7 @@ mod post {
             if filesystem.is_primary_server_fs()
                 && (ignored
                     .as_ref()
-                    .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
+                    .is_some_and(|o| o.is_ignored(&path, FileType::File))
                     || server
                         .filesystem
                         .async_is_ignored(&path, FileType::File)
@@ -346,10 +347,7 @@ mod head {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::{
-            cap::FileType,
-            uploads::{ignore_match_path, part_path},
-        },
+        server::filesystem::{cap::FileType, uploads::part_path},
     };
     use axum::{body::Body, extract::Query, http::StatusCode};
     use serde::Deserialize;
@@ -437,10 +435,10 @@ mod head {
 
         if ignored
             .as_ref()
-            .is_some_and(|o| o.matched(parent, true).is_ignore())
+            .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
             || server
                 .filesystem
-                .async_is_ignored(parent, FileType::Dir)
+                .async_is_ignored_subtree(parent, FileType::Dir)
                 .await
         {
             return ApiResponse::error("file not found")
@@ -457,7 +455,7 @@ mod head {
         if filesystem.is_primary_server_fs()
             && (ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
+                .is_some_and(|o| o.is_ignored(&path, FileType::File))
                 || server
                     .filesystem
                     .async_is_ignored(&path, FileType::File)
@@ -503,7 +501,7 @@ mod patch {
             activity::{Activity, ActivityEvent},
             filesystem::{
                 cap::FileType,
-                uploads::{NewUpload, ignore_match_path, part_path},
+                uploads::{NewUpload, part_path},
             },
         },
     };
@@ -657,10 +655,10 @@ mod patch {
 
         if ignored
             .as_ref()
-            .is_some_and(|o| o.matched(&parent, true).is_ignore())
+            .is_some_and(|o| o.is_ignored_subtree(&parent, FileType::Dir))
             || server
                 .filesystem
-                .async_is_ignored(&parent, FileType::Dir)
+                .async_is_ignored_subtree(&parent, FileType::Dir)
                 .await
         {
             return ApiResponse::error("file not found")
@@ -677,7 +675,7 @@ mod patch {
         if filesystem.is_primary_server_fs()
             && (ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
+                .is_some_and(|o| o.is_ignored(&path, FileType::File))
                 || server
                     .filesystem
                     .async_is_ignored(&path, FileType::File)
@@ -826,10 +824,7 @@ mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::{
-            cap::FileType,
-            uploads::{ignore_match_path, part_path},
-        },
+        server::filesystem::{cap::FileType, uploads::part_path},
     };
     use axum::{extract::Query, http::StatusCode};
     use serde::{Deserialize, Serialize};
@@ -920,10 +915,10 @@ mod delete {
 
         if ignored
             .as_ref()
-            .is_some_and(|o| o.matched(parent, true).is_ignore())
+            .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
             || server
                 .filesystem
-                .async_is_ignored(parent, FileType::Dir)
+                .async_is_ignored_subtree(parent, FileType::Dir)
                 .await
         {
             return ApiResponse::error("file not found")
@@ -940,7 +935,7 @@ mod delete {
         if filesystem.is_primary_server_fs()
             && (ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(ignore_match_path(&path), false).is_ignore())
+                .is_some_and(|o| o.is_ignored(&path, FileType::File))
                 || server
                     .filesystem
                     .async_is_ignored(&path, FileType::File)

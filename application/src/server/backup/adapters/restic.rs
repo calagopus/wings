@@ -619,14 +619,59 @@ impl BackupCreateExt for ResticBackup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        _ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
-        let mut excluded_paths = Vec::new();
-        for line in ignore_raw.lines() {
-            excluded_paths.push("--exclude");
-            excluded_paths.push(line);
-        }
+        // restic has no re-includes, so a list that needs them is handed the exact
+        // entries to leave out instead; a plain list keeps restic's own matching,
+        // which also covers files created while the backup runs
+        let base_path = super::glob_literal(&server.filesystem.base_path);
+        let mut excluded_paths: Vec<std::ffi::OsString> = Vec::new();
+        let _exclude_file = if ignore.has_reincludes() {
+            let filesystem = server.filesystem.clone();
+            let frontier =
+                tokio::task::spawn_blocking(move || ignore.exclusion_frontier(&filesystem))
+                    .await??;
+            if frontier.len() > super::EXCLUSION_FRONTIER_WARN {
+                tracing::warn!(
+                    server = %server.uuid,
+                    "restic backup {} excludes {} entries one by one, expect a slow scan",
+                    uuid,
+                    frontier.len()
+                );
+            }
+
+            let mut contents = String::new();
+            for path in frontier {
+                contents.push_str(&base_path);
+                contents.push('/');
+                contents.push_str(&super::glob_literal(&path));
+                contents.push('\n');
+            }
+
+            let mut exclude_file = tempfile::NamedTempFile::new_in(
+                server
+                    .app_state
+                    .config
+                    .resolve_as_path(|cfg| &cfg.system.tmp_directory),
+            )?;
+            exclude_file.write_all(contents.as_bytes())?;
+
+            excluded_paths.push("--exclude-file".into());
+            excluded_paths.push(exclude_file.path().into());
+
+            Some(exclude_file)
+        } else {
+            for line in ignore_raw.lines() {
+                excluded_paths.push("--exclude".into());
+                excluded_paths.push(match line.strip_prefix('/') {
+                    Some(anchored) => format!("{base_path}/{anchored}").into(),
+                    None => line.into(),
+                });
+            }
+
+            None
+        };
 
         let (mut child, configuration) = if tokio::fs::metadata(
             server
@@ -1791,6 +1836,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             let child_path = match is_ignored
                 .call_async(FileType::Dir, path.join(name.as_str()))
                 .await
+                .keep()
             {
                 Some(kept) => kept,
                 None => continue,
@@ -1804,6 +1850,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             let child_path = match is_ignored
                 .call_async(meta.file_type, path.join(name.as_str()))
                 .await
+                .keep()
             {
                 Some(kept) => kept,
                 None => continue,
@@ -1882,13 +1929,13 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             ) {
                 for (name, meta) in node.files.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
                         out.push((meta.file_type, filtered));
                     }
                 }
                 for (name, child) in node.dirs.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                         out.push((FileType::Dir, filtered));
                     }
                     walk(child, &child_path, is_ignored, out);
@@ -1929,13 +1976,13 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             ) {
                 for (name, meta) in node.files.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
                         out.push((meta.file_type, filtered));
                     }
                 }
                 for (name, child) in node.dirs.iter() {
                     let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
                         out.push((FileType::Dir, filtered));
                     }
                     walk(child, &child_path, is_ignored, out);
@@ -2019,7 +2066,11 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         skip_notifier = false;
                     }
 
-                    if let Some(path) = is_ignored.call_async(file_type, entry_path.clone()).await {
+                    if let Some(path) = is_ignored
+                        .call_async(file_type, entry_path.clone())
+                        .await
+                        .keep()
+                    {
                         let full_path = server_path.join(&entry_path);
 
                         if file_type.is_dir() {
@@ -2060,7 +2111,8 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         _ => continue,
                                     };
 
-                                    let Some(relative) = (is_ignored)(file_type, relative) else {
+                                    let Some(relative) = (is_ignored)(file_type, relative).keep()
+                                    else {
                                         continue;
                                     };
 
@@ -2310,7 +2362,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         };
 
                         let absolute_path = path.join(&relative);
-                        if (is_ignored)(file_type, absolute_path).is_none() {
+                        if (is_ignored)(file_type, absolute_path).keep().is_none() {
                             continue;
                         }
 
@@ -2393,7 +2445,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         };
 
                         let absolute_path = path.join(&relative);
-                        if (is_ignored)(file_type, absolute_path).is_none() {
+                        if (is_ignored)(file_type, absolute_path).keep().is_none() {
                             continue;
                         }
 
@@ -2456,7 +2508,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         };
 
                         let absolute_path = path.join(&relative);
-                        if (is_ignored)(file_type, absolute_path).is_none() {
+                        if (is_ignored)(file_type, absolute_path).keep().is_none() {
                             continue;
                         }
 
@@ -2680,7 +2732,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     };
 
                                     let absolute_path = path.join(&relative);
-                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                    if (is_ignored)(file_type, absolute_path).keep().is_none() {
                                         continue;
                                     }
 
@@ -2812,7 +2864,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     };
 
                                     let absolute_path = path.join(&relative);
-                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                    if (is_ignored)(file_type, absolute_path).keep().is_none() {
                                         continue;
                                     }
 
@@ -2963,7 +3015,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     };
 
                                     let absolute_path = path.join(&entry_path).join(&relative);
-                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                    if (is_ignored)(file_type, absolute_path).keep().is_none() {
                                         continue;
                                     }
 

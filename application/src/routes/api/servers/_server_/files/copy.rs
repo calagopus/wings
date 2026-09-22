@@ -164,7 +164,7 @@ mod post {
         if filesystem.is_primary_server_fs()
             && server
                 .filesystem
-                .async_is_ignored(parent, FileType::Dir)
+                .async_is_ignored_subtree(parent, FileType::Dir)
                 .await
         {
             return ApiResponse::error("parent directory not found")

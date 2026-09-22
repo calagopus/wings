@@ -385,7 +385,7 @@ impl BackupCreateExt for WingsBackup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let file_name = Self::get_file_name(&server.app_state.config, uuid);

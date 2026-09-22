@@ -4,7 +4,6 @@ use crate::{
 };
 use compact_str::ToCompactString;
 use futures::TryStreamExt;
-use ignore::gitignore::GitignoreBuilder;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -121,14 +120,10 @@ impl BackupManager {
             "creating backup",
         );
 
-        let mut ignore_builder = GitignoreBuilder::new("");
-        let mut ignore_raw = compact_str::CompactString::default();
+        let mut ignore_builder = crate::server::filesystem::ignore_list::IgnoreList::builder();
 
         for line in ignore.lines() {
-            if ignore_builder.add_line(None, line).is_ok() {
-                ignore_raw.push_str(line);
-                ignore_raw.push('\n');
-            }
+            ignore_builder.push_line(line);
         }
 
         if let Ok(pteroignore) = server
@@ -137,21 +132,16 @@ impl BackupManager {
             .await
         {
             for line in pteroignore.lines() {
-                if ignore_builder.add_line(None, line).is_ok() {
-                    ignore_raw.push_str(line);
-                    ignore_raw.push('\n');
-                }
+                ignore_builder.push_line(line);
             }
         }
 
         for line in server.configuration.read().await.egg.file_denylist.iter() {
-            if ignore_builder.add_line(None, line).is_ok() {
-                ignore_raw.push_str(line);
-                ignore_raw.push('\n');
-            }
+            ignore_builder.push_line(line);
         }
 
-        ignore_raw.shrink_to_fit();
+        let ignore_raw = ignore_builder.raw().to_compact_string();
+        let ignore = ignore_builder.build()?;
 
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
@@ -211,7 +201,7 @@ impl BackupManager {
                     Arc::clone(&files),
                 ),
                 Arc::clone(&total),
-                ignore_builder.build()?,
+                ignore,
                 ignore_raw,
             )
             .await

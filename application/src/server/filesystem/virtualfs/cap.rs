@@ -134,7 +134,7 @@ impl VirtualCapFilesystem {
         let Some(is_ignored) = &self.is_ignored else {
             return Ok(path);
         };
-        let Some(path) = (is_ignored)(file_type, path) else {
+        let Some(path) = (is_ignored)(file_type, path).keep() else {
             return Err(Self::denied());
         };
 
@@ -150,7 +150,46 @@ impl VirtualCapFilesystem {
         let Some(is_ignored) = &self.is_ignored else {
             return Ok(path);
         };
-        let Some(path) = is_ignored.call_async(file_type, path).await else {
+        let Some(path) = is_ignored.call_async(file_type, path).await.keep() else {
+            return Err(Self::denied());
+        };
+
+        Ok(path)
+    }
+
+    /// Like [`Self::check_ignored`], but a directory the filter only descends
+    /// into stays reachable so the re-included entries beneath it can be listed
+    /// and opened. Read paths use this; write paths keep the strict check.
+    pub fn check_reachable(
+        &self,
+        file_type: FileType,
+        path: impl Into<PathBuf>,
+    ) -> Result<PathBuf, anyhow::Error> {
+        let path = path.into();
+        let Some(is_ignored) = &self.is_ignored else {
+            return Ok(path);
+        };
+        let Some(path) = (is_ignored)(file_type, path).reachable(file_type) else {
+            return Err(Self::denied());
+        };
+
+        Ok(path)
+    }
+
+    pub async fn async_check_reachable(
+        &self,
+        file_type: FileType,
+        path: impl Into<PathBuf>,
+    ) -> Result<PathBuf, anyhow::Error> {
+        let path = path.into();
+        let Some(is_ignored) = &self.is_ignored else {
+            return Ok(path);
+        };
+        let Some(path) = is_ignored
+            .call_async(file_type, path)
+            .await
+            .reachable(file_type)
+        else {
             return Err(Self::denied());
         };
 
@@ -371,7 +410,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.metadata(path)?;
         let metadata: FileMetadata = metadata.into();
 
-        self.check_ignored(metadata.file_type, path.as_ref())?;
+        self.check_reachable(metadata.file_type, path.as_ref())?;
 
         Ok(metadata)
     }
@@ -382,7 +421,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.async_metadata(path).await?;
         let metadata: FileMetadata = metadata.into();
 
-        self.async_check_ignored(metadata.file_type, path.as_ref())
+        self.async_check_reachable(metadata.file_type, path.as_ref())
             .await?;
 
         Ok(metadata)
@@ -395,7 +434,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.symlink_metadata(path)?;
         let metadata: FileMetadata = metadata.into();
 
-        self.check_ignored(metadata.file_type, path.as_ref())?;
+        self.check_reachable(metadata.file_type, path.as_ref())?;
 
         Ok(metadata)
     }
@@ -406,7 +445,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.async_symlink_metadata(path).await?;
         let metadata: FileMetadata = metadata.into();
 
-        self.async_check_ignored(metadata.file_type, path.as_ref())
+        self.async_check_reachable(metadata.file_type, path.as_ref())
             .await?;
 
         Ok(metadata)
@@ -419,7 +458,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.async_symlink_metadata(path).await?;
 
         let path = self
-            .async_check_ignored(metadata.file_type().into(), path.as_ref())
+            .async_check_reachable(metadata.file_type().into(), path.as_ref())
             .await?;
 
         self.server
@@ -439,7 +478,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let metadata = self.inner.symlink_metadata(path)?;
-        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+        let path = self.check_reachable(metadata.file_type().into(), path.as_ref())?;
 
         Ok(self.server.filesystem.to_api_entry_buffer_blocking(
             path,
@@ -517,7 +556,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         scratch.clear();
                         scratch.push(&path);
                         scratch.push(&name);
-                        match is_ignored(file_type, std::mem::take(&mut scratch)) {
+                        match is_ignored(file_type, std::mem::take(&mut scratch))
+                            .reachable(file_type)
+                        {
                             Some(kept) => scratch = kept,
                             None => continue,
                         }
@@ -1405,8 +1446,11 @@ mod tests {
         server::{
             Server,
             filesystem::{
-                Filesystem, cap::CapFilesystem, usage::SpaceDelta,
-                virtualfs::VirtualReadableFilesystem,
+                Filesystem,
+                cap::CapFilesystem,
+                ignore_list::IgnoreList,
+                usage::SpaceDelta,
+                virtualfs::{VirtualReadableFilesystem, VirtualWritableFilesystem},
             },
         },
     };
@@ -1499,9 +1543,7 @@ mod tests {
                 .with_is_ignored(Filesystem::deny_filter(&server));
             fs.is_primary_server_fs = true;
 
-            let ignored: IsIgnoredFn =
-                crate::server::filesystem::build_gitignore_matcher(["request-denied.txt"].iter())?
-                    .into();
+            let ignored: IsIgnoredFn = IgnoreList::from_lines(["request-denied.txt"])?.into();
 
             Ok(Self {
                 state,
@@ -1734,13 +1776,9 @@ mod tests {
                 // deny filter; matching only symlinks by raw path must list exactly what the
                 // full second pass listed.
                 for directory in ["", "nested"] {
-                    let full: IsIgnoredFn = vec![
-                        fixture.server.filesystem.get_ignored(),
-                        crate::server::filesystem::build_gitignore_matcher(
-                            ["request-denied.txt"].iter(),
-                        )?,
-                    ]
-                    .into();
+                    let full: IsIgnoredFn =
+                        IsIgnoredFn::from(fixture.server.filesystem.get_ignored())
+                            .merge(IgnoreList::from_lines(["request-denied.txt"])?.into());
                     let symlinks_only = fixture
                         .server
                         .filesystem
@@ -2052,5 +2090,56 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn descended_directories_stay_reachable_but_not_writable() {
+        with_one_blocking_worker(|| async {
+            let fixture = ListingFixture::new(0).await?;
+            let root = &fixture.server.filesystem.base_path;
+
+            std::fs::create_dir_all(root.join("game/csgo/cfg"))?;
+            std::fs::write(root.join("game/csgo/cfg/server.cfg"), b"hostname wings")?;
+            std::fs::write(root.join("game/csgo/other.txt"), b"other")?;
+            std::fs::write(root.join("top.txt"), b"top")?;
+
+            let mut fs = fixture
+                .cap
+                .get_virtual(fixture.server.clone())
+                .with_is_ignored(IsIgnoredFn::from(IgnoreList::from_lines([
+                    "*",
+                    "!game/csgo/cfg",
+                ])?));
+            fs.is_writable = true;
+
+            fn names(listing: &DirectoryListing) -> Vec<String> {
+                listing
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.to_string())
+                    .collect()
+            }
+
+            let root_listing = fs
+                .async_read_dir(&"", None, 1, IsIgnoredFn::default(), NameAsc)
+                .await?;
+            let root_names = names(&root_listing);
+            assert!(root_names.iter().any(|name| name == "game"));
+            assert!(!root_names.iter().any(|name| name == "top.txt"));
+
+            fs.async_metadata(&"game").await?;
+
+            let csgo = fs
+                .async_read_dir(&"game/csgo", None, 1, IsIgnoredFn::default(), NameAsc)
+                .await?;
+            let csgo_names = names(&csgo);
+            assert!(csgo_names.iter().any(|name| name == "cfg"));
+            assert!(!csgo_names.iter().any(|name| name == "other.txt"));
+
+            assert!(fs.async_metadata(&"top.txt").await.is_err());
+            assert!(fs.async_create_dir_all(&"game/newdir").await.is_err());
+
+            Ok(())
+        });
     }
 }

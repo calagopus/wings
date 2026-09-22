@@ -3,6 +3,7 @@ use crate::{
     response::ApiResponse,
     server::filesystem::{
         archive::{ArchiveFormat, StreamableArchiveFormat},
+        ignore_list::IgnoreList,
         virtualfs::{ByteRange, VirtualReadableFilesystem},
     },
     utils::TokioStdoutTakeExt,
@@ -249,7 +250,7 @@ pub trait BackupCreateExt {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: IgnoreList,
         ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error>;
 }

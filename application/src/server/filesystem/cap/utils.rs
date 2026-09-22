@@ -185,7 +185,7 @@ impl WalkEntry {
 
 pub struct AsyncWalkDir {
     cap_filesystem: super::CapFilesystem,
-    stack: Vec<(PathBuf, AsyncReadDir)>,
+    stack: Vec<(PathBuf, AsyncReadDir, bool)>,
     is_ignored: IsIgnoredFn,
     reversed: bool,
 }
@@ -199,7 +199,7 @@ impl AsyncWalkDir {
 
         Ok(Self {
             cap_filesystem,
-            stack: vec![(path, read_dir)],
+            stack: vec![(path, read_dir, true)],
             is_ignored: IsIgnoredFn::default(),
             reversed: false,
         })
@@ -219,26 +219,29 @@ impl AsyncWalkDir {
     }
 
     pub async fn next_entry(&mut self) -> Option<Result<WalkEntry, std::io::Error>> {
-        'stack: while let Some((parent_path, read_dir)) = self.stack.last_mut() {
+        'stack: while let Some((parent_path, read_dir, _)) = self.stack.last_mut() {
             match read_dir.next().await {
                 Some(Ok(entry)) => {
                     let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
                     let full_path = parent_path.join(entry.file_name());
 
-                    let Some(full_path) = self.is_ignored.call_async(file_type, full_path).await
-                    else {
+                    let verdict = self.is_ignored.call_async(file_type, full_path).await;
+                    let kept = verdict.is_kept();
+                    let Some(full_path) = verdict.descend() else {
                         continue 'stack;
                     };
 
                     if file_type.is_dir() {
                         match self.cap_filesystem.async_read_dir(&full_path).await {
-                            Ok(dir) => self.stack.push((full_path.clone(), dir)),
+                            Ok(dir) => self.stack.push((full_path.clone(), dir, kept)),
                             Err(err) => return Some(Err(err)),
                         };
 
-                        if self.reversed {
+                        if self.reversed || !kept {
                             continue 'stack;
                         }
+                    } else if !kept {
+                        continue 'stack;
                     }
 
                     return Some(Ok(WalkEntry {
@@ -249,9 +252,9 @@ impl AsyncWalkDir {
                 }
                 Some(Err(err)) => return Some(Err(err)),
                 None => {
-                    let (path, _) = self.stack.pop()?;
+                    let (path, _, kept) = self.stack.pop()?;
 
-                    if self.reversed && !self.stack.is_empty() {
+                    if self.reversed && kept && !self.stack.is_empty() {
                         return Some(Ok(WalkEntry {
                             path,
                             file_type: FileType::Dir,
@@ -373,7 +376,7 @@ async fn finish_walk_tasks(
 
 pub struct WalkDir {
     cap_filesystem: super::CapFilesystem,
-    stack: Vec<(PathBuf, ReadDir)>,
+    stack: Vec<(PathBuf, ReadDir, bool)>,
     is_ignored: IsIgnoredFn,
     reversed: bool,
 }
@@ -387,7 +390,7 @@ impl WalkDir {
 
         Ok(Self {
             cap_filesystem,
-            stack: vec![(path, read_dir)],
+            stack: vec![(path, read_dir, true)],
             is_ignored: IsIgnoredFn::default(),
             reversed: false,
         })
@@ -408,25 +411,29 @@ impl WalkDir {
     }
 
     pub fn next_entry(&mut self) -> Option<Result<WalkEntry, std::io::Error>> {
-        'stack: while let Some((parent_path, read_dir)) = self.stack.last_mut() {
+        'stack: while let Some((parent_path, read_dir, _)) = self.stack.last_mut() {
             match read_dir.next() {
                 Some(Ok(entry)) => {
                     let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
                     let full_path = parent_path.join(entry.file_name());
 
-                    let Some(full_path) = (self.is_ignored)(file_type, full_path) else {
+                    let verdict = (self.is_ignored)(file_type, full_path);
+                    let kept = verdict.is_kept();
+                    let Some(full_path) = verdict.descend() else {
                         continue 'stack;
                     };
 
                     if file_type.is_dir() {
                         match self.cap_filesystem.read_dir(&full_path) {
-                            Ok(dir) => self.stack.push((full_path.clone(), dir)),
+                            Ok(dir) => self.stack.push((full_path.clone(), dir, kept)),
                             Err(err) => return Some(Err(err)),
                         };
 
-                        if self.reversed {
+                        if self.reversed || !kept {
                             continue 'stack;
                         }
+                    } else if !kept {
+                        continue 'stack;
                     }
 
                     return Some(Ok(WalkEntry {
@@ -439,9 +446,9 @@ impl WalkDir {
                     return Some(Err(err));
                 }
                 None => {
-                    let (path, _) = self.stack.pop()?;
+                    let (path, _, kept) = self.stack.pop()?;
 
-                    if self.reversed && !self.stack.is_empty() {
+                    if self.reversed && kept && !self.stack.is_empty() {
                         return Some(Ok(WalkEntry {
                             path,
                             file_type: FileType::Dir,
@@ -590,7 +597,7 @@ impl WalkDir {
             return self.run_multithreaded_filtered(threads, filter, func);
         }
 
-        let (root, root_read_dir) = self.stack.pop().expect("stack holds the root");
+        let (root, root_read_dir, _) = self.stack.pop().expect("stack holds the root");
         let pool = crate::threading::build_pool(threads)?;
         let context = ParallelWalkContext {
             cap_filesystem: self.cap_filesystem.clone(),
@@ -671,13 +678,19 @@ fn parallel_walk_visit<'scope, F>(
         let file_type = entry.file_type().map_or(FileType::Unknown, FileType::from);
         let full_path = path.join(entry.file_name());
 
-        let Some(full_path) = (context.is_ignored)(file_type, full_path) else {
+        let verdict = (context.is_ignored)(file_type, full_path);
+        let kept = verdict.is_kept();
+        let Some(full_path) = verdict.descend() else {
             continue;
         };
 
         if file_type.is_dir() {
             let child = full_path.clone();
             scope.spawn(move |scope| parallel_walk_visit(scope, context, child, None));
+        }
+
+        if !kept {
+            continue;
         }
 
         if let Some(filter) = &context.filter

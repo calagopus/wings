@@ -511,7 +511,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 if let Some(node) = sizes.get_path(&path) {
                     for (child_name, _child_node) in node.get_entries() {
                         let Some(filtered_path) =
-                            (is_ignored)(FileType::Dir, path.join(child_name.as_str()))
+                            (is_ignored)(FileType::Dir, path.join(child_name.as_str())).keep()
                         else {
                             continue;
                         };
@@ -547,6 +547,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         Self::seven_zip_entry_to_file_type(entry),
                         name.to_path_buf(),
                     )
+                    .keep()
                     .is_none()
                     {
                         continue;
@@ -745,7 +746,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     let file_type = VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()).keep() {
                         return Some(Ok((file_type, name)));
                     }
                 }
@@ -791,6 +792,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         .is_ignored
                         .call_async(file_type, name.to_path_buf())
                         .await
+                        .keep()
                     {
                         return Some(Ok((file_type, name)));
                     }
@@ -831,7 +833,10 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                 let file_type = VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry);
 
-                if (is_ignored)(file_type, name_path.to_path_buf()).is_some() {
+                if (is_ignored)(file_type, name_path.to_path_buf())
+                    .keep()
+                    .is_some()
+                {
                     if entry.is_directory() {
                         loose_files.push_back((entry.name().to_string(), file_type));
                     } else if let Some(Some(block_index)) =
@@ -1117,6 +1122,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
                             name.to_path_buf(),
                         )
+                        .keep()
                         .is_none()
                         {
                             continue;
@@ -1223,6 +1229,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
                             name.to_path_buf(),
                         )
+                        .keep()
                         .is_none()
                         {
                             continue;
@@ -1324,7 +1331,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         let Some(relative) = (is_ignored)(
                             VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
                             relative,
-                        ) else {
+                        )
+                        .keep() else {
                             continue;
                         };
                         entries.push((relative, i));

@@ -9,6 +9,7 @@ mod get {
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{
             cap::FileType,
+            ignore_list::IgnoreList,
             uploads::{UploadEntry, target_name},
             virtualfs::IsIgnoredFn,
         },
@@ -63,6 +64,7 @@ mod get {
             if is_ignored
                 .call_async(FileType::File, root.join(upload.target_name.as_str()))
                 .await
+                .keep()
                 .is_some()
             {
                 uploads.push(upload);
@@ -131,7 +133,7 @@ mod get {
         let ignore = if data.ignored.is_empty() {
             None
         } else {
-            match crate::server::filesystem::build_gitignore_matcher(data.ignored.iter()) {
+            match IgnoreList::try_from_lines(data.ignored.iter()) {
                 Ok(ignore) => Some(ignore),
                 Err(err) => {
                     tracing::error!(

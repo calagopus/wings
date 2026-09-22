@@ -18,6 +18,25 @@ pub mod s3;
 pub mod wings;
 pub mod zfs;
 
+/// Above this many exclusion frontier entries an external engine, which matches
+/// every path against every pattern, gets noticeably slow.
+const EXCLUSION_FRONTIER_WARN: usize = 20_000;
+
+/// A path spelled as a literal pattern for an external engine's glob syntax.
+fn glob_literal(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    let mut literal = String::with_capacity(path.len());
+
+    for character in path.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '\\') {
+            literal.push('\\');
+        }
+        literal.push(character);
+    }
+
+    literal
+}
+
 async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyhow::Error> {
     let mut first_byte = [0; 1];
     if reader.read(&mut first_byte).await? == 0 {
@@ -129,7 +148,7 @@ impl BackupAdapter {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
         ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         match self {
@@ -269,5 +288,18 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    // glob_literal
+    #[test]
+    fn glob_literal_escapes_every_metacharacter() {
+        assert_eq!(
+            glob_literal(std::path::Path::new("game/we*ird?/[x]\\y")),
+            "game/we\\*ird\\?/\\[x\\]\\\\y"
+        );
+        assert_eq!(
+            glob_literal(std::path::Path::new("plain/path.txt")),
+            "plain/path.txt"
+        );
     }
 }

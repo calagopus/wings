@@ -5,7 +5,11 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
-        server::filesystem::uploads::ignore_match_path,
+        server::filesystem::{
+            cap::FileType,
+            ignore_list::IgnoreList,
+            virtualfs::{IgnoreVerdict, IsIgnoredFn},
+        },
     };
     use axum::http::StatusCode;
     use axum_extra::extract::Query;
@@ -45,7 +49,7 @@ mod get {
         let ignore = if data.ignored.is_empty() {
             None
         } else {
-            match crate::server::filesystem::build_gitignore_matcher(data.ignored.iter()) {
+            match IgnoreList::try_from_lines(data.ignored.iter()) {
                 Ok(ignore) => Some(ignore),
                 Err(err) => {
                     tracing::error!(
@@ -72,14 +76,10 @@ mod get {
                 .ok();
         }
 
+        let is_ignored = IsIgnoredFn::from(server.filesystem.get_ignored());
         let is_ignored = match ignore {
-            Some(ignore) => vec![server.filesystem.get_ignored(), ignore],
-            None => vec![server.filesystem.get_ignored()],
-        };
-        let is_path_ignored = |path: &Path, is_dir: bool| {
-            is_ignored
-                .iter()
-                .any(|gi| gi.matched(ignore_match_path(path), is_dir).is_ignore())
+            Some(ignore) => is_ignored.merge(IsIgnoredFn::from(ignore)),
+            None => is_ignored,
         };
 
         let root = server
@@ -101,11 +101,17 @@ mod get {
         stack.push((PathBuf::new(), root_usage));
 
         while let Some((usage_path, usage)) = stack.pop() {
-            if !usage_path.as_os_str().is_empty() {
-                if is_path_ignored(&root.join(&usage_path), true) {
-                    continue;
+            let counted = if usage_path.as_os_str().is_empty() {
+                false
+            } else {
+                match is_ignored(FileType::Dir, root.join(&usage_path)) {
+                    IgnoreVerdict::Keep(_) => true,
+                    IgnoreVerdict::Descend(_) => false,
+                    IgnoreVerdict::Skip => continue,
                 }
+            };
 
+            if counted {
                 let self_size = usage.space.get_logical().saturating_sub(
                     usage
                         .get_entries()

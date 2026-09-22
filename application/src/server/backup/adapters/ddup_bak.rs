@@ -23,7 +23,7 @@ use crate::{
 };
 use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::WalkBuilder;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use sha1::Digest;
 use std::{
@@ -345,8 +345,8 @@ impl BackupCreateExt for DdupBakBackup {
         uuid: uuid::Uuid,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
-        ignore: ignore::gitignore::Gitignore,
-        ignore_raw: compact_str::CompactString,
+        ignore: crate::server::filesystem::ignore_list::IgnoreList,
+        _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&server.app_state.config).await?;
         let path = repository.archive_path(&uuid.to_string());
@@ -379,21 +379,24 @@ impl BackupCreateExt for DdupBakBackup {
         let server = server.clone();
         let archive_task =
             tokio::task::spawn_blocking(move || -> Result<(u64, u64), anyhow::Error> {
-                let mut override_builder = OverrideBuilder::new(&server.filesystem.base_path);
-
-                for line in ignore_raw.lines() {
-                    if let Some(line) = line.trim().strip_prefix('!') {
-                        override_builder.add(line).ok();
-                    } else {
-                        override_builder.add(&format!("!{}", line.trim())).ok();
-                    }
-                }
+                let base_path = server.filesystem.base_path.clone();
 
                 let archive = repository.create_archive(
                     &uuid.to_string(),
                     Some(
                         WalkBuilder::new(&server.filesystem.base_path)
-                            .overrides(override_builder.build()?)
+                            .filter_entry(move |entry| {
+                                let Ok(relative) = entry.path().strip_prefix(&*base_path) else {
+                                    return true;
+                                };
+                                let file_type =
+                                    entry.file_type().map_or(FileType::Unknown, FileType::from);
+
+                                ignore
+                                    .verdict(file_type, relative.to_path_buf())
+                                    .descend()
+                                    .is_some()
+                            })
                             .ignore(false)
                             .git_ignore(false)
                             .follow_links(false)

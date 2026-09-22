@@ -6,7 +6,10 @@ use crate::{
         compression::CompressionLevel,
         fixed_reader::FixedReader,
     },
-    server::filesystem::{cap::CapFilesystem, virtualfs::IsIgnoredFn},
+    server::filesystem::{
+        cap::{CapFilesystem, FileType},
+        virtualfs::IsIgnoredFn,
+    },
     utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
@@ -477,17 +480,22 @@ impl<Z: Write + Seek> Pipeline<Z> {
                 }
             };
 
-            let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
+            let file_type: FileType = source_metadata.file_type().into();
+            let verdict = (is_ignored)(file_type, source);
+            let kept = verdict.is_kept();
+            let Some(source) = verdict.reachable(file_type) else {
                 continue;
             };
 
             if source_metadata.is_dir() {
-                if let Some(entry) = Entry::from_metadata(
-                    &self.writer.filesystem,
-                    relative,
-                    source.clone(),
-                    &source_metadata,
-                ) {
+                if kept
+                    && let Some(entry) = Entry::from_metadata(
+                        &self.writer.filesystem,
+                        relative,
+                        source.clone(),
+                        &source_metadata,
+                    )
+                {
                     self.push(entry)?;
                 }
 
@@ -553,6 +561,7 @@ impl<Z: Write + Seek> Pipeline<Z> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::filesystem::ignore_list::IgnoreList;
     use std::collections::HashMap;
 
     fn random(len: usize) -> Vec<u8> {
@@ -623,6 +632,29 @@ mod tests {
                 ArchiveProgress::default(),
                 IsIgnoredFn::default(),
                 options(threads),
+            )
+            .await?;
+
+            Ok(archive.into_inner())
+        })
+    }
+
+    fn zip_tree_filtered(
+        root: &Path,
+        sources: Vec<&'static str>,
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        tokio_test::block_on(async {
+            let filesystem = CapFilesystem::new(root).await?;
+
+            let archive = create_zip(
+                filesystem,
+                Cursor::new(Vec::new()),
+                Path::new(""),
+                sources,
+                ArchiveProgress::default(),
+                is_ignored,
+                options(1),
             )
             .await?;
 
@@ -814,6 +846,54 @@ mod tests {
             "unzip -t rejected the archive: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reincluded_subtree_is_archived_without_its_excluded_parents() -> Result<(), anyhow::Error> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("game/csgo/cfg/nested"))?;
+        std::fs::create_dir_all(root.join("game/hl2"))?;
+        for (name, contents) in [
+            ("game/csgo/cfg/server.cfg", "hostname wings"),
+            ("game/csgo/cfg/nested/deep.cfg", "sv_cheats 0"),
+            ("game/csgo/other.txt", "other"),
+            ("game/hl2/hl2.txt", "hl2"),
+            ("top.txt", "top"),
+        ] {
+            std::fs::write(root.join(name), contents)?;
+        }
+
+        let is_ignored = IsIgnoredFn::from(IgnoreList::from_lines(["*", "!game/csgo/cfg"])?);
+        let bytes = zip_tree_filtered(root, vec!["game", "top.txt"], is_ignored)?;
+
+        let seen = entries(bytes.clone())?;
+        let mut names: Vec<&str> = seen.keys().map(String::as_str).collect();
+        names.sort_unstable();
+
+        assert_eq!(
+            names,
+            ["game/csgo/cfg/nested/deep.cfg", "game/csgo/cfg/server.cfg"]
+        );
+        assert_eq!(
+            seen.get("game/csgo/cfg/server.cfg").map(Vec::as_slice),
+            Some(b"hostname wings".as_slice())
+        );
+        assert_eq!(
+            seen.get("game/csgo/cfg/nested/deep.cfg").map(Vec::as_slice),
+            Some(b"sv_cheats 0".as_slice())
+        );
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+        for index in 0..archive.len() {
+            let name = archive.by_index(index)?.name().to_string();
+            let name = name.trim_end_matches('/');
+
+            assert!(name != "game" && name != "game/csgo", "{name} was archived");
+        }
 
         Ok(())
     }

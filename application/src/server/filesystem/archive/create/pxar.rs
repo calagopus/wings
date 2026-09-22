@@ -5,7 +5,7 @@ use crate::{
         abort::{AbortGuard, AbortWriter},
         fixed_reader::FixedReader,
     },
-    server::filesystem::virtualfs::IsIgnoredFn,
+    server::filesystem::{cap::FileType, virtualfs::IsIgnoredFn},
     utils::PortablePermissions,
 };
 use compact_str::ToCompactString;
@@ -138,7 +138,8 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                 }
             };
 
-            let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
+            let file_type: FileType = source_metadata.file_type().into();
+            let Some(source) = (is_ignored)(file_type, source).reachable(file_type) else {
                 continue;
             };
 

@@ -5,7 +5,7 @@ use crate::{
         compression::{CompressionLevel, CompressionType, writer::CompressionWriter},
         fixed_reader::FixedReader,
     },
-    server::filesystem::virtualfs::IsIgnoredFn,
+    server::filesystem::{cap::FileType, virtualfs::IsIgnoredFn},
     utils::PortablePermissions,
 };
 use std::{
@@ -53,7 +53,10 @@ pub async fn create_tar<W: Write + Send + 'static>(
                 }
             };
 
-            let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
+            let file_type: FileType = source_metadata.file_type().into();
+            let verdict = (is_ignored)(file_type, source);
+            let kept = verdict.is_kept();
+            let Some(source) = verdict.reachable(file_type) else {
                 continue;
             };
 
@@ -73,10 +76,12 @@ pub async fn create_tar<W: Write + Send + 'static>(
             );
 
             if source_metadata.is_dir() {
-                header.set_entry_type(tar::EntryType::Directory);
+                if kept {
+                    header.set_entry_type(tar::EntryType::Directory);
 
-                archive.append_data(&mut header, relative, std::io::empty())?;
-                progress.increment_bytes(source_metadata.len());
+                    archive.append_data(&mut header, relative, std::io::empty())?;
+                    progress.increment_bytes(source_metadata.len());
+                }
 
                 let mut walker = filesystem
                     .walk_dir(source)?
@@ -260,4 +265,102 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
         Ok(inner)
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::filesystem::{cap::CapFilesystem, ignore_list::IgnoreList};
+    use std::{
+        collections::HashMap,
+        io::{Cursor, Read},
+    };
+
+    fn tar_tree_filtered(
+        root: &Path,
+        sources: Vec<&'static str>,
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        tokio_test::block_on(async {
+            let filesystem = CapFilesystem::new(root).await?;
+
+            let archive = create_tar(
+                filesystem,
+                Cursor::new(Vec::new()),
+                Path::new(""),
+                sources,
+                ArchiveProgress::default(),
+                is_ignored,
+                CreateTarOptions {
+                    compression_type: CompressionType::None,
+                    compression_level: CompressionLevel::BestSpeed,
+                    threads: 1,
+                },
+            )
+            .await?;
+
+            Ok(archive.into_inner())
+        })
+    }
+
+    // create_tar
+    #[test]
+    fn reincluded_subtree_is_archived_without_its_excluded_parents() -> Result<(), anyhow::Error> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("game/csgo/cfg/nested"))?;
+        std::fs::create_dir_all(root.join("game/hl2"))?;
+        for (name, contents) in [
+            ("game/csgo/cfg/server.cfg", "hostname wings"),
+            ("game/csgo/cfg/nested/deep.cfg", "sv_cheats 0"),
+            ("game/csgo/other.txt", "other"),
+            ("game/hl2/hl2.txt", "hl2"),
+            ("top.txt", "top"),
+        ] {
+            std::fs::write(root.join(name), contents)?;
+        }
+
+        let is_ignored = IsIgnoredFn::from(IgnoreList::from_lines(["*", "!game/csgo/cfg"])?);
+        let bytes = tar_tree_filtered(root, vec!["game", "top.txt"], is_ignored)?;
+
+        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        let mut files: HashMap<String, String> = HashMap::new();
+
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let name = entry.path()?.to_string_lossy().into_owned();
+            let name = name.trim_end_matches('/').to_string();
+
+            if entry.header().entry_type().is_dir() {
+                assert!(name != "game" && name != "game/csgo", "{name} was archived");
+                continue;
+            }
+
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents)?;
+
+            assert!(files.insert(name, contents).is_none());
+        }
+
+        let mut names: Vec<&str> = files.keys().map(String::as_str).collect();
+        names.sort_unstable();
+
+        assert_eq!(
+            names,
+            ["game/csgo/cfg/nested/deep.cfg", "game/csgo/cfg/server.cfg"]
+        );
+        assert_eq!(
+            files.get("game/csgo/cfg/server.cfg").map(String::as_str),
+            Some("hostname wings")
+        );
+        assert_eq!(
+            files
+                .get("game/csgo/cfg/nested/deep.cfg")
+                .map(String::as_str),
+            Some("sv_cheats 0")
+        );
+
+        Ok(())
+    }
 }

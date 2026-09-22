@@ -10,13 +10,16 @@ mod post {
         },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::virtualfs::{
-            DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
-            VirtualWalkEntry,
+        server::filesystem::{
+            ignore_list::IgnoreList,
+            virtualfs::{
+                DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
+                VirtualWalkEntry,
+            },
         },
     };
     use axum::http::StatusCode;
-    use ignore::{gitignore::GitignoreBuilder, overrides::OverrideBuilder};
+    use ignore::overrides::OverrideBuilder;
     use parking_lot::Mutex;
     use serde::{Deserialize, Serialize};
     use std::{
@@ -671,7 +674,7 @@ mod post {
                 }
 
                 let mut override_builder = OverrideBuilder::new("/");
-                let mut ignore_builder = GitignoreBuilder::new("/");
+                let mut ignore_builder = IgnoreList::builder();
 
                 if let Some(path_filter) = &data.path_filter {
                     override_builder.case_insensitive(path_filter.case_insensitive)?;
@@ -681,7 +684,17 @@ mod post {
                         override_builder.add(glob).ok();
                     }
                     for glob in &path_filter.exclude {
-                        ignore_builder.add_line(None, glob).ok();
+                        if let Err(err) = ignore_builder.try_push_line(glob) {
+                            tracing::error!(
+                                server = %server.uuid,
+                                "rejecting search, path filter exclude cannot be compiled: {:#?}",
+                                err
+                            );
+
+                            return ApiResponse::error("invalid path filter")
+                                .with_status(StatusCode::EXPECTATION_FAILED)
+                                .ok();
+                        }
                     }
                 }
 
