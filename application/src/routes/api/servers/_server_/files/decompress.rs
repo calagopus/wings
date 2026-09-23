@@ -156,7 +156,7 @@ mod post {
                         .await
                 },
             )
-            .await;
+            .await?;
 
         if data.foreground {
             match task.await {

@@ -235,7 +235,7 @@ mod post {
                     }
                 },
             )
-            .await;
+            .await?;
 
         if data.foreground {
             let copied = match task.await {

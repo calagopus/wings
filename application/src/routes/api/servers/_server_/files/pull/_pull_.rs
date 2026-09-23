@@ -35,13 +35,11 @@ mod delete {
         server: GetServer,
         Path((_server, pull_id)): Path<(uuid::Uuid, uuid::Uuid)>,
     ) -> ApiResponseResult {
-        if !server.filesystem.operations.abort_operation(pull_id).await {
+        if !server.filesystem.operations.abort_pull(pull_id).await {
             return ApiResponse::error("pull not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
-
-        server.filesystem.pulls.write().await.remove(&pull_id);
 
         ApiResponse::new_serialized(Response {}).ok()
     }

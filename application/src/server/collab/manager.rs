@@ -1041,6 +1041,10 @@ impl CollabManager {
 
         let _save_guard = session.save_lock.lock().await;
 
+        if server.locked_state().is_some() {
+            return Err(CollabError::User("server is in a locked state"));
+        }
+
         if session.is_diverged() {
             tracing::warn!(
                 server = %self.server,

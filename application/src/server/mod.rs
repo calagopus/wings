@@ -66,7 +66,8 @@ pub struct InnerServer {
     suspended: AtomicBool,
     installing: AtomicBool,
     restoring: AtomicBool,
-    pub transferring: AtomicBool,
+    transferring: AtomicBool,
+    last_locked: tokio::sync::watch::Sender<i64>,
 
     pub restarting: AtomicBool,
     stopping: AtomicBool,
@@ -228,6 +229,7 @@ impl Server {
             installing: AtomicBool::new(false),
             restoring: AtomicBool::new(false),
             transferring: AtomicBool::new(false),
+            last_locked: tokio::sync::watch::Sender::new(0),
 
             restarting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -736,8 +738,7 @@ impl Server {
         self.filesystem
             .update_ignored(&configuration.egg.file_denylist)
             .await;
-        self.suspended
-            .store(configuration.suspended, Ordering::SeqCst);
+        self.set_suspended(configuration.suspended).await;
         {
             let mut configuration_lock = self.configuration.write().await;
             let old_configuration = std::mem::replace(&mut *configuration_lock, configuration);
@@ -858,6 +859,61 @@ impl Server {
         }
 
         false
+    }
+
+    /// Returns whether the flag was already set. Entering any lock aborts the filesystem
+    /// operations and uploads in flight at that moment; ones started afterwards are left alone,
+    /// since only the panel can start them while the server is locked.
+    async fn set_lock_flag(&self, flag: &AtomicBool, locked: bool) -> bool {
+        let was_locked = flag.swap(locked, Ordering::SeqCst);
+
+        if locked && !was_locked {
+            self.last_locked
+                .send_replace(chrono::Utc::now().timestamp());
+            self.filesystem.operations.abort_all().await;
+        }
+
+        was_locked
+    }
+
+    #[inline]
+    pub async fn set_suspended(&self, suspended: bool) -> bool {
+        self.set_lock_flag(&self.suspended, suspended).await
+    }
+
+    #[inline]
+    pub async fn set_installing(&self, installing: bool) -> bool {
+        self.set_lock_flag(&self.installing, installing).await
+    }
+
+    #[inline]
+    pub async fn set_restoring(&self, restoring: bool) -> bool {
+        self.set_lock_flag(&self.restoring, restoring).await
+    }
+
+    #[inline]
+    pub async fn set_transferring(&self, transferring: bool) -> bool {
+        self.set_lock_flag(&self.transferring, transferring).await
+    }
+
+    #[inline]
+    pub fn is_transferring(&self) -> bool {
+        self.transferring.load(Ordering::SeqCst)
+    }
+
+    /// Unix timestamp of the last time the server entered a locked state, `0` if it never did.
+    #[inline]
+    pub fn last_locked_at(&self) -> i64 {
+        *self.last_locked.borrow()
+    }
+
+    /// Resolves once the server next enters a locked state; earlier ones do not count.
+    pub fn locked_signal(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut receiver = self.last_locked.subscribe();
+
+        async move {
+            receiver.changed().await.ok();
+        }
     }
 
     pub async fn setup_container(&self) -> Result<(), anyhow::Error> {
@@ -1477,7 +1533,7 @@ impl Server {
             "destroying server"
         );
 
-        self.suspended.store(true, Ordering::SeqCst);
+        self.set_suspended(true).await;
         self.kill(true).await.ok();
         self.destroy_container().await;
         self.configuration
@@ -1526,5 +1582,154 @@ impl Deref for Server {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::AppState;
+    use filesystem::operations::FilesystemOperation;
+
+    fn with_server<F, Fut>(f: F)
+    where
+        F: FnOnce(Server) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir().expect("failed to create temp dir");
+            let state = AppState::mock();
+            state
+                .config
+                .mutate_in_place_for_testing()
+                .system
+                .data_directory =
+                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+
+            let server = Server::mock(uuid::Uuid::new_v4(), Arc::clone(&state));
+            server.filesystem.disk_checker.abort();
+
+            f(server).await;
+        });
+    }
+
+    fn copy() -> FilesystemOperation {
+        FilesystemOperation::Copy {
+            path: "a".into(),
+            destination_path: "b".into(),
+            start_time: chrono::Utc::now(),
+            bytes_processed: Arc::default(),
+            bytes_total: Arc::default(),
+            files_processed: Arc::default(),
+        }
+    }
+
+    async fn pending() -> Result<(), anyhow::Error> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn resolves(signal: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), signal)
+            .await
+            .is_ok()
+    }
+
+    // Server lock setters
+    #[test]
+    fn setters_return_previous_value_and_report_state() {
+        with_server(|server| async move {
+            assert!(!server.set_suspended(true).await);
+            assert!(server.set_suspended(true).await);
+            assert_eq!(server.locked_state(), Some("suspended"));
+            assert!(server.set_suspended(false).await);
+            assert!(!server.set_suspended(false).await);
+            assert_eq!(server.locked_state(), None);
+
+            assert!(!server.set_installing(true).await);
+            assert_eq!(server.locked_state(), Some("installing"));
+            server.set_installing(false).await;
+
+            assert!(!server.set_restoring(true).await);
+            assert_eq!(server.locked_state(), Some("restoring"));
+            server.set_restoring(false).await;
+
+            assert!(!server.set_transferring(true).await);
+            assert!(server.is_transferring());
+            assert_eq!(server.locked_state(), Some("transferring"));
+            assert!(server.set_transferring(false).await);
+            assert!(!server.is_transferring());
+        });
+    }
+
+    #[test]
+    fn rising_edge_signals_stamps_and_aborts_operations() {
+        with_server(|server| async move {
+            assert_eq!(server.last_locked_at(), 0);
+            let signal = server.locked_signal();
+            let (_, handle) = server
+                .filesystem
+                .operations
+                .add_operation(copy(), pending())
+                .await
+                .expect("operation should start");
+
+            let before = chrono::Utc::now().timestamp();
+            server.set_installing(true).await;
+
+            assert!(resolves(signal).await);
+            assert!(matches!(handle.await, Ok(None)));
+            assert!(server.filesystem.operations.operations().await.is_empty());
+            assert!(server.last_locked_at() >= before);
+            assert!(server.last_locked_at() <= chrono::Utc::now().timestamp());
+        });
+    }
+
+    #[test]
+    fn only_new_rising_edges_signal_and_abort() {
+        with_server(|server| async move {
+            server.set_suspended(true).await;
+
+            let signal = server.locked_signal();
+            let (_, handle) = server
+                .filesystem
+                .operations
+                .add_operation(copy(), pending())
+                .await
+                .expect("operation should start");
+
+            server.set_suspended(true).await;
+            server.set_restoring(false).await;
+            tokio::task::yield_now().await;
+            assert!(!handle.is_finished());
+            assert_eq!(server.filesystem.operations.operations().await.len(), 1);
+
+            let mut signal = Box::pin(signal);
+            assert!(!resolves(signal.as_mut()).await);
+
+            server.set_installing(true).await;
+            assert!(resolves(signal).await);
+            assert!(matches!(handle.await, Ok(None)));
+        });
+    }
+
+    #[test]
+    fn unlocking_does_not_signal_or_abort() {
+        with_server(|server| async move {
+            server.set_transferring(true).await;
+            let signal = server.locked_signal();
+            let (_, handle) = server
+                .filesystem
+                .operations
+                .add_operation(copy(), pending())
+                .await
+                .expect("operation should start");
+
+            server.set_transferring(false).await;
+            assert!(!resolves(signal).await);
+            assert!(!handle.is_finished());
+
+            server.filesystem.operations.abort_all().await;
+        });
     }
 }

@@ -55,9 +55,12 @@ mod post {
                 .ok();
         }
 
-        server
-            .transferring
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if server.set_transferring(true).await {
+            return ApiResponse::error("server is locked")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        }
+
         let mut transfer = crate::server::transfer::OutgoingServerTransfer::new(
             &server,
             data.archive_format,
@@ -79,9 +82,7 @@ mod post {
         {
             server.outgoing_transfer.write().await.replace(transfer);
         } else {
-            server
-                .transferring
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            server.set_transferring(false).await;
 
             return ApiResponse::error("failed to start server transfer")
                 .with_status(StatusCode::EXPECTATION_FAILED)
@@ -117,18 +118,13 @@ mod delete {
         ),
     ))]
     pub async fn route(server: GetServer) -> ApiResponseResult {
-        if !server
-            .transferring
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !server.is_transferring() {
             return ApiResponse::error("server is not transferring")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
         }
 
-        server
-            .transferring
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        server.set_transferring(false).await;
         if let Some(transfer) = server.outgoing_transfer.write().await.take()
             && let Some(handle) = transfer.task.as_ref()
         {

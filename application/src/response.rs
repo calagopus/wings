@@ -155,6 +155,13 @@ where
     fn from(err: T) -> Self {
         let err = err.into();
 
+        if let Some(err) =
+            err.downcast_ref::<crate::server::filesystem::operations::OperationLimitReached>()
+        {
+            return ApiResponse::error(&err.to_string())
+                .with_status(axum::http::StatusCode::EXPECTATION_FAILED);
+        }
+
         tracing::error!("a request error occurred: {:?}", err);
 
         let message = if let Some(err) = err.downcast_ref::<&str>() {

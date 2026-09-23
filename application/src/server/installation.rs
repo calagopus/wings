@@ -1,10 +1,7 @@
 use anyhow::Context;
 use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
@@ -293,7 +290,7 @@ impl ServerInstaller {
     }
 
     pub async fn unset_installing(&self, successful: bool) -> Result<(), anyhow::Error> {
-        self.server.installing.store(false, Ordering::SeqCst);
+        self.server.set_installing(false).await;
         self.server.installer.write().await.take();
 
         if let Err(err) = self.cleanup_container().await {
@@ -361,7 +358,11 @@ impl ServerInstaller {
             ));
         }
 
-        self.server.installing.store(true, Ordering::SeqCst);
+        if self.server.set_installing(true).await {
+            return Err(anyhow::anyhow!(
+                "server is in a locked state (installing), cannot start installation process"
+            ));
+        }
         self.server.websocket.send(
             super::websocket::WebsocketMessage::builder(
                 super::websocket::WebsocketEvent::ServerInstallStarted,
@@ -593,7 +594,7 @@ impl ServerInstaller {
     }
 
     pub async fn attach(self: &Arc<Self>) -> Result<(), anyhow::Error> {
-        self.server.installing.store(true, Ordering::SeqCst);
+        self.server.set_installing(true).await;
         self.server.websocket.send(
             super::websocket::WebsocketMessage::builder(
                 super::websocket::WebsocketEvent::ServerInstallStarted,

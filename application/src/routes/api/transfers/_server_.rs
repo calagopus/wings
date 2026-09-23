@@ -33,9 +33,7 @@ mod delete {
             }
         };
 
-        server
-            .transferring
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        server.set_transferring(false).await;
         server.incoming_transfer.write().await.take();
         server.outgoing_transfer.write().await.take();
 

@@ -8,6 +8,7 @@ use utoipa_axum::{
 mod post {
     use crate::{
         io::{
+            abort::{AbortGuard, AbortReader},
             compression::{CompressionType, reader::CompressionReader},
             counting_writer::CountingWriter,
             hash_reader::HashReader,
@@ -169,7 +170,7 @@ mod post {
         let (_, task) = server
             .filesystem
             .operations
-            .add_operation(
+            .add_linked_operation(
                 crate::server::filesystem::operations::FilesystemOperation::CopyRemote {
                     server: payload.server,
                     path: PathBuf::from(&payload.root),
@@ -189,6 +190,8 @@ mod post {
                     let files_processed = files_processed.clone();
 
                     async move {
+                        let (_guard, listener) = AbortGuard::new();
+
                         tokio::task::spawn_blocking(move || {
                             let mut archive_checksum = None;
                             let mut archive_received = false;
@@ -202,7 +205,10 @@ mod post {
                                             tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
                                                 std::io::Error::other(format!("failed to read multipart field: {err}"))
                                             }));
-                                        let reader = tokio_util::io::SyncIoBridge::new(reader);
+                                        let reader = AbortReader::new(
+                                            tokio_util::io::SyncIoBridge::new(reader),
+                                            listener.clone(),
+                                        );
                                         let reader = LimitedReader::new_with_bytes_per_second(
                                             reader,
                                             state.config.load().system.transfers.download_limit.as_bytes(),

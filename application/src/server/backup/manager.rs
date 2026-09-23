@@ -616,7 +616,11 @@ impl BackupManager {
             ));
         }
 
-        server.restoring.store(true, Ordering::SeqCst);
+        if server.set_restoring(true).await {
+            return Err(anyhow::anyhow!(
+                "server is in a locked state (restoring), cannot restore backup"
+            ));
+        }
         if let Err(err) = server
             .stop_with_kill_timeout(std::time::Duration::from_secs(30), false)
             .await
@@ -627,7 +631,7 @@ impl BackupManager {
                 err
             );
 
-            server.restoring.store(false, Ordering::SeqCst);
+            server.set_restoring(false).await;
             server
                 .app_state
                 .config
@@ -646,7 +650,7 @@ impl BackupManager {
         );
 
         if truncate_directory && let Err(err) = server.filesystem.truncate_root().await {
-            server.restoring.store(false, Ordering::SeqCst);
+            server.set_restoring(false).await;
             server
                 .app_state
                 .config
@@ -716,7 +720,7 @@ impl BackupManager {
             Ok(_) => {
                 progress_task.abort();
 
-                server.restoring.store(false, Ordering::SeqCst);
+                server.set_restoring(false).await;
                 server.log_daemon(
                     format!(
                         "Completed server restoration from {} backup.",
@@ -754,7 +758,7 @@ impl BackupManager {
             Err(err) => {
                 progress_task.abort();
 
-                server.restoring.store(false, Ordering::SeqCst);
+                server.set_restoring(false).await;
                 server
                     .app_state
                     .config

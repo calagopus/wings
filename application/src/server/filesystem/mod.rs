@@ -16,7 +16,6 @@ use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
@@ -25,10 +24,7 @@ use std::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{RwLock, RwLockReadGuard},
-};
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 pub mod archive;
 pub mod cap;
@@ -176,7 +172,6 @@ pub struct Filesystem {
     disk_ignored: arc_swap::ArcSwap<IgnoreList>,
 
     pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
-    pub pulls: RwLock<HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>>,
     pub operations: operations::OperationManager,
     pub uploads: uploads::UploadManager,
 }
@@ -257,8 +252,7 @@ impl Filesystem {
             archive_fs_cache: moka::future::CacheBuilder::new(8)
                 .time_to_idle(std::time::Duration::from_mins(1))
                 .build(),
-            pulls: RwLock::new(HashMap::new()),
-            operations: operations::OperationManager::new(sender.clone()),
+            operations: operations::OperationManager::new(sender.clone(), Arc::clone(&config)),
             uploads: uploads::UploadManager::new(sender),
         }
     }
@@ -464,22 +458,6 @@ impl Filesystem {
             Ok(path) => path,
             Err(_) => self.async_canonicalize_parent(path).await,
         }
-    }
-
-    pub async fn pulls(
-        &self,
-    ) -> RwLockReadGuard<'_, HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>> {
-        if let Ok(mut pulls) = self.pulls.try_write() {
-            let operations = self.operations.operations().await;
-
-            for key in pulls.keys().copied().collect::<Vec<_>>() {
-                if !operations.contains_key(&key) {
-                    pulls.remove(&key);
-                }
-            }
-        }
-
-        self.pulls.read().await
     }
 
     #[inline]

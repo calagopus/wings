@@ -31,9 +31,6 @@ fn api_host() -> String {
 fn api_port() -> u16 {
     8080
 }
-fn api_server_remote_download_limit() -> usize {
-    3
-}
 fn api_remote_download_blocked_cidrs() -> Vec<cidr::IpCidr> {
     unsafe {
         Vec::from([
@@ -608,6 +605,10 @@ fn docker_log_config_config() -> BTreeMap<String, String> {
     ])
 }
 
+fn limits_server_concurrent_pulls() -> usize {
+    3
+}
+
 fn throttles_enabled() -> bool {
     true
 }
@@ -758,8 +759,10 @@ nestify::nest! {
             pub disable_openapi_docs: bool,
             #[serde(default)]
             pub disable_remote_download: bool,
-            #[serde(default = "api_server_remote_download_limit")]
-            pub server_remote_download_limit: usize,
+            /// moved to `limits.server_concurrent_pulls`, only read to migrate older configs
+            #[serde(default, skip_serializing)]
+            #[schema(ignore)]
+            pub server_remote_download_limit: Option<usize>,
             #[serde(default = "api_remote_download_blocked_cidrs")]
             #[schema(value_type = Vec<String>)]
             pub remote_download_blocked_cidrs: Vec<cidr::IpCidr>,
@@ -1356,6 +1359,17 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
+        pub limits: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Limits {
+            #[serde(default = "limits_server_concurrent_pulls")]
+            /// 0 = unlimited
+            pub server_concurrent_pulls: usize,
+            #[serde(default)]
+            /// 0 = unlimited, pulls count towards this too
+            pub server_concurrent_operations: usize,
+        },
+
+        #[serde(default)]
+        #[schema(inline)]
         pub throttles: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Throttles {
             #[serde(default = "throttles_enabled")]
             pub enabled: bool,
@@ -1510,6 +1524,7 @@ type ReloadHandle =
     tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
 
 const LOG_CHANNEL_LINES: usize = 4096;
+const LEGACY_LIMITS_WARNING: &str = "migrated api.server_remote_download_limit to limits.server_concurrent_pulls, the old key is no longer used";
 
 fn log_filter(debug: bool) -> Targets {
     let crate_level = if debug {
@@ -1573,6 +1588,7 @@ impl Config {
 
         #[cfg(unix)]
         let migrated_tmp_directory = Self::migrate_tmp_directory(&mut inner);
+        let migrated_legacy_limits = Self::migrate_legacy_limits(&mut inner);
 
         Self::ensure_directories(&inner)?;
 
@@ -1642,6 +1658,10 @@ impl Config {
             );
         }
 
+        if migrated_legacy_limits {
+            tracing::warn!("{LEGACY_LIMITS_WARNING}");
+        }
+
         let disk_check_concurrency_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
             inner.system.disk_check_concurrency,
         ));
@@ -1684,7 +1704,10 @@ impl Config {
         self.inner.load()
     }
 
-    pub fn replace(&self, new: InnerConfig) -> Result<(), anyhow::Error> {
+    pub fn replace(&self, mut new: InnerConfig) -> Result<(), anyhow::Error> {
+        if Self::migrate_legacy_limits(&mut new) {
+            tracing::warn!("{LEGACY_LIMITS_WARNING}");
+        }
         Self::validate_inner(&new)?;
         Self::save_to(&self.path, &new)?;
 
@@ -1919,6 +1942,23 @@ impl Config {
         cfg.system.tmp_directory = system_tmp_directory();
 
         Some((old, cfg.system.tmp_directory.as_str(cfg).into_owned()))
+    }
+
+    /// Moves `api.server_remote_download_limit` into `limits.server_concurrent_pulls`. The old
+    /// key blocked every pull at `0`, where the new one means unlimited, so `0` turns into
+    /// `api.disable_remote_download` instead.
+    fn migrate_legacy_limits(cfg: &mut InnerConfig) -> bool {
+        let Some(limit) = cfg.api.server_remote_download_limit.take() else {
+            return false;
+        };
+
+        if limit == 0 {
+            cfg.api.disable_remote_download = true;
+        } else {
+            cfg.limits.server_concurrent_pulls = limit;
+        }
+
+        true
     }
 
     fn ensure_directories(cfg: &InnerConfig) -> std::io::Result<()> {
@@ -2447,5 +2487,67 @@ impl Config {
         self.save()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_yaml(yaml: &str) -> InnerConfig {
+        serde_norway::from_str(yaml).expect("failed to parse config")
+    }
+
+    // migrate_legacy_limits
+    #[test]
+    fn positive_legacy_limit_moves_to_pulls_and_is_not_serialized() {
+        let mut cfg = from_yaml("api:\n  server_remote_download_limit: 7\n");
+
+        assert!(Config::migrate_legacy_limits(&mut cfg));
+        assert_eq!(cfg.limits.server_concurrent_pulls, 7);
+        assert!(!cfg.api.disable_remote_download);
+        assert_eq!(cfg.api.server_remote_download_limit, None);
+        assert!(!Config::migrate_legacy_limits(&mut cfg));
+        assert_eq!(cfg.limits.server_concurrent_pulls, 7);
+
+        let yaml = serde_norway::to_string(&cfg).expect("config should round trip");
+        assert!(!yaml.contains("server_remote_download_limit"));
+        let reparsed = from_yaml(&yaml);
+        assert_eq!(reparsed.limits.server_concurrent_pulls, 7);
+    }
+
+    #[test]
+    fn zero_legacy_limit_disables_remote_downloads() {
+        let mut cfg = from_yaml("api:\n  server_remote_download_limit: 0\n");
+        let default_pulls = InnerConfig::default().limits.server_concurrent_pulls;
+
+        assert!(Config::migrate_legacy_limits(&mut cfg));
+        assert!(cfg.api.disable_remote_download);
+        assert_eq!(cfg.limits.server_concurrent_pulls, default_pulls);
+        assert_eq!(cfg.api.server_remote_download_limit, None);
+        assert!(!Config::migrate_legacy_limits(&mut cfg));
+    }
+
+    #[test]
+    fn absent_legacy_limit_is_untouched() {
+        let mut cfg = from_yaml("limits:\n  server_concurrent_pulls: 9\n");
+
+        assert!(!Config::migrate_legacy_limits(&mut cfg));
+        assert_eq!(cfg.limits.server_concurrent_pulls, 9);
+        assert!(!cfg.api.disable_remote_download);
+    }
+
+    #[test]
+    fn legacy_limit_in_merge_patch_is_migrated() {
+        let mut doc =
+            serde_json::to_value(InnerConfig::default()).expect("config should round trip");
+        json_patch::merge(
+            &mut doc,
+            &serde_json::json!({ "api": { "server_remote_download_limit": 5 } }),
+        );
+        let mut cfg: InnerConfig = serde_json::from_value(doc).expect("config should round trip");
+
+        assert!(Config::migrate_legacy_limits(&mut cfg));
+        assert_eq!(cfg.limits.server_concurrent_pulls, 5);
     }
 }

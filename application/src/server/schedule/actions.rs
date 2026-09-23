@@ -1605,7 +1605,8 @@ impl ScheduleAction {
                             }
                         },
                     )
-                    .await;
+                    .await
+                    .map_err(|err| err.to_string())?;
 
                 if *foreground {
                     match task.await {
@@ -1974,7 +1975,8 @@ impl ScheduleAction {
                             }
                         },
                     )
-                    .await;
+                    .await
+                    .map_err(|err| err.to_string())?;
 
                 server.activity.log_activity(Activity {
                     event: ActivityEvent::FileCompress,
@@ -2104,7 +2106,8 @@ impl ScheduleAction {
                                 .await
                         },
                     )
-                    .await;
+                    .await
+                    .map_err(|err| err.to_string())?;
 
                 server.activity.log_activity(Activity {
                     event: ActivityEvent::FileDecompress,
@@ -2208,7 +2211,7 @@ impl ScheduleAction {
                     return Err("failed to create directory".into());
                 }
 
-                let download = match crate::server::filesystem::pull::Download::new(
+                let mut download = match crate::server::filesystem::pull::Download::new(
                     server.clone(),
                     filesystem,
                     &root,
@@ -2218,7 +2221,7 @@ impl ScheduleAction {
                 )
                 .await
                 {
-                    Ok(download) => Arc::new(tokio::sync::RwLock::new(download)),
+                    Ok(download) => download,
                     Err(err) => {
                         tracing::error!(
                             server = %server.uuid,
@@ -2230,17 +2233,7 @@ impl ScheduleAction {
                     }
                 };
 
-                let mut pulls = server.filesystem.pulls.write().await;
-                {
-                    let operations = server.filesystem.operations.operations().await;
-                    pulls.retain(|key, _| operations.contains_key(key));
-                }
-
-                if pulls.len() >= state.config.load().api.server_remote_download_limit {
-                    return Err("too many concurrent pulls".into());
-                }
-
-                let (identifier, task) = match download.write().await.start().await {
+                let (_, task) = match download.start().await {
                     Ok(started) => started,
                     Err(err) => {
                         tracing::error!(
@@ -2252,8 +2245,6 @@ impl ScheduleAction {
                         return Err(format!("failed to start pull: {err}").into());
                     }
                 };
-                pulls.insert(identifier, Arc::clone(&download));
-                drop(pulls);
 
                 server.activity.log_activity(Activity {
                     event: ActivityEvent::FilePull,

@@ -69,7 +69,7 @@ mod post {
     use futures::TryStreamExt;
     use serde::Serialize;
     use sha1::Digest;
-    use std::{io::Write, str::FromStr, sync::atomic::Ordering};
+    use std::{io::Write, str::FromStr};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
@@ -160,14 +160,14 @@ mod post {
                 )
                 .await;
 
-            server.transferring.store(true, Ordering::SeqCst);
+            server.set_transferring(true).await;
             server
         } else {
             let mut tries = 0;
 
             loop {
                 if let Some(server) = state.server_manager.get_server(subject).await
-                    && server.transferring.load(Ordering::SeqCst)
+                    && server.is_transferring()
                     && server.incoming_transfer.read().await.is_some()
                 {
                     break server;
@@ -739,7 +739,7 @@ mod post {
                                     .await
                                     .is_ok()
                                 {
-                                    server.transferring.store(false, Ordering::SeqCst);
+                                    server.set_transferring(false).await;
                                     server
                                         .websocket
                                         .send(
@@ -798,7 +798,7 @@ mod post {
                                     .await
                                     .is_ok()
                                 {
-                                    server.transferring.store(false, Ordering::SeqCst);
+                                    server.set_transferring(false).await;
                                     server
                                         .websocket
                                         .send(

@@ -30,15 +30,10 @@ mod get {
         note = "This endpoint is purely for pterodactyl compatibility. Use the operations system instead."
     )]
     pub async fn route(server: GetServer) -> ApiResponseResult {
-        let values = server.filesystem.pulls().await;
-        let mut downloads = Vec::new();
-        downloads.reserve_exact(values.len());
-
-        for download in values.values() {
-            downloads.push(download.read().await.to_api_response());
-        }
-
-        ApiResponse::new_serialized(Response { downloads }).ok()
+        ApiResponse::new_serialized(Response {
+            downloads: server.filesystem.operations.pulls().await,
+        })
+        .ok()
     }
 }
 
@@ -50,8 +45,6 @@ mod post {
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -148,52 +141,35 @@ mod post {
                 .ok();
         }
 
-        if server.filesystem.pulls().await.len()
-            >= state.config.load().api.server_remote_download_limit
-        {
+        let pull_limit = state.config.load().limits.server_concurrent_pulls;
+        if pull_limit != 0 && server.filesystem.operations.pulls().await.len() >= pull_limit {
             return ApiResponse::error("too many concurrent pulls")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
         }
 
         filesystem.async_create_dir_all(&root).await?;
-        let download = Arc::new(RwLock::new(
-            match crate::server::filesystem::pull::Download::new(
-                server.0.clone(),
-                filesystem,
-                &root,
-                data.file_name,
-                data.url,
-                data.use_header,
-            )
-            .await
-            {
-                Ok(download) => download,
-                Err(err) => {
-                    tracing::error!("failed to create pull: {:?}", err);
-
-                    return ApiResponse::error(&format!("failed to create pull: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            },
-        ));
-
-        let mut pulls = server.filesystem.pulls.write().await;
+        let mut download = match crate::server::filesystem::pull::Download::new(
+            server.0.clone(),
+            filesystem,
+            &root,
+            data.file_name,
+            data.url,
+            data.use_header,
+        )
+        .await
         {
-            let operations = server.filesystem.operations.operations().await;
-            pulls.retain(|key, _| operations.contains_key(key));
-        }
+            Ok(download) => download,
+            Err(err) => {
+                tracing::error!("failed to create pull: {:?}", err);
 
-        if pulls.len() >= state.config.load().api.server_remote_download_limit {
-            return ApiResponse::error("too many concurrent pulls")
-                .with_status(StatusCode::EXPECTATION_FAILED)
-                .ok();
-        }
+                return ApiResponse::error(&format!("failed to create pull: {err}"))
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
 
-        let (identifier, task) = download.write().await.start().await?;
-        pulls.insert(identifier, Arc::clone(&download));
-        drop(pulls);
+        let (identifier, task) = download.start().await?;
 
         if data.foreground {
             match task.await {

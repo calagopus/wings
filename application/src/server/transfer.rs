@@ -251,7 +251,7 @@ impl OutgoingServerTransfer {
             .ok();
         server.outgoing_transfer.write().await.take();
 
-        server.transferring.store(false, Ordering::SeqCst);
+        server.set_transferring(false).await;
         server
             .websocket
             .send(
@@ -952,7 +952,7 @@ impl OutgoingServerTransfer {
                 }
             }
 
-            server.transferring.store(false, Ordering::SeqCst);
+            server.set_transferring(false).await;
 
             tracing::info!(
                 server = %server.uuid,

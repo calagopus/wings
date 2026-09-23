@@ -34,6 +34,12 @@ impl FileJwtPayload {
     }
 }
 
+const LOCKED_ERROR: &str = "server entered a locked state, upload aborted";
+
+fn issued_before_lock(payload: &FileJwtPayload, server: &crate::server::Server) -> bool {
+    payload.base.issued_at.unwrap_or(0) < server.last_locked_at()
+}
+
 type UploadLocks = moka::future::Cache<(uuid::Uuid, std::path::PathBuf), Arc<Mutex<()>>>;
 static UPLOAD_LOCKS: LazyLock<UploadLocks> = LazyLock::new(|| moka::future::Cache::new(10240));
 
@@ -136,6 +142,15 @@ mod post {
                     .ok();
             }
         };
+
+        let locked = server.locked_signal();
+        tokio::pin!(locked);
+
+        if super::issued_before_lock(&payload, &server) {
+            return ApiResponse::error(super::LOCKED_ERROR)
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
 
         let total_size = params.total_size.and_then(|s| s.parse::<u64>().ok());
         if let Some(total_size) = total_size {
@@ -293,7 +308,19 @@ mod post {
                 None
             };
 
-            while let Some(chunk) = field.chunk().await? {
+            loop {
+                let chunk = tokio::select! {
+                    chunk = field.chunk() => chunk?,
+                    _ = &mut locked => {
+                        return ApiResponse::error(super::LOCKED_ERROR)
+                            .with_status(StatusCode::EXPECTATION_FAILED)
+                            .ok();
+                    }
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+
                 let config = state.config.load();
                 if crate::unlikely(
                     config.api.upload_limit.as_bytes() != 0
@@ -593,6 +620,15 @@ mod patch {
             }
         };
 
+        let locked = server.locked_signal();
+        tokio::pin!(locked);
+
+        if super::issued_before_lock(&payload, &server) {
+            return ApiResponse::error(super::LOCKED_ERROR)
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
+
         let upload_limit = state.config.load().api.upload_limit.as_bytes();
         if upload_limit != 0 && upload_length.is_some_and(|total| total > upload_limit) {
             return ApiResponse::error(&format!(
@@ -752,7 +788,21 @@ mod patch {
         let mut written_size = disk_offset;
         let mut stream = body.into_data_stream();
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = &mut locked => {
+                    file.shutdown().await?;
+
+                    return ApiResponse::error(super::LOCKED_ERROR)
+                        .with_status(StatusCode::EXPECTATION_FAILED)
+                        .ok();
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+
             let chunk = chunk.map_err(|err| {
                 std::io::Error::other(format!("failed to read request body: {err}"))
             })?;

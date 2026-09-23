@@ -329,12 +329,12 @@ mod post {
                         }
                     },
                 )
-                .await;
+                .await?;
 
             let (_, destination_task) = destination_server
                 .filesystem
                 .operations
-                .add_operation(
+                .add_linked_operation(
                     crate::server::filesystem::operations::FilesystemOperation::CopyRemote {
                         server: server.uuid,
                         path: PathBuf::from(data.root),
@@ -539,7 +539,7 @@ mod post {
                         }
                     },
                 )
-                .await;
+                .await?;
 
             if data.foreground {
                 match task.await {

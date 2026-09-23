@@ -134,7 +134,6 @@ impl PullQueryResponse {
 }
 
 pub struct Download {
-    pub identifier: uuid::Uuid,
     pub progress: Arc<AtomicU64>,
     pub total: u64,
     pub destination: PathBuf,
@@ -229,7 +228,6 @@ impl Download {
         }
 
         Ok(Self {
-            identifier: uuid::Uuid::new_v4(),
             progress: Arc::new(AtomicU64::new(0)),
             total: response.content_length().unwrap_or_else(|| {
                 response
@@ -312,20 +310,8 @@ impl Download {
                     }
                 },
             )
-            .await;
-
-        self.identifier = identifier;
+            .await?;
 
         Ok((identifier, task))
-    }
-
-    #[inline]
-    pub fn to_api_response(&self) -> crate::models::Download {
-        crate::models::Download {
-            identifier: self.identifier,
-            destination: self.destination.to_string_lossy().to_string(),
-            progress: self.progress.load(Ordering::Relaxed),
-            total: self.total,
-        }
     }
 }

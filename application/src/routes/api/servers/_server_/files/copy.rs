@@ -275,7 +275,7 @@ mod post {
                     }
                 },
             )
-            .await;
+            .await?;
 
         if data.foreground {
             match task.await {

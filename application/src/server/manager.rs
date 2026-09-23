@@ -1,8 +1,5 @@
 use super::{Server, state::ServerState};
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -360,7 +357,7 @@ impl ServerManager {
 
         if let Some(pos) = servers.iter().position(|s| s.uuid == server.uuid) {
             let server = servers.remove(pos);
-            server.suspended.store(true, Ordering::SeqCst);
+            server.set_suspended(true).await;
 
             tokio::spawn(async move { server.destroy().await });
         }
