@@ -6,7 +6,7 @@ mod get {
 
     use crate::{
         io::{compression::reader::AsyncCompressionReader, fixed_reader::AsyncFixedReader},
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
     use axum::http::{HeaderMap, StatusCode};
@@ -80,23 +80,13 @@ mod get {
             }
         };
 
-        let parent = match Path::new(&data.file).parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let parent = Path::new(&data.file)
+            .parent()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
 
-        let file_name = match Path::new(&data.file).file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let file_name = Path::new(&data.file)
+            .file_name()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
         let (root, filesystem) = server
             .filesystem

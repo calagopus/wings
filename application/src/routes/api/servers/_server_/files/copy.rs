@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::{cap::FileType, virtualfs::VirtualReadableFilesystem},
     };
@@ -72,23 +72,13 @@ mod post {
             }
         };
 
-        let parent = match Path::new(&data.path).parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let parent = Path::new(&data.path)
+            .parent()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
 
-        let file_name = match Path::new(&data.path).file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let file_name = Path::new(&data.path)
+            .file_name()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -180,22 +170,13 @@ mod post {
         };
         let file_name = parent.join(&new_name);
 
-        let destination_parent = match file_name.parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("destination has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-        let destination_file_name = match file_name.file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid destination file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let destination_parent = file_name
+            .parent()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "destination has no parent")?;
+        let destination_file_name = file_name.file_name().or_api_error(
+            StatusCode::EXPECTATION_FAILED,
+            "invalid destination file name",
+        )?;
 
         let (destination_path, destination_filesystem) = server
             .filesystem

@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod get {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::cap::FileType,
     };
@@ -64,11 +64,11 @@ mod get {
             }
         };
 
-        let Some(revision_path) = server.diff.revision_path(revision_id).await? else {
-            return ApiResponse::error("revision not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        };
+        let revision_path = server
+            .diff
+            .revision_path(revision_id)
+            .await?
+            .or_api_error(StatusCode::NOT_FOUND, "revision not found")?;
         let revision_path = std::path::Path::new(&revision_path);
 
         if server
@@ -96,11 +96,11 @@ mod get {
                 .ok();
         }
 
-        let Some(contents) = server.diff.get_content(revision_id).await? else {
-            return ApiResponse::error("revision not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        };
+        let contents = server
+            .diff
+            .get_content(revision_id)
+            .await?
+            .or_api_error(StatusCode::NOT_FOUND, "revision not found")?;
 
         ApiResponse::new(axum::body::Body::from(contents)).ok()
     }

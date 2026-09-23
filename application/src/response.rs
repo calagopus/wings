@@ -150,7 +150,6 @@ impl ApiResponse {
 
 /// Turns a missing value or a failure into an early-returnable error response,
 /// discarding the original error: `value.or_api_error(StatusCode::NOT_FOUND, "server not found")?`.
-#[allow(dead_code)]
 pub trait ApiErrorExt<T> {
     fn or_api_error(self, status: axum::http::StatusCode, error: &str) -> Result<T, ApiResponse>;
 }

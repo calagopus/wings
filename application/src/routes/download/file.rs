@@ -6,7 +6,7 @@ mod get {
 
     use crate::{
         io::fixed_reader::AsyncFixedReader,
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::GetState,
         server::filesystem::{cap::FileType, virtualfs::ByteRange},
     };
@@ -64,23 +64,13 @@ mod get {
 
         let server = crate::routes::token::server(&state, payload.server_uuid).await?;
 
-        let parent = match Path::new(&payload.file_path).parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let parent = Path::new(&payload.file_path)
+            .parent()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
 
-        let file_name = match Path::new(&payload.file_path).file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let file_name = Path::new(&payload.file_path)
+            .file_name()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
         let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
         let path = root.join(file_name);

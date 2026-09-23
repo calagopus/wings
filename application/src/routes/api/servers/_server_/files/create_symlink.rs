@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::cap::{CapFilesystem, FileType},
     };
@@ -86,14 +86,10 @@ mod post {
         let (contents, target) =
             CapFilesystem::resolve_symlink_contents(&link, Path::new(data.target.as_str()));
 
-        let target_metadata = match filesystem.async_symlink_metadata(&target).await {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                return ApiResponse::error("target not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let target_metadata = filesystem
+            .async_symlink_metadata(&target)
+            .await
+            .or_api_error(StatusCode::NOT_FOUND, "target not found")?;
 
         if filesystem.is_primary_server_fs()
             && server

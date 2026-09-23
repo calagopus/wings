@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
     use axum::{extract::Path, http::StatusCode};
@@ -41,14 +41,10 @@ mod post {
     ) -> ApiResponseResult {
         let schedules = server.schedules.get_schedules().await;
 
-        let schedule = match schedules.iter().find(|s| s.uuid == schedule_id) {
-            Some(schedule) => schedule,
-            None => {
-                return ApiResponse::error("schedule not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let schedule = schedules
+            .iter()
+            .find(|s| s.uuid == schedule_id)
+            .or_api_error(StatusCode::NOT_FOUND, "schedule not found")?;
 
         schedule.trigger(data.skip_condition);
 

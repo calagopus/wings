@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
     use axum::http::StatusCode;
@@ -18,11 +18,10 @@ mod post {
         (status = NOT_IMPLEMENTED, body = ApiError),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let Some(tundra) = state.tundra.as_ref() else {
-            return ApiResponse::error("tundra is not enabled on this node")
-                .with_status(StatusCode::NOT_IMPLEMENTED)
-                .ok();
-        };
+        let tundra = state.tundra.as_ref().or_api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "tundra is not enabled on this node",
+        )?;
 
         tundra.poke();
 

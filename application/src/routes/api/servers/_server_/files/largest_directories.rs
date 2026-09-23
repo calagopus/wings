@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod get {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::{
             cap::FileType,
@@ -91,11 +91,9 @@ mod get {
         let mut entries = Vec::new();
         let directories = server.filesystem.disk_usage.read().await;
 
-        let Some(root_usage) = directories.get_path(&root) else {
-            return ApiResponse::error("directory not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        };
+        let root_usage = directories
+            .get_path(&root)
+            .or_api_error(StatusCode::NOT_FOUND, "directory not found")?;
 
         let mut stack = Vec::with_capacity(32);
         stack.push((PathBuf::new(), root_usage));

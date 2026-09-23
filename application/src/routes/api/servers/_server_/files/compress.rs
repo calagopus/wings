@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{
             archive::{ArchiveFormat, generated_archive_name},
@@ -94,23 +94,13 @@ mod post {
             .unwrap_or_else(|| generated_archive_name(data.format.extension()));
         let file_name = root.join(&archive_name);
 
-        let parent = match file_name.parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let parent = file_name
+            .parent()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
 
-        let file_name = match file_name.file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let file_name = file_name
+            .file_name()
+            .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
         let (destination_root, destination_filesystem) = server
             .filesystem

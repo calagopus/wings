@@ -5,7 +5,7 @@ mod ws;
 
 mod get {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
     use axum::http::StatusCode;
@@ -16,11 +16,10 @@ mod get {
         (status = SERVICE_UNAVAILABLE, body = ApiError),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let Some(tundra) = state.tundra.as_ref() else {
-            return ApiResponse::error("tundra is not enabled on this node")
-                .with_status(StatusCode::NOT_IMPLEMENTED)
-                .ok();
-        };
+        let tundra = state.tundra.as_ref().or_api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "tundra is not enabled on this node",
+        )?;
 
         match tundra.hub.request_metrics().await {
             Ok(metrics) => ApiResponse::new_serialized(metrics).ok(),

@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         io::SafeDigestExt,
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
     use axum::http::{HeaderMap, HeaderName, StatusCode};
@@ -50,22 +50,14 @@ mod post {
         }
 
         let current_exe = std::env::current_exe()?;
-        let current_exe_parent = match current_exe.parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("unable to find parent of current exe")
-                    .with_status(StatusCode::BAD_REQUEST)
-                    .ok();
-            }
-        };
-        let current_exe_filename = match current_exe.file_name() {
-            Some(filename) => filename,
-            None => {
-                return ApiResponse::error("unable to find file name of current exe")
-                    .with_status(StatusCode::BAD_REQUEST)
-                    .ok();
-            }
-        };
+        let current_exe_parent = current_exe.parent().or_api_error(
+            StatusCode::BAD_REQUEST,
+            "unable to find parent of current exe",
+        )?;
+        let current_exe_filename = current_exe.file_name().or_api_error(
+            StatusCode::BAD_REQUEST,
+            "unable to find file name of current exe",
+        )?;
 
         let tmp_file =
             current_exe_parent.join(format!("{}.upgrade", current_exe_filename.display()));

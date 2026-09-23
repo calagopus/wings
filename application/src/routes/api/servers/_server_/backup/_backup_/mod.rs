@@ -5,7 +5,7 @@ mod restore;
 
 mod delete {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
     };
     use axum::{extract::Path, http::StatusCode};
@@ -35,14 +35,11 @@ mod delete {
         server: GetServer,
         Path((_server, backup_id)): Path<(uuid::Uuid, uuid::Uuid)>,
     ) -> ApiResponseResult {
-        let backup = match state.backup_manager.find(&state, backup_id).await? {
-            Some(backup) => backup,
-            None => {
-                return ApiResponse::error("backup not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let backup = state
+            .backup_manager
+            .find(&state, backup_id)
+            .await?
+            .or_api_error(StatusCode::NOT_FOUND, "backup not found")?;
 
         tokio::spawn(async move {
             if let Err(err) = backup.delete(&state).await {

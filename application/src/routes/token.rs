@@ -1,5 +1,7 @@
 use crate::{
-    remote::jwt::BasePayload, response::ApiResponse, server::filesystem::ignore_list::IgnoreList,
+    remote::jwt::BasePayload,
+    response::{ApiErrorExt, ApiResponse},
+    server::filesystem::ignore_list::IgnoreList,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -20,10 +22,11 @@ pub fn verify<P: TokenPayload>(
     token: &str,
     scope: &str,
 ) -> Result<P, ApiResponse> {
-    let payload: P =
-        state.config.jwt.verify(token).map_err(|_| {
-            ApiResponse::error("invalid token").with_status(StatusCode::UNAUTHORIZED)
-        })?;
+    let payload: P = state
+        .config
+        .jwt
+        .verify(token)
+        .or_api_error(StatusCode::UNAUTHORIZED, "invalid token")?;
 
     if let Err(err) = payload.base().validate(&state.config.jwt, Some(scope)) {
         return Err(ApiResponse::error(&format!("invalid token: {err}"))
@@ -52,7 +55,7 @@ pub async fn server(
         .server_manager
         .get_server(uuid)
         .await
-        .ok_or_else(|| ApiResponse::error("server not found").with_status(StatusCode::NOT_FOUND))
+        .or_api_error(StatusCode::NOT_FOUND, "server not found")
 }
 
 pub fn subject_uuid(payload: &BasePayload) -> Result<uuid::Uuid, ApiResponse> {
@@ -60,7 +63,7 @@ pub fn subject_uuid(payload: &BasePayload) -> Result<uuid::Uuid, ApiResponse> {
         .subject
         .as_deref()
         .and_then(|subject| subject.parse().ok())
-        .ok_or_else(|| ApiResponse::error("invalid token").with_status(StatusCode::UNAUTHORIZED))
+        .or_api_error(StatusCode::UNAUTHORIZED, "invalid token")
 }
 
 /// Subuser file restrictions carried by file tokens, meant to be `#[serde(flatten)]`ed.

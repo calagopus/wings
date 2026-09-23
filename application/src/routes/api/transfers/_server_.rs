@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod delete {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
     use axum::{extract::Path, http::StatusCode};
@@ -24,14 +24,11 @@ mod delete {
         ),
     ))]
     pub async fn route(state: GetState, Path(server): Path<uuid::Uuid>) -> ApiResponseResult {
-        let server = match state.server_manager.get_server(server).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let server = state
+            .server_manager
+            .get_server(server)
+            .await
+            .or_api_error(StatusCode::NOT_FOUND, "server not found")?;
 
         server.set_transferring(false).await;
         server.incoming_transfer.write().await.take();

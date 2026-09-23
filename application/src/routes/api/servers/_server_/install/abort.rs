@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
     use axum::http::StatusCode;
@@ -24,14 +24,12 @@ mod post {
         ),
     ))]
     pub async fn route(server: GetServer) -> ApiResponseResult {
-        let installer = match server.installer.write().await.take() {
-            Some(installer) => installer,
-            None => {
-                return ApiResponse::error("server is not installing")
-                    .with_status(StatusCode::CONFLICT)
-                    .ok();
-            }
-        };
+        let installer = server
+            .installer
+            .write()
+            .await
+            .take()
+            .or_api_error(StatusCode::CONFLICT, "server is not installing")?;
 
         installer.abort();
 

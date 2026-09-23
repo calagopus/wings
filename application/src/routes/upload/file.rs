@@ -1,6 +1,6 @@
 use super::State;
 use crate::{
-    response::ApiResponse,
+    response::{ApiErrorExt, ApiResponse},
     server::filesystem::{cap::FileType, uploads::part_path, virtualfs::VirtualWritableFilesystem},
 };
 use axum::{extract::DefaultBodyLimit, http::StatusCode};
@@ -99,16 +99,12 @@ async fn resolve_target(
     };
 
     let relative = PathBuf::from(directory).join(file);
-    let Some(parent) = relative.parent() else {
-        return Err(
-            ApiResponse::error("file has no parent").with_status(StatusCode::EXPECTATION_FAILED)
-        );
-    };
-    let Some(file_name) = relative.file_name() else {
-        return Err(
-            ApiResponse::error("invalid file name").with_status(StatusCode::EXPECTATION_FAILED)
-        );
-    };
+    let parent = relative
+        .parent()
+        .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
+    let file_name = relative
+        .file_name()
+        .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
     if ignored
         .as_ref()
@@ -136,11 +132,8 @@ async fn resolve_target(
         return Err(not_found());
     }
 
-    let Some(part) = part_path(&path) else {
-        return Err(
-            ApiResponse::error("file name too long").with_status(StatusCode::EXPECTATION_FAILED)
-        );
-    };
+    let part =
+        part_path(&path).or_api_error(StatusCode::EXPECTATION_FAILED, "file name too long")?;
 
     Ok(UploadTarget {
         parent: parent.to_path_buf(),
@@ -154,7 +147,7 @@ async fn resolve_target(
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
@@ -289,14 +282,9 @@ mod post {
                 }
             };
             let path = directory.join(&filename);
-            let parent = match path.parent() {
-                Some(parent) => parent,
-                None => {
-                    return ApiResponse::error("file has no parent")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            };
+            let parent = path
+                .parent()
+                .or_api_error(StatusCode::EXPECTATION_FAILED, "file has no parent")?;
 
             if ignored
                 .as_ref()
@@ -311,14 +299,9 @@ mod post {
                     .ok();
             }
 
-            let file_name = match path.file_name() {
-                Some(name) => name,
-                None => {
-                    return ApiResponse::error("invalid file name")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            };
+            let file_name = path
+                .file_name()
+                .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
             let (root, filesystem) = server
                 .filesystem
@@ -342,14 +325,8 @@ mod post {
 
             filesystem.async_create_dir_all(&root).await?;
 
-            let part = match part_path(&path) {
-                Some(part) => part,
-                None => {
-                    return ApiResponse::error("file name too long")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            };
+            let part = part_path(&path)
+                .or_api_error(StatusCode::EXPECTATION_FAILED, "file name too long")?;
 
             let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
             let _lock_guard = lock.lock().await;

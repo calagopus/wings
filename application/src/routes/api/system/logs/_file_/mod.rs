@@ -19,7 +19,7 @@ fn log_file_path(state: &State, file: &str) -> Option<std::path::PathBuf> {
 mod get {
     use crate::{
         io::compression::{CompressionType, reader::AsyncCompressionReader},
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
     use axum::{
@@ -60,11 +60,7 @@ mod get {
             None => None,
         };
 
-        let Some(mut opened) = opened else {
-            return ApiResponse::error("log file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        };
+        let mut opened = opened.or_api_error(StatusCode::NOT_FOUND, "log file not found")?;
 
         let lines = params.lines.map(|n| n.min(crate::io::tail::LINES_CAP));
 

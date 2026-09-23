@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
-        response::{ApiResponse, ApiResponseResult},
+        response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::cap::FileType,
     };
@@ -68,14 +68,11 @@ mod post {
             }
         };
 
-        let root = match server.filesystem.async_canonicalize(data.root).await {
-            Ok(path) => path,
-            Err(_) => {
-                return ApiResponse::error("root not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let root = server
+            .filesystem
+            .async_canonicalize(data.root)
+            .await
+            .or_api_error(StatusCode::NOT_FOUND, "root not found")?;
 
         let metadata = server.filesystem.async_metadata(&root).await;
         if !metadata.map(|m| m.is_dir()).unwrap_or(true) {
