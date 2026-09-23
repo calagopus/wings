@@ -9,7 +9,7 @@ use crate::{
     utils::TokioStdoutTakeExt,
 };
 use axum::http::{HeaderMap, HeaderValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::AtomicU64};
 use utoipa::ToSchema;
 
@@ -66,56 +66,129 @@ pub fn validate_dump_extension(extension: &str) -> Result<(), anyhow::Error> {
     }
 }
 
-pub enum Backup {
-    Wings(adapters::wings::WingsBackup),
-    S3(adapters::s3::S3Backup),
-    DdupBak(adapters::ddup_bak::DdupBakBackup),
-    Btrfs(adapters::btrfs::BtrfsBackup),
-    Zfs(adapters::zfs::ZfsBackup),
-    Restic(adapters::restic::ResticBackup),
-    ProxmoxBackupServer(adapters::pbs::PbsBackup),
-    Kopia(adapters::kopia::KopiaBackup),
+/// Dispatch surface of a backup instance; lets [`Backup`] forward to whichever adapter it holds.
+trait BackupDyn: BackupExt + BackupStreamExt {}
+
+impl<T: BackupExt + BackupStreamExt> BackupDyn for T {}
+
+macro_rules! backup_adapters {
+    ($($variant:ident($backup:ty) => $name:literal),* $(,)?) => {
+        pub enum Backup {
+            $($variant($backup),)*
+        }
+
+        impl Backup {
+            #[inline]
+            pub fn adapter(&self) -> adapters::BackupAdapter {
+                match self {
+                    $(Self::$variant(_) => adapters::BackupAdapter::$variant,)*
+                }
+            }
+
+            #[inline]
+            fn inner(&self) -> &(dyn BackupDyn + Send + Sync) {
+                match self {
+                    $(Self::$variant(backup) => backup,)*
+                }
+            }
+        }
+
+        #[derive(ToSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+        pub enum BackupAdapter {
+            $(#[serde(rename = $name)] #[schema(rename = $name)] $variant,)*
+        }
+
+        impl BackupAdapter {
+            #[inline]
+            pub fn variants() -> &'static [Self] {
+                &[$(Self::$variant,)*]
+            }
+
+            #[inline]
+            pub fn to_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+
+            pub async fn find(
+                self,
+                state: &crate::routes::State,
+                uuid: uuid::Uuid,
+            ) -> Result<Option<Backup>, anyhow::Error> {
+                match self {
+                    $(Self::$variant => <$backup as BackupFindExt>::find(state, uuid).await,)*
+                }
+            }
+
+            pub async fn create(
+                self,
+                server: &crate::server::Server,
+                uuid: uuid::Uuid,
+                progress: crate::server::filesystem::archive::create::ArchiveProgress,
+                total: Arc<AtomicU64>,
+                ignore: IgnoreList,
+                ignore_raw: compact_str::CompactString,
+            ) -> Result<RawServerBackup, anyhow::Error> {
+                match self {
+                    $(Self::$variant => {
+                        <$backup as BackupCreateExt>::create(
+                            server, uuid, progress, total, ignore, ignore_raw,
+                        )
+                        .await
+                    })*
+                }
+            }
+
+            async fn create_from_prepared_stream(
+                self,
+                state: &crate::routes::State,
+                uuid: uuid::Uuid,
+                extension: &str,
+                reader: DumpReader,
+            ) -> Result<RawServerBackup, anyhow::Error> {
+                match self {
+                    $(Self::$variant => {
+                        <$backup as BackupStreamCreateExt>::create_from_stream(
+                            state, uuid, extension, reader,
+                        )
+                        .await
+                    })*
+                }
+            }
+
+            pub async fn clean(
+                self,
+                server: &crate::server::Server,
+                uuid: uuid::Uuid,
+            ) -> Result<(), anyhow::Error> {
+                match self {
+                    $(Self::$variant => <$backup as BackupCleanExt>::clean(server, uuid).await,)*
+                }
+            }
+        }
+    };
+}
+
+backup_adapters! {
+    Wings(adapters::wings::WingsBackup) => "wings",
+    S3(adapters::s3::S3Backup) => "s3",
+    DdupBak(adapters::ddup_bak::DdupBakBackup) => "ddup-bak",
+    Btrfs(adapters::btrfs::BtrfsBackup) => "btrfs",
+    Zfs(adapters::zfs::ZfsBackup) => "zfs",
+    Restic(adapters::restic::ResticBackup) => "restic",
+    ProxmoxBackupServer(adapters::pbs::PbsBackup) => "proxmox-backup-server",
+    Kopia(adapters::kopia::KopiaBackup) => "kopia",
 }
 
 impl Backup {
-    pub fn uuid(&self) -> uuid::Uuid {
-        match self {
-            Backup::Wings(backup) => backup.uuid(),
-            Backup::S3(backup) => backup.uuid(),
-            Backup::DdupBak(backup) => backup.uuid(),
-            Backup::Btrfs(backup) => backup.uuid(),
-            Backup::Zfs(backup) => backup.uuid(),
-            Backup::Restic(backup) => backup.uuid(),
-            Backup::ProxmoxBackupServer(backup) => backup.uuid(),
-            Backup::Kopia(backup) => backup.uuid(),
-        }
-    }
-
     #[inline]
-    pub fn adapter(&self) -> adapters::BackupAdapter {
-        match self {
-            Backup::Wings(_) => adapters::BackupAdapter::Wings,
-            Backup::S3(_) => adapters::BackupAdapter::S3,
-            Backup::DdupBak(_) => adapters::BackupAdapter::DdupBak,
-            Backup::Btrfs(_) => adapters::BackupAdapter::Btrfs,
-            Backup::Zfs(_) => adapters::BackupAdapter::Zfs,
-            Backup::Restic(_) => adapters::BackupAdapter::Restic,
-            Backup::ProxmoxBackupServer(_) => adapters::BackupAdapter::ProxmoxBackupServer,
-            Backup::Kopia(_) => adapters::BackupAdapter::Kopia,
-        }
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.inner().uuid()
     }
 
     pub async fn download_info(&self) -> Result<BackupDownloadInfo, anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.download_info().await,
-            Backup::S3(backup) => backup.download_info().await,
-            Backup::DdupBak(backup) => backup.download_info().await,
-            Backup::Btrfs(backup) => backup.download_info().await,
-            Backup::Zfs(backup) => backup.download_info().await,
-            Backup::Restic(backup) => backup.download_info().await,
-            Backup::ProxmoxBackupServer(backup) => backup.download_info().await,
-            Backup::Kopia(backup) => backup.download_info().await,
-        }
+        self.inner().download_info().await
     }
 
     pub async fn download(
@@ -124,18 +197,7 @@ impl Backup {
         archive_format: StreamableArchiveFormat,
         range: Option<ByteRange>,
     ) -> Result<ApiResponse, anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.download(state, archive_format, range).await,
-            Backup::S3(backup) => backup.download(state, archive_format, range).await,
-            Backup::DdupBak(backup) => backup.download(state, archive_format, range).await,
-            Backup::Btrfs(backup) => backup.download(state, archive_format, range).await,
-            Backup::Zfs(backup) => backup.download(state, archive_format, range).await,
-            Backup::Restic(backup) => backup.download(state, archive_format, range).await,
-            Backup::ProxmoxBackupServer(backup) => {
-                backup.download(state, archive_format, range).await
-            }
-            Backup::Kopia(backup) => backup.download(state, archive_format, range).await,
-        }
+        self.inner().download(state, archive_format, range).await
     }
 
     pub async fn restore(
@@ -145,18 +207,9 @@ impl Backup {
         total: Arc<AtomicU64>,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::S3(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::DdupBak(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::Btrfs(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::Zfs(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::Restic(backup) => backup.restore(server, progress, total, download_url).await,
-            Backup::ProxmoxBackupServer(backup) => {
-                backup.restore(server, progress, total, download_url).await
-            }
-            Backup::Kopia(backup) => backup.restore(server, progress, total, download_url).await,
-        }
+        self.inner()
+            .restore(server, progress, total, download_url)
+            .await
     }
 
     pub async fn read_stream(
@@ -164,16 +217,7 @@ impl Backup {
         state: &crate::routes::State,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<BackupStream, anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.read_stream(state, download_url).await,
-            Backup::S3(backup) => backup.read_stream(state, download_url).await,
-            Backup::DdupBak(backup) => backup.read_stream(state, download_url).await,
-            Backup::Btrfs(backup) => backup.read_stream(state, download_url).await,
-            Backup::Zfs(backup) => backup.read_stream(state, download_url).await,
-            Backup::Restic(backup) => backup.read_stream(state, download_url).await,
-            Backup::ProxmoxBackupServer(backup) => backup.read_stream(state, download_url).await,
-            Backup::Kopia(backup) => backup.read_stream(state, download_url).await,
-        }
+        self.inner().read_stream(state, download_url).await
     }
 
     pub async fn download_database(
@@ -205,32 +249,14 @@ impl Backup {
     }
 
     pub async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.delete(state).await,
-            Backup::S3(backup) => backup.delete(state).await,
-            Backup::DdupBak(backup) => backup.delete(state).await,
-            Backup::Btrfs(backup) => backup.delete(state).await,
-            Backup::Zfs(backup) => backup.delete(state).await,
-            Backup::Restic(backup) => backup.delete(state).await,
-            Backup::ProxmoxBackupServer(backup) => backup.delete(state).await,
-            Backup::Kopia(backup) => backup.delete(state).await,
-        }
+        self.inner().delete(state).await
     }
 
     async fn browse(
         &self,
         server: &crate::server::Server,
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
-        match self {
-            Backup::Wings(backup) => backup.browse(server).await,
-            Backup::S3(backup) => backup.browse(server).await,
-            Backup::DdupBak(backup) => backup.browse(server).await,
-            Backup::Btrfs(backup) => backup.browse(server).await,
-            Backup::Zfs(backup) => backup.browse(server).await,
-            Backup::Restic(backup) => backup.browse(server).await,
-            Backup::ProxmoxBackupServer(backup) => backup.browse(server).await,
-            Backup::Kopia(backup) => backup.browse(server).await,
-        }
+        self.inner().browse(server).await
     }
 }
 
@@ -418,5 +444,44 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    // BackupAdapter
+    #[test]
+    fn backup_adapter_wire_names_are_stable() -> Result<(), anyhow::Error> {
+        let expected = [
+            "wings",
+            "s3",
+            "ddup-bak",
+            "btrfs",
+            "zfs",
+            "restic",
+            "proxmox-backup-server",
+            "kopia",
+        ];
+
+        let names: Vec<&str> = BackupAdapter::variants()
+            .iter()
+            .map(|adapter| adapter.to_str())
+            .collect();
+        assert_eq!(names, expected);
+
+        for adapter in BackupAdapter::variants() {
+            let json = serde_json::to_string(adapter)?;
+            assert_eq!(json, format!("\"{}\"", adapter.to_str()));
+            assert_eq!(serde_json::from_str::<BackupAdapter>(&json)?, *adapter);
+        }
+
+        let schema = serde_json::to_value(<BackupAdapter as utoipa::PartialSchema>::schema())?;
+        let schema_names: Vec<&str> = schema
+            .get("enum")
+            .and_then(|values| values.as_array())
+            .ok_or_else(|| anyhow::anyhow!("schema has no enum values: {schema}"))?
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(schema_names, expected);
+
+        Ok(())
     }
 }

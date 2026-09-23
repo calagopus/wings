@@ -578,92 +578,31 @@ impl ServerWebsocketHandler {
     }
 
     async fn send_error(&self, message: impl Into<Cow<'_, str>>) {
-        let message = WebsocketMessage::builder(WebsocketEvent::ServerDaemonMessage)
-            .arg(
-                nu_ansi_term::Style::new()
-                    .bold()
-                    .on(nu_ansi_term::Color::Red)
-                    .paint(message.into())
-                    .to_compact_string(),
-            )
-            .build();
-
-        let message = if self.binary_mode.load(Ordering::Relaxed) {
-            let message = match rmp_serde::to_vec(&message) {
-                Ok(message) => message,
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
-                }
-            };
-            Message::Binary(message.into())
-        } else {
-            let message = match serde_json::to_string(&message) {
-                Ok(message) => message,
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
-                }
-            };
-            Message::Text(message.into())
-        };
-
-        if let Err(err) = self.sender.lock().await.send(message).await
-            && err.source().is_none_or(|e| {
-                e.downcast_ref::<std::io::Error>()
-                    .is_none_or(|i| i.kind() != std::io::ErrorKind::BrokenPipe)
-            })
-        {
-            tracing::error!("failed to send websocket message: {:?}", err);
-        }
+        self.send_message(
+            WebsocketMessage::builder(WebsocketEvent::ServerDaemonMessage)
+                .arg(
+                    nu_ansi_term::Style::new()
+                        .bold()
+                        .on(nu_ansi_term::Color::Red)
+                        .paint(message.into())
+                        .to_compact_string(),
+                )
+                .build(),
+        )
+        .await;
     }
 
     async fn send_admin_error(&self, message: impl Into<anyhow::Error>) {
-        let message = if self.socket_jwt.read().await.as_ref().is_some_and(|j| {
+        let show_error = self.socket_jwt.read().await.as_ref().is_some_and(|j| {
             j.permissions
                 .has_permission(super::permissions::Permission::AdminWebsocketErrors)
-        }) {
-            format!("{}", message.into())
-        } else {
-            "An unexpected error occurred. Please contact an Administrator.".into()
-        };
+        });
 
-        let message = WebsocketMessage::builder(WebsocketEvent::ServerDaemonMessage)
-            .arg(
-                nu_ansi_term::Style::new()
-                    .bold()
-                    .on(nu_ansi_term::Color::Red)
-                    .paint(message)
-                    .to_compact_string(),
-            )
-            .build();
-        let message = if self.binary_mode.load(Ordering::Relaxed) {
-            let message = match rmp_serde::to_vec(&message) {
-                Ok(message) => message,
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
-                }
-            };
-            Message::Binary(message.into())
+        if show_error {
+            self.send_error(message.into().to_string()).await;
         } else {
-            let message = match serde_json::to_string(&message) {
-                Ok(message) => message,
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
-                }
-            };
-            Message::Text(message.into())
-        };
-
-        if let Err(err) = self.sender.lock().await.send(message).await
-            && err.source().is_none_or(|e| {
-                e.downcast_ref::<std::io::Error>()
-                    .is_none_or(|i| i.kind() != std::io::ErrorKind::BrokenPipe)
-            })
-        {
-            tracing::error!("failed to send websocket message: {:?}", err);
+            self.send_error("An unexpected error occurred. Please contact an Administrator.")
+                .await;
         }
     }
 }

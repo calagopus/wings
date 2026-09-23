@@ -8,7 +8,7 @@ mod get {
         io::fixed_reader::AsyncFixedReader,
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::{cap::FileType, ignore_list::IgnoreList, virtualfs::ByteRange},
+        server::filesystem::{cap::FileType, virtualfs::ByteRange},
     };
     use axum::{
         extract::Query,
@@ -28,19 +28,16 @@ mod get {
         pub base: crate::remote::jwt::BasePayload,
 
         pub file_path: compact_str::CompactString,
-        #[serde(default)]
-        pub ignored_files: Vec<compact_str::CompactString>,
+        #[serde(flatten)]
+        pub ignored_files: crate::routes::token::IgnoredFiles,
         pub server_uuid: uuid::Uuid,
         pub unique_id: compact_str::CompactString,
     }
 
-    impl FileJwtPayload {
-        fn ignored(&self) -> Result<Option<IgnoreList>, ignore::Error> {
-            if self.ignored_files.is_empty() {
-                return Ok(None);
-            }
-
-            IgnoreList::try_from_lines(self.ignored_files.iter()).map(Some)
+    impl crate::routes::token::TokenPayload for FileJwtPayload {
+        #[inline]
+        fn base(&self) -> &crate::remote::jwt::BasePayload {
+            &self.base
         }
     }
 
@@ -60,38 +57,12 @@ mod get {
         headers: HeaderMap,
         Query(data): Query<Params>,
     ) -> ApiResponseResult {
-        let payload: FileJwtPayload = match state.config.jwt.verify(&data.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let payload: FileJwtPayload =
+            crate::routes::token::verify(&state, &data.token, "file-download")?;
 
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("file-download"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        crate::routes::token::consume(&state, &payload.unique_id)?;
 
-        if !state.config.jwt.limited_jwt_id(&payload.unique_id) {
-            return ApiResponse::error("token has already been used")
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        let server = match state.server_manager.get_server(payload.server_uuid).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let server = crate::routes::token::server(&state, payload.server_uuid).await?;
 
         let parent = match Path::new(&payload.file_path).parent() {
             Some(parent) => parent,
@@ -131,7 +102,7 @@ mod get {
             }
         };
 
-        let ignored = match payload.ignored() {
+        let ignored = match payload.ignored_files.compile() {
             Ok(ignored) => ignored,
             Err(err) => {
                 tracing::error!(

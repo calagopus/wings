@@ -275,6 +275,19 @@ pub fn redact_query(query: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(redacted)
 }
 
+pub fn lowercase_first_ascii(text: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    if !text.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return text;
+    }
+
+    let mut text = text.into_owned();
+    if let Some(first) = text.get_mut(..1) {
+        first.make_ascii_lowercase();
+    }
+
+    std::borrow::Cow::Owned(text)
+}
+
 pub(crate) trait IntoMode {
     fn into_mode(self) -> u16;
 }

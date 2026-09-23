@@ -620,33 +620,11 @@ impl ScheduleAction {
 
                 return Err("timeout while waiting for matching console output.".into());
             }
-            ScheduleAction::SendPower { action, .. } => match action {
-                crate::models::ServerPowerAction::Start => {
-                    if server.state.get_state() != crate::server::state::ServerState::Offline {
-                        return Err("server is already running or starting.".into());
-                    }
-
-                    if let Err(err) = server.start(None, false).await {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                return Err(message.into());
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to start server: {:#?}",
-                                    err,
-                                );
-
-                                return Err(
-                                    "an unexpected error occurred while starting the server."
-                                        .into(),
-                                );
-                            }
-                        }
-                    } else {
+            ScheduleAction::SendPower { action, .. } => {
+                match server.checked_power_action(*action).await {
+                    Ok(()) => {
                         server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerStart,
+                            event: action.activity_event(),
                             user: None,
                             ip: None,
                             metadata: None,
@@ -654,124 +632,18 @@ impl ScheduleAction {
                             timestamp: chrono::Utc::now(),
                         });
                     }
-                }
-                crate::models::ServerPowerAction::Restart => {
-                    if server.restarting.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Err("server is already restarting.".into());
+                    Err(crate::server::PowerActionError::User(message)) => {
+                        return Err(crate::utils::lowercase_first_ascii(message));
                     }
-
-                    let auto_kill = server.configuration.read().await.auto_kill;
-                    if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                        server
-                            .restart_with_kill_timeout(
-                                None,
-                                std::time::Duration::from_secs(auto_kill.seconds),
-                            )
-                            .await
-                    } else {
-                        server.restart(None).await
-                    } {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                return Err(message.into());
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to restart server: {:#?}",
-                                    err
-                                );
-
-                                return Err(
-                                    "an unexpected error occurred while restarting the server."
-                                        .into(),
-                                );
-                            }
-                        }
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerRestart,
-                            user: None,
-                            ip: None,
-                            metadata: None,
-                            schedule: Some(execution_context.schedule_uuid),
-                            timestamp: chrono::Utc::now(),
-                        });
+                    Err(crate::server::PowerActionError::Internal(_)) => {
+                        return Err(format!(
+                            "an unexpected error occurred while trying to {} the server.",
+                            action.to_str()
+                        )
+                        .into());
                     }
                 }
-                crate::models::ServerPowerAction::Stop => {
-                    if matches!(
-                        server.state.get_state(),
-                        crate::server::state::ServerState::Offline
-                            | crate::server::state::ServerState::Stopping
-                    ) {
-                        return Err("server is already offline or stopping.".into());
-                    }
-
-                    let auto_kill = server.configuration.read().await.auto_kill;
-                    if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                        server
-                            .stop_with_kill_timeout(
-                                std::time::Duration::from_secs(auto_kill.seconds),
-                                false,
-                            )
-                            .await
-                    } else {
-                        server.stop(None, false).await
-                    } {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                return Err(message.into());
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to stop server: {:#?}",
-                                    err
-                                );
-
-                                return Err(
-                                    "an unexpected error occurred while stopping the server."
-                                        .into(),
-                                );
-                            }
-                        }
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerStop,
-                            user: None,
-                            ip: None,
-                            metadata: None,
-                            schedule: Some(execution_context.schedule_uuid),
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                }
-                crate::models::ServerPowerAction::Kill => {
-                    if server.state.get_state() == crate::server::state::ServerState::Offline {
-                        return Err("server is already offline.".into());
-                    }
-
-                    if let Err(err) = server.kill(false).await {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to kill server: {:#?}",
-                            err
-                        );
-
-                        return Err("an unexpected error occurred while killing the server.".into());
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerKill,
-                            user: None,
-                            ip: None,
-                            metadata: None,
-                            schedule: Some(execution_context.schedule_uuid),
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                }
-            },
+            }
             ScheduleAction::SendCommand { command, .. } => {
                 if server.state.get_state() == crate::server::state::ServerState::Offline {
                     return Err("server is not running.".into());

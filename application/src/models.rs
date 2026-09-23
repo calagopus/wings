@@ -32,6 +32,41 @@ pub enum ServerPowerAction {
     Kill,
 }
 
+impl ServerPowerAction {
+    #[inline]
+    pub const fn to_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Kill => "kill",
+        }
+    }
+
+    #[inline]
+    pub const fn required_permission(self) -> crate::server::permissions::Permission {
+        use crate::server::permissions::Permission;
+
+        match self {
+            Self::Start => Permission::ControlStart,
+            Self::Restart => Permission::ControlRestart,
+            Self::Stop | Self::Kill => Permission::ControlStop,
+        }
+    }
+
+    #[inline]
+    pub const fn activity_event(self) -> crate::server::activity::ActivityEvent {
+        use crate::server::activity::ActivityEvent;
+
+        match self {
+            Self::Start => ActivityEvent::PowerStart,
+            Self::Stop => ActivityEvent::PowerStop,
+            Self::Restart => ActivityEvent::PowerRestart,
+            Self::Kill => ActivityEvent::PowerKill,
+        }
+    }
+}
+
 impl FromStr for ServerPowerAction {
     type Err = anyhow::Error;
 

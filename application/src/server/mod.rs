@@ -34,6 +34,11 @@ pub mod transfer;
 pub mod tunnel;
 pub mod websocket;
 
+pub enum PowerActionError {
+    User(std::borrow::Cow<'static, str>),
+    Internal(anyhow::Error),
+}
+
 pub struct InnerServer {
     pub uuid: uuid::Uuid,
     app_state: crate::routes::State,
@@ -1113,9 +1118,15 @@ impl Server {
         skip_schedules: bool,
     ) -> Result<(), anyhow::Error> {
         if let Some(state) = self.locked_state() {
-            return Err(anyhow::anyhow!(
-                "Server is in a locked state ({state}), cannot start the server."
-            ));
+            return Err(anyhow::anyhow!(match state {
+                "suspended" => "Server is in a locked state (suspended), cannot start the server.",
+                "installing" =>
+                    "Server is in a locked state (installing), cannot start the server.",
+                "restoring" => "Server is in a locked state (restoring), cannot start the server.",
+                "transferring" =>
+                    "Server is in a locked state (transferring), cannot start the server.",
+                _ => "Server is in a locked state, cannot start the server.",
+            }));
         }
 
         if self.state.get_state() != state::ServerState::Offline {
@@ -1503,6 +1514,81 @@ impl Server {
         .await?
     }
 
+    /// Runs a power action, honoring the server's auto kill configuration for
+    /// stops and restarts.
+    pub async fn power_action(
+        &self,
+        action: crate::models::ServerPowerAction,
+        aquire_timeout: Option<std::time::Duration>,
+    ) -> Result<(), anyhow::Error> {
+        use crate::models::ServerPowerAction;
+
+        let auto_kill = self.configuration.read().await.auto_kill;
+        let kill_timeout = (auto_kill.enabled && auto_kill.seconds > 0)
+            .then(|| std::time::Duration::from_secs(auto_kill.seconds));
+
+        match (action, kill_timeout) {
+            (ServerPowerAction::Start, _) => self.start(aquire_timeout, false).await,
+            (ServerPowerAction::Stop, Some(timeout)) => {
+                self.stop_with_kill_timeout(timeout, false).await
+            }
+            (ServerPowerAction::Stop, None) => self.stop(aquire_timeout, false).await,
+            (ServerPowerAction::Restart, Some(timeout)) => {
+                self.restart_with_kill_timeout(aquire_timeout, timeout)
+                    .await
+            }
+            (ServerPowerAction::Restart, None) => self.restart(aquire_timeout).await,
+            (ServerPowerAction::Kill, _) => self.kill(false).await,
+        }
+    }
+
+    /// [`Self::power_action`] for user-initiated requests: rejects actions the
+    /// current state makes redundant and logs internal errors before returning them.
+    pub async fn checked_power_action(
+        &self,
+        action: crate::models::ServerPowerAction,
+    ) -> Result<(), PowerActionError> {
+        use crate::models::ServerPowerAction;
+
+        let state = self.state.get_state();
+        let redundant = match action {
+            ServerPowerAction::Start => (state != state::ServerState::Offline)
+                .then_some("Server is already running or starting."),
+            ServerPowerAction::Restart => self
+                .restarting
+                .load(Ordering::SeqCst)
+                .then_some("Server is already restarting."),
+            ServerPowerAction::Stop => matches!(
+                state,
+                state::ServerState::Offline | state::ServerState::Stopping
+            )
+            .then_some("Server is already offline or stopping."),
+            ServerPowerAction::Kill => {
+                (state == state::ServerState::Offline).then_some("Server is already offline.")
+            }
+        };
+
+        if let Some(message) = redundant {
+            return Err(PowerActionError::User(message.into()));
+        }
+
+        self.power_action(action, None)
+            .await
+            .map_err(|err| match err.downcast::<&str>() {
+                Ok(message) => PowerActionError::User(message.into()),
+                Err(err) => {
+                    tracing::error!(
+                        server = %self.uuid,
+                        "failed to {} server: {:#?}",
+                        action.to_str(),
+                        err
+                    );
+
+                    PowerActionError::Internal(err)
+                }
+            })
+    }
+
     pub async fn destroy_container(&self) {
         tracing::info!(
             server = %self.uuid,
@@ -1730,6 +1816,42 @@ mod tests {
             assert!(!handle.is_finished());
 
             server.filesystem.operations.abort_all().await;
+        });
+    }
+
+    // Server::checked_power_action
+    #[test]
+    fn redundant_or_locked_power_actions_are_user_errors() {
+        use crate::models::ServerPowerAction;
+
+        async fn user_error(server: &Server, action: ServerPowerAction) -> String {
+            match server.checked_power_action(action).await {
+                Err(PowerActionError::User(message)) => message.into_owned(),
+                Err(PowerActionError::Internal(err)) => panic!("{action:?}: internal error {err}"),
+                Ok(()) => panic!("{action:?}: unexpectedly executed"),
+            }
+        }
+
+        with_server(|server| async move {
+            assert_eq!(server.state.get_state(), state::ServerState::Offline);
+            user_error(&server, ServerPowerAction::Stop).await;
+            user_error(&server, ServerPowerAction::Kill).await;
+
+            server.set_suspended(true).await;
+            assert!(
+                user_error(&server, ServerPowerAction::Start)
+                    .await
+                    .contains("suspended")
+            );
+            server.set_suspended(false).await;
+
+            server.restarting.store(true, Ordering::SeqCst);
+            user_error(&server, ServerPowerAction::Restart).await;
+            server.restarting.store(false, Ordering::SeqCst);
+
+            server.state.set_state(state::ServerState::Running).await;
+            user_error(&server, ServerPowerAction::Start).await;
+            assert_eq!(server.state.get_state(), state::ServerState::Running);
         });
     }
 }

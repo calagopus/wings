@@ -1,13 +1,8 @@
 use crate::{
     remote::backups::RawServerBackup,
-    server::backup::{
-        Backup, BackupCleanExt, BackupCreateExt, BackupFindExt, BackupStreamCreateExt, DumpReader,
-    },
+    server::backup::{Backup, DumpReader},
 };
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, atomic::AtomicU64};
 use tokio::io::AsyncReadExt;
-use utoipa::ToSchema;
 
 pub mod btrfs;
 pub mod ddup_bak;
@@ -17,6 +12,8 @@ pub mod restic;
 pub mod s3;
 pub mod wings;
 pub mod zfs;
+
+pub use super::BackupAdapter;
 
 /// Above this many exclusion frontier entries an external engine, which matches
 /// every path against every pattern, gets noticeably slow.
@@ -46,139 +43,22 @@ async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyho
     Ok(Box::new(std::io::Cursor::new(first_byte).chain(reader)))
 }
 
-#[derive(ToSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-#[schema(rename_all = "kebab-case")]
-pub enum BackupAdapter {
-    Wings,
-    S3,
-    DdupBak,
-    Btrfs,
-    Zfs,
-    Restic,
-    ProxmoxBackupServer,
-    Kopia,
-}
-
-impl BackupAdapter {
-    #[inline]
-    pub fn variants() -> &'static [Self] {
-        &[
-            Self::Wings,
-            Self::S3,
-            Self::DdupBak,
-            Self::Btrfs,
-            Self::Zfs,
-            Self::Restic,
-            Self::ProxmoxBackupServer,
-            Self::Kopia,
-        ]
-    }
-
-    #[inline]
-    pub fn to_str(self) -> &'static str {
-        match self {
-            Self::Wings => "wings",
-            Self::S3 => "s3",
-            Self::DdupBak => "ddup-bak",
-            Self::Btrfs => "btrfs",
-            Self::Zfs => "zfs",
-            Self::Restic => "restic",
-            Self::ProxmoxBackupServer => "proxmox-backup-server",
-            Self::Kopia => "kopia",
-        }
-    }
-}
-
 impl BackupAdapter {
     pub async fn find_all(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<(Self, Backup)>, anyhow::Error> {
         for adapter in Self::variants() {
-            if let Some(backup) = match adapter {
-                BackupAdapter::Wings => {
-                    <wings::WingsBackup as BackupFindExt>::find(state, uuid).await
-                }
-                BackupAdapter::S3 => Ok(None),
-                BackupAdapter::DdupBak => {
-                    <ddup_bak::DdupBakBackup as BackupFindExt>::find(state, uuid).await
-                }
-                BackupAdapter::Btrfs => {
-                    <btrfs::BtrfsBackup as BackupFindExt>::find(state, uuid).await
-                }
-                BackupAdapter::Zfs => <zfs::ZfsBackup as BackupFindExt>::find(state, uuid).await,
-                BackupAdapter::Restic => {
-                    <restic::ResticBackup as BackupFindExt>::find(state, uuid).await
-                }
-                BackupAdapter::ProxmoxBackupServer => {
-                    <pbs::PbsBackup as BackupFindExt>::find(state, uuid).await
-                }
-                BackupAdapter::Kopia => {
-                    <kopia::KopiaBackup as BackupFindExt>::find(state, uuid).await
-                }
-            }? {
+            if *adapter == Self::S3 {
+                continue;
+            }
+
+            if let Some(backup) = adapter.find(state, uuid).await? {
                 return Ok(Some((*adapter, backup)));
             }
         }
 
         Ok(None)
-    }
-
-    pub async fn find(
-        self,
-        state: &crate::routes::State,
-        uuid: uuid::Uuid,
-    ) -> Result<Option<Backup>, anyhow::Error> {
-        match self {
-            BackupAdapter::Wings => wings::WingsBackup::find(state, uuid).await,
-            BackupAdapter::S3 => s3::S3Backup::find(state, uuid).await,
-            BackupAdapter::DdupBak => ddup_bak::DdupBakBackup::find(state, uuid).await,
-            BackupAdapter::Btrfs => btrfs::BtrfsBackup::find(state, uuid).await,
-            BackupAdapter::Zfs => zfs::ZfsBackup::find(state, uuid).await,
-            BackupAdapter::Restic => restic::ResticBackup::find(state, uuid).await,
-            BackupAdapter::ProxmoxBackupServer => pbs::PbsBackup::find(state, uuid).await,
-            BackupAdapter::Kopia => kopia::KopiaBackup::find(state, uuid).await,
-        }
-    }
-
-    pub async fn create(
-        self,
-        server: &crate::server::Server,
-        uuid: uuid::Uuid,
-        progress: crate::server::filesystem::archive::create::ArchiveProgress,
-        total: Arc<AtomicU64>,
-        ignore: crate::server::filesystem::ignore_list::IgnoreList,
-        ignore_raw: compact_str::CompactString,
-    ) -> Result<RawServerBackup, anyhow::Error> {
-        match self {
-            BackupAdapter::Wings => {
-                wings::WingsBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-            BackupAdapter::S3 => {
-                s3::S3Backup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-            BackupAdapter::DdupBak => {
-                ddup_bak::DdupBakBackup::create(server, uuid, progress, total, ignore, ignore_raw)
-                    .await
-            }
-            BackupAdapter::Btrfs => {
-                btrfs::BtrfsBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-            BackupAdapter::Zfs => {
-                zfs::ZfsBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-            BackupAdapter::Restic => {
-                restic::ResticBackup::create(server, uuid, progress, total, ignore, ignore_raw)
-                    .await
-            }
-            BackupAdapter::ProxmoxBackupServer => {
-                pbs::PbsBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-            BackupAdapter::Kopia => {
-                kopia::KopiaBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
-            }
-        }
     }
 
     pub async fn create_from_stream(
@@ -191,49 +71,8 @@ impl BackupAdapter {
         super::validate_dump_extension(extension)?;
         let reader = prepare_dump_reader(reader).await?;
 
-        match self {
-            BackupAdapter::Wings => {
-                wings::WingsBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::S3 => {
-                s3::S3Backup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::DdupBak => {
-                ddup_bak::DdupBakBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::Btrfs => {
-                btrfs::BtrfsBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::Zfs => {
-                zfs::ZfsBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::Restic => {
-                restic::ResticBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::ProxmoxBackupServer => {
-                pbs::PbsBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-            BackupAdapter::Kopia => {
-                kopia::KopiaBackup::create_from_stream(state, uuid, extension, reader).await
-            }
-        }
-    }
-
-    pub async fn clean(
-        self,
-        server: &crate::server::Server,
-        uuid: uuid::Uuid,
-    ) -> Result<(), anyhow::Error> {
-        match self {
-            BackupAdapter::Wings => wings::WingsBackup::clean(server, uuid).await,
-            BackupAdapter::S3 => s3::S3Backup::clean(server, uuid).await,
-            BackupAdapter::DdupBak => ddup_bak::DdupBakBackup::clean(server, uuid).await,
-            BackupAdapter::Btrfs => btrfs::BtrfsBackup::clean(server, uuid).await,
-            BackupAdapter::Zfs => zfs::ZfsBackup::clean(server, uuid).await,
-            BackupAdapter::Restic => restic::ResticBackup::clean(server, uuid).await,
-            BackupAdapter::ProxmoxBackupServer => pbs::PbsBackup::clean(server, uuid).await,
-            BackupAdapter::Kopia => kopia::KopiaBackup::clean(server, uuid).await,
-        }
+        self.create_from_prepared_stream(state, uuid, extension, reader)
+            .await
     }
 }
 

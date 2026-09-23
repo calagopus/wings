@@ -1,8 +1,15 @@
 use super::State;
-use crate::server::filesystem::ignore_list::IgnoreList;
-use axum::extract::DefaultBodyLimit;
+use crate::{
+    response::ApiResponse,
+    server::filesystem::{cap::FileType, uploads::part_path, virtualfs::VirtualWritableFilesystem},
+};
+use axum::{extract::DefaultBodyLimit, http::StatusCode};
 use serde::Deserialize;
-use std::sync::{Arc, LazyLock};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 use tokio::sync::Mutex;
 use utoipa_axum::{
     router::{OpenApiRouter, UtoipaMethodRouterExt},
@@ -20,17 +27,14 @@ pub struct FileJwtPayload {
     pub user_name: Option<compact_str::CompactString>,
     pub unique_id: compact_str::CompactString,
 
-    #[serde(default)]
-    pub ignored_files: Vec<compact_str::CompactString>,
+    #[serde(flatten)]
+    pub ignored_files: crate::routes::token::IgnoredFiles,
 }
 
-impl FileJwtPayload {
-    fn ignored(&self) -> Result<Option<IgnoreList>, ignore::Error> {
-        if self.ignored_files.is_empty() {
-            return Ok(None);
-        }
-
-        IgnoreList::try_from_lines(self.ignored_files.iter()).map(Some)
+impl crate::routes::token::TokenPayload for FileJwtPayload {
+    #[inline]
+    fn base(&self) -> &crate::remote::jwt::BasePayload {
+        &self.base
     }
 }
 
@@ -49,6 +53,103 @@ async fn upload_lock(key: (uuid::Uuid, std::path::PathBuf)) -> Arc<Mutex<()>> {
     UPLOAD_LOCKS
         .get_with(key, async { Arc::new(Mutex::new(())) })
         .await
+}
+
+async fn authenticate(
+    state: &crate::routes::AppState,
+    token: &str,
+) -> Result<(FileJwtPayload, crate::server::Server), ApiResponse> {
+    let payload: FileJwtPayload = crate::routes::token::verify(state, token, "file-upload")?;
+    let server = crate::routes::token::server(state, payload.server_uuid).await?;
+
+    Ok((payload, server))
+}
+
+struct UploadTarget {
+    parent: PathBuf,
+    file_name: OsString,
+    root: PathBuf,
+    filesystem: Arc<dyn VirtualWritableFilesystem>,
+    path: PathBuf,
+    part: PathBuf,
+}
+
+/// Resolves the staging `.part` path of a resumable upload, rejecting targets
+/// hidden by the subuser's or the server's ignore lists.
+async fn resolve_target(
+    server: &crate::server::Server,
+    payload: &FileJwtPayload,
+    directory: &str,
+    file: &str,
+    action: &str,
+) -> Result<UploadTarget, ApiResponse> {
+    let not_found = || ApiResponse::error("file not found").with_status(StatusCode::NOT_FOUND);
+
+    let ignored = match payload.ignored_files.compile() {
+        Ok(ignored) => ignored,
+        Err(err) => {
+            tracing::error!(
+                server = %server.uuid,
+                "failed to compile subuser ignored files, denying {action}: {:#?}",
+                err
+            );
+
+            return Err(not_found());
+        }
+    };
+
+    let relative = PathBuf::from(directory).join(file);
+    let Some(parent) = relative.parent() else {
+        return Err(
+            ApiResponse::error("file has no parent").with_status(StatusCode::EXPECTATION_FAILED)
+        );
+    };
+    let Some(file_name) = relative.file_name() else {
+        return Err(
+            ApiResponse::error("invalid file name").with_status(StatusCode::EXPECTATION_FAILED)
+        );
+    };
+
+    if ignored
+        .as_ref()
+        .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
+        || server
+            .filesystem
+            .async_is_ignored_subtree(parent, FileType::Dir)
+            .await
+    {
+        return Err(not_found());
+    }
+
+    let (root, filesystem) = server.filesystem.resolve_writable_fs(server, parent).await;
+    let path = root.join(file_name);
+
+    if filesystem.is_primary_server_fs()
+        && (ignored
+            .as_ref()
+            .is_some_and(|o| o.is_ignored(&path, FileType::File))
+            || server
+                .filesystem
+                .async_is_ignored(&path, FileType::File)
+                .await)
+    {
+        return Err(not_found());
+    }
+
+    let Some(part) = part_path(&path) else {
+        return Err(
+            ApiResponse::error("file name too long").with_status(StatusCode::EXPECTATION_FAILED)
+        );
+    };
+
+    Ok(UploadTarget {
+        parent: parent.to_path_buf(),
+        file_name: file_name.to_owned(),
+        root,
+        filesystem,
+        path,
+        part,
+    })
 }
 
 mod post {
@@ -110,38 +211,9 @@ mod post {
         Query(params): Query<Params>,
         mut multipart: Multipart,
     ) -> ApiResponseResult {
-        let payload: super::FileJwtPayload = match state.config.jwt.verify(&params.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let (payload, server) = super::authenticate(&state, &params.token).await?;
 
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("file-upload"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        if !state.config.jwt.limited_jwt_id(&payload.unique_id) {
-            return ApiResponse::error("token has already been used")
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        let server = match state.server_manager.get_server(payload.server_uuid).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        crate::routes::token::consume(&state, &payload.unique_id)?;
 
         let locked = server.locked_signal();
         tokio::pin!(locked);
@@ -181,7 +253,7 @@ mod post {
             }
         }
 
-        let ignored = match payload.ignored() {
+        let ignored = match payload.ignored_files.compile() {
             Ok(ignored) => ignored,
             Err(err) => {
                 tracing::error!(
@@ -374,11 +446,9 @@ mod head {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::{cap::FileType, uploads::part_path},
     };
     use axum::{body::Body, extract::Query, http::StatusCode};
     use serde::Deserialize;
-    use std::path::PathBuf;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -400,107 +470,13 @@ mod head {
         ("file" = String, Query, description = "The file name (may include a sub-path) within the directory"),
     ))]
     pub async fn route(state: GetState, Query(params): Query<Params>) -> ApiResponseResult {
-        let payload: super::FileJwtPayload = match state.config.jwt.verify(&params.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let (payload, server) = super::authenticate(&state, &params.token).await?;
 
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("file-upload"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        let super::UploadTarget {
+            filesystem, part, ..
+        } = super::resolve_target(&server, &payload, &params.directory, &params.file, "upload")
+            .await?;
 
-        let server = match state.server_manager.get_server(payload.server_uuid).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let ignored = match payload.ignored() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying upload: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
-        let parent = match relative.parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-        let file_name = match relative.file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-
-        if ignored
-            .as_ref()
-            .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
-            || server
-                .filesystem
-                .async_is_ignored_subtree(parent, FileType::Dir)
-                .await
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let (root, filesystem) = server
-            .filesystem
-            .resolve_writable_fs(&server, &parent)
-            .await;
-        let path = root.join(file_name);
-
-        if filesystem.is_primary_server_fs()
-            && (ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored(&path, FileType::File))
-                || server
-                    .filesystem
-                    .async_is_ignored(&path, FileType::File)
-                    .await)
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let part = match part_path(&path) {
-            Some(part) => part,
-            None => {
-                return ApiResponse::error("file name too long")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
         let offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
                 if !metadata.file_type.is_file() {
@@ -526,10 +502,7 @@ mod patch {
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::{
-                cap::FileType,
-                uploads::{NewUpload, part_path},
-            },
+            filesystem::{cap::FileType, uploads::NewUpload},
         },
     };
     use axum::{
@@ -540,7 +513,7 @@ mod patch {
     use futures::StreamExt;
     use serde::Deserialize;
     use serde_json::json;
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::net::SocketAddr;
     use tokio::io::AsyncWriteExt;
     use utoipa::ToSchema;
 
@@ -570,23 +543,7 @@ mod patch {
         Query(params): Query<Params>,
         body: Body,
     ) -> ApiResponseResult {
-        let payload: super::FileJwtPayload = match state.config.jwt.verify(&params.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
-
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("file-upload"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        let (payload, server) = super::authenticate(&state, &params.token).await?;
 
         let upload_offset = match headers
             .get("Upload-Offset")
@@ -610,15 +567,6 @@ mod patch {
             .get("Upload-Length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-
-        let server = match state.server_manager.get_server(payload.server_uuid).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
 
         let locked = server.locked_signal();
         tokio::pin!(locked);
@@ -656,80 +604,15 @@ mod patch {
             }
         }
 
-        let ignored = match payload.ignored() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying upload: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
-        let parent = match relative.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-        let file_name = match relative.file_name() {
-            Some(name) => name.to_owned(),
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-
-        if ignored
-            .as_ref()
-            .is_some_and(|o| o.is_ignored_subtree(&parent, FileType::Dir))
-            || server
-                .filesystem
-                .async_is_ignored_subtree(&parent, FileType::Dir)
-                .await
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let (root, filesystem) = server
-            .filesystem
-            .resolve_writable_fs(&server, &parent)
-            .await;
-        let path = root.join(&file_name);
-
-        if filesystem.is_primary_server_fs()
-            && (ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored(&path, FileType::File))
-                || server
-                    .filesystem
-                    .async_is_ignored(&path, FileType::File)
-                    .await)
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let part = match part_path(&path) {
-            Some(part) => part,
-            None => {
-                return ApiResponse::error("file name too long")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let super::UploadTarget {
+            parent,
+            file_name,
+            root,
+            filesystem,
+            path,
+            part,
+        } = super::resolve_target(&server, &payload, &params.directory, &params.file, "upload")
+            .await?;
 
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
         let _lock_guard = lock.lock().await;
@@ -874,11 +757,9 @@ mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::{cap::FileType, uploads::part_path},
     };
     use axum::{extract::Query, http::StatusCode};
     use serde::{Deserialize, Serialize};
-    use std::path::PathBuf;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -903,107 +784,18 @@ mod delete {
         ("file" = String, Query, description = "The file name (may include a sub-path) within the directory"),
     ))]
     pub async fn route(state: GetState, Query(params): Query<Params>) -> ApiResponseResult {
-        let payload: super::FileJwtPayload = match state.config.jwt.verify(&params.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let (payload, server) = super::authenticate(&state, &params.token).await?;
 
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("file-upload"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        let server = match state.server_manager.get_server(payload.server_uuid).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let ignored = match payload.ignored() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying discard: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let relative = PathBuf::from(params.directory.as_str()).join(params.file.as_str());
-        let parent = match relative.parent() {
-            Some(parent) => parent,
-            None => {
-                return ApiResponse::error("file has no parent")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-        let file_name = match relative.file_name() {
-            Some(name) => name,
-            None => {
-                return ApiResponse::error("invalid file name")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
-
-        if ignored
-            .as_ref()
-            .is_some_and(|o| o.is_ignored_subtree(parent, FileType::Dir))
-            || server
-                .filesystem
-                .async_is_ignored_subtree(parent, FileType::Dir)
-                .await
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let (root, filesystem) = server
-            .filesystem
-            .resolve_writable_fs(&server, &parent)
-            .await;
-        let path = root.join(file_name);
-
-        if filesystem.is_primary_server_fs()
-            && (ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored(&path, FileType::File))
-                || server
-                    .filesystem
-                    .async_is_ignored(&path, FileType::File)
-                    .await)
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
-        let part = match part_path(&path) {
-            Some(part) => part,
-            None => {
-                return ApiResponse::error("file name too long")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        };
+        let super::UploadTarget {
+            filesystem, part, ..
+        } = super::resolve_target(
+            &server,
+            &payload,
+            &params.directory,
+            &params.file,
+            "discard",
+        )
+        .await?;
 
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
         let _lock_guard = lock.lock().await;

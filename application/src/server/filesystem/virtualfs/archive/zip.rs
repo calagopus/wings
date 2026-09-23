@@ -553,7 +553,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     .chain(other_entries.into_iter().map(|(i, s)| (Some(i), s)));
 
                 if let Some(per_page) = per_page {
-                    let start = (page - 1) * per_page;
+                    let start = page.saturating_sub(1).saturating_mul(per_page);
 
                     for (zip_index, sortable) in merged.skip(start).take(per_page) {
                         match zip_index {

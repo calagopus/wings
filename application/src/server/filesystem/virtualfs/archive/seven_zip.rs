@@ -609,7 +609,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 );
 
                 let target_entries: Vec<_> = if let Some(per_page) = per_page {
-                    let start = (page - 1) * per_page;
+                    let start = page.saturating_sub(1).saturating_mul(per_page);
                     merged.skip(start).take(per_page).collect()
                 } else {
                     merged.collect()

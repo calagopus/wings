@@ -5,6 +5,7 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub mod api;
 mod download;
+mod token;
 mod upload;
 
 #[derive(Debug, ToSchema, Serialize, Clone, Copy)]

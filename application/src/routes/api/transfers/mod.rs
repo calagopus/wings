@@ -106,36 +106,10 @@ mod post {
                 .ok();
         }
 
-        let payload: crate::remote::jwt::BasePayload = match state.config.jwt.verify(token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let payload: crate::remote::jwt::BasePayload =
+            crate::routes::token::verify(&state, token, "transfer")?;
 
-        if let Err(err) = payload.validate(&state.config.jwt, Some("transfer")) {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        let subject: uuid::Uuid = match payload.subject {
-            Some(subject) => match subject.parse() {
-                Ok(subject) => subject,
-                Err(_) => {
-                    return ApiResponse::error("invalid token")
-                        .with_status(StatusCode::UNAUTHORIZED)
-                        .ok();
-                }
-            },
-            None => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let subject = crate::routes::token::subject_uuid(&payload)?;
 
         let is_multiplex = headers.contains_key("Multiplex-Stream");
         let multiplex_stream_count: usize = headers

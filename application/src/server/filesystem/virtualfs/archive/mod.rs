@@ -164,4 +164,101 @@ mod tests {
             .expect("archive search stalled with one blocking worker")
             .expect("archive entry test failed");
     }
+
+    // VirtualReadableFilesystem::async_read_dir
+    #[test]
+    fn archive_listing_page_zero_matches_first_page() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("creating archive listing test runtime failed");
+
+        let result = runtime.block_on(async {
+            let temp = tempfile::tempdir()?;
+            let state = AppState::mock();
+            state
+                .config
+                .mutate_in_place_for_testing()
+                .system
+                .data_directory =
+                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+            let server = Server::mock(uuid::Uuid::new_v4(), state);
+            server.filesystem.disk_checker.abort();
+
+            let mut zip = zip::ZipWriter::new(tempfile::tempfile()?);
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())?;
+            }
+            let zip = zip::ZipArchive::new(MultiReader::new(Arc::new(zip.finish()?))?)?;
+
+            let mut seven_zip = sevenz_rust2::Archive::default();
+            seven_zip.files = ["a.txt", "b.txt", "c.txt"]
+                .into_iter()
+                .map(|name| sevenz_rust2::ArchiveEntry {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .collect();
+
+            let content = temp.path().join("content");
+            std::fs::create_dir_all(&content)?;
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                std::fs::write(content.join(name), [])?;
+            }
+            let mut ddup = ddup_bak::archive::Archive::new(tempfile::tempfile()?)?;
+            ddup.add_directory(content.to_str().expect("temporary path is UTF-8"), None)?;
+
+            let archives: Vec<Arc<dyn VirtualReadableFilesystem>> = vec![
+                Arc::new(VirtualZipArchive::new(
+                    server.clone(),
+                    zip,
+                    Default::default(),
+                )),
+                Arc::new(VirtualSevenZipArchive::new(
+                    server.clone(),
+                    Arc::new(seven_zip),
+                    Default::default(),
+                    MultiReader::new(Arc::new(tempfile::tempfile()?))?,
+                )),
+                Arc::new(VirtualDdupBakArchive::new(
+                    server,
+                    Arc::new(ddup),
+                    Default::default(),
+                    None,
+                )),
+            ];
+
+            for filesystem in archives {
+                let list = async |per_page, page| {
+                    filesystem
+                        .async_read_dir(
+                            &"",
+                            Some(per_page),
+                            page,
+                            IsIgnoredFn::default(),
+                            Default::default(),
+                        )
+                        .await
+                };
+
+                let first = list(2, 1).await?;
+                let zero = list(2, 0).await?;
+                assert_eq!(first.total_entries, 3);
+                assert_eq!(first.entries.len(), 2);
+                assert_eq!(zero.total_entries, first.total_entries);
+                assert_eq!(
+                    serde_json::to_value(&zero.entries)?,
+                    serde_json::to_value(&first.entries)?
+                );
+
+                let unbounded = list(usize::MAX, 1).await?;
+                assert_eq!(unbounded.entries.len(), 3);
+            }
+
+            Ok::<_, anyhow::Error>(())
+        });
+
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        result.expect("archive listing test failed");
+    }
 }

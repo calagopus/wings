@@ -1,5 +1,6 @@
 use super::{WebsocketEvent, WebsocketMessage};
 use crate::server::{
+    PowerActionError,
     activity::{Activity, ActivityEvent},
     collab::CollabError,
     permissions::Permission,
@@ -115,227 +116,39 @@ pub async fn handle_message(
             };
             let power_action = crate::models::ServerPowerAction::from_str(action)?;
 
-            match power_action {
-                crate::models::ServerPowerAction::Start => {
-                    let socket_jwt = websocket_handler.get_jwt().await?;
+            let socket_jwt = websocket_handler.get_jwt().await?;
 
-                    if !socket_jwt
-                        .permissions
-                        .has_permission(Permission::ControlStart)
-                    {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            "jwt does not have permission to start server: {:?}",
-                            socket_jwt.permissions
-                        );
+            if !socket_jwt
+                .permissions
+                .has_permission(power_action.required_permission())
+            {
+                tracing::debug!(
+                    server = %server.uuid,
+                    "jwt does not have permission to {} server: {:?}",
+                    power_action.to_str(),
+                    socket_jwt.permissions
+                );
 
-                        return Ok(());
-                    }
-                    drop(socket_jwt);
+                return Ok(());
+            }
+            drop(socket_jwt);
 
-                    if server.state.get_state() != crate::server::state::ServerState::Offline {
-                        websocket_handler
-                            .send_error("Server is already running or starting.")
-                            .await;
-
-                        return Ok(());
-                    }
-
-                    if let Err(err) = server.start(None, false).await {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                websocket_handler.send_error(message).await;
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to start server: {:#?}",
-                                    err,
-                                );
-
-                                websocket_handler.send_admin_error(err).await;
-                            }
-                        }
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerStart,
-                            user: Some(websocket_handler.get_jwt().await?.user_uuid),
-                            ip: user_ip,
-                            metadata: None,
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
+            match server.checked_power_action(power_action).await {
+                Ok(()) => {
+                    server.activity.log_activity(Activity {
+                        event: power_action.activity_event(),
+                        user: Some(websocket_handler.get_jwt().await?.user_uuid),
+                        ip: user_ip,
+                        metadata: None,
+                        schedule: None,
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
-                crate::models::ServerPowerAction::Restart => {
-                    let socket_jwt = websocket_handler.get_jwt().await?;
-
-                    if !socket_jwt
-                        .permissions
-                        .has_permission(Permission::ControlRestart)
-                    {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            "jwt does not have permission to start server: {:?}",
-                            socket_jwt.permissions
-                        );
-
-                        return Ok(());
-                    }
-                    drop(socket_jwt);
-
-                    if server.restarting.load(std::sync::atomic::Ordering::SeqCst) {
-                        websocket_handler
-                            .send_error("Server is already restarting.")
-                            .await;
-
-                        return Ok(());
-                    }
-
-                    let auto_kill = server.configuration.read().await.auto_kill;
-                    if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                        server
-                            .restart_with_kill_timeout(
-                                None,
-                                std::time::Duration::from_secs(auto_kill.seconds),
-                            )
-                            .await
-                    } else {
-                        server.restart(None).await
-                    } {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                websocket_handler.send_error(message).await;
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to restart server: {:#?}",
-                                    err
-                                );
-
-                                websocket_handler.send_admin_error(err).await;
-                            }
-                        }
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerRestart,
-                            user: Some(websocket_handler.get_jwt().await?.user_uuid),
-                            ip: user_ip,
-                            metadata: None,
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
+                Err(PowerActionError::User(message)) => {
+                    websocket_handler.send_error(message).await;
                 }
-                crate::models::ServerPowerAction::Stop => {
-                    let socket_jwt = websocket_handler.get_jwt().await?;
-
-                    if !socket_jwt
-                        .permissions
-                        .has_permission(Permission::ControlStop)
-                    {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            "jwt does not have permission to start server: {:?}",
-                            socket_jwt.permissions
-                        );
-
-                        return Ok(());
-                    }
-                    drop(socket_jwt);
-
-                    if matches!(
-                        server.state.get_state(),
-                        crate::server::state::ServerState::Offline
-                            | crate::server::state::ServerState::Stopping
-                    ) {
-                        websocket_handler
-                            .send_error("Server is already offline or stopping.")
-                            .await;
-
-                        return Ok(());
-                    }
-
-                    let auto_kill = server.configuration.read().await.auto_kill;
-                    if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                        server
-                            .stop_with_kill_timeout(
-                                std::time::Duration::from_secs(auto_kill.seconds),
-                                false,
-                            )
-                            .await
-                    } else {
-                        server.stop(None, false).await
-                    } {
-                        match err.downcast::<&str>() {
-                            Ok(message) => {
-                                websocket_handler.send_error(message).await;
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    server = %server.uuid,
-                                    "failed to stop server: {:#?}",
-                                    err
-                                );
-
-                                websocket_handler.send_admin_error(err).await;
-                            }
-                        }
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerStop,
-                            user: Some(websocket_handler.get_jwt().await?.user_uuid),
-                            ip: user_ip,
-                            metadata: None,
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                }
-                crate::models::ServerPowerAction::Kill => {
-                    let socket_jwt = websocket_handler.get_jwt().await?;
-
-                    if !socket_jwt
-                        .permissions
-                        .has_permission(Permission::ControlStop)
-                    {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            "jwt does not have permission to start server: {:?}",
-                            socket_jwt.permissions,
-                        );
-
-                        return Ok(());
-                    }
-                    drop(socket_jwt);
-
-                    if server.state.get_state() == crate::server::state::ServerState::Offline {
-                        websocket_handler
-                            .send_error("Server is already offline.")
-                            .await;
-
-                        return Ok(());
-                    }
-
-                    if let Err(err) = server.kill(false).await {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to kill server: {:#?}",
-                            err
-                        );
-
-                        websocket_handler.send_admin_error(err).await;
-                    } else {
-                        server.activity.log_activity(Activity {
-                            event: ActivityEvent::PowerKill,
-                            user: Some(websocket_handler.get_jwt().await?.user_uuid),
-                            ip: user_ip,
-                            metadata: None,
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
+                Err(PowerActionError::Internal(err)) => {
+                    websocket_handler.send_admin_error(err).await;
                 }
             }
         }

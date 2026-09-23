@@ -33,63 +33,13 @@ mod post {
 
         let spawn_task = |server: crate::server::Server| {
             tokio::spawn(async move {
-                match data.action {
-                    crate::models::ServerPowerAction::Start => {
-                        if let Err(err) = server.start(aquire_timeout, false).await {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to start server: {:#?}",
-                                err
-                            );
-                        }
-                    }
-                    crate::models::ServerPowerAction::Stop => {
-                        let auto_kill = server.configuration.read().await.auto_kill;
-                        if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                            server
-                                .stop_with_kill_timeout(
-                                    std::time::Duration::from_secs(auto_kill.seconds),
-                                    false,
-                                )
-                                .await
-                        } else {
-                            server.stop(aquire_timeout, false).await
-                        } {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to stop server: {:#?}",
-                                err
-                            );
-                        }
-                    }
-                    crate::models::ServerPowerAction::Restart => {
-                        let auto_kill = server.configuration.read().await.auto_kill;
-                        if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                            server
-                                .restart_with_kill_timeout(
-                                    aquire_timeout,
-                                    std::time::Duration::from_secs(auto_kill.seconds),
-                                )
-                                .await
-                        } else {
-                            server.restart(None).await
-                        } {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to auto kill server: {:#?}",
-                                err
-                            );
-                        }
-                    }
-                    crate::models::ServerPowerAction::Kill => {
-                        if let Err(err) = server.kill(false).await {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to kill server: {:#?}",
-                                err
-                            );
-                        }
-                    }
+                if let Err(err) = server.power_action(data.action, aquire_timeout).await {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to {} server: {:#?}",
+                        data.action.to_str(),
+                        err
+                    );
                 }
             });
         };

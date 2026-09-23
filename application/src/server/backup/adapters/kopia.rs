@@ -1505,7 +1505,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let merged = dir_children.into_iter().chain(file_children);
 
         let target: Vec<(PathBuf, &KopiaEntry)> = if let Some(per_page) = per_page {
-            let start = page.saturating_sub(1) * per_page;
+            let start = page.saturating_sub(1).saturating_mul(per_page);
             merged.skip(start).take(per_page).collect()
         } else {
             merged.collect()

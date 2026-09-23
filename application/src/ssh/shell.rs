@@ -1,6 +1,8 @@
 use crate::{
+    models::ServerPowerAction,
     routes::State,
     server::{
+        PowerActionError,
         activity::{Activity, ActivityEvent},
         permissions::Permission,
         websocket::WebsocketEvent,
@@ -8,7 +10,7 @@ use crate::{
 };
 use russh::{Channel, ChannelWriteHalf, server::Msg};
 use serde_json::json;
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, str::FromStr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::broadcast::error::RecvError,
@@ -67,181 +69,48 @@ impl ShellSession {
             Some("version") => {
                 writeln(&format!("Current version: {}", crate::VERSION)).await;
             }
-            Some("power") => match segments.next() {
-                Some("start") => {
-                    if self.has_permission(Permission::ControlStart) {
-                        if self.server.state.get_state()
-                            != crate::server::state::ServerState::Offline
-                        {
-                            writeln("Server is already online.").await;
-                            return;
-                        }
-
-                        if let Err(err) = self.server.start(None, false).await {
-                            match err.downcast::<&str>() {
-                                Ok(message) => writeln(message).await,
-                                Err(err) => {
-                                    tracing::error!(
-                                        server = %self.server.uuid,
-                                        "failed to start server: {:#?}",
-                                        err,
-                                    );
-
-                                    writeln("An unexpected error occurred while starting the server. Please contact an Administrator.")
-                                        .await;
-                                }
-                            }
-                        } else {
-                            self.server.activity.log_activity(Activity {
-                                event: ActivityEvent::PowerStart,
-                                user: Some(self.user_uuid),
-                                ip: Some(self.user_ip),
-                                metadata: None,
-                                schedule: None,
-                                timestamp: chrono::Utc::now(),
-                            });
-                        }
-                    } else {
-                        writeln("You are missing the `control.start` permission to do this.").await;
-                    }
-                }
-                Some("restart") => {
-                    if self.has_permission(Permission::ControlRestart) {
-                        if self
-                            .server
-                            .restarting
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            writeln("Server is already restarting.").await;
-                            return;
-                        }
-
-                        let auto_kill = self.server.configuration.read().await.auto_kill;
-                        if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                            self.server
-                                .restart_with_kill_timeout(
-                                    None,
-                                    std::time::Duration::from_secs(auto_kill.seconds),
-                                )
-                                .await
-                        } else {
-                            self.server.restart(None).await
-                        } {
-                            match err.downcast::<&str>() {
-                                Ok(message) => writeln(message).await,
-                                Err(err) => {
-                                    tracing::error!(
-                                        server = %self.server.uuid,
-                                        "failed to restart server: {:#?}",
-                                        err,
-                                    );
-
-                                    writeln("An unexpected error occurred while restarting the server. Please contact an Administrator.")
-                                        .await;
-                                }
-                            }
-                        } else {
-                            self.server.activity.log_activity(Activity {
-                                event: ActivityEvent::PowerRestart,
-                                user: Some(self.user_uuid),
-                                ip: Some(self.user_ip),
-                                metadata: None,
-                                schedule: None,
-                                timestamp: chrono::Utc::now(),
-                            });
-                        }
-                    } else {
-                        writeln("You are missing the `control.restart` permission to do this.")
-                            .await;
-                    }
-                }
-                Some("stop") => {
-                    if self.has_permission(Permission::ControlStop) {
-                        if matches!(
-                            self.server.state.get_state(),
-                            crate::server::state::ServerState::Offline
-                                | crate::server::state::ServerState::Stopping
-                        ) {
-                            writeln("Server is already offline or stopping.").await;
-                            return;
-                        }
-
-                        let auto_kill = self.server.configuration.read().await.auto_kill;
-                        if let Err(err) = if auto_kill.enabled && auto_kill.seconds > 0 {
-                            self.server
-                                .stop_with_kill_timeout(
-                                    std::time::Duration::from_secs(auto_kill.seconds),
-                                    false,
-                                )
-                                .await
-                        } else {
-                            self.server.stop(None, false).await
-                        } {
-                            match err.downcast::<&str>() {
-                                Ok(message) => writeln(message).await,
-                                Err(err) => {
-                                    tracing::error!(
-                                        server = %self.server.uuid,
-                                        "failed to stop server: {:#?}",
-                                        err,
-                                    );
-
-                                    writeln("An unexpected error occurred while stopping the server. Please contact an Administrator.")
-                                        .await;
-                                }
-                            }
-                        } else {
-                            self.server.activity.log_activity(Activity {
-                                event: ActivityEvent::PowerStop,
-                                user: Some(self.user_uuid),
-                                ip: Some(self.user_ip),
-                                metadata: None,
-                                schedule: None,
-                                timestamp: chrono::Utc::now(),
-                            });
-                        }
-                    } else {
-                        writeln("You are missing the `control.stop` permission to do this.").await;
-                    }
-                }
-                Some("kill") => {
-                    if self.has_permission(Permission::ControlStop) {
-                        if self.server.state.get_state()
-                            == crate::server::state::ServerState::Offline
-                        {
-                            writeln("Server is already offline.").await;
-                            return;
-                        }
-
-                        if let Err(err) = self.server.kill(false).await {
-                            tracing::error!(
-                                server = %self.server.uuid,
-                                "failed to kill server: {:#?}",
-                                err,
-                            );
-
-                            writeln("An unexpected error occurred while killing the server. Please contact an Administrator.")
-                                        .await;
-                        } else {
-                            self.server.activity.log_activity(Activity {
-                                event: ActivityEvent::PowerKill,
-                                user: Some(self.user_uuid),
-                                ip: Some(self.user_ip),
-                                metadata: None,
-                                schedule: None,
-                                timestamp: chrono::Utc::now(),
-                            });
-                        }
-                    } else {
-                        writeln("You are missing the `control.stop` permission to do this.").await;
-                    }
-                }
-                _ => {
+            Some("power") => {
+                let Some(action) = segments
+                    .next()
+                    .and_then(|action| ServerPowerAction::from_str(action).ok())
+                else {
                     let config = self.state.config.load();
                     let prefix = &config.system.sftp.shell.cli.name;
                     writeln(&format!("Usage: {prefix} power <start|restart|stop|kill>")).await;
+                    return;
+                };
+
+                let permission = action.required_permission();
+                if !self.has_permission(permission) {
+                    writeln(&format!(
+                        "You are missing the `{}` permission to do this.",
+                        permission.to_str()
+                    ))
+                    .await;
+                    return;
                 }
-            },
+
+                match self.server.checked_power_action(action).await {
+                    Ok(()) => {
+                        self.server.activity.log_activity(Activity {
+                            event: action.activity_event(),
+                            user: Some(self.user_uuid),
+                            ip: Some(self.user_ip),
+                            metadata: None,
+                            schedule: None,
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                    Err(PowerActionError::User(message)) => writeln(&message).await,
+                    Err(PowerActionError::Internal(_)) => {
+                        writeln(&format!(
+                            "An unexpected error occurred while trying to {} the server. Please contact an Administrator.",
+                            action.to_str()
+                        ))
+                        .await;
+                    }
+                }
+            }
             Some("stats") => {
                 let resource_usage = self.server.resource_usage();
 

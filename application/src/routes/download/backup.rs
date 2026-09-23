@@ -34,6 +34,13 @@ mod get {
         pub database: bool,
     }
 
+    impl crate::routes::token::TokenPayload for BackupJwtPayload {
+        #[inline]
+        fn base(&self) -> &crate::remote::jwt::BasePayload {
+            &self.base
+        }
+    }
+
     #[utoipa::path(get, path = "/", responses(
         (status = OK, body = String),
         (status = UNAUTHORIZED, body = String),
@@ -50,29 +57,10 @@ mod get {
         headers: HeaderMap,
         Query(data): Query<Params>,
     ) -> ApiResponseResult {
-        let payload: BackupJwtPayload = match state.config.jwt.verify(&data.token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let payload: BackupJwtPayload =
+            crate::routes::token::verify(&state, &data.token, "backup-download")?;
 
-        if let Err(err) = payload
-            .base
-            .validate(&state.config.jwt, Some("backup-download"))
-        {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
-
-        if !state.config.jwt.limited_jwt_id(&payload.unique_id) {
-            return ApiResponse::error("token has already been used")
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        crate::routes::token::consume(&state, &payload.unique_id)?;
 
         if let Some(server_uuid) = payload.server_uuid
             && state.server_manager.get_server(server_uuid).await.is_none()

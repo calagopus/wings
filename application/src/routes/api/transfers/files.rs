@@ -51,6 +51,13 @@ mod post {
         pub destination_path: compact_str::CompactString,
     }
 
+    impl crate::routes::token::TokenPayload for FileTransferJwtPayload {
+        #[inline]
+        fn base(&self) -> &crate::remote::jwt::BasePayload {
+            &self.base
+        }
+    }
+
     fn remap_root_path(path: &Path, files: &[crate::models::CopyFile]) -> PathBuf {
         for file in files {
             if let Ok(stripped) = path.strip_prefix(Path::new(&file.from)) {
@@ -96,45 +103,12 @@ mod post {
                 .ok();
         }
 
-        let payload: FileTransferJwtPayload = match state.config.jwt.verify(token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
+        let payload: FileTransferJwtPayload =
+            crate::routes::token::verify(&state, token, "transfer")?;
 
-        if let Err(err) = payload.base.validate(&state.config.jwt, Some("transfer")) {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        let subject = crate::routes::token::subject_uuid(&payload.base)?;
 
-        let subject: uuid::Uuid = match payload.base.subject {
-            Some(subject) => match subject.parse() {
-                Ok(subject) => subject,
-                Err(_) => {
-                    return ApiResponse::error("invalid token")
-                        .with_status(StatusCode::UNAUTHORIZED)
-                        .ok();
-                }
-            },
-            None => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
-
-        let server = match state.server_manager.get_server(subject).await {
-            Some(server) => server,
-            None => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let server = crate::routes::token::server(&state, subject).await?;
 
         let total_bytes: u64 = headers
             .get("Total-Bytes")

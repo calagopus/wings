@@ -34,20 +34,7 @@ mod get {
                 .ok();
         }
 
-        let payload: crate::remote::jwt::BasePayload = match state.config.jwt.verify(token) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ApiResponse::error("invalid token")
-                    .with_status(StatusCode::UNAUTHORIZED)
-                    .ok();
-            }
-        };
-
-        if let Err(err) = payload.validate(&state.config.jwt, Some("transfer")) {
-            return ApiResponse::error(&format!("invalid token: {err}"))
-                .with_status(StatusCode::UNAUTHORIZED)
-                .ok();
-        }
+        crate::routes::token::verify::<crate::remote::jwt::BasePayload>(&state, token, "transfer")?;
 
         ApiResponse::new_serialized(TransferCapabilities::from_config(&state.config.load())).ok()
     }

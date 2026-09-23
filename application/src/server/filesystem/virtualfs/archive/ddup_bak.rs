@@ -725,7 +725,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                         let mut entries = Vec::new();
 
                         if let Some(per_page) = per_page {
-                            let start = (page - 1) * per_page;
+                            let start = page.saturating_sub(1).saturating_mul(per_page);
 
                             for entry in directory_entries
                                 .into_iter()
@@ -802,7 +802,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                         let mut entries = Vec::new();
 
                         if let Some(per_page) = per_page {
-                            let start = (page - 1) * per_page;
+                            let start = page.saturating_sub(1).saturating_mul(per_page);
 
                             for entry in directory_entries
                                 .into_iter()

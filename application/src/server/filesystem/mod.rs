@@ -1703,62 +1703,7 @@ impl Filesystem {
             );
         }
 
-        if self.cap_filesystem.is_uninitialized() {
-            let base_path = self.base_path.clone();
-            match tokio::task::spawn_blocking(move || {
-                cap_std::fs::Dir::open_ambient_dir(&base_path, cap_std::ambient_authority())
-            })
-            .await
-            {
-                Ok(Ok(dir)) => {
-                    self.cap_filesystem.inner.store(Some(Arc::new(dir)));
-                    if self.app_state.config.load().system.disk_check_use_inotify {
-                        tokio::spawn({
-                            let state = self.app_state.clone();
-                            let server_notifier = self.server_notifier.clone();
-                            let server_use_server_notifier = self.use_server_notifier.clone();
-                            let server_uuid = self.uuid;
-
-                            async move {
-                                match state
-                                    .inotify_manager
-                                    .register_server_with_notifier(
-                                        server_notifier.clone(),
-                                        server_uuid,
-                                    )
-                                    .await
-                                {
-                                    Ok(watching) => {
-                                        server_use_server_notifier
-                                            .store(watching, Ordering::Relaxed);
-                                    }
-                                    Err(err) => {
-                                        tracing::error!(
-                                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                            err
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                Ok(Err(err)) => {
-                    tracing::error!(
-                        path = %self.base_path.display(),
-                        "failed to open server base directory: {:?}",
-                        err
-                    );
-                }
-                Err(err) => {
-                    tracing::error!(
-                        path = %self.base_path.display(),
-                        "failed to open server base directory: {:?}",
-                        err
-                    );
-                }
-            }
-        }
+        self.open_cap_filesystem().await;
     }
 
     pub async fn attach(&self) {
@@ -1770,61 +1715,68 @@ impl Filesystem {
             );
         }
 
-        if self.cap_filesystem.is_uninitialized() {
-            let base_path = self.base_path.clone();
-            match tokio::task::spawn_blocking(move || {
-                cap_std::fs::Dir::open_ambient_dir(&base_path, cap_std::ambient_authority())
-            })
-            .await
-            {
-                Ok(Ok(dir)) => {
-                    self.cap_filesystem.inner.store(Some(Arc::new(dir)));
-                    if self.app_state.config.load().system.disk_check_use_inotify {
-                        tokio::spawn({
-                            let state = self.app_state.clone();
-                            let server_notifier = self.server_notifier.clone();
-                            let server_use_server_notifier = self.use_server_notifier.clone();
-                            let server_uuid = self.uuid;
+        self.open_cap_filesystem().await;
+    }
 
-                            async move {
-                                match state
-                                    .inotify_manager
-                                    .register_server_with_notifier(
-                                        server_notifier.clone(),
-                                        server_uuid,
-                                    )
-                                    .await
-                                {
-                                    Ok(watching) => {
-                                        server_use_server_notifier
-                                            .store(watching, Ordering::Relaxed);
-                                    }
-                                    Err(err) => {
-                                        tracing::error!(
-                                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                            err
-                                        );
-                                    }
-                                }
-                            }
-                        });
+    async fn open_cap_filesystem(&self) {
+        if !self.cap_filesystem.is_uninitialized() {
+            return;
+        }
+
+        let base_path = self.base_path.clone();
+        let dir = match tokio::task::spawn_blocking(move || {
+            cap_std::fs::Dir::open_ambient_dir(&base_path, cap_std::ambient_authority())
+        })
+        .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(err)) => {
+                tracing::error!(
+                    path = %self.base_path.display(),
+                    "failed to open server base directory: {:?}",
+                    err
+                );
+
+                return;
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %self.base_path.display(),
+                    "failed to open server base directory: {:?}",
+                    err
+                );
+
+                return;
+            }
+        };
+
+        self.cap_filesystem.inner.store(Some(Arc::new(dir)));
+
+        if self.app_state.config.load().system.disk_check_use_inotify {
+            tokio::spawn({
+                let state = self.app_state.clone();
+                let server_notifier = self.server_notifier.clone();
+                let server_use_server_notifier = self.use_server_notifier.clone();
+                let server_uuid = self.uuid;
+
+                async move {
+                    match state
+                        .inotify_manager
+                        .register_server_with_notifier(server_notifier, server_uuid)
+                        .await
+                    {
+                        Ok(watching) => {
+                            server_use_server_notifier.store(watching, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                                err
+                            );
+                        }
                     }
                 }
-                Ok(Err(err)) => {
-                    tracing::error!(
-                        path = %self.base_path.display(),
-                        "failed to open server base directory: {}",
-                        err
-                    );
-                }
-                Err(err) => {
-                    tracing::error!(
-                        path = %self.base_path.display(),
-                        "failed to open server base directory: {}",
-                        err
-                    );
-                }
-            }
+            });
         }
     }
 
@@ -2082,53 +2034,14 @@ impl Filesystem {
             mime_type.unwrap_or_default()
         };
 
-        crate::models::DirectoryEntry {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            mode: encode_mode(raw_mode(metadata)),
-            mode_bits: compact_str::format_compact!(
-                "{:o}",
-                PortablePermissions::from(metadata.permissions()).mode()
-            ),
-            size,
-            size_physical,
-            editable: real_metadata.is_file() && detected_mime.valid_utf8,
-            inner_editable: real_metadata.is_file() && detected_mime.valid_inner_utf8,
-            directory: real_metadata.is_dir(),
-            file: real_metadata.is_file(),
-            symlink: metadata.is_symlink(),
-            r#virtual: options.r#virtual,
-            mime: detected_mime.mime,
-            modified: chrono::DateTime::from_timestamp(
-                metadata
-                    .modified()
-                    .map(|t| {
-                        t.into_std()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                0,
-            )
-            .unwrap_or_default(),
-            created: chrono::DateTime::from_timestamp(
-                metadata
-                    .created()
-                    .map(|t| {
-                        t.into_std()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                0,
-            )
-            .unwrap_or_default(),
-        }
+        Self::assemble_api_entry(
+            path,
+            metadata,
+            real_metadata,
+            options,
+            (size, size_physical),
+            detected_mime,
+        )
     }
 
     pub async fn to_api_entry_cap(

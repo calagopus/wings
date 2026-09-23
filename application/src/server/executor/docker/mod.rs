@@ -973,6 +973,72 @@ impl DockerExecutor {
         }
     }
 
+    fn installer_host_config(
+        &self,
+        server_base: &str,
+        resources: bollard::models::Resources,
+        staging_dir: &std::path::Path,
+        staging_target: &str,
+    ) -> bollard::plugin::HostConfig {
+        let (mounts, binds) = split_selinux_binds(vec![
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    server_base,
+                )),
+                target: Some("/mnt/server".to_string()),
+                ..Default::default()
+            },
+            bollard::plugin::Mount {
+                typ: Some(bollard::plugin::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    self.host_mounts(),
+                    &staging_dir.to_string_lossy(),
+                )),
+                target: Some(staging_target.to_string()),
+                ..Default::default()
+            },
+        ]);
+        let config = self.app_config.load();
+
+        bollard::plugin::HostConfig {
+            memory: resources.memory,
+            memory_reservation: resources.memory_reservation,
+            memory_swap: resources.memory_swap,
+            cpu_quota: resources.cpu_quota,
+            cpu_period: resources.cpu_period,
+            cpuset_cpus: resources.cpuset_cpus,
+            cpuset_mems: resources.cpuset_mems,
+            pids_limit: resources.pids_limit,
+            blkio_weight: resources.blkio_weight,
+            oom_kill_disable: resources.oom_kill_disable,
+            mounts: Some(mounts),
+            binds,
+            network_mode: Some(config.docker.network.mode.clone()),
+            dns: Some(config.docker.network.dns.clone()),
+            dns_options: Some(config.docker.network.dns_options.clone()),
+            tmpfs: Some(HashMap::from([(
+                "/tmp".to_string(),
+                format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size.as_mib()),
+            )])),
+            log_config: Some(bollard::plugin::HostConfigLogConfig {
+                typ: Some(config.docker.log_config.r#type.clone()),
+                config: Some(
+                    config
+                        .docker
+                        .log_config
+                        .config
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+            }),
+            userns_mode: string_to_option(&config.docker.userns_mode),
+            ..Default::default()
+        }
+    }
+
     #[inline]
     fn host_mounts(&self) -> Option<&host_mounts::HostMountTable> {
         self.host_mounts.get().and_then(Option::as_ref)
@@ -2873,67 +2939,13 @@ impl super::ServerExecutor for DockerExecutor {
             )
         })?;
 
-        let (mounts, binds) = split_selinux_binds(vec![
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &server.filesystem.base(),
-                )),
-                target: Some("/mnt/server".to_string()),
-                ..Default::default()
-            },
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &tmp_dir.to_string_lossy(),
-                )),
-                target: Some("/mnt/install".to_string()),
-                ..Default::default()
-            },
-        ]);
-
         let bollard_config = bollard::plugin::ContainerCreateBody {
-            host_config: Some(bollard::plugin::HostConfig {
-                memory: resources.memory,
-                memory_reservation: resources.memory_reservation,
-                memory_swap: resources.memory_swap,
-                cpu_quota: resources.cpu_quota,
-                cpu_period: resources.cpu_period,
-                cpuset_cpus: resources.cpuset_cpus,
-                cpuset_mems: resources.cpuset_mems,
-                pids_limit: resources.pids_limit,
-                blkio_weight: resources.blkio_weight,
-                oom_kill_disable: resources.oom_kill_disable,
-                mounts: Some(mounts),
-                binds,
-                network_mode: Some(self.app_config.load().docker.network.mode.clone()),
-                dns: Some(self.app_config.load().docker.network.dns.clone()),
-                dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    format!(
-                        "rw,exec,nosuid,size={}M",
-                        self.app_config.load().docker.tmpfs_size.as_mib()
-                    ),
-                )])),
-                log_config: Some(bollard::plugin::HostConfigLogConfig {
-                    typ: Some(self.app_config.load().docker.log_config.r#type.clone()),
-                    config: Some(
-                        self.app_config
-                            .load()
-                            .docker
-                            .log_config
-                            .config
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                }),
-                userns_mode: string_to_option(&self.app_config.load().docker.userns_mode),
-                ..Default::default()
-            }),
+            host_config: Some(self.installer_host_config(
+                &server.filesystem.base(),
+                resources,
+                &tmp_dir,
+                "/mnt/install",
+            )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
                 "/mnt/install/install.sh".to_string(),
@@ -3089,67 +3101,13 @@ impl super::ServerExecutor for DockerExecutor {
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
-        let (mounts, binds) = split_selinux_binds(vec![
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &server.filesystem.base(),
-                )),
-                target: Some("/mnt/server".to_string()),
-                ..Default::default()
-            },
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &tmp_dir.to_string_lossy(),
-                )),
-                target: Some("/mnt/script".to_string()),
-                ..Default::default()
-            },
-        ]);
-
         let bollard_config = bollard::plugin::ContainerCreateBody {
-            host_config: Some(bollard::plugin::HostConfig {
-                memory: resources.memory,
-                memory_reservation: resources.memory_reservation,
-                memory_swap: resources.memory_swap,
-                cpu_quota: resources.cpu_quota,
-                cpu_period: resources.cpu_period,
-                cpuset_cpus: resources.cpuset_cpus,
-                cpuset_mems: resources.cpuset_mems,
-                pids_limit: resources.pids_limit,
-                blkio_weight: resources.blkio_weight,
-                oom_kill_disable: resources.oom_kill_disable,
-                mounts: Some(mounts),
-                binds,
-                network_mode: Some(self.app_config.load().docker.network.mode.clone()),
-                dns: Some(self.app_config.load().docker.network.dns.clone()),
-                dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    format!(
-                        "rw,exec,nosuid,size={}M",
-                        self.app_config.load().docker.tmpfs_size.as_mib()
-                    ),
-                )])),
-                log_config: Some(bollard::plugin::HostConfigLogConfig {
-                    typ: Some(self.app_config.load().docker.log_config.r#type.clone()),
-                    config: Some(
-                        self.app_config
-                            .load()
-                            .docker
-                            .log_config
-                            .config
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                }),
-                userns_mode: string_to_option(&self.app_config.load().docker.userns_mode),
-                ..Default::default()
-            }),
+            host_config: Some(self.installer_host_config(
+                &server.filesystem.base(),
+                resources,
+                &tmp_dir,
+                "/mnt/script",
+            )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
                 "/mnt/script/script.sh".to_string(),
