@@ -37,10 +37,10 @@ uuid = { workspace = true }
 rand = "0.10.0"
 tar = { workspace = true }
 zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-ng", "zstd", "lzma", "xz"] }
-sevenz-rust2 = { version = "0.22.2", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
+sevenz-rust2 = { version = "0.23.0", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
 flate2 = { version = "1.1.1", default-features = false, features = ["zlib-ng"] }
 sha2 = { workspace = true }
-ddup-bak = "0.10.0"
+ddup-bak = "0.11.0"
 infer = "0.22.0"
 rustls = { workspace = true }
 bytes = { workspace = true }
@@ -48,7 +48,7 @@ ignore = "0.4.23"
 sha1 = "0.11.0"
 futures = { workspace = true }
 russh = "0.63.1"
-russh-sftp = "2.1.1"
+russh-sftp = "3.0.0"
 md5 = "0.8.0"
 human_bytes = "0.4.3"
 nu-ansi-term = "0.50.3"
@@ -66,7 +66,7 @@ new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
 chrono-tz = "0.10.4"
 gzp = { version = "2.0.0", default-features = false, features = ["deflate_zlib_ng"] }
-lzma-rust2 = { version = "0.20.1", features = ["optimization"] }
+lzma-rust2 = { version = "0.21.0", features = ["optimization"] }
 bzip2 = "0.6.0"
 zstd = { workspace = true }
 base64 = "0.23.0"
@@ -99,7 +99,7 @@ blake3 = "1.8.5"
 parking_lot = "0.12.5"
 toml_edit = "0.25.12"
 ini-roundtrip = "0.2.1"
-yrs = "0.27.2"
+yrs = "0.28.0"
 croner = { version = "4.0.0", features = ["serde"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 time = "0.3.55"

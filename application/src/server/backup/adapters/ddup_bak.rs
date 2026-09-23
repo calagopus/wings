@@ -66,7 +66,13 @@ pub async fn get_repository(
     } else {
         let repository = Arc::new(
             tokio::task::spawn_blocking(move || {
-                ddup_bak::repository::Repository::new(&path, 1024 * 1024, 0, None)
+                ddup_bak::repository::Repository::new_with_hash(
+                    &path,
+                    1024 * 1024,
+                    0,
+                    ddup_bak::chunks::HashAlgorithm::Blake3,
+                    None,
+                )
             })
             .await??,
         );
@@ -314,7 +320,7 @@ impl DdupBakBackup {
 impl BackupFindExt for DdupBakBackup {
     async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
         let repository = get_repository(&state.config).await?;
-        let path = repository.archive_path(&uuid.to_string());
+        let path = repository.archive_path(&uuid.to_string())?;
 
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
@@ -349,7 +355,7 @@ impl BackupCreateExt for DdupBakBackup {
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&server.app_state.config).await?;
-        let path = repository.archive_path(&uuid.to_string());
+        let path = repository.archive_path(&uuid.to_string())?;
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -433,6 +439,9 @@ impl BackupCreateExt for DdupBakBackup {
                                 crate::config::SystemBackupsDdupBakCompressionFormat::Brotli => {
                                     ddup_bak::archive::CompressionFormat::Brotli
                                 }
+                                crate::config::SystemBackupsDdupBakCompressionFormat::Zstd => {
+                                    ddup_bak::archive::CompressionFormat::Zstd
+                                }
                             }
                         })
                     }),
@@ -504,7 +513,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         mut reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&state.config).await?;
-        let path = repository.archive_path(&uuid.to_string());
+        let path = repository.archive_path(&uuid.to_string())?;
 
         let staging_dir = Self::get_dump_staging_path(&state.config, uuid);
         tokio::fs::create_dir_all(&staging_dir).await?;
@@ -553,6 +562,9 @@ impl BackupStreamCreateExt for DdupBakBackup {
                         }
                         crate::config::SystemBackupsDdupBakCompressionFormat::Brotli => {
                             ddup_bak::archive::CompressionFormat::Brotli
+                        }
+                        crate::config::SystemBackupsDdupBakCompressionFormat::Zstd => {
+                            ddup_bak::archive::CompressionFormat::Zstd
                         }
                     })),
                     create_threads,
@@ -922,7 +934,7 @@ impl BackupExt for DdupBakBackup {
         server: &crate::server::Server,
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
         let repository = get_repository(&server.app_state.config).await?;
-        let path = repository.archive_path(&self.uuid.to_string());
+        let path = repository.archive_path(&self.uuid.to_string())?;
 
         let metadata = tokio::fs::metadata(&path).await?;
 

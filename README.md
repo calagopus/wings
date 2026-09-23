@@ -181,8 +181,8 @@ system:
       # how many threads to use when creating a ddup-bak backup
       create_threads: 4
       # the compression format to use for each ddup-bak chunk
-      # none, deflate, gzip, brotli
-      compression_format: deflate
+      # none, deflate, gzip, brotli, zstd
+      compression_format: zstd
 
     # settings for the restic backup driver
     restic:

@@ -1109,10 +1109,11 @@ nestify::nest! {
                     #[serde(default)]
                     pub compression_format: #[derive(ToSchema, Clone, Copy, Deserialize, Serialize, Default)] #[serde(rename_all = "snake_case")] pub enum SystemBackupsDdupBakCompressionFormat {
                         None,
-                        #[default]
                         Deflate,
                         Gzip,
-                        Brotli
+                        Brotli,
+                        #[default]
+                        Zstd
                     },
                 },
                 #[serde(default)]
