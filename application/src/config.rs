@@ -403,6 +403,9 @@ fn system_backup_wings_restore_threads() -> usize {
 fn system_backup_s3_create_threads() -> usize {
     4
 }
+fn system_backup_s3_streaming() -> bool {
+    true
+}
 fn system_backup_s3_part_upload_timeout() -> u64 {
     2 * 60 * 60
 }
@@ -1095,6 +1098,8 @@ nestify::nest! {
                 pub s3: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsS3 {
                     #[serde(default = "system_backup_s3_create_threads")]
                     pub create_threads: usize,
+                    #[serde(default = "system_backup_s3_streaming")]
+                    pub streaming: bool,
                     #[serde(default = "system_backup_s3_part_upload_timeout")]
                     pub part_upload_timeout: u64,
                     #[serde(default = "system_backup_s3_retry_limit")]
@@ -2497,6 +2502,19 @@ mod tests {
 
     fn from_yaml(yaml: &str) -> InnerConfig {
         serde_norway::from_str(yaml).expect("failed to parse config")
+    }
+
+    #[test]
+    fn s3_streaming_defaults_to_true_and_can_be_disabled() {
+        assert!(from_yaml("{}").system.backups.s3.streaming);
+        assert!(InnerConfig::default().system.backups.s3.streaming);
+
+        let cfg = from_yaml("system:\n  backups:\n    s3:\n      streaming: false\n");
+        assert!(!cfg.system.backups.s3.streaming);
+        assert_eq!(
+            cfg.system.backups.s3.retry_limit,
+            InnerConfig::default().system.backups.s3.retry_limit
+        );
     }
 
     // migrate_legacy_limits
