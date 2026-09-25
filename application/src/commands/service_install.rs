@@ -103,6 +103,9 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                     }
                 };
 
+                let awaiting_pairing = config.is_none() && crate::config::Config::find().is_none();
+                let start = config.is_some() || awaiting_pairing;
+
                 let mut init_system = args.init.clone();
                 if init_system == InitSystem::Auto {
                     if Path::new("/run/systemd/system").exists() {
@@ -149,11 +152,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
 
                                 if let Err(err) = Command::new("systemctl")
                                     .arg("enable")
-                                    .args(if config.is_some() {
-                                        &["--now"]
-                                    } else {
-                                        &[] as &[&str]
-                                    })
+                                    .args(if start { &["--now"] } else { &[] as &[&str] })
                                     .arg("wings.service")
                                     .output()
                                     .await
@@ -162,10 +161,16 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                                     return Ok(1);
                                 }
 
-                                if config.is_some() {
+                                if start {
                                     println!("service enabled on startup and started");
                                 } else {
                                     println!("service enabled on startup");
+                                }
+
+                                if awaiting_pairing {
+                                    println!(
+                                        "wings is waiting to be paired, run `journalctl -u wings` to see the pairing code"
+                                    );
                                 }
                             }
                             Err(err) => {
@@ -222,7 +227,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                                     return Ok(1);
                                 }
 
-                                if config.is_some() {
+                                if start {
                                     if let Err(err) = Command::new("rc-service")
                                         .arg("wings")
                                         .arg("start")
@@ -235,6 +240,12 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                                     println!("service enabled on startup and started");
                                 } else {
                                     println!("service enabled on startup");
+                                }
+
+                                if awaiting_pairing {
+                                    println!(
+                                        "wings is waiting to be paired, generate an enrollment command in the panel and run it here"
+                                    );
                                 }
                             }
                             Err(err) => {

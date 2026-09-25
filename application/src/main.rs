@@ -27,6 +27,7 @@ mod bins;
 mod commands;
 mod config;
 mod deserialize;
+mod env_overrides;
 mod io;
 mod models;
 mod net;
@@ -35,6 +36,7 @@ mod remote;
 mod response;
 mod routes;
 mod server;
+mod setup;
 mod ssh;
 mod stats;
 mod threading;
@@ -363,6 +365,10 @@ async fn main_rt() {
         .get_one::<bool>("ignore_certificate_errors")
         .copied()
         .unwrap_or(false);
+    let no_setup = matches
+        .get_one::<bool>("no_setup")
+        .copied()
+        .unwrap_or(false);
     let config = crate::config::Config::open(
         config_path,
         debug,
@@ -407,6 +413,17 @@ async fn main_rt() {
 
     let (config, _guard) = match config {
         Ok(config) => config,
+        Err(_) if !no_setup && crate::setup::config_missing(config_path) => {
+            if let Err(err) = crate::setup::run(config_path, ignore_certificate_errors).await {
+                exit_error!("{:#}", err);
+            }
+
+            match crate::config::Config::open(config_path, debug, false, ignore_certificate_errors)
+            {
+                Ok(config) => config,
+                Err(err) => exit_error!("failed to load config from {}: {:?}", config_path, err),
+            }
+        }
         Err(err) => exit_error!("failed to load config from {}: {:?}", config_path, err),
     };
     tracing::info!("config loaded from {}", config_path);

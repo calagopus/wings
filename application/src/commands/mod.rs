@@ -62,6 +62,15 @@ impl CliCommandGroupBuilder {
                         .value_parser(clap::value_parser!(bool))
                         .required(false),
                 )
+                .arg(
+                    Arg::new("no_setup")
+                        .help("exit instead of waiting to be paired when no configuration file exists")
+                        .num_args(0)
+                        .long("no-setup")
+                        .default_value("false")
+                        .value_parser(clap::value_parser!(bool))
+                        .required(false),
+                )
                 .about(about),
             map: HashMap::new(),
         }

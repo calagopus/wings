@@ -6176,6 +6176,7 @@ dependencies = [
  "gzp",
  "hex",
  "hickory-resolver",
+ "hmac",
  "human_bytes",
  "ignore",
  "infer",

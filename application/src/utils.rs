@@ -1,8 +1,40 @@
 use crate::routes::MimeCacheValue;
 use std::{
+    collections::BTreeSet,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
+
+fn is_assignable_ip(ip: &IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+
+    match ip {
+        IpAddr::V4(ip) => !ip.is_link_local(),
+        IpAddr::V6(ip) => !ip.is_unicast_link_local(),
+    }
+}
+
+pub async fn assignable_host_ips(
+    docker_network_name: String,
+) -> Result<BTreeSet<IpAddr>, tokio::task::JoinError> {
+    let networks = tokio::task::spawn_blocking(sysinfo::Networks::new_with_refreshed_list).await?;
+
+    Ok(networks
+        .iter()
+        .filter(|(name, _)| {
+            *name != &docker_network_name
+                && !name.starts_with("docker")
+                && !name.starts_with("br-")
+                && !name.starts_with("veth")
+        })
+        .flat_map(|(_, data)| data.ip_networks())
+        .map(|network| network.addr)
+        .filter(is_assignable_ip)
+        .collect())
+}
 
 pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     let progress_percentage = (current / total) * 100.0;
