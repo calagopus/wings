@@ -171,6 +171,9 @@ system:
     s3:
       # how many threads to use when creating a .gz s3 backup
       create_threads: 4
+      # whether to try the panel's streaming upload endpoint first (falls back to buffered uploads if the panel does not provide it)
+      # set to false for panels without that endpoint to skip the failing request and its retries on every backup
+      streaming: true
       # how long in seconds to wait until a backup part is uploaded to s3
       part_upload_timeout: 7200
       # how often to attempt retrying each failed backup part

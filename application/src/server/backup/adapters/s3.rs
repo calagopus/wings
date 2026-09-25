@@ -762,6 +762,15 @@ impl BackupCreateExt for S3Backup {
         ignore: crate::server::filesystem::ignore_list::IgnoreList,
         _ignore_raw: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let streaming = server.app_state.config.load().system.backups.s3.streaming;
+        if !streaming {
+            tracing::debug!(
+                backup = %uuid,
+                "streaming s3 backups disabled, using buffered path"
+            );
+            return Self::create_buffered(server, uuid, progress, total, ignore).await;
+        }
+
         match server
             .app_state
             .config
