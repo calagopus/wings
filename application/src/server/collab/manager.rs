@@ -184,11 +184,83 @@ fn broadcast_permissions() -> Permissions {
     permissions
 }
 
+const BOM: char = '\u{feff}';
+
+fn normalize_line_endings(text: String) -> String {
+    let (mut cr, mut lf, mut crlf) = (0usize, 0usize, 0usize);
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\r' if bytes.next_if_eq(&b'\n').is_some() => crlf += 1,
+            b'\r' => cr += 1,
+            b'\n' => lf += 1,
+            _ => {}
+        }
+    }
+
+    let total = cr + lf + crlf;
+    let eol = if (cr + crlf) * 2 > total {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let needs_rewrite = if eol == "\r\n" {
+        cr > 0 || lf > 0
+    } else {
+        cr > 0 || crlf > 0
+    };
+    if !needs_rewrite {
+        return text;
+    }
+
+    let mut normalized = String::with_capacity(text.len() + lf);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                normalized.push_str(eol);
+            }
+            '\n' => normalized.push_str(eol),
+            c => normalized.push(c),
+        }
+    }
+
+    normalized
+}
+
+struct DiskContent {
+    text: String,
+    hash: blake3::Hash,
+    bom: bool,
+}
+
+impl DiskContent {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, std::string::FromUtf8Error> {
+        let hash = blake3::hash(&bytes);
+        let mut text = String::from_utf8(bytes)?;
+        let bom = text.starts_with(BOM);
+        if bom {
+            text.drain(..BOM.len_utf8());
+        }
+
+        Ok(Self {
+            text: normalize_line_endings(text),
+            hash,
+            bom,
+        })
+    }
+}
+
 struct CollabDoc {
     doc: Doc,
     text: TextRef,
     applied_update_bytes: u64,
+    /// hash of the raw bytes on disk, including a BOM and original line endings
     disk_hash: blake3::Hash,
+    /// hash of the text as loaded into or last saved from the document
+    text_hash: blake3::Hash,
+    bom: bool,
     epoch: uuid::Uuid,
 }
 
@@ -202,13 +274,41 @@ impl CollabDoc {
             text.insert(&mut txn, 0, content);
         }
 
+        let hash = blake3::hash(content.as_bytes());
+
         Self {
             doc,
             text,
             applied_update_bytes: 0,
-            disk_hash: blake3::hash(content.as_bytes()),
+            disk_hash: hash,
+            text_hash: hash,
+            bom: false,
             epoch: uuid::Uuid::new_v4(),
         }
+    }
+
+    fn from_disk(content: &DiskContent) -> Self {
+        let mut doc = Self::new(&content.text);
+        doc.disk_hash = content.hash;
+        doc.bom = content.bom;
+
+        doc
+    }
+
+    fn bom_len(&self) -> u64 {
+        if self.bom { BOM.len_utf8() as u64 } else { 0 }
+    }
+
+    fn to_disk_bytes(&self, content: String) -> Vec<u8> {
+        if !self.bom {
+            return content.into_bytes();
+        }
+
+        let mut prefixed = String::with_capacity(BOM.len_utf8() + content.len());
+        prefixed.push(BOM);
+        prefixed.push_str(&content);
+
+        prefixed.into_bytes()
     }
 
     fn encode_full_state(&self) -> Vec<u8> {
@@ -226,9 +326,11 @@ impl CollabDoc {
     }
 
     fn rebuild_with(&mut self, content: &str) {
-        let disk_hash = self.disk_hash;
+        let (disk_hash, text_hash, bom) = (self.disk_hash, self.text_hash, self.bom);
         *self = Self::new(content);
         self.disk_hash = disk_hash;
+        self.text_hash = text_hash;
+        self.bom = bom;
     }
 
     fn rebuild(&mut self) {
@@ -481,7 +583,7 @@ impl CollabManager {
         filesystem: &Arc<dyn VirtualWritableFilesystem>,
         path: &Path,
         size_cap: u64,
-    ) -> Result<String, CollabError> {
+    ) -> Result<DiskContent, CollabError> {
         let metadata = filesystem
             .async_metadata(&path)
             .await
@@ -517,7 +619,15 @@ impl CollabManager {
             ));
         }
 
-        String::from_utf8(buf).map_err(|_| CollabError::User("file is not editable as text"))
+        let content = DiskContent::from_bytes(buf)
+            .map_err(|_| CollabError::User("file is not editable as text"))?;
+        if (content.text.len() + if content.bom { BOM.len_utf8() } else { 0 }) as u64 > size_cap {
+            return Err(CollabError::User(
+                "file is too large for collaborative editing",
+            ));
+        }
+
+        Ok(content)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -593,8 +703,8 @@ impl CollabManager {
                         };
                         {
                             let mut doc = session.doc.lock();
-                            if doc.disk_hash != blake3::hash(content.as_bytes()) {
-                                *doc = CollabDoc::new(&content);
+                            if doc.disk_hash != content.hash {
+                                *doc = CollabDoc::from_disk(&content);
                             }
                         }
                         session.set_conflict(None);
@@ -616,7 +726,7 @@ impl CollabManager {
                         abs_path: path.clone(),
                         filesystem: Arc::clone(&filesystem),
                         websocket: self.websocket.clone(),
-                        doc: parking_lot::Mutex::new(CollabDoc::new(&content)),
+                        doc: parking_lot::Mutex::new(CollabDoc::from_disk(&content)),
                         dirty: AtomicBool::new(false),
                         diverged_ticks: std::sync::atomic::AtomicU32::new(0),
                         conflict: parking_lot::Mutex::new(None),
@@ -720,7 +830,7 @@ impl CollabManager {
                 if session.dirty.load(Ordering::Relaxed) {
                     let converged = {
                         let doc = session.doc.lock();
-                        blake3::hash(doc.content().as_bytes()) == doc.disk_hash
+                        blake3::hash(doc.content().as_bytes()) == doc.text_hash
                     };
                     if converged {
                         session.dirty.store(false, Ordering::Relaxed);
@@ -753,7 +863,7 @@ impl CollabManager {
                     Ok(content) => {
                         reported_unreadable = false;
 
-                        let disk_hash = blake3::hash(content.as_bytes());
+                        let disk_hash = content.hash;
                         let matches = {
                             let doc = session.doc.lock();
                             doc.disk_hash == disk_hash
@@ -782,7 +892,7 @@ impl CollabManager {
                                 if !session.dirty.load(Ordering::Relaxed)
                                     && doc.disk_hash != disk_hash
                                 {
-                                    *doc = CollabDoc::new(&content);
+                                    *doc = CollabDoc::from_disk(&content);
                                     true
                                 } else {
                                     false
@@ -929,13 +1039,14 @@ impl CollabManager {
                 txn.apply_update(decoded)
                     .map_err(|_| CollabError::User("invalid update"))?;
 
-                doc.text.len(&txn) as u64 > size_cap
+                doc.text.len(&txn) as u64 + doc.bom_len() > size_cap
             };
             session.dirty.store(true, Ordering::Relaxed);
 
             if overflow {
                 let mut content = guard.content();
-                let mut cap = (size_cap as usize).min(content.len());
+                let mut cap =
+                    (size_cap.saturating_sub(guard.bom_len()) as usize).min(content.len());
                 while cap > 0 && !content.is_char_boundary(cap) {
                     cap -= 1;
                 }
@@ -1056,10 +1167,13 @@ impl CollabManager {
             return Ok(());
         }
 
-        let (content, doc_disk_hash) = {
+        let (content, bytes, doc_disk_hash) = {
             let doc = session.doc.lock();
-            (doc.content(), doc.disk_hash)
+            let content = doc.content();
+            let bytes = doc.to_disk_bytes(content.clone());
+            (content, bytes, doc.disk_hash)
         };
+        let written_hash = blake3::hash(&bytes);
 
         let config = self.config.load();
         let history = &config.system.file_history;
@@ -1123,7 +1237,7 @@ impl CollabManager {
 
         if !server
             .filesystem
-            .has_headroom(content.len() as i64 - old_content_size)
+            .has_headroom(bytes.len() as i64 - old_content_size)
         {
             return Err(CollabError::User("failed to allocate space"));
         }
@@ -1141,7 +1255,7 @@ impl CollabManager {
         };
 
         let mut file = filesystem.async_create_file(&path).await?;
-        file.write_all(content.as_bytes())
+        file.write_all(&bytes)
             .await
             .map_err(|err| CollabError::Internal(anyhow::anyhow!("failed to write file: {err}")))?;
         file.shutdown()
@@ -1149,15 +1263,10 @@ impl CollabManager {
             .map_err(|err| CollabError::Internal(anyhow::anyhow!("failed to write file: {err}")))?;
 
         let mut revision_id = None;
-        if history_enabled && content.len() as u64 <= history_size_cap {
+        if history_enabled && bytes.len() as u64 <= history_size_cap {
             match server
                 .diff
-                .record_edit(
-                    &key,
-                    captured_before,
-                    content.clone().into_bytes(),
-                    Some(user_uuid),
-                )
+                .record_edit(&key, captured_before, bytes, Some(user_uuid))
                 .await
             {
                 Ok(id) => {
@@ -1177,7 +1286,8 @@ impl CollabManager {
 
         {
             let mut doc = session.doc.lock();
-            doc.disk_hash = blake3::hash(content.as_bytes());
+            doc.disk_hash = written_hash;
+            doc.text_hash = blake3::hash(content.as_bytes());
             session
                 .dirty
                 .store(doc.content() != content, Ordering::Relaxed);
@@ -1229,7 +1339,7 @@ impl CollabManager {
         let content = Self::read_content(&session.filesystem, &session.abs_path, size_cap).await?;
         {
             let mut doc = session.doc.lock();
-            *doc = CollabDoc::new(&content);
+            *doc = CollabDoc::from_disk(&content);
         }
         session.dirty.store(false, Ordering::Relaxed);
         session.set_conflict(None);
@@ -1544,6 +1654,8 @@ mod tests {
 
         let mut doc = CollabDoc::new("");
         doc.disk_hash = blake3::hash(b"on disk");
+        doc.text_hash = blake3::hash(b"on disk text");
+        doc.bom = true;
         apply(&doc, &updates[0]);
         apply(&doc, &updates[2]);
 
@@ -1553,9 +1665,18 @@ mod tests {
         // claiming convergence here makes the reconciler drop `dirty` and reload over
         // unsaved work
         assert_eq!(doc.disk_hash, blake3::hash(b"on disk"));
-        assert_ne!(doc.disk_hash, blake3::hash(doc.content().as_bytes()));
+        assert_eq!(doc.text_hash, blake3::hash(b"on disk text"));
+        assert_ne!(doc.text_hash, blake3::hash(doc.content().as_bytes()));
+        assert!(doc.bom);
         // and the rebuilt document is clean, so it cannot resync in a loop
         assert!(!doc.has_missing_updates());
+
+        doc.rebuild_with("other");
+
+        assert_eq!(doc.content(), "other");
+        assert_eq!(doc.disk_hash, blake3::hash(b"on disk"));
+        assert_eq!(doc.text_hash, blake3::hash(b"on disk text"));
+        assert!(doc.bom);
     }
 
     #[test]
@@ -1580,5 +1701,100 @@ mod tests {
 
         doc.rebuild();
         assert_ne!(doc.epoch, epoch);
+    }
+
+    // normalize_line_endings
+    #[test]
+    fn mostly_crlf_file_with_an_lf_tail_becomes_all_crlf() {
+        let mut mixed = String::new();
+        let mut expected = String::new();
+        for line in 1..=74 {
+            let ending = if line <= 43 { "\r\n" } else { "\n" };
+            mixed.push_str(&format!("line {line}{ending}"));
+            expected.push_str(&format!("line {line}\r\n"));
+        }
+
+        let normalized = normalize_line_endings(mixed);
+
+        assert_eq!(normalized, expected);
+        assert_eq!(normalized.lines().count(), 74);
+    }
+
+    #[test]
+    fn line_endings_follow_the_majority_and_ties_go_to_lf() {
+        assert_eq!(normalize_line_endings("a\r\nb\nc\n".into()), "a\nb\nc\n");
+        assert_eq!(normalize_line_endings("a\r\nb\n".into()), "a\nb\n");
+        assert_eq!(normalize_line_endings("a\rb\n".into()), "a\nb\n");
+        assert_eq!(normalize_line_endings("a\rb\rc".into()), "a\r\nb\r\nc");
+        assert_eq!(
+            normalize_line_endings("héllo\r\nwörld\n日本\r\n".into()),
+            "héllo\r\nwörld\r\n日本\r\n"
+        );
+    }
+
+    #[test]
+    fn uniform_line_endings_are_left_alone() {
+        for text in ["a\r\nb\r\n", "a\nb\n", "no endings", ""] {
+            assert_eq!(normalize_line_endings(text.into()), text);
+        }
+    }
+
+    // DiskContent
+    #[test]
+    fn disk_content_strips_the_bom_normalizes_and_hashes_the_raw_bytes() {
+        let raw = b"\xEF\xBB\xBFa\r\nb\r\nc\n".to_vec();
+
+        let content = DiskContent::from_bytes(raw.clone()).unwrap();
+
+        assert_eq!(content.text, "a\r\nb\r\nc\r\n");
+        assert_eq!(content.hash, blake3::hash(&raw));
+        assert!(content.bom);
+    }
+
+    #[test]
+    fn disk_content_only_treats_a_leading_feff_as_a_bom() {
+        let content = DiskContent::from_bytes("a\u{FEFF}b".into()).unwrap();
+
+        assert_eq!(content.text, "a\u{FEFF}b");
+        assert!(!content.bom);
+    }
+
+    #[test]
+    fn disk_content_rejects_invalid_utf8() {
+        assert!(DiskContent::from_bytes(vec![b'a', 0xFF, b'b']).is_err());
+    }
+
+    // CollabDoc::from_disk
+    #[test]
+    fn doc_from_disk_keeps_raw_and_normalized_hashes_apart() {
+        let raw = b"\xEF\xBB\xBFa\r\nb\n".to_vec();
+        let content = DiskContent::from_bytes(raw.clone()).unwrap();
+
+        let doc = CollabDoc::from_disk(&content);
+
+        assert_eq!(doc.content(), content.text);
+        assert_eq!(doc.disk_hash, blake3::hash(&raw));
+        assert_eq!(doc.text_hash, blake3::hash(content.text.as_bytes()));
+        assert!(doc.bom);
+        assert_eq!(doc.bom_len(), 3);
+    }
+
+    // CollabDoc::to_disk_bytes
+    #[test]
+    fn bom_file_with_uniform_endings_round_trips_byte_for_byte() {
+        let raw = b"\xEF\xBB\xBFfirst\r\nsecond\r\n".to_vec();
+        let doc = CollabDoc::from_disk(&DiskContent::from_bytes(raw.clone()).unwrap());
+
+        assert_eq!(doc.to_disk_bytes(doc.content()), raw);
+    }
+
+    #[test]
+    fn file_without_bom_is_written_unchanged() {
+        let raw = b"first\nsecond\n".to_vec();
+        let doc = CollabDoc::from_disk(&DiskContent::from_bytes(raw.clone()).unwrap());
+
+        assert!(!doc.bom);
+        assert_eq!(doc.bom_len(), 0);
+        assert_eq!(doc.to_disk_bytes(doc.content()), raw);
     }
 }
