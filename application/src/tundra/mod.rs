@@ -71,7 +71,7 @@ pub struct TundraManager {
     pub data_dir: PathBuf,
     pub hub: hub::Hub,
     ca: ca::LocalCa,
-    docker: Arc<bollard::Docker>,
+    docker: Option<Arc<bollard::Docker>>,
     token: parking_lot::RwLock<String>,
 
     control: parking_lot::Mutex<ControlState>,
@@ -88,7 +88,7 @@ pub struct TundraManager {
 impl TundraManager {
     pub fn create(
         config: &crate::config::Config,
-        docker: Arc<bollard::Docker>,
+        docker: Option<Arc<bollard::Docker>>,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let cfg = config.load();
         let data_dir = cfg.tundra.data_directory.as_path(&cfg);
@@ -134,8 +134,8 @@ impl TundraManager {
     }
 
     #[inline]
-    pub fn docker(&self) -> Arc<bollard::Docker> {
-        Arc::clone(&self.docker)
+    pub fn docker(&self) -> Option<Arc<bollard::Docker>> {
+        self.docker.as_ref().map(Arc::clone)
     }
 
     #[inline]
@@ -203,10 +203,37 @@ impl TundraManager {
         self.control.lock().enriched.as_deref().cloned()
     }
 
+    fn supports_process_refs(metrics: &serde_json::Value) -> bool {
+        metrics
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("process_container_refs"))
+            })
+    }
+
     async fn rebuild(&self, state: &State) {
         let Some(cached) = self.cached() else {
             return;
         };
+
+        if state.config.load().runtime.backend == crate::config::RuntimeBackend::PveLxc {
+            let supported = self
+                .hub
+                .request_metrics()
+                .await
+                .as_ref()
+                .is_ok_and(Self::supports_process_refs);
+            if !supported {
+                tracing::error!(
+                    "refusing to publish Proxmox LXC references because the connected tundra-node does not advertise process_container_refs support"
+                );
+                return;
+            }
+        }
+
         let mut snapshot = Snapshot::clone(&cached);
         let cfg = state.config.load();
 
@@ -388,6 +415,19 @@ pub async fn run(state: State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_reference_capability_is_explicit() {
+        assert!(TundraManager::supports_process_refs(&serde_json::json!({
+            "capabilities": ["process_container_refs"]
+        })));
+        assert!(!TundraManager::supports_process_refs(
+            &serde_json::json!({})
+        ));
+        assert!(!TundraManager::supports_process_refs(&serde_json::json!({
+            "capabilities": ["some_future_capability"]
+        })));
+    }
     use crate::remote::tundra::{Disabled, TunnelState};
 
     fn manager(dir: &Path) -> TundraManager {
@@ -395,7 +435,9 @@ mod tests {
             data_dir: dir.to_path_buf(),
             hub: hub::Hub::default(),
             ca: ca::LocalCa::load_or_create(dir).unwrap(),
-            docker: Arc::new(bollard::Docker::connect_with_local_defaults().unwrap()),
+            docker: Some(Arc::new(
+                bollard::Docker::connect_with_local_defaults().unwrap(),
+            )),
             token: parking_lot::RwLock::new(String::new()),
             control: parking_lot::Mutex::new(ControlState {
                 cached: None,

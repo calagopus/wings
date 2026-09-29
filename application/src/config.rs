@@ -25,6 +25,9 @@ use utoipa::ToSchema;
 fn app_name() -> String {
     "Calagopus".to_string()
 }
+fn default_true() -> bool {
+    true
+}
 fn api_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -718,6 +721,84 @@ impl From<String> for SystemPath {
     }
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBackend {
+    #[default]
+    Auto,
+    Docker,
+    PveLxc,
+}
+
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PveLxcFirewallBackend {
+    #[default]
+    Auto,
+    Proxmox,
+    Nftables,
+    Iptables,
+    Disabled,
+}
+
+fn pve_lxc_pct_path() -> String {
+    "/usr/sbin/pct".to_string()
+}
+
+fn pve_lxc_pvesh_path() -> String {
+    "/usr/bin/pvesh".to_string()
+}
+
+fn pve_lxc_pveversion_path() -> String {
+    "/usr/bin/pveversion".to_string()
+}
+fn pve_lxc_pvesm_path() -> String {
+    "/usr/sbin/pvesm".to_string()
+}
+
+fn pve_lxc_lxc_attach_path() -> String {
+    "/usr/bin/lxc-attach".to_string()
+}
+
+fn pve_lxc_lxc_stop_path() -> String {
+    "/usr/bin/lxc-stop".to_string()
+}
+
+fn pve_lxc_perl_path() -> String {
+    "/usr/bin/perl".to_string()
+}
+
+fn pve_lxc_template_storage() -> String {
+    "local".to_string()
+}
+
+fn pve_lxc_rootfs_storage() -> String {
+    "auto".to_string()
+}
+
+fn pve_lxc_bridge() -> String {
+    "vmbr0".to_string()
+}
+
+fn pve_lxc_edge_wireguard_interface() -> String {
+    "wg-calagopus".to_string()
+}
+
+fn pve_lxc_rootfs_size_gib() -> u64 {
+    8
+}
+fn pve_lxc_console_log_max_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+fn pve_lxc_tag_prefix() -> String {
+    "calagopus".to_string()
+}
+
+fn pve_lxc_managed_file_directory() -> SystemPath {
+    SystemPath::new("/var/lib/lxc/calagopus-wings-managed")
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
@@ -732,6 +813,86 @@ nestify::nest! {
         pub token_id: String,
         #[serde(default)]
         pub token: String,
+
+        #[serde(default)]
+        #[schema(inline)]
+        pub runtime: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Runtime {
+            #[serde(default)]
+            pub backend: RuntimeBackend,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub pve_lxc: #[derive(Clone, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct PveLxcRuntime {
+                #[serde(default = "pve_lxc_pct_path")]
+                pub pct_path: String,
+                #[serde(default = "pve_lxc_pvesh_path")]
+                pub pvesh_path: String,
+                #[serde(default = "pve_lxc_pveversion_path")]
+                pub pveversion_path: String,
+                #[serde(default = "pve_lxc_pvesm_path")]
+                pub pvesm_path: String,
+                #[serde(default = "pve_lxc_lxc_attach_path")]
+                pub lxc_attach_path: String,
+                #[serde(default = "pve_lxc_lxc_stop_path")]
+                pub lxc_stop_path: String,
+                #[serde(default = "pve_lxc_perl_path")]
+                pub perl_path: String,
+
+                /// Empty means discover the local Proxmox node name at runtime.
+                #[serde(default)]
+                pub node: String,
+                #[serde(default = "pve_lxc_template_storage")]
+                pub template_storage: String,
+                #[serde(default = "pve_lxc_rootfs_storage")]
+                pub rootfs_storage: String,
+                #[serde(default = "pve_lxc_bridge")]
+                pub bridge: String,
+                /// Optional VLAN tag applied to each LXC veth on `bridge`.
+                #[serde(default)]
+                pub vlan_tag: Option<u16>,
+                /// IPv4 CIDR prefix used by static panel allocations (for example, 24).
+                #[serde(default)]
+                pub network_prefix: Option<u8>,
+                /// IPv4 gateway used by static panel allocations on the LXC network.
+                #[serde(default)]
+                pub gateway: Option<String>,
+                /// WireGuard interface whose peers publish private LXC allocations.
+                /// The panel allocation IP is matched against each peer endpoint.
+                #[serde(default = "pve_lxc_edge_wireguard_interface")]
+                pub edge_wireguard_interface: String,
+                /// Restricted SSH key used only to synchronize edge port forwards.
+                #[serde(default)]
+                pub edge_ssh_identity_path: String,
+                /// Pinned SSH known-hosts file for the edge host.
+                #[serde(default)]
+                pub edge_known_hosts_path: String,
+                #[serde(default = "pve_lxc_rootfs_size_gib")]
+                pub rootfs_size_gib: u64,
+                /// Maximum retained console bytes for each LXC server. When the
+                /// limit is reached Wings starts a fresh bounded log.
+                #[serde(default = "pve_lxc_console_log_max_bytes")]
+                pub console_log_max_bytes: u64,
+                #[serde(default = "pve_lxc_tag_prefix")]
+                pub tag_prefix: String,
+                /// Host-visible staging directory used for read-only managed file binds.
+                /// Its parent path must be traversable by unprivileged LXC mount setup.
+                #[serde(default = "pve_lxc_managed_file_directory")]
+                pub managed_file_directory: SystemPath,
+                #[serde(default = "default_true")]
+                pub unprivileged: bool,
+
+                #[serde(default)]
+                #[schema(inline)]
+                pub firewall: #[derive(Clone, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct PveLxcFirewall {
+                    #[serde(default)]
+                    pub backend: PveLxcFirewallBackend,
+                    #[serde(default = "docker_firewall_source_file_max_entries")]
+                    pub source_file_max_entries: u64,
+                    #[serde(default = "docker_firewall_source_file_max_bytes")]
+                    pub source_file_max_bytes: u64,
+                },
+            },
+        },
 
         #[serde(default)]
         #[schema(inline)]
