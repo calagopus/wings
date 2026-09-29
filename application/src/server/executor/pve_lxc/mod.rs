@@ -143,10 +143,13 @@ struct PveProcessHandle {
 }
 
 impl PveProcessHandle {
+    const EXIT_STATUS_FILE: &'static str = ".wings-exit-status";
+
     fn observed_status(
         status: cli::ContainerStatus,
         start_succeeded: bool,
         seen_running: &mut bool,
+        exit_status: Option<(i32, bool)>,
     ) -> Option<super::ProcessStatus> {
         match status {
             cli::ContainerStatus::Running => {
@@ -154,11 +157,43 @@ impl PveProcessHandle {
                 Some(super::ProcessStatus::Running)
             }
             cli::ContainerStatus::Stopped if !*seen_running && !start_succeeded => None,
-            cli::ContainerStatus::Stopped => Some(super::ProcessStatus::Stopped {
-                exit_code: -1,
-                oom_killed: false,
-            }),
+            cli::ContainerStatus::Stopped => {
+                let (exit_code, oom_killed) = exit_status.unwrap_or((-1, false));
+                Some(super::ProcessStatus::Stopped {
+                    exit_code,
+                    oom_killed,
+                })
+            }
         }
+    }
+
+    fn parse_exit_status(contents: &str) -> Option<(i32, bool)> {
+        let mut exit_code = None;
+        let mut oom_killed = None;
+        for line in contents.lines() {
+            let (key, value) = line.split_once('=')?;
+            match key {
+                "exit_code" => exit_code = value.parse::<i32>().ok(),
+                "oom_killed" => {
+                    oom_killed = match value {
+                        "0" => Some(false),
+                        "1" => Some(true),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some((exit_code?, oom_killed?))
+    }
+
+    async fn read_exit_status(path: &std::path::Path) -> Option<(i32, bool)> {
+        let contents = tokio::fs::read_to_string(path).await.ok()?;
+        Self::parse_exit_status(&contents)
+    }
+
+    fn exit_status_path(server: &crate::server::InnerServer) -> PathBuf {
+        std::path::Path::new(server.filesystem.base().as_str()).join(Self::EXIT_STATUS_FILE)
     }
 
     fn managed_file_stage_name(target: &str) -> Result<&'static str, anyhow::Error> {
@@ -248,6 +283,7 @@ impl PveProcessHandle {
         let state_started = Arc::clone(&started);
         let state_cli = cli.clone();
         let state_server_uuid = server.uuid;
+        let state_exit_status_path = Self::exit_status_path(server);
         let status_task = tokio::spawn(async move {
             let mut seen_running = state_started.load(Ordering::Acquire);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -256,14 +292,22 @@ impl PveProcessHandle {
             loop {
                 tick.tick().await;
                 let process_status = match state_cli.status(vmid).await {
-                    Ok(status) => match Self::observed_status(
-                        status,
-                        state_started.load(Ordering::Acquire),
-                        &mut seen_running,
-                    ) {
-                        Some(status) => status,
-                        None => continue,
-                    },
+                    Ok(status) => {
+                        let exit_status = if status == cli::ContainerStatus::Stopped {
+                            Self::read_exit_status(&state_exit_status_path).await
+                        } else {
+                            None
+                        };
+                        match Self::observed_status(
+                            status,
+                            state_started.load(Ordering::Acquire),
+                            &mut seen_running,
+                            exit_status,
+                        ) {
+                            Some(status) => status,
+                            None => continue,
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(
                             server = %state_server_uuid,
@@ -903,13 +947,65 @@ impl PveProcessHandle {
 attempt=0
 while [ "$attempt" -lt 120 ]; do
     if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
-        exec "$@"
+        break
     fi
     attempt=$((attempt + 1))
     sleep 0.25
 done
-echo 'timed out waiting for Proxmox DHCP' >&2
-exit 1
+if [ "$attempt" -ge 120 ]; then
+    echo 'timed out waiting for Proxmox DHCP' >&2
+    exit 1
+fi
+
+read_oom_kills() {
+    value=0
+    if [ -r /sys/fs/cgroup/memory.events ]; then
+        while read -r key count; do
+            if [ "$key" = oom_kill ]; then
+                value=$count
+                break
+            fi
+        done < /sys/fs/cgroup/memory.events
+    fi
+    printf '%s' "$value"
+}
+
+child=0
+forward_signal() {
+    if [ "$child" -gt 0 ]; then
+        kill "-$1" "$child" 2>/dev/null || true
+    fi
+}
+trap 'forward_signal HUP' HUP
+trap 'forward_signal INT' INT
+trap 'forward_signal QUIT' QUIT
+trap 'forward_signal ABRT' ABRT
+trap 'forward_signal TERM' TERM
+
+oom_before=$(read_oom_kills)
+"$@" <&0 &
+child=$!
+while :; do
+    wait "$child"
+    status=$?
+    if ! kill -0 "$child" 2>/dev/null; then
+        break
+    fi
+done
+oom_after=$(read_oom_kills)
+oom_killed=0
+if [ "$oom_after" -gt "$oom_before" ]; then
+    oom_killed=1
+fi
+
+marker=/home/container/.wings-exit-status
+temporary="${marker}.tmp.$$"
+(
+    umask 077
+    printf 'exit_code=%s\noom_killed=%s\n' "$status" "$oom_killed" > "$temporary"
+)
+mv -f "$temporary" "$marker"
+exit "$status"
 "#,
             )
             .await
@@ -1189,6 +1285,20 @@ impl ProcessHandle for PveProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
+        let server = self.get_server()?;
+        let exit_status_path = Self::exit_status_path(&server);
+        match tokio::fs::remove_file(&exit_status_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to clear stale Proxmox LXC exit status {}",
+                        exit_status_path.display()
+                    )
+                });
+            }
+        }
         self.cli.start(self.vmid).await?;
         self.started.store(true, Ordering::Release);
 
@@ -1240,6 +1350,16 @@ impl ProcessHandle for PveProcessHandle {
     }
 
     async fn kill(&self) -> Result<(), anyhow::Error> {
+        let server = self.get_server()?;
+        let exit_status_path = Self::exit_status_path(&server);
+        tokio::fs::write(&exit_status_path, "exit_code=137\noom_killed=0\n")
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to record forced Proxmox LXC exit status {}",
+                    exit_status_path.display()
+                )
+            })?;
         self.cli.stop(self.vmid).await
     }
 }
@@ -4105,11 +4225,32 @@ mod tests {
             cli::ContainerStatus::Stopped,
             true,
             &mut seen_running,
+            Some((42, true)),
         );
         assert!(matches!(
             status,
-            Some(crate::server::executor::ProcessStatus::Stopped { .. })
+            Some(crate::server::executor::ProcessStatus::Stopped {
+                exit_code: 42,
+                oom_killed: true,
+            })
         ));
+    }
+
+    #[test]
+    fn parses_managed_exit_status_strictly() {
+        assert_eq!(
+            PveProcessHandle::parse_exit_status("exit_code=137\noom_killed=1\n"),
+            Some((137, true))
+        );
+        assert_eq!(
+            PveProcessHandle::parse_exit_status("oom_killed=0\nexit_code=0\n"),
+            Some((0, false))
+        );
+        assert_eq!(PveProcessHandle::parse_exit_status("exit_code=0\n"), None);
+        assert_eq!(
+            PveProcessHandle::parse_exit_status("exit_code=nope\noom_killed=0\n"),
+            None
+        );
     }
 
     #[tokio::test]
