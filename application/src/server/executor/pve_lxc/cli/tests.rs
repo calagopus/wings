@@ -1024,3 +1024,34 @@ fn lifecycle_arguments_request_nonblocking_graceful_shutdown_and_console() {
         vec!["console", "1234", "--escape", "^z"]
     );
 }
+
+#[test]
+fn vmid_floor_skips_ids_below_the_minimum() {
+    let used: std::collections::HashSet<u32> = [100, 101, 200].into_iter().collect();
+    assert_eq!(PveCli::first_free_vmid_at_or_above(200, &used), Some(201));
+    assert_eq!(
+        PveCli::first_free_vmid_at_or_above(200, &std::collections::HashSet::new()),
+        Some(200)
+    );
+}
+
+#[test]
+fn vmid_floor_finds_gaps_and_ignores_lower_ids() {
+    let used: std::collections::HashSet<u32> = [100, 200, 201, 203].into_iter().collect();
+    assert_eq!(PveCli::first_free_vmid_at_or_above(200, &used), Some(202));
+}
+
+#[test]
+fn allocated_vmids_include_every_guest_type() {
+    let output = br#"[
+        {"vmid": 200, "type": "lxc", "node": "pve1"},
+        {"vmid": "201", "type": "qemu", "node": "pve1"},
+        {"type": "lxc", "node": "pve1"},
+        {"vmid": 202, "type": "storage", "node": "pve1"}
+    ]"#;
+    let used = PveCli::parse_allocated_vmids(output).expect("valid inventory");
+    assert!(used.contains(&200));
+    assert!(used.contains(&201));
+    assert!(used.contains(&202));
+    assert_eq!(PveCli::first_free_vmid_at_or_above(200, &used), Some(203));
+}

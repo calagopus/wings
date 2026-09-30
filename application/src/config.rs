@@ -791,6 +791,11 @@ fn pve_lxc_edge_ssh_user() -> String {
 fn pve_lxc_rootfs_size_gib() -> u64 {
     8
 }
+
+fn pve_lxc_min_vmid() -> u32 {
+    200
+}
+
 fn pve_lxc_console_log_max_bytes() -> u64 {
     5 * 1024 * 1024
 }
@@ -891,6 +896,12 @@ nestify::nest! {
                 /// legacy Docker limit is used for configuration compatibility.
                 #[serde(default)]
                 pub pids_limit: Option<u64>,
+                /// Minimum VMID used when Wings auto-allocates Proxmox
+                /// containers. PVE itself starts at 100; raising the floor
+                /// (for example to 200) keeps Wings-owned guests clear of
+                /// manually created infrastructure containers.
+                #[serde(default = "pve_lxc_min_vmid")]
+                pub min_vmid: u32,
 
                 #[serde(default)]
                 #[schema(inline)]
