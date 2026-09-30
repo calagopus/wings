@@ -219,7 +219,7 @@ impl TundraManager {
             return;
         };
 
-        if state.config.load().runtime.backend == crate::config::RuntimeBackend::PveLxc {
+        if state.config.active_runtime_backend() == crate::config::RuntimeBackend::PveLxc {
             let supported = self
                 .hub
                 .request_metrics()

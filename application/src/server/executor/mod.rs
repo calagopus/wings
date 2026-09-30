@@ -17,6 +17,11 @@ pub struct Runtime {
 
 pub async fn create_runtime(config: Arc<crate::config::Config>) -> Result<Runtime, anyhow::Error> {
     let backend = resolve_backend(&config).await?;
+    config
+        .set_active_runtime_backend(backend)
+        .map_err(|active| anyhow::anyhow!(
+            "runtime backend was already resolved as {active:?}, cannot replace it with {backend:?}"
+        ))?;
 
     match backend {
         crate::config::RuntimeBackend::Auto => Err(anyhow::anyhow!(
@@ -109,6 +114,44 @@ async fn resolve_backend(
     let pve_lxc = snapshot.runtime.pve_lxc.clone();
     drop(snapshot);
 
+    let state_path = config
+        .resolve_as_path(|config| &config.system.root_directory)
+        .join("runtime-backend");
+    match tokio::fs::read_to_string(&state_path).await {
+        Ok(value) => {
+            let selected = match value.trim() {
+                "docker" => crate::config::RuntimeBackend::Docker,
+                "pve_lxc" => crate::config::RuntimeBackend::PveLxc,
+                value => anyhow::bail!(
+                    "persisted automatic runtime backend at {} is invalid: {value}",
+                    state_path.display()
+                ),
+            };
+            let available = match selected {
+                crate::config::RuntimeBackend::Docker => docker_available(&docker_socket).await,
+                crate::config::RuntimeBackend::PveLxc => pve_lxc_available(&pve_lxc).await,
+                crate::config::RuntimeBackend::Auto => false,
+            };
+            if !available {
+                anyhow::bail!(
+                    "persisted automatic runtime backend {selected:?} is unavailable; remove {} to run detection again",
+                    state_path.display()
+                );
+            }
+            tracing::info!(runtime_backend = ?selected, "using persisted automatic runtime backend");
+            return Ok(selected);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read persisted automatic runtime backend {}",
+                    state_path.display()
+                )
+            });
+        }
+    }
+
     let selected = if docker_available(&docker_socket).await {
         crate::config::RuntimeBackend::Docker
     } else if pve_lxc_available(&pve_lxc).await {
@@ -119,11 +162,29 @@ async fn resolve_backend(
         );
     };
 
-    let mut persisted: crate::config::InnerConfig =
-        serde_json::from_value(serde_json::to_value(&**config.load())?)?;
-    persisted.runtime.backend = selected;
-    config.replace(persisted)?;
-    tracing::info!(runtime_backend = ?selected, "automatically selected and persisted runtime backend");
+    let temporary = state_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let value = match selected {
+        crate::config::RuntimeBackend::Docker => "docker\n",
+        crate::config::RuntimeBackend::PveLxc => "pve_lxc\n",
+        crate::config::RuntimeBackend::Auto => {
+            anyhow::bail!("automatic runtime selection returned auto")
+        }
+    };
+    tokio::fs::write(&temporary, value).await.with_context(|| {
+        format!(
+            "failed to write automatic runtime backend state {}",
+            temporary.display()
+        )
+    })?;
+    tokio::fs::rename(&temporary, &state_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to persist automatic runtime backend state {}",
+                state_path.display()
+            )
+        })?;
+    tracing::info!(runtime_backend = ?selected, "automatically selected and persisted runtime backend state");
 
     Ok(selected)
 }

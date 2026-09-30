@@ -97,6 +97,7 @@ fn maps_panel_resources_to_native_pve_limits() {
             swap_unlimited: false,
             cpu_limit_percent: Some(250),
             cores: None,
+            cpuset_cpus: None,
         })
     );
     assert_eq!(
@@ -108,6 +109,7 @@ fn maps_panel_resources_to_native_pve_limits() {
             swap_unlimited: false,
             cpu_limit_percent: None,
             cores: None,
+            cpuset_cpus: None,
         })
     );
 }
@@ -130,6 +132,7 @@ fn maps_unlimited_memory_and_swap_to_lxc_overrides() {
             swap_unlimited: true,
             cpu_limit_percent: None,
             cores: None,
+            cpuset_cpus: None,
         })
     );
     assert_eq!(
@@ -141,13 +144,22 @@ fn maps_unlimited_memory_and_swap_to_lxc_overrides() {
             swap_unlimited: true,
             cpu_limit_percent: None,
             cores: None,
+            cpuset_cpus: None,
         })
     );
 }
 
 #[test]
 fn accepts_panel_cpu_pinning_syntax() {
-    assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("0-3,8")).is_ok());
+    let resources = PveCli::panel_resources(2048, 0, 0, 0, Some("0-3,8")).expect("valid CPU set");
+    assert_eq!(resources.cores, Some(5));
+    assert_eq!(resources.cpuset_cpus.as_deref(), Some("0-3,8"));
+    assert_eq!(
+        PveCli::panel_resources(2048, 0, 0, 0, Some("0-3,2-5"))
+            .expect("overlapping CPU set")
+            .cores,
+        Some(6)
+    );
     assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("0,,2")).is_err());
 }
 
@@ -175,6 +187,7 @@ fn resource_update_arguments_set_all_mutable_limits_and_clear_cpu_limit() {
                 swap_unlimited: false,
                 cpu_limit_percent: Some(250),
                 cores: Some(4),
+                cpuset_cpus: None,
             },
         ),
         vec![
@@ -201,6 +214,7 @@ fn resource_update_arguments_set_all_mutable_limits_and_clear_cpu_limit() {
                 swap_unlimited: false,
                 cpu_limit_percent: None,
                 cores: None,
+                cpuset_cpus: None,
             },
         ),
         vec![
@@ -212,6 +226,8 @@ fn resource_update_arguments_set_all_mutable_limits_and_clear_cpu_limit() {
             "0",
             "--cpulimit",
             "0",
+            "--delete",
+            "cores",
         ]
     );
 }
@@ -618,6 +634,28 @@ fn parses_runtime_status_for_cgroup_discovery() {
             "--output-format",
             "json",
         ]
+    );
+}
+
+#[test]
+fn parses_node_runtime_statuses_in_one_inventory() {
+    assert_eq!(
+        PveCli::parse_node_runtime_statuses(
+            br#"[{"vmid":100,"status":"running","pid":4321},{"vmid":101,"status":"stopped"}]"#,
+        )
+        .ok(),
+        Some(vec![
+            NodeContainerRuntimeStatus {
+                vmid: 100,
+                status: ContainerStatus::Running,
+                pid: Some(4321),
+            },
+            NodeContainerRuntimeStatus {
+                vmid: 101,
+                status: ContainerStatus::Stopped,
+                pid: None,
+            },
+        ])
     );
 }
 

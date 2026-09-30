@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufWriter, IsTerminal},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -784,6 +784,10 @@ fn pve_lxc_edge_wireguard_interface() -> String {
     "wg-calagopus".to_string()
 }
 
+fn pve_lxc_edge_ssh_user() -> String {
+    "root".to_string()
+}
+
 fn pve_lxc_rootfs_size_gib() -> u64 {
     8
 }
@@ -860,6 +864,9 @@ nestify::nest! {
                 /// The panel allocation IP is matched against each peer endpoint.
                 #[serde(default = "pve_lxc_edge_wireguard_interface")]
                 pub edge_wireguard_interface: String,
+                /// SSH account used by the restricted edge forwarding key.
+                #[serde(default = "pve_lxc_edge_ssh_user")]
+                pub edge_ssh_user: String,
                 /// Restricted SSH key used only to synchronize edge port forwards.
                 #[serde(default)]
                 pub edge_ssh_identity_path: String,
@@ -880,6 +887,10 @@ nestify::nest! {
                 pub managed_file_directory: SystemPath,
                 #[serde(default = "default_true")]
                 pub unprivileged: bool,
+                /// Maximum process count for LXC workloads. When omitted, the
+                /// legacy Docker limit is used for configuration compatibility.
+                #[serde(default)]
+                pub pids_limit: Option<u64>,
 
                 #[serde(default)]
                 #[schema(inline)]
@@ -1711,6 +1722,7 @@ fn log_filter(debug: bool) -> Targets {
 
 pub struct Config {
     inner: ArcSwap<InnerConfig>,
+    active_runtime_backend: OnceLock<RuntimeBackend>,
     log_reload_handle: ReloadHandle,
 
     pub path: String,
@@ -1848,6 +1860,7 @@ impl Config {
 
         let config = Arc::new(Self {
             inner: ArcSwap::new(Arc::new(inner)),
+            active_runtime_backend: OnceLock::new(),
             log_reload_handle,
 
             path: path.to_string(),
@@ -1868,6 +1881,7 @@ impl Config {
 
         Self {
             inner: ArcSwap::new(Arc::new(inner)),
+            active_runtime_backend: OnceLock::new(),
             log_reload_handle: tracing_subscriber::reload::Layer::new(log_filter(false)).1,
             path: String::new(),
             ignore_certificate_errors: false,
@@ -1880,6 +1894,26 @@ impl Config {
     #[inline]
     pub fn load(&self) -> ConfigSnapshot {
         self.inner.load()
+    }
+
+    /// Runtime selected for this Wings process. Automatic detection is kept in
+    /// memory so starting Wings never rewrites the operator's configuration.
+    pub fn active_runtime_backend(&self) -> RuntimeBackend {
+        self.active_runtime_backend
+            .get()
+            .copied()
+            .unwrap_or_else(|| self.load().runtime.backend)
+    }
+
+    pub fn set_active_runtime_backend(
+        &self,
+        backend: RuntimeBackend,
+    ) -> Result<(), RuntimeBackend> {
+        match self.active_runtime_backend.set(backend) {
+            Ok(()) => Ok(()),
+            Err(backend) if self.active_runtime_backend.get() == Some(&backend) => Ok(()),
+            Err(backend) => Err(backend),
+        }
     }
 
     pub fn replace(&self, mut new: InnerConfig) -> Result<(), anyhow::Error> {
@@ -2757,5 +2791,24 @@ mod tests {
 
         assert!(Config::migrate_legacy_limits(&mut cfg));
         assert_eq!(cfg.limits.server_concurrent_pulls, 5);
+    }
+
+    #[tokio::test]
+    async fn active_runtime_backend_is_process_local_and_idempotent() {
+        let config = Config::mock();
+        assert_eq!(config.active_runtime_backend(), RuntimeBackend::Auto);
+        assert_eq!(
+            config.set_active_runtime_backend(RuntimeBackend::PveLxc),
+            Ok(())
+        );
+        assert_eq!(config.active_runtime_backend(), RuntimeBackend::PveLxc);
+        assert_eq!(
+            config.set_active_runtime_backend(RuntimeBackend::PveLxc),
+            Ok(())
+        );
+        assert_eq!(
+            config.set_active_runtime_backend(RuntimeBackend::Docker),
+            Err(RuntimeBackend::Docker)
+        );
     }
 }
