@@ -5397,7 +5397,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tundra-common"
 version = "1.0.1"
-source = "git+https://github.com/calagopus/tundra.git?rev=ccb05e1406232f8c39f05a984133277026cd79d6#ccb05e1406232f8c39f05a984133277026cd79d6"
+source = "git+https://github.com/calagopus/tundra.git#ccb05e1406232f8c39f05a984133277026cd79d6"
 dependencies = [
  "base64 0.23.1",
  "bytes",
