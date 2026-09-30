@@ -188,8 +188,8 @@ configure_data_mount() {
   config="$(pct config "$vmid" | tr -d '\000')"
   uid="$(printf '%s\n' "$config" | awk -F': *' '$1 == "lxc.init.uid" {print $2; exit}')"
   gid="$(printf '%s\n' "$config" | awk -F': *' '$1 == "lxc.init.gid" {print $2; exit}')"
-  if [[ -z "$uid" || -z "$gid" || "$uid" == "0" || "$gid" == "0" ]]; then
-    echo "error: OCI image did not resolve to a non-root lxc.init.uid/gid" >&2
+  if [[ ! "$uid" =~ ^[0-9]+$ || ! "$gid" =~ ^[0-9]+$ ]]; then
+    echo "error: OCI image did not resolve to numeric lxc.init.uid/gid values" >&2
     printf '%s\n' "$config" >&2
     exit 1
   fi
