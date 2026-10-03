@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::io::{AsyncWriteExt, ReadBuf};
 
-pub mod cgroup;
+use super::cgroup;
 pub mod host_mounts;
 #[cfg(unix)]
 pub mod lxcfs;
@@ -488,6 +488,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
 
         crate::server::firewall::FirewallServerSpec {
             server: self.uuid,
+            target: None,
             bindings: bindings.into_iter().collect(),
             container_ports: container_ports.into_iter().collect(),
             container_ips: Vec::new(),
@@ -2788,6 +2789,13 @@ impl super::ServerExecutor for DockerExecutor {
         }
 
         Ok(())
+    }
+
+    async fn reconcile_firewall(
+        &self,
+        servers: &[crate::remote::servers::RawServer],
+    ) -> Result<(), anyhow::Error> {
+        DockerExecutor::reconcile_firewall(self, servers).await
     }
 
     async fn setup_server_process(
