@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Weak},
 };
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 pub const SET_PREFIX: &str = "wf-";
 const ENTRY_BATCH_SIZE: usize = 256;
@@ -223,6 +223,36 @@ fn parse_line(line: &str) -> Option<Result<cidr::IpCidr, ()>> {
     )
 }
 
+async fn next_line<'a>(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    bytes: &mut u64,
+    max_bytes: u64,
+    buffer: &'a mut Vec<u8>,
+) -> Result<Option<&'a str>, LoadError> {
+    buffer.clear();
+    let limit = max_bytes.saturating_sub(*bytes).saturating_add(1);
+    if reader.take(limit).read_until(b'\n', buffer).await? == 0 {
+        return Ok(None);
+    }
+
+    if buffer.ends_with(b"\n") {
+        buffer.pop();
+        if buffer.ends_with(b"\r") {
+            buffer.pop();
+        }
+    }
+
+    *bytes += buffer.len() as u64 + 1;
+    if *bytes > max_bytes {
+        return Err(LoadError::TooLarge { max_bytes });
+    }
+
+    let line = std::str::from_utf8(buffer)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+    Ok(Some(line))
+}
+
 pub async fn stream_source_file(
     filesystem: &crate::server::filesystem::cap::CapFilesystem,
     path: &Path,
@@ -231,22 +261,17 @@ pub async fn stream_source_file(
     write_batch: impl Fn(&mut Vec<u8>, &[cidr::IpCidr]),
 ) -> Result<LoadStats, LoadError> {
     let file = filesystem.async_open(path).await?;
-    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut reader = tokio::io::BufReader::new(file);
 
     let mut stats = LoadStats::default();
     let mut bytes: u64 = 0;
+    let mut buffer = Vec::new();
     let mut batch = Vec::with_capacity(ENTRY_BATCH_SIZE);
     let mut rendered = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
-        bytes += line.len() as u64 + 1;
-        if bytes > limits.max_bytes {
-            return Err(LoadError::TooLarge {
-                max_bytes: limits.max_bytes,
-            });
-        }
-
-        match parse_line(&line) {
+    while let Some(line) = next_line(&mut reader, &mut bytes, limits.max_bytes, &mut buffer).await?
+    {
+        match parse_line(line) {
             None => continue,
             Some(Err(())) => {
                 stats.invalid += 1;
@@ -504,5 +529,151 @@ mod tests {
             source_file_path("./lists/allow.txt"),
             PathBuf::from("lists/allow.txt")
         );
+    }
+
+    async fn read_lines(
+        input: &[u8],
+        capacity: usize,
+        max_bytes: u64,
+    ) -> (Vec<String>, Result<(), LoadError>) {
+        let mut reader = tokio::io::BufReader::with_capacity(capacity, input);
+        let mut bytes = 0;
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+
+        loop {
+            match next_line(&mut reader, &mut bytes, max_bytes, &mut buffer).await {
+                Ok(Some(line)) => lines.push(line.to_string()),
+                Ok(None) => return (lines, Ok(())),
+                Err(err) => return (lines, Err(err)),
+            }
+        }
+    }
+
+    // next_line
+
+    #[test]
+    fn next_line_stops_reading_endless_unterminated_input_at_the_budget() {
+        tokio_test::block_on(async {
+            for already_read in [0, 40] {
+                let mut reader =
+                    tokio::io::BufReader::with_capacity(16, tokio::io::repeat(b'a').take(8192));
+                let mut bytes = already_read;
+                let mut buffer = Vec::new();
+
+                assert!(matches!(
+                    next_line(&mut reader, &mut bytes, 64, &mut buffer).await,
+                    Err(LoadError::TooLarge { max_bytes: 64 })
+                ));
+
+                let consumed = 8192 - reader.get_ref().limit() - reader.buffer().len() as u64;
+                assert!(
+                    consumed <= 64 - already_read + 1,
+                    "consumed {consumed} bytes"
+                );
+                assert!(buffer.len() as u64 <= 64 - already_read + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn next_line_splits_like_tokio_lines_within_the_budget() {
+        tokio_test::block_on(async {
+            let input = b"a\r\nbb\n\r\n\n\rc\r\r\nd\re\nlast\r";
+            let expected = ["a", "bb", "", "", "\rc\r", "d\re", "last\r"];
+            let mut all_but_last = expected.to_vec();
+            all_but_last.pop();
+            let cost: u64 = expected.iter().map(|line| line.len() as u64 + 1).sum();
+
+            for capacity in [1, 2, 3, 5, 8192] {
+                let (lines, result) = read_lines(input, capacity, cost).await;
+                assert_eq!(lines, expected, "capacity {capacity}");
+                assert!(result.is_ok(), "capacity {capacity}: {result:?}");
+
+                let (lines, result) = read_lines(input, capacity, cost - 1).await;
+                assert_eq!(lines, all_but_last, "capacity {capacity}");
+                assert!(
+                    matches!(result, Err(LoadError::TooLarge { max_bytes }) if max_bytes == cost - 1),
+                    "capacity {capacity}: {result:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn next_line_charges_stripped_length_plus_one_per_line() {
+        tokio_test::block_on(async {
+            let cases: [(&[u8], Option<&str>); 8] = [
+                (b"1234567\r\n", Some("1234567")),
+                (b"1234567\n", Some("1234567")),
+                (b"1234567", Some("1234567")),
+                (b"123456\r", Some("123456\r")),
+                (b"12345678\r\n", None),
+                (b"12345678\n", None),
+                (b"12345678", None),
+                (b"1234567\r", None),
+            ];
+
+            for capacity in [1, 2, 3, 8192] {
+                for (input, expected) in cases {
+                    let (lines, result) = read_lines(input, capacity, 8).await;
+                    match expected {
+                        Some(line) => {
+                            assert_eq!(lines, [line], "{input:?} capacity {capacity}");
+                            assert!(result.is_ok(), "{input:?} capacity {capacity}: {result:?}");
+                        }
+                        None => {
+                            assert!(lines.is_empty(), "{input:?} capacity {capacity}: {lines:?}");
+                            assert!(
+                                matches!(result, Err(LoadError::TooLarge { max_bytes: 8 })),
+                                "{input:?} capacity {capacity}: {result:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn next_line_over_budget_line_is_too_large_never_truncated() {
+        tokio_test::block_on(async {
+            for target in ["10.0.0.123", "10.0.0.1 # é€"] {
+                let input = format!("1.2.3.4\n{target}\n");
+                let fits = 8 + target.len() as u64 + 1;
+
+                for capacity in [1, 3, 8192] {
+                    for max_bytes in 0..fits {
+                        let (lines, result) =
+                            read_lines(input.as_bytes(), capacity, max_bytes).await;
+                        let before: &[&str] = if max_bytes >= 8 { &["1.2.3.4"] } else { &[] };
+                        assert_eq!(
+                            lines, before,
+                            "{target:?} max {max_bytes} capacity {capacity}"
+                        );
+                        assert!(
+                            matches!(result, Err(LoadError::TooLarge { .. })),
+                            "{target:?} max {max_bytes} capacity {capacity}: {result:?}"
+                        );
+                    }
+
+                    let (lines, result) = read_lines(input.as_bytes(), capacity, fits).await;
+                    assert_eq!(lines, ["1.2.3.4", target]);
+                    assert!(result.is_ok(), "{result:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn next_line_rejects_invalid_utf8_within_the_budget() {
+        tokio_test::block_on(async {
+            let (lines, result) = read_lines(b"1.2.3.4\ncaf\xc3\n", 1, 64).await;
+            assert_eq!(lines, ["1.2.3.4"]);
+            assert!(
+                matches!(&result, Err(LoadError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData),
+                "{result:?}"
+            );
+        });
     }
 }

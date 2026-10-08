@@ -11,6 +11,8 @@ mod limiter;
 mod sftp;
 mod shell;
 
+pub use auth::auth_methods;
+
 pub struct Server {
     ratelimiter: Arc<limiter::SshLimiter>,
     state: State,
@@ -43,6 +45,8 @@ impl russh::server::Server for Server {
 
             clients: HashMap::new(),
             shell_clients: HashSet::new(),
+
+            removal_task: None,
         }
     }
 }

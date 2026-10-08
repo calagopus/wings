@@ -5,7 +5,6 @@ mod post {
     use crate::{
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
-        server::filesystem::cap::FileType,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -53,20 +52,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let root = server
             .filesystem
@@ -87,10 +73,7 @@ mod post {
             .await;
 
         if destination_filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(&root, FileType::Dir)
-                .await
+            && ignored.is_ignored_subtree_resolved(&server, &root).await
         {
             return ApiResponse::error("root not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -98,10 +81,10 @@ mod post {
         }
 
         let source = root.join(data.file);
+        let source_type = server.filesystem.probe_file_type(&source).await;
 
-        if server
-            .filesystem
-            .async_is_ignored(&source, server.filesystem.probe_file_type(&source).await)
+        if ignored
+            .is_ignored_resolved(&server, &source, source_type)
             .await
         {
             return ApiResponse::error("file not found")

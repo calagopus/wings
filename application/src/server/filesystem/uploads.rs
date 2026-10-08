@@ -422,39 +422,7 @@ impl UploadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{routes::AppState, server::Server};
-
-    fn with_server<F, Fut>(f: F)
-    where
-        F: FnOnce(Server) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        tokio_test::block_on(async {
-            let temp = tempfile::tempdir().expect("failed to create temp dir");
-            let state = AppState::mock();
-            state
-                .config
-                .mutate_in_place_for_testing()
-                .system
-                .data_directory =
-                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-
-            let server = Server::mock(uuid::Uuid::new_v4(), Arc::clone(&state));
-            server.filesystem.disk_checker.abort();
-
-            let root = server.filesystem.base_path.to_path_buf();
-            std::fs::create_dir_all(&root).expect("failed to create server root");
-            let cap = super::super::cap::CapFilesystem::new(&root)
-                .await
-                .expect("failed to open server root");
-            server
-                .filesystem
-                .inner
-                .store(Some(cap.get_inner().expect("failed to get inner")));
-
-            f(server).await;
-        });
-    }
+    use crate::server::Server;
 
     async fn register_upload(server: &Server, target: &str) -> UploadGuard {
         register_upload_as(server, target, uuid::Uuid::new_v4()).await
@@ -528,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_registered_upload_is_reported_as_active() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let _guard = register_upload(&server, "plugins/server.jar").await;
 
             let directory = server.filesystem.base_path.join("plugins");
@@ -550,7 +518,7 @@ mod tests {
 
     #[test]
     fn dropping_the_guard_leaves_an_inactive_record() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let guard = register_upload(&server, "plugins/server.jar").await;
             guard.upload.set_progress(40);
             drop(guard);
@@ -570,7 +538,7 @@ mod tests {
 
     #[test]
     fn completing_an_upload_forgets_it() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             register_upload(&server, "plugins/server.jar")
                 .await
                 .complete()
@@ -592,7 +560,7 @@ mod tests {
     /// over SFTP, or by the server process - so an inactive record has to answer for its own file.
     #[test]
     fn a_record_whose_staging_file_vanished_is_pruned() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let guard = register_upload(&server, "plugins/server.jar").await;
             drop(guard);
 
@@ -614,7 +582,7 @@ mod tests {
 
     #[test]
     fn an_active_record_outlives_its_staging_file() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let _guard = register_upload(&server, "plugins/server.jar").await;
 
             let target = server.filesystem.base_path.join("plugins/server.jar");
@@ -637,7 +605,7 @@ mod tests {
     /// missing file as gone would retire every record the first time one is closed.
     #[test]
     fn an_unreadable_filesystem_prunes_nothing() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             drop(register_upload(&server, "plugins/server.jar").await);
             server.filesystem.close();
 
@@ -656,7 +624,7 @@ mod tests {
 
     #[test]
     fn a_staging_file_picked_up_by_another_user_changes_hands() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let ada = uuid::Uuid::new_v4();
             let grace = uuid::Uuid::new_v4();
 
@@ -679,7 +647,7 @@ mod tests {
 
     #[test]
     fn an_untracked_staging_file_has_no_owner() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let target = server.filesystem.base_path.join("plugins/server.jar");
             let part = part_path(&target).expect("staging path");
 
@@ -696,7 +664,7 @@ mod tests {
 
     #[test]
     fn a_discarded_upload_is_forgotten() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let _guard = register_upload(&server, "plugins/server.jar").await;
 
             let target = server.filesystem.base_path.join("plugins/server.jar");
@@ -721,7 +689,7 @@ mod tests {
 
     #[test]
     fn entries_span_every_directory() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let _plugins = register_upload(&server, "plugins/server.jar").await;
             let _mods = register_upload(&server, "mods/other.jar").await;
 
@@ -736,7 +704,7 @@ mod tests {
 
     #[test]
     fn uploads_are_scoped_to_their_own_directory() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             let _plugins = register_upload(&server, "plugins/server.jar").await;
             let _mods = register_upload(&server, "mods/other.jar").await;
 

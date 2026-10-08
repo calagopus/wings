@@ -1487,16 +1487,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                let temp = tempfile::tempdir()?;
-                let state = crate::routes::AppState::mock();
-                state
-                    .config
-                    .mutate_in_place_for_testing()
-                    .system
-                    .data_directory =
-                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-                let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
-                server.filesystem.disk_checker.abort();
+                let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
 
                 let first = vec![b'a'; crate::BUFFER_SIZE * 4];
                 let second = vec![b'b'; crate::BUFFER_SIZE * 4];

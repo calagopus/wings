@@ -1,6 +1,6 @@
 use clap::{Args, FromArgMatches, ValueEnum};
 use colored::Colorize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[derive(ValueEnum, Clone, Default, PartialEq, Debug)]
@@ -27,6 +27,21 @@ pub struct ServiceInstallArgs {
         default_value = "auto"
     )]
     init: InitSystem,
+
+    #[arg(
+        long = "lxcfs",
+        help = "install a dedicated lxcfs service for server containers instead of the wings service"
+    )]
+    lxcfs: bool,
+}
+
+const LXCFS_DIRECTORY: &str = "/var/lib/calagopus-wings/lxcfs";
+const LXCFS_RUNTIME_DIRECTORY: &str = "/run/calagopus-wings-lxcfs";
+
+fn lxcfs_args() -> String {
+    format!(
+        "--enable-cfs -p {LXCFS_RUNTIME_DIRECTORY}.pid --runtime-dir={LXCFS_RUNTIME_DIRECTORY} {LXCFS_DIRECTORY}"
+    )
 }
 
 fn generate_systemd_service(binary_path: &Path) -> String {
@@ -55,6 +70,30 @@ WantedBy=multi-user.target
     )
 }
 
+fn generate_systemd_lxcfs_service(lxcfs_path: &Path) -> String {
+    format!(
+        r#"[Unit]
+Description=Calagopus Wings LXCFS
+Before=docker.service
+
+[Service]
+OOMScoreAdjust=-1000
+ExecStartPre=/bin/mkdir -p {LXCFS_DIRECTORY}
+ExecStart={} {}
+KillMode=process
+Restart=on-failure
+ExecStopPost=-/bin/umount -l {LXCFS_DIRECTORY}
+Delegate=yes
+ExecReload=/bin/kill -USR1 $MAINPID
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        lxcfs_path.display(),
+        lxcfs_args()
+    )
+}
+
 fn generate_openrc_service(binary_path: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
@@ -76,6 +115,159 @@ depend() {{
 "#,
         binary_path.display()
     )
+}
+
+fn generate_openrc_lxcfs_service(lxcfs_path: &Path) -> String {
+    format!(
+        r#"#!/sbin/openrc-run
+
+description="Calagopus Wings LXCFS"
+
+command="{}"
+command_args="{}"
+supervisor="supervise-daemon"
+pidfile="/run/calagopus-wings-lxcfs.supervise.pid"
+
+respawn_delay=5
+
+depend() {{
+    before docker
+}}
+
+start_pre() {{
+    checkpath -d {LXCFS_DIRECTORY}
+}}
+
+stop_post() {{
+    umount -l {LXCFS_DIRECTORY} 2>/dev/null || true
+}}
+"#,
+        lxcfs_path.display(),
+        lxcfs_args()
+    )
+}
+
+fn find_lxcfs() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join("lxcfs"))
+        .find(|path| path.is_file())
+}
+
+async fn install_lxcfs(
+    init_system: InitSystem,
+    r#override: bool,
+    config: Option<std::sync::Arc<crate::config::Config>>,
+) -> Result<i32, anyhow::Error> {
+    let Some(lxcfs_path) = find_lxcfs() else {
+        eprintln!(
+            "{}",
+            "lxcfs was not found in PATH, install it with your package manager first".red()
+        );
+        return Ok(1);
+    };
+
+    let (service_path, service_content) = match init_system {
+        InitSystem::Systemd => (
+            Path::new("/etc/systemd/system/wings-lxcfs.service"),
+            generate_systemd_lxcfs_service(&lxcfs_path),
+        ),
+        InitSystem::Openrc => (
+            Path::new("/etc/init.d/wings-lxcfs"),
+            generate_openrc_lxcfs_service(&lxcfs_path),
+        ),
+        InitSystem::Auto => {
+            eprintln!("{}", "failed to detect init system".red());
+            return Ok(1);
+        }
+    };
+
+    if tokio::fs::metadata(service_path).await.is_ok() && !r#override {
+        eprintln!("{}", "service file already exists".red());
+        return Ok(1);
+    }
+
+    if let Err(err) = tokio::fs::write(service_path, service_content).await {
+        eprintln!("{}: {err}", "failed to write service file".red());
+        return Ok(1);
+    }
+
+    println!("lxcfs service file created successfully");
+
+    let commands: &[&[&str]] = match init_system {
+        InitSystem::Systemd => &[
+            &["systemctl", "daemon-reload"],
+            &["systemctl", "enable", "--now", "wings-lxcfs.service"],
+        ],
+        _ => {
+            #[cfg(unix)]
+            if let Err(err) = tokio::fs::set_permissions(
+                service_path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .await
+            {
+                eprintln!("{}: {err}", "failed to make openrc script executable".red());
+                return Ok(1);
+            }
+
+            &[
+                &["rc-update", "add", "wings-lxcfs", "default"],
+                &["rc-service", "wings-lxcfs", "start"],
+            ]
+        }
+    };
+
+    for command in commands {
+        let Some((program, args)) = command.split_first() else {
+            continue;
+        };
+
+        match Command::new(program).args(args).output().await {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                eprintln!(
+                    "{} `{}`: {}",
+                    "failed to run".red(),
+                    command.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return Ok(1);
+            }
+            Err(err) => {
+                eprintln!("{} `{}`: {err}", "failed to run".red(), command.join(" "));
+                return Ok(1);
+            }
+        }
+    }
+
+    println!("lxcfs service enabled on startup and started");
+
+    let Some(config) = config else {
+        println!(
+            "set `docker.lxcfs.enabled: true` and `docker.lxcfs.directory: {LXCFS_DIRECTORY}` in the wings config to use it"
+        );
+        return Ok(0);
+    };
+
+    let mut doc = serde_json::to_value(&**config.load())?;
+    json_patch::merge(
+        &mut doc,
+        &serde_json::json!({
+            "docker": {
+                "lxcfs": {
+                    "enabled": true,
+                    "directory": LXCFS_DIRECTORY,
+                },
+            },
+        }),
+    );
+    config.replace(serde_json::from_value(doc)?)?;
+
+    println!(
+        "wings config updated, restart wings and then each server for containers to pick up lxcfs"
+    );
+
+    Ok(0)
 }
 
 pub struct ServiceInstallCommand;
@@ -118,6 +310,10 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                         eprintln!("{}", "could not auto-detect init system, please specify explicitly via --init".red());
                         return Ok(1);
                     }
+                }
+
+                if args.lxcfs {
+                    return install_lxcfs(init_system, args.r#override, config).await;
                 }
 
                 match init_system {

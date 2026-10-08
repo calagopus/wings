@@ -1,7 +1,7 @@
 use crate::{
     remote::jwt::BasePayload,
     response::{ApiErrorExt, ApiResponse},
-    server::filesystem::ignore_list::IgnoreList,
+    server::filesystem::RequestIgnored,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -66,6 +66,22 @@ pub fn subject_uuid(payload: &BasePayload) -> Result<uuid::Uuid, ApiResponse> {
         .or_api_error(StatusCode::UNAUTHORIZED, "invalid token")
 }
 
+pub fn ignored<S: AsRef<str>>(
+    server: &crate::server::Server,
+    patterns: &[S],
+    missing: &str,
+) -> Result<RequestIgnored, ApiResponse> {
+    RequestIgnored::compile(patterns).map_err(|err| {
+        tracing::error!(
+            server = %server.uuid,
+            "rejecting request, subuser ignored files cannot be compiled: {:#?}",
+            err
+        );
+
+        ApiResponse::error(missing).with_status(StatusCode::NOT_FOUND)
+    })
+}
+
 /// Subuser file restrictions carried by file tokens, meant to be `#[serde(flatten)]`ed.
 #[derive(Deserialize)]
 pub struct IgnoredFiles {
@@ -74,12 +90,12 @@ pub struct IgnoredFiles {
 }
 
 impl IgnoredFiles {
-    pub fn compile(&self) -> Result<Option<IgnoreList>, ignore::Error> {
-        if self.ignored_files.is_empty() {
-            return Ok(None);
-        }
-
-        IgnoreList::try_from_lines(self.ignored_files.iter()).map(Some)
+    pub fn request_ignored(
+        &self,
+        server: &crate::server::Server,
+        missing: &str,
+    ) -> Result<RequestIgnored, ApiResponse> {
+        ignored(server, &self.ignored_files, missing)
     }
 }
 
@@ -140,25 +156,47 @@ mod tests {
 
     // IgnoredFiles
     #[test]
-    fn ignored_files_compile_from_flattened_payload() -> Result<(), anyhow::Error> {
-        let absent: FilePayload = serde_json::from_str(r#"{"file":"a"}"#)?;
-        assert_eq!(absent.file, "a");
-        assert!(absent.ignored_files.compile()?.is_none());
+    fn request_ignored_from_flattened_payload() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            let file = crate::server::filesystem::cap::FileType::File;
 
-        let present: FilePayload =
-            serde_json::from_str(r#"{"file":"a","ignored_files":["*.log"]}"#)?;
-        let list = present
-            .ignored_files
-            .compile()?
-            .ok_or_else(|| anyhow::anyhow!("patterns compiled to no list"))?;
-        let file = crate::server::filesystem::cap::FileType::File;
-        assert!(list.is_ignored(Path::new("foo.log"), file));
-        assert!(!list.is_ignored(Path::new("foo.txt"), file));
+            let absent: FilePayload = serde_json::from_str(r#"{"file":"a"}"#)?;
+            assert_eq!(absent.file, "a");
+            assert!(
+                absent
+                    .ignored_files
+                    .request_ignored(&server, "file not found")
+                    .is_ok_and(|ignored| ignored.filter(&server).is_none())
+            );
 
-        let malformed: FilePayload =
-            serde_json::from_str(r#"{"file":"a","ignored_files":["foo[.log"]}"#)?;
-        assert!(malformed.ignored_files.compile().is_err());
+            let present: FilePayload =
+                serde_json::from_str(r#"{"file":"a","ignored_files":["*.log"]}"#)?;
+            let ignored = present
+                .ignored_files
+                .request_ignored(&server, "file not found")
+                .map_err(|_| anyhow::anyhow!("valid patterns failed to compile"))?;
+            assert!(
+                ignored
+                    .is_ignored(&server, Path::new("foo.log"), file)
+                    .await
+            );
+            assert!(
+                !ignored
+                    .is_ignored(&server, Path::new("foo.txt"), file)
+                    .await
+            );
 
-        Ok(())
+            let malformed: FilePayload =
+                serde_json::from_str(r#"{"file":"a","ignored_files":["foo[.log"]}"#)?;
+            assert!(
+                malformed
+                    .ignored_files
+                    .request_ignored(&server, "file not found")
+                    .is_err()
+            );
+
+            Ok(())
+        })
     }
 }

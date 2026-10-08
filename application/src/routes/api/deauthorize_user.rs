@@ -30,7 +30,7 @@ mod post {
     ) -> ApiResponseResult {
         for server in state.server_manager.get_servers().await.iter() {
             if data.servers.is_empty() || data.servers.contains(&server.uuid) {
-                server.user_permissions.set_permissions(
+                server.user_permissions.set_pushed_permissions(
                     data.user,
                     Permissions::default(),
                     Some(&[] as &[&str]),

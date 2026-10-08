@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["application", "pbs-client", "unrar-rs"]
 default-members = ["application"]
-package.rust-version = "1.97.0"
+package.rust-version = "1.99.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.138", features = ["derive"] }

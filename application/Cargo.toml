@@ -1,7 +1,7 @@
 [package]
 name = "wings-rs"
 rust-version = { workspace = true }
-version = "1.2.4"
+version = "1.2.5"
 edition = "2024"
 
 [dependencies]
@@ -96,7 +96,7 @@ hex = { workspace = true }
 json-patch = "4.2.0"
 itaf = "0.3.0"
 arc-swap = "1.9.1"
-rusqlite = { version = "0.40.0", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
 blake3 = "1.8.5"
 parking_lot = "0.12.5"
 toml_edit = "0.25.12"

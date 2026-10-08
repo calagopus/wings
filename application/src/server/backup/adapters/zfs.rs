@@ -587,6 +587,7 @@ impl BackupStreamCreateExt for ZfsBackup {
         _state: &crate::routes::State,
         _uuid: uuid::Uuid,
         _extension: &str,
+        _compression: crate::io::compression::CompressionType,
         _reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         Err(anyhow::anyhow!(

@@ -5,13 +5,18 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub mod api;
 mod download;
-mod token;
+pub mod token;
 mod upload;
 
 #[derive(Debug, ToSchema, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum AppContainerType {
     Official,
+    #[serde(rename = "official_aio")]
+    OfficialAIO,
+    OfficialHeavy,
+    #[serde(rename = "official_heavy_aio")]
+    OfficialHeavyAIO,
     Unknown,
     None,
 }

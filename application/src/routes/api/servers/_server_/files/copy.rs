@@ -5,7 +5,7 @@ mod post {
     use crate::{
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
-        server::filesystem::{cap::FileType, virtualfs::VirtualReadableFilesystem},
+        server::filesystem::virtualfs::{VirtualReadableFilesystem, resolve_copy_source},
     };
     use axum::http::StatusCode;
     use compact_str::ToCompactString;
@@ -57,20 +57,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let parent = Path::new(&data.path)
             .parent()
@@ -86,17 +73,13 @@ mod post {
             .await;
         let path = root.join(file_name);
 
-        let metadata = match filesystem.async_metadata(&path).await {
-            Ok(metadata) => {
-                if !metadata.file_type.is_file() && !metadata.file_type.is_dir() {
-                    return ApiResponse::error("file not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                } else {
-                    metadata
-                }
+        let (metadata, source) = match resolve_copy_source(&*filesystem, &path).await {
+            Ok((metadata, source))
+                if metadata.file_type.is_file() || metadata.file_type.is_dir() =>
+            {
+                (metadata, source)
             }
-            Err(_) => {
+            _ => {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
                     .ok();
@@ -151,17 +134,6 @@ mod post {
             compact_str::format_compact!("{base_name}{suffix}{extension}")
         }
 
-        if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(parent, FileType::Dir)
-                .await
-        {
-            return ApiResponse::error("parent directory not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
-                .ok();
-        }
-
         let explicit_name = data.name.is_some();
         let new_name = if let Some(name) = data.name {
             name
@@ -187,13 +159,12 @@ mod post {
             .relative_path(&destination_path.join(destination_file_name));
 
         if destination_filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(&destination_path, metadata.file_type)
+            && ignored
+                .is_ignored_resolved(&server, &destination_path, metadata.file_type)
                 .await
         {
             return ApiResponse::error("destination file not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
+                .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
 
@@ -245,7 +216,7 @@ mod post {
                                 ),
                                 &server,
                                 metadata,
-                                path,
+                                source,
                                 filesystem.clone(),
                                 destination_path,
                                 destination_filesystem,

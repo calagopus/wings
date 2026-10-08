@@ -153,6 +153,20 @@ pub struct DirectoryEntry {
     pub modified: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(ToSchema, Serialize)]
+pub struct DirectorySizes {
+    pub name: compact_str::CompactString,
+    pub size: u64,
+    pub size_physical: u64,
+    pub files_size: u64,
+    pub inaccessible_size: u64,
+    pub other_size: u64,
+    pub other_count: u64,
+    pub truncated: bool,
+    #[schema(no_recursion)]
+    pub children: Vec<DirectorySizes>,
+}
+
 fn serialize_utc_seconds<S: serde::Serializer>(
     datetime: &chrono::DateTime<chrono::Utc>,
     serializer: S,

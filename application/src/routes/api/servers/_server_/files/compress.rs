@@ -62,20 +62,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -109,13 +96,12 @@ mod post {
         let destination_path = destination_root.join(file_name);
 
         if destination_filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(&destination_path, FileType::File)
+            && ignored
+                .is_ignored_resolved(&server, &destination_path, FileType::File)
                 .await
         {
             return ApiResponse::error("file not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
+                .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
 

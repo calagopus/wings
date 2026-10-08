@@ -6,7 +6,6 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
-    use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use std::path::Path;
     use utoipa::ToSchema;
@@ -41,20 +40,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let mut entries = Vec::new();
         entries.reserve_exact(data.files.len());

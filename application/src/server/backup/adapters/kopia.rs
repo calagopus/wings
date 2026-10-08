@@ -529,6 +529,7 @@ impl BackupStreamCreateExt for KopiaBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        _compression: crate::io::compression::CompressionType,
         mut reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_kopia_configuration(uuid).await?;

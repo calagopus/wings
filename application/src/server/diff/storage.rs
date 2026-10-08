@@ -1,5 +1,5 @@
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::{
     io::{Read, Write},
     path::Path,
@@ -78,7 +78,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn open(path: &Path, zstd_level: i32) -> Result<Self, anyhow::Error> {
-        let conn = Connection::open(path)
+        let conn = crate::server::filesystem::sqlite::open(path, OpenFlags::default())
             .with_context(|| format!("opening diff db {}", path.display()))?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;

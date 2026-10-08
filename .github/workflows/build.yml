@@ -38,12 +38,12 @@ jobs:
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
             jemalloc_lg_page: 12
-            link_flags: ""
+            link_flags: -C relocation-model=static
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
             jemalloc_lg_page: 16
-            link_flags: ""
+            link_flags: -C relocation-model=static
 
     steps:
       - name: Checkout sources
@@ -58,6 +58,8 @@ jobs:
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 --locked
+        env:
+          CARGO_BUILD_WARNINGS: allow
 
       - name: Run cargo test
         run: cross test --release --target ${{ matrix.target }}

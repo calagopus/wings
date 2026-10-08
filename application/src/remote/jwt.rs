@@ -172,7 +172,7 @@ impl JwtClient {
 
         let claim_use = |count: &std::sync::atomic::AtomicUsize| {
             count
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |count| (count < self.max_jwt_uses).then_some(count + 1),

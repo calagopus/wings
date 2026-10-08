@@ -53,6 +53,16 @@ impl IgnoreVerdict {
         matches!(self, Self::Keep(_))
     }
 
+    /// The same verdict carrying `path` instead of the one it was reached with.
+    #[inline]
+    pub fn with_path(self, path: PathBuf) -> Self {
+        match self {
+            Self::Keep(_) => Self::Keep(path),
+            Self::Descend(_) => Self::Descend(path),
+            Self::Skip => Self::Skip,
+        }
+    }
+
     /// The most a later filter can grant an entry an earlier filter only
     /// descended into: kept drops to descend, skip and descend stay.
     #[inline]

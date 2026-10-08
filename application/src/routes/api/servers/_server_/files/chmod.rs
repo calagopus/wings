@@ -8,7 +8,6 @@ mod post {
         server::filesystem::virtualfs::{AsyncDirectoryWalkFn, VirtualWalkEntry},
         utils::PortablePermissions,
     };
-    use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use std::{
         path::Path,
@@ -60,20 +59,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let mut updated_count = 0;
         for file in data.files {

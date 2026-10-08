@@ -9,7 +9,6 @@ mod get {
         routes::api::servers::_server_::GetServer,
         server::filesystem::cap::FileType,
     };
-    use axum::http::StatusCode;
     use axum_extra::extract::Query;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
@@ -46,32 +45,14 @@ mod get {
         ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let path = server
             .filesystem
             .diff_key(std::path::Path::new(&data.file))
             .await;
 
-        if server
-            .filesystem
-            .async_is_ignored(&path, FileType::File)
-            .await
-            || ignored.is_ignored(&server, &path, FileType::File).await
-        {
+        if ignored.is_ignored(&server, &path, FileType::File).await {
             return ApiResponse::new_serialized(Response {
                 revisions: Vec::new(),
             })

@@ -3,7 +3,10 @@ use crate::{
     server::{
         activity::{Activity, ActivityEvent},
         filesystem::{
-            RenameParents, archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn,
+            RenameParents,
+            archive::ArchiveFormat,
+            cap::FileType,
+            virtualfs::{AsyncWritableFileStream, IsIgnoredFn},
         },
     },
 };
@@ -1254,27 +1257,6 @@ impl ScheduleAction {
                     server.filesystem.resolve_writable_fs(server, &parent).await;
                 let path = root.join(file_name);
 
-                let metadata = filesystem.async_metadata(&path).await;
-
-                if filesystem.is_primary_server_fs()
-                    && server
-                        .filesystem
-                        .async_is_ignored(parent, FileType::Dir)
-                        .await
-                {
-                    return Err("file not found".into());
-                }
-
-                let old_content_size = if let Ok(metadata) = metadata {
-                    if !metadata.file_type.is_file() {
-                        return Err("file is not a file".into());
-                    }
-
-                    metadata.size as i64
-                } else {
-                    0
-                };
-
                 if filesystem.is_primary_server_fs()
                     && server
                         .filesystem
@@ -1284,36 +1266,37 @@ impl ScheduleAction {
                     return Err("parent directory not found".into());
                 }
 
+                if let Ok(metadata) = filesystem.async_metadata(&path).await
+                    && !metadata.file_type.is_file()
+                {
+                    return Err("file is not a file".into());
+                }
+
                 if let Err(err) = server.filesystem.async_create_dir_all(parent).await {
                     tracing::error!(path = %parent.display(), "failed to create parent directory: {:?}", err);
 
                     return Err("failed to create parent directory".into());
                 }
 
-                let mut options = OpenOptions::new();
-                options
-                    .write(true)
-                    .create(true)
-                    .truncate(!*append)
-                    .append(*append);
+                let file = if *append {
+                    let mut options = OpenOptions::new();
+                    options.write(true).create(true).append(true);
 
-                let mut file = match filesystem
-                    .async_open_file_with_options(&path, options)
-                    .await
-                {
+                    filesystem
+                        .async_open_file_with_options(&path, options)
+                        .await
+                        .map(|file| file as AsyncWritableFileStream)
+                } else {
+                    filesystem.async_create_file(&path).await
+                };
+
+                let mut file = match file {
                     Ok(file) => file,
                     Err(err) => {
                         tracing::error!(path = %path.display(), "failed to open file: {:?}", err);
                         return Err("failed to open file".into());
                     }
                 };
-
-                if filesystem.is_primary_server_fs() && !*append && old_content_size > 0 {
-                    server
-                        .filesystem
-                        .async_allocate_in_path(parent, -old_content_size, true)
-                        .await;
-                }
 
                 if let Err(err) = file.write_all(content.as_bytes()).await {
                     if err.kind() == std::io::ErrorKind::StorageFull {

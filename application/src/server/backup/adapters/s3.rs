@@ -807,6 +807,7 @@ impl BackupStreamCreateExt for S3Backup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         _extension: &str,
+        source_compression: CompressionType,
         reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let (part_size, initial_urls) = state.config.client.backup_s3_part_urls(uuid, 1).await?;
@@ -820,6 +821,14 @@ impl BackupStreamCreateExt for S3Backup {
                 anyhow::anyhow!("no initial urls provided for s3 backup, cannot upload backup")
             })?;
         let compression = Self::compression_from_url(&url);
+        let (reader, compression) = if compression == source_compression {
+            (reader, CompressionType::None)
+        } else {
+            (
+                super::decompress_dump(reader, source_compression),
+                compression,
+            )
+        };
 
         let config = state.config.load();
         let compression_level = config.system.backups.compression_level;

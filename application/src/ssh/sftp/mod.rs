@@ -1291,6 +1291,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
         let file = tokio::task::spawn_blocking({
             let server = self.server.clone();
+            let user_uuid = self.user_uuid;
             let path = path.clone();
 
             move || {
@@ -1311,18 +1312,27 @@ impl russh_sftp::server::Handler for SftpSession {
                         open_options.create(true);
                     }
                 }
-                if pflags.contains(OpenFlags::TRUNCATE) {
-                    open_options.truncate(true);
-                }
 
-                let file = server.filesystem.open_with(&path, open_options)?;
-                let initial_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-
-                let mut file = crate::server::filesystem::file::ServerFile::new_file(
+                let mut file = crate::server::filesystem::file::ServerFile::open_checked(
                     server.clone(),
                     &path,
-                    file,
-                    initial_size,
+                    open_options,
+                    pflags.contains(OpenFlags::TRUNCATE),
+                    |file| {
+                        #[cfg(target_os = "linux")]
+                        if Self::is_ignored_server(
+                            &server,
+                            user_uuid,
+                            &server.filesystem.opened_relative_path(file)?,
+                            FileType::File,
+                        ) {
+                            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = (user_uuid, file);
+
+                        Ok(())
+                    },
                 )
                 .map_err(std::io::Error::other)?;
 
@@ -1343,8 +1353,6 @@ impl russh_sftp::server::Handler for SftpSession {
             tracing::warn!("failed to chown new file: {:?}", err);
         }
 
-        let path_components = self.server.filesystem.path_to_components(&path);
-
         if let Some(event) = activity_event {
             self.server.activity.log_activity(Activity {
                 event,
@@ -1356,16 +1364,6 @@ impl russh_sftp::server::Handler for SftpSession {
                 schedule: None,
                 timestamp: chrono::Utc::now(),
             });
-        }
-
-        if pflags.contains(OpenFlags::TRUNCATE)
-            && let Some(old) = pre_size.filter(|&s| s > 0)
-            && let Some(parent_components) = path_components.get(0..path_components.len() - 1)
-        {
-            self.server
-                .filesystem
-                .async_allocate_in_path_iterator(parent_components, -(old as i64), true)
-                .await;
         }
 
         let handle = self.next_handle_id();

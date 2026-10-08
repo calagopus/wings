@@ -22,6 +22,15 @@ pub enum ShellMode {
     WinScp,
 }
 
+fn can_read_console(server: &crate::server::Server, user_uuid: uuid::Uuid) -> bool {
+    server.user_permissions.has_user(user_uuid)
+        && server.user_permissions.has_calagopus_permission_or(
+            user_uuid,
+            Permission::ControlReadConsole,
+            true,
+        )
+}
+
 pub struct ShellSession {
     pub state: State,
     pub server: crate::server::Server,
@@ -492,11 +501,7 @@ impl ShellSession {
                 .await
                 .unwrap_or_default();
 
-            if self.server.user_permissions.has_calagopus_permission_or(
-                self.user_uuid,
-                Permission::ControlReadConsole,
-                true,
-            ) {
+            if can_read_console(&self.server, self.user_uuid) {
                 let mut log_stream = self
                     .server
                     .logs(Some(self.state.config.load().system.websocket_log_count))
@@ -580,7 +585,9 @@ impl ShellSession {
                                             .await
                                             .unwrap_or_default();
                                     }
-                                    WebsocketEvent::ServerConsoleOutput => {
+                                    WebsocketEvent::ServerConsoleOutput
+                                        if can_read_console(&server, user_uuid) =>
+                                    {
                                         writer
                                             .write_all(
                                                 format!("{}\r\n\x1b[2K", message.args.join(" "))
@@ -589,7 +596,9 @@ impl ShellSession {
                                             .await
                                             .unwrap_or_default();
                                     }
-                                    WebsocketEvent::ServerDaemonMessage => {
+                                    WebsocketEvent::ServerDaemonMessage
+                                        if can_read_console(&server, user_uuid) =>
+                                    {
                                         writer
                                             .write_all(
                                                 format!("{}\r\n\x1b[2K", message.args.join(" "))
@@ -642,22 +651,14 @@ impl ShellSession {
 
                     Box::pin(async move {
                         'outer: loop {
-                            if !server.user_permissions.has_calagopus_permission_or(
-                                user_uuid,
-                                Permission::ControlReadConsole,
-                                true,
-                            ) {
+                            if !can_read_console(&server, user_uuid) {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                 continue;
                             }
 
                             if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                                 loop {
-                                    if !server.user_permissions.has_calagopus_permission_or(
-                                        user_uuid,
-                                        Permission::ControlReadConsole,
-                                        true,
-                                    ) {
+                                    if !can_read_console(&server, user_uuid) {
                                         let prelude = config.daemon_prelude();
 
                                         writer
@@ -794,6 +795,67 @@ impl ShellSession {
                     tracing::debug!("shell handles finished");
                 }
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::Server;
+
+    // can_read_console
+
+    #[test]
+    fn absent_user_cannot_read() {
+        Server::with_mock(|server| async move {
+            assert!(!can_read_console(&server, uuid::Uuid::new_v4()));
+        });
+    }
+
+    #[test]
+    fn calagopus_user_with_read_console_can_read() {
+        Server::with_mock(|server| async move {
+            let user = uuid::Uuid::new_v4();
+            server.user_permissions.grant(
+                user,
+                &[Permission::MetaCalagopus, Permission::ControlReadConsole],
+            );
+            assert!(can_read_console(&server, user));
+        });
+    }
+
+    #[test]
+    fn calagopus_user_without_read_console_cannot_read() {
+        Server::with_mock(|server| async move {
+            let user = uuid::Uuid::new_v4();
+            server
+                .user_permissions
+                .grant(user, &[Permission::MetaCalagopus, Permission::FileSftp]);
+            assert!(!can_read_console(&server, user));
+        });
+    }
+
+    #[test]
+    fn legacy_user_without_read_console_can_read() {
+        Server::with_mock(|server| async move {
+            let sftp = uuid::Uuid::new_v4();
+            let read = uuid::Uuid::new_v4();
+            server.user_permissions.grant(sftp, &[Permission::FileSftp]);
+            server.user_permissions.grant(read, &[Permission::FileRead]);
+            assert!(can_read_console(&server, sftp));
+            assert!(can_read_console(&server, read));
+        });
+    }
+
+    #[test]
+    fn removed_user_cannot_read() {
+        Server::with_mock(|server| async move {
+            let user = uuid::Uuid::new_v4();
+            server.user_permissions.grant(user, &[Permission::FileSftp]);
+            assert!(can_read_console(&server, user));
+            server.user_permissions.grant(user, &[]);
+            assert!(!can_read_console(&server, user));
         });
     }
 }

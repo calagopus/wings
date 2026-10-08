@@ -877,6 +877,7 @@ impl BackupStreamCreateExt for ResticBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        _compression: crate::io::compression::CompressionType,
         mut reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let file_name = format!("{uuid}.{extension}");

@@ -585,6 +585,11 @@ fn docker_runtime_boost_max_concurrent() -> u64 {
     3
 }
 
+#[cfg(unix)]
+fn docker_lxcfs_directory() -> SystemPath {
+    SystemPath::new("/var/lib/lxcfs")
+}
+
 fn docker_installer_limits_timeout() -> u64 {
     30 * 60
 }
@@ -1507,6 +1512,18 @@ nestify::nest! {
                 pub max_concurrent: u64,
             },
 
+            #[cfg(unix)]
+            #[serde(default)]
+            #[schema(inline)]
+            pub lxcfs: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerLxcfs {
+                #[cfg(unix)]
+                #[serde(default)]
+                pub enabled: bool,
+                #[cfg(unix)]
+                #[serde(default = "docker_lxcfs_directory")]
+                pub directory: SystemPath,
+            },
+
             #[serde(default)]
             #[schema(inline)]
             pub installer_limits: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerInstallerLimits {
@@ -1688,6 +1705,7 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.user",
     "system.passwd",
     "docker.socket",
+    "docker.lxcfs.directory",
     "tundra.data_directory",
     "tundra.binary",
     "tundra.image",
@@ -2736,6 +2754,24 @@ mod tests {
             vec![compact_str::CompactString::from("/dev/null")]
         );
         assert!(config.debug);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lxcfs_directory_cannot_be_changed_by_panel_patches_but_enabled_can() {
+        let defaults = from_yaml("{}");
+        assert!(!defaults.docker.lxcfs.enabled);
+        assert_eq!(defaults.docker.lxcfs.directory.0, "/var/lib/lxcfs");
+
+        let mut doc = serde_json::to_value(defaults).expect("config should serialize");
+        let mut patch = serde_json::json!({
+            "docker": { "lxcfs": { "enabled": true, "directory": "/" } }
+        });
+        crate::utils::strip_paths(&mut patch, FORBIDDEN_PATHS);
+        json_patch::merge(&mut doc, &patch);
+        let config: InnerConfig = serde_json::from_value(doc).expect("config should deserialize");
+        assert!(config.docker.lxcfs.enabled);
+        assert_eq!(config.docker.lxcfs.directory.0, "/var/lib/lxcfs");
     }
 
     #[test]

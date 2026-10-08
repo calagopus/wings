@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use russh::{
-    Channel, ChannelId, MethodSet,
+    Channel, ChannelId, Disconnect, MethodSet, Pty,
     server::{Auth, Msg, Session},
 };
 use serde_json::json;
@@ -29,6 +29,16 @@ fn validate_username(username: &str) -> bool {
     segments >= 2 && last.len() == 8 && last.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+pub fn auth_methods(config: &crate::config::InnerConfig) -> MethodSet {
+    let mut methods = MethodSet::empty();
+    if !config.system.sftp.disable_password_auth {
+        methods.push(russh::MethodKind::Password);
+    }
+    methods.push(russh::MethodKind::PublicKey);
+
+    methods
+}
+
 pub struct SshSession {
     pub limiter: Arc<super::limiter::SshLimiter>,
     pub state: State,
@@ -40,21 +50,117 @@ pub struct SshSession {
 
     pub clients: HashMap<ChannelId, Channel<Msg>>,
     pub shell_clients: HashSet<ChannelId>,
+
+    pub removal_task: Option<tokio::task::AbortHandle>,
 }
 
 impl SshSession {
-    fn get_auth_methods(&self) -> MethodSet {
-        let mut methods = MethodSet::empty();
-        if !self.state.config.load().system.sftp.disable_password_auth {
-            methods.push(russh::MethodKind::Password);
+    fn reject(&self) -> Auth {
+        Auth::Reject {
+            proceed_with_methods: Some(auth_methods(&self.state.config.load())),
+            partial_success: false,
         }
-        methods.push(russh::MethodKind::PublicKey);
-
-        methods
     }
 
     pub fn get_channel(&mut self, channel_id: ChannelId) -> Option<Channel<Msg>> {
         self.clients.remove(&channel_id)
+    }
+
+    fn authenticated(&self) -> Option<(uuid::Uuid, crate::server::Server)> {
+        self.user_uuid.zip(self.server.clone())
+    }
+
+    fn shell_user(&self) -> Option<(uuid::Uuid, crate::server::Server)> {
+        if !self.state.config.load().system.sftp.shell.enabled {
+            return None;
+        }
+
+        let (user_uuid, server) = self.authenticated()?;
+
+        server
+            .user_permissions
+            .has_permission(user_uuid, Permission::WebsocketConnect)
+            .then_some((user_uuid, server))
+    }
+
+    async fn authenticate(
+        &mut self,
+        authentication_type: AuthenticationType,
+        username: &str,
+        credential: &str,
+    ) -> Result<Auth, russh::Error> {
+        if !validate_username(username) {
+            return Ok(self.reject());
+        }
+
+        self.limiter
+            .check_attempt(self.user_ip, authentication_type)
+            .await?;
+
+        let (user, server, permissions, ignored_files) = match self
+            .state
+            .config
+            .client
+            .get_sftp_auth(authentication_type, username, credential)
+            .await
+        {
+            Ok(data) => data,
+            Err(err) => {
+                tracing::debug!(
+                    username = username,
+                    method = ?authentication_type,
+                    "failed to authenticate: {:#?}",
+                    err
+                );
+
+                return Ok(self.reject());
+            }
+        };
+
+        if !permissions.has_permission(Permission::FileSftp) {
+            return Ok(self.reject());
+        }
+
+        self.limiter
+            .finish_attempt(&self.user_ip, authentication_type)
+            .await;
+
+        let Some(server) = self.state.server_manager.get_server(server).await else {
+            return Ok(self.reject());
+        };
+
+        if server.locked_state().is_some() {
+            return Ok(self.reject());
+        }
+
+        self.limiter.increment_sessions(user)?;
+        self.user_uuid = Some(user);
+
+        tracing::debug!(
+            server = %server.uuid,
+            %user,
+            method = ?authentication_type,
+            "user authenticated"
+        );
+
+        server
+            .user_permissions
+            .set_fetched_permissions(user, permissions, Some(&ignored_files));
+        if self.state.config.load().system.sftp.activity.log_logins {
+            server.activity.log_activity(Activity {
+                event: ActivityEvent::SftpLogin,
+                user: Some(user),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({
+                    "method": authentication_type,
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        self.server = Some(server);
+
+        Ok(Auth::Accept)
     }
 }
 
@@ -62,10 +168,7 @@ impl russh::server::Handler for SshSession {
     type Error = russh::Error;
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        Ok(Auth::Reject {
-            proceed_with_methods: Some(self.get_auth_methods()),
-            partial_success: false,
-        })
+        Ok(self.reject())
     }
 
     async fn auth_password(&mut self, username: &str, password: &str) -> Result<Auth, Self::Error> {
@@ -73,81 +176,8 @@ impl russh::server::Handler for SshSession {
             return Ok(Auth::UnsupportedMethod);
         }
 
-        if !validate_username(username) {
-            return Ok(Auth::Reject {
-                proceed_with_methods: Some(self.get_auth_methods()),
-                partial_success: false,
-            });
-        }
-
-        self.limiter
-            .check_attempt(self.user_ip, AuthenticationType::Password)
-            .await?;
-
-        let (user, server, permissions, ignored_files) = match self
-            .state
-            .config
-            .client
-            .get_sftp_auth(AuthenticationType::Password, username, password)
+        self.authenticate(AuthenticationType::Password, username, password)
             .await
-        {
-            Ok(data) => data,
-            Err(err) => {
-                tracing::debug!(
-                    username = username,
-                    "failed to authenticate (password): {:#?}",
-                    err
-                );
-
-                return Ok(Auth::reject());
-            }
-        };
-
-        if !permissions.has_permission(Permission::FileSftp) {
-            return Ok(Auth::reject());
-        }
-
-        self.limiter
-            .finish_attempt(&self.user_ip, AuthenticationType::Password)
-            .await;
-
-        let server = match self.state.server_manager.get_server(server).await {
-            Some(server) => server,
-            None => {
-                return Ok(Auth::Reject {
-                    proceed_with_methods: Some(self.get_auth_methods()),
-                    partial_success: false,
-                });
-            }
-        };
-
-        if server.locked_state().is_some() {
-            return Ok(Auth::reject());
-        }
-
-        self.limiter.increment_sessions(user)?;
-        self.user_uuid = Some(user);
-
-        tracing::debug!(server = %server.uuid, %user, "user authenticated with password");
-
-        server
-            .user_permissions
-            .set_permissions(user, permissions, Some(&ignored_files));
-        if self.state.config.load().system.sftp.activity.log_logins {
-            server.activity.log_activity(Activity {
-                event: ActivityEvent::SftpLogin,
-                user: Some(user),
-                ip: Some(self.user_ip),
-                metadata: Some(json!({
-                    "method": "password",
-                })),
-                schedule: None,
-                timestamp: chrono::Utc::now(),
-            });
-        }
-        self.server = Some(server);
-
-        Ok(Auth::Accept)
     }
 
     async fn auth_publickey(
@@ -155,83 +185,41 @@ impl russh::server::Handler for SshSession {
         username: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if !validate_username(username) {
-            return Ok(Auth::Reject {
-                proceed_with_methods: Some(self.get_auth_methods()),
-                partial_success: false,
-            });
-        }
+        self.authenticate(
+            AuthenticationType::PublicKey,
+            username,
+            &public_key.to_openssh()?,
+        )
+        .await
+    }
 
-        self.limiter
-            .check_attempt(self.user_ip, AuthenticationType::PublicKey)
-            .await?;
-
-        let (user, server, permissions, ignored_files) = match self
-            .state
-            .config
-            .client
-            .get_sftp_auth(
-                AuthenticationType::PublicKey,
-                username,
-                &public_key.to_openssh()?,
-            )
-            .await
-        {
-            Ok(data) => data,
-            Err(err) => {
-                tracing::debug!(
-                    username = username,
-                    "failed to authenticate (public_key): {:#?}",
-                    err
-                );
-
-                return Ok(Auth::Reject {
-                    proceed_with_methods: Some(self.get_auth_methods()),
-                    partial_success: false,
-                });
-            }
+    async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
+        let Some((user_uuid, server)) = self.authenticated() else {
+            return Ok(());
         };
 
-        if !permissions.has_permission(Permission::FileSftp) {
-            return Ok(Auth::reject());
-        }
+        let handle = session.handle();
+        let task = tokio::spawn(async move {
+            server.user_permissions.wait_for_removal(user_uuid).await;
 
-        self.limiter
-            .finish_attempt(&self.user_ip, AuthenticationType::PublicKey)
-            .await;
+            tracing::debug!(
+                server = %server.uuid,
+                "closing ssh session due to user permissions removal"
+            );
 
-        let server = match self.state.server_manager.get_server(server).await {
-            Some(server) => server,
-            None => return Ok(Auth::reject()),
-        };
+            handle
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "permission revoked".to_string(),
+                    String::new(),
+                )
+                .await
+                .ok();
+        });
 
-        if server.locked_state().is_some() {
-            return Ok(Auth::reject());
-        }
+        self.removal_task = Some(task.abort_handle());
 
-        self.limiter.increment_sessions(user)?;
-        self.user_uuid = Some(user);
-
-        tracing::debug!(server = %server.uuid, %user, "user authenticated with public key");
-
-        server
-            .user_permissions
-            .set_permissions(user, permissions, Some(&ignored_files));
-        if self.state.config.load().system.sftp.activity.log_logins {
-            server.activity.log_activity(Activity {
-                event: ActivityEvent::SftpLogin,
-                user: Some(user),
-                ip: Some(self.user_ip),
-                metadata: Some(json!({
-                    "method": "public_key",
-                })),
-                schedule: None,
-                timestamp: chrono::Utc::now(),
-            });
-        }
-        self.server = Some(server);
-
-        Ok(Auth::Accept)
+        Ok(())
     }
 
     async fn channel_open_session(
@@ -281,6 +269,52 @@ impl russh::server::Handler for SshSession {
         Ok(())
     }
 
+    async fn pty_request(
+        &mut self,
+        channel_id: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if self.shell_user().is_some() {
+            session.channel_success(channel_id)?;
+        } else {
+            session.channel_failure(channel_id)?;
+        }
+
+        Ok(())
+    }
+
+    async fn x11_request(
+        &mut self,
+        channel_id: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel_id)?;
+
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        channel_id: ChannelId,
+        _variable_name: &str,
+        _variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel_id)?;
+
+        Ok(())
+    }
+
     async fn shell_request(
         &mut self,
         channel_id: ChannelId,
@@ -288,18 +322,9 @@ impl russh::server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         tracing::debug!("channel shell request: {}", channel_id);
 
-        if !self.state.config.load().system.sftp.shell.enabled {
-            return Err(russh::Error::RequestDenied);
-        }
-
-        let user_uuid = match self.user_uuid {
-            Some(uuid) => uuid,
-            None => return Err(russh::Error::RequestDenied),
-        };
-
-        let server = match &self.server {
-            Some(server) => server.clone(),
-            None => return Err(russh::Error::UnsupportedAuthMethod),
+        let Some((user_uuid, server)) = self.shell_user() else {
+            session.channel_failure(channel_id)?;
+            return Ok(());
         };
 
         let channel = match self.get_channel(channel_id) {
@@ -331,14 +356,9 @@ impl russh::server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data);
 
-        let user_uuid = match self.user_uuid {
-            Some(uuid) => uuid,
-            None => return Err(russh::Error::RequestDenied),
-        };
-
-        let server = match &self.server {
-            Some(server) => server.clone(),
-            None => return Err(russh::Error::UnsupportedAuthMethod),
+        let Some((user_uuid, server)) = self.shell_user() else {
+            session.channel_failure(channel_id)?;
+            return Ok(());
         };
 
         let channel = match self.get_channel(channel_id) {
@@ -379,14 +399,9 @@ impl russh::server::Handler for SshSession {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let user_uuid = match self.user_uuid {
-            Some(uuid) => uuid,
-            None => return Err(russh::Error::RequestDenied),
-        };
-
-        let server = match &self.server {
-            Some(server) => server.clone(),
-            None => return Err(russh::Error::UnsupportedAuthMethod),
+        let Some((user_uuid, server)) = self.authenticated() else {
+            session.channel_failure(channel_id)?;
+            return Ok(());
         };
 
         if name == "sftp" {
@@ -418,6 +433,10 @@ impl russh::server::Handler for SshSession {
 
 impl Drop for SshSession {
     fn drop(&mut self) {
+        if let Some(task) = self.removal_task.take() {
+            task.abort();
+        }
+
         if let Some(user) = self.user_uuid {
             self.limiter.decrement_sessions(user);
         }

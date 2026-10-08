@@ -561,6 +561,9 @@ async fn main_rt() {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
             Ok("official") => crate::routes::AppContainerType::Official,
+            Ok("official-aio") => crate::routes::AppContainerType::OfficialAIO,
+            Ok("official-heavy") => crate::routes::AppContainerType::OfficialHeavy,
+            Ok("official-heavy-aio") => crate::routes::AppContainerType::OfficialHeavyAIO,
             Ok(_) => crate::routes::AppContainerType::Unknown,
             Err(_) => crate::routes::AppContainerType::None,
         },
@@ -778,6 +781,7 @@ async fn main_rt() {
                     maximum_packet_size: 32 * 1024,
                     keepalive_interval: Some(std::time::Duration::from_secs(60)),
                     max_auth_attempts: 6,
+                    methods: crate::ssh::auth_methods(&state.config.load()),
                     channel_buffer_size: 1024,
                     event_buffer_size: 1024,
                     keys: vec![key],

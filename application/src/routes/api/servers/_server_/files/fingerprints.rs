@@ -8,7 +8,6 @@ mod get {
         routes::{FingerprintCacheKey, GetState, api::servers::_server_::GetServer},
         server::filesystem::virtualfs::VirtualReadableFilesystem,
     };
-    use axum::http::StatusCode;
     use axum_extra::extract::Query;
     use compact_str::ToCompactString;
     use serde::{Deserialize, Serialize};
@@ -258,20 +257,7 @@ mod get {
         server: GetServer,
         Query(data): Query<Params>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let semaphore = Arc::new(Semaphore::new(crate::threading::resolve_threads(
             state.config.load().api.file_fingerprint_threads,

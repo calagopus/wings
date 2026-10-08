@@ -134,8 +134,27 @@ impl IgnoredFiles {
 }
 
 type UserPermissions = (Permissions, IgnoredFiles, std::time::Instant);
+
+/// When permissions for a user last came fresh from the panel, as unix timestamps.
+#[derive(Default, Clone, Copy)]
+struct PanelStamps {
+    pushed: Option<i64>,
+    fetched: Option<i64>,
+}
+
+/// Outcome of [`UserPermissionsMap::set_token_permissions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenVerdict {
+    Applied,
+    /// The token predates a fetch at an SSH login, which is kept as the fresher state.
+    Kept,
+    /// The token predates a panel push and must not be accepted.
+    Stale,
+}
+
 pub struct UserPermissionsMap {
     map: Arc<Mutex<HashMap<uuid::Uuid, UserPermissions>>>,
+    stamps: Arc<Mutex<HashMap<uuid::Uuid, PanelStamps>>>,
     removal_sender: tokio::sync::broadcast::Sender<uuid::Uuid>,
     _removal_receiver: tokio::sync::broadcast::Receiver<uuid::Uuid>,
 
@@ -145,15 +164,26 @@ pub struct UserPermissionsMap {
 impl Default for UserPermissionsMap {
     fn default() -> Self {
         let map = Arc::new(Mutex::new(HashMap::new()));
+        let stamps = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = tokio::sync::broadcast::channel(32);
 
         Self {
             map: Arc::clone(&map),
+            stamps: Arc::clone(&stamps),
             removal_sender: tx,
             _removal_receiver: rx,
             task: tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                    let now = chrono::Utc::now().timestamp();
+                    stamps
+                        .lock()
+                        .retain(|_, &mut PanelStamps { pushed, fetched }| {
+                            pushed
+                                .max(fetched)
+                                .is_some_and(|stamp| now - stamp < 60 * 60 * 24)
+                        });
 
                     let mut map = map.lock();
                     map.retain(|_, (_, _, last_access)| {
@@ -169,29 +199,36 @@ impl UserPermissionsMap {
     pub async fn wait_for_removal(&self, user_uuid: uuid::Uuid) {
         let mut receiver = self.removal_sender.subscribe();
 
-        loop {
+        while self.map.lock().contains_key(&user_uuid) {
             match receiver.recv().await {
                 Ok(uuid) if uuid == user_uuid => break,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
-                    if !self.map.lock().contains_key(&user_uuid) =>
-                {
-                    break;
-                }
                 _ => {}
             }
         }
     }
 
-    pub fn has_permission(&self, user_uuid: uuid::Uuid, permission: Permission) -> bool {
+    fn with_user<T>(
+        &self,
+        user_uuid: uuid::Uuid,
+        f: impl FnOnce(&Permissions, &IgnoredFiles) -> T,
+    ) -> Option<T> {
         let mut map = self.map.lock();
-        if let Some((permissions, _, last_access)) = map.get_mut(&user_uuid) {
-            *last_access = std::time::Instant::now();
+        let (permissions, ignored, last_access) = map.get_mut(&user_uuid)?;
+        *last_access = std::time::Instant::now();
 
+        Some(f(permissions, ignored))
+    }
+
+    pub fn has_user(&self, user_uuid: uuid::Uuid) -> bool {
+        self.with_user(user_uuid, |_, _| ()).is_some()
+    }
+
+    pub fn has_permission(&self, user_uuid: uuid::Uuid, permission: Permission) -> bool {
+        self.with_user(user_uuid, |permissions, _| {
             permissions.has_permission(permission)
-        } else {
-            false
-        }
+        })
+        .unwrap_or(false)
     }
 
     pub fn has_calagopus_permission_or(
@@ -200,25 +237,17 @@ impl UserPermissionsMap {
         permission: Permission,
         default: bool,
     ) -> bool {
-        let mut map = self.map.lock();
-        if let Some((permissions, _, last_access)) = map.get_mut(&user_uuid) {
-            *last_access = std::time::Instant::now();
-
+        self.with_user(user_uuid, |permissions, _| {
             permissions.has_calagopus_permission_or(permission, default)
-        } else {
-            default
-        }
+        })
+        .unwrap_or(default)
     }
 
     pub fn has_ignored_files(&self, user_uuid: uuid::Uuid) -> bool {
-        let mut map = self.map.lock();
-        if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
-            *last_access = std::time::Instant::now();
-
+        self.with_user(user_uuid, |_, ignored| {
             !matches!(ignored, IgnoredFiles::Unrestricted)
-        } else {
-            false
-        }
+        })
+        .unwrap_or(false)
     }
 
     pub fn is_ignored(
@@ -266,17 +295,70 @@ impl UserPermissionsMap {
         path: std::path::PathBuf,
         file_type: FileType,
     ) -> bool {
-        let mut map = self.map.lock();
-        if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
-            *last_access = std::time::Instant::now();
-
-            ignored.matches(path, file_type)
-        } else {
-            false
-        }
+        self.with_user(user_uuid, |_, ignored| ignored.matches(path, file_type))
+            .unwrap_or(false)
     }
 
-    pub fn set_permissions(
+    /// Applies permissions pushed by the panel, and records the push so that tokens
+    /// issued before it are refused by [`Self::set_token_permissions`].
+    pub fn set_pushed_permissions(
+        &self,
+        user_uuid: uuid::Uuid,
+        permissions: Permissions,
+        ignored_files: Option<&[impl AsRef<str>]>,
+    ) {
+        let mut stamps = self.stamps.lock();
+        let pushed = &mut stamps.entry(user_uuid).or_default().pushed;
+        *pushed = (*pushed).max(Some(chrono::Utc::now().timestamp()));
+
+        self.apply_permissions(user_uuid, permissions, ignored_files);
+    }
+
+    /// Applies permissions fetched from the panel at an SSH login. Unlike a push, a fetch
+    /// does not mean the panel changed anything, so tokens issued before it are still
+    /// accepted, they just cannot overwrite these fresher permissions.
+    pub fn set_fetched_permissions(
+        &self,
+        user_uuid: uuid::Uuid,
+        permissions: Permissions,
+        ignored_files: Option<&[impl AsRef<str>]>,
+    ) {
+        let mut stamps = self.stamps.lock();
+        let fetched = &mut stamps.entry(user_uuid).or_default().fetched;
+        *fetched = (*fetched).max(Some(chrono::Utc::now().timestamp()));
+
+        self.apply_permissions(user_uuid, permissions, ignored_files);
+    }
+
+    /// Applies the permissions carried by a token unless a panel push or SSH fetch since
+    /// `issued_at` supersedes them.
+    pub fn set_token_permissions(
+        &self,
+        user_uuid: uuid::Uuid,
+        issued_at: Option<i64>,
+        permissions: Permissions,
+        ignored_files: Option<&[impl AsRef<str>]>,
+    ) -> TokenVerdict {
+        let stamps = self.stamps.lock();
+        let PanelStamps { pushed, fetched } = stamps.get(&user_uuid).copied().unwrap_or_default();
+        let issued_at = issued_at.unwrap_or(i64::MIN);
+
+        if pushed.is_some_and(|pushed| issued_at <= pushed) {
+            return TokenVerdict::Stale;
+        }
+
+        if fetched.is_some_and(|fetched| issued_at <= fetched)
+            && self.map.lock().contains_key(&user_uuid)
+        {
+            return TokenVerdict::Kept;
+        }
+
+        self.apply_permissions(user_uuid, permissions, ignored_files);
+
+        TokenVerdict::Applied
+    }
+
+    fn apply_permissions(
         &self,
         user_uuid: uuid::Uuid,
         permissions: Permissions,
@@ -315,6 +397,11 @@ impl UserPermissionsMap {
             self.removal_sender.send(user_uuid).ok();
         }
     }
+
+    #[cfg(test)]
+    pub fn grant(&self, user_uuid: uuid::Uuid, list: &[Permission]) {
+        self.set_pushed_permissions(user_uuid, Permissions::from_list(list), None::<&[&str]>);
+    }
 }
 
 impl Drop for UserPermissionsMap {
@@ -351,6 +438,16 @@ impl Permissions {
         }
 
         self.has_permission(permission)
+    }
+
+    #[cfg(test)]
+    pub fn from_list(list: &[Permission]) -> Self {
+        let mut permissions = Self::default();
+        for &permission in list {
+            permissions.insert(permission);
+        }
+
+        permissions
     }
 }
 
@@ -431,14 +528,6 @@ mod tests {
         Permission::FileSftp,
     ];
 
-    fn perms(list: &[Permission]) -> Permissions {
-        let mut p = Permissions::default();
-        for &x in list {
-            p.insert(x);
-        }
-        p
-    }
-
     // Permission
 
     #[test]
@@ -480,7 +569,7 @@ mod tests {
 
     #[test]
     fn wildcard_grants_everything_except_admin() {
-        let p = perms(&[Permission::All]);
+        let p = Permissions::from_list(&[Permission::All]);
         assert!(p.has_permission(Permission::FileRead));
         assert!(p.has_permission(Permission::ControlStart));
         assert!(!p.has_permission(Permission::AdminWebsocketErrors));
@@ -488,7 +577,7 @@ mod tests {
 
     #[test]
     fn admin_permission_requires_explicit_grant() {
-        let p = perms(&[Permission::All, Permission::AdminWebsocketErrors]);
+        let p = Permissions::from_list(&[Permission::All, Permission::AdminWebsocketErrors]);
         assert!(p.has_permission(Permission::AdminWebsocketErrors));
         // a different admin permission is still not covered by the wildcard
         assert!(!p.has_permission(Permission::AdminWebsocketInstall));
@@ -496,7 +585,7 @@ mod tests {
 
     #[test]
     fn explicit_and_missing_permissions() {
-        let p = perms(&[Permission::FileRead]);
+        let p = Permissions::from_list(&[Permission::FileRead]);
         assert!(p.has_permission(Permission::FileRead));
         assert!(!p.has_permission(Permission::FileDelete));
         assert!(!Permissions::default().has_permission(Permission::FileRead));
@@ -504,18 +593,18 @@ mod tests {
 
     #[test]
     fn is_calagopus_checks_meta_marker() {
-        assert!(perms(&[Permission::MetaCalagopus]).is_calagopus());
-        assert!(!perms(&[Permission::FileRead]).is_calagopus());
+        assert!(Permissions::from_list(&[Permission::MetaCalagopus]).is_calagopus());
+        assert!(!Permissions::from_list(&[Permission::FileRead]).is_calagopus());
     }
 
     #[test]
     fn calagopus_permission_or_uses_default_only_for_non_calagopus() {
-        let plain = perms(&[Permission::FileRead]);
+        let plain = Permissions::from_list(&[Permission::FileRead]);
         // not a calagopus user: the default is returned, ignoring the actual grant
         assert!(!plain.has_calagopus_permission_or(Permission::FileRead, false));
         assert!(plain.has_calagopus_permission_or(Permission::FileRead, true));
 
-        let calagopus = perms(&[Permission::MetaCalagopus, Permission::FileRead]);
+        let calagopus = Permissions::from_list(&[Permission::MetaCalagopus, Permission::FileRead]);
         // calagopus user: the real grant decides, the default is ignored
         assert!(calagopus.has_calagopus_permission_or(Permission::FileRead, false));
         assert!(!calagopus.has_calagopus_permission_or(Permission::FileDelete, true));
@@ -552,7 +641,7 @@ mod tests {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             assert!(!permissions.has_permission(user, Permission::FileRead));
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileRead]);
             assert!(permissions.has_permission(user, Permission::FileRead));
             assert!(!permissions.has_permission(user, Permission::FileDelete));
         });
@@ -563,8 +652,8 @@ mod tests {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
-            permissions.set_permissions(user, Permissions::default(), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileRead]);
+            permissions.grant(user, &[]);
             assert!(!permissions.has_permission(user, Permission::FileRead));
         });
     }
@@ -574,8 +663,8 @@ mod tests {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
-            permissions.set_permissions(user, perms(&[Permission::FileDelete]), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileRead]);
+            permissions.grant(user, &[Permission::FileDelete]);
             assert!(!permissions.has_permission(user, Permission::FileRead));
             assert!(permissions.has_permission(user, Permission::FileDelete));
         });
@@ -592,6 +681,27 @@ mod tests {
     }
 
     #[test]
+    fn map_has_user_follows_grants_and_removal() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let other = uuid::Uuid::new_v4();
+            assert!(!permissions.has_user(user));
+
+            permissions.grant(user, &[Permission::FileRead]);
+            permissions.grant(other, &[Permission::FileRead]);
+            assert!(permissions.has_user(user));
+
+            permissions.grant(user, &[]);
+            assert!(!permissions.has_user(user));
+            assert!(permissions.has_user(other));
+
+            permissions.clear_permissions();
+            assert!(!permissions.has_user(other));
+        });
+    }
+
+    #[test]
     fn map_is_ignored_matches_patterns() {
         tokio_test::block_on(async {
             let state = crate::routes::AppState::mock();
@@ -599,7 +709,11 @@ mod tests {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             let ignored: &[&str] = &["*.log"];
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                Some(ignored),
+            );
             assert!(permissions.is_ignored(&server, user, "server.log", FileType::File));
             assert!(permissions.is_ignored(&server, user, "sub/server.log", FileType::File));
             assert!(!permissions.is_ignored(&server, user, "server.txt", FileType::File));
@@ -623,7 +737,11 @@ mod tests {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             let ignored: &[&str] = &["*.log"];
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                Some(ignored),
+            );
 
             assert!(permissions.is_ignored(
                 &server,
@@ -648,9 +766,13 @@ mod tests {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             let ignored: &[&str] = &["*.log"];
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                Some(ignored),
+            );
             assert!(permissions.is_ignored(&server, user, "x.log", FileType::File));
-            permissions.set_permissions(user, perms(&[Permission::FileDelete]), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileDelete]);
             assert!(permissions.is_ignored(&server, user, "x.log", FileType::File));
         });
     }
@@ -666,7 +788,11 @@ mod tests {
             // an unclosed character class cannot be compiled - the whole list is then
             // unusable, and must hide everything rather than nothing
             let ignored: &[&str] = &["[abc", "*.log"];
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                Some(ignored),
+            );
 
             assert!(permissions.is_ignored(&server, user, "server.log", FileType::File));
             assert!(permissions.is_ignored(&server, user, "anything.txt", FileType::File));
@@ -679,7 +805,7 @@ mod tests {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileRead]);
 
             let done = tokio::time::timeout(Duration::from_secs(2), async {
                 let removal = permissions.wait_for_removal(user);
@@ -701,12 +827,12 @@ mod tests {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
-            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
+            permissions.grant(user, &[Permission::FileRead]);
 
             for _ in 0..64 {
-                permissions.set_permissions(
+                permissions.set_pushed_permissions(
                     uuid::Uuid::new_v4(),
-                    perms(&[Permission::FileRead]),
+                    Permissions::from_list(&[Permission::FileRead]),
                     None::<&[&str]>,
                 );
             }
@@ -722,6 +848,288 @@ mod tests {
             .await;
 
             assert!(done.is_ok(), "wait_for_removal did not resolve after lag");
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_token_applies_without_push() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileRead]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_stale_token_does_not_override_push() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let ignored: &[&str] = &["*.log"];
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                Some(ignored),
+            );
+
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[
+                        Permission::FileRead,
+                        Permission::FileReadContent,
+                        Permission::ControlConsole
+                    ]),
+                    Some(&[] as &[&str])
+                ),
+                TokenVerdict::Stale
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileReadContent));
+            assert!(!permissions.has_permission(user, Permission::ControlConsole));
+            assert!(permissions.has_ignored_files(user));
+        });
+    }
+
+    #[test]
+    fn map_stale_token_does_not_restore_revoked_user() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_pushed_permissions(user, Permissions::default(), Some(&[] as &[&str]));
+
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::All, Permission::FileRead]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Stale
+            );
+            assert!(!permissions.has_permission(user, Permission::All));
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_token_issued_after_push_applies() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+
+            let iat = chrono::Utc::now().timestamp() + 2;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileDelete));
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_token_issued_in_push_second_or_without_iat_is_refused() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+            let pushed = permissions
+                .stamps
+                .lock()
+                .get(&user)
+                .unwrap()
+                .pushed
+                .unwrap();
+
+            for issued_at in [Some(pushed), None] {
+                assert_eq!(
+                    permissions.set_token_permissions(
+                        user,
+                        issued_at,
+                        Permissions::from_list(&[Permission::FileDelete]),
+                        None::<&[&str]>
+                    ),
+                    TokenVerdict::Stale
+                );
+            }
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_token_older_than_fetch_is_kept() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Kept
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_token_issued_in_fetch_second_is_kept() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+            let fetched = permissions
+                .stamps
+                .lock()
+                .get(&user)
+                .unwrap()
+                .fetched
+                .unwrap();
+
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(fetched),
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Kept
+            );
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    None,
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Kept
+            );
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_token_issued_after_fetch_applies() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+
+            let iat = chrono::Utc::now().timestamp() + 2;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_push_after_fetch_makes_older_token_stale() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+            permissions.set_pushed_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Stale
+            );
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_fetch_then_revoking_push_does_not_restore_user() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(
+                user,
+                Permissions::from_list(&[Permission::FileRead]),
+                None::<&[&str]>,
+            );
+            permissions.set_pushed_permissions(user, Permissions::default(), Some(&[] as &[&str]));
+
+            let iat = chrono::Utc::now().timestamp() - 100;
+            assert_eq!(
+                permissions.set_token_permissions(
+                    user,
+                    Some(iat),
+                    Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Stale
+            );
+            assert!(!permissions.has_user(user));
             assert!(!permissions.has_permission(user, Permission::FileRead));
         });
     }

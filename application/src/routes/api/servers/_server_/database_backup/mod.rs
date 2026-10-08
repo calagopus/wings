@@ -7,7 +7,7 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::backup::{adapters::BackupAdapter, validate_dump_extension},
+        server::backup::{adapters::BackupAdapter, parse_dump_extension},
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        if let Err(err) = validate_dump_extension(&data.extension) {
+        if let Err(err) = parse_dump_extension(&data.extension) {
             return ApiResponse::error(&err.to_string())
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();

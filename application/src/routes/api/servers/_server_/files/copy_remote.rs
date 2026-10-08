@@ -10,10 +10,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::{
-            filesystem::{
-                cap::FileType,
-                virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualWalkEntry},
-            },
+            filesystem::virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualWalkEntry},
             transfer::TransferArchiveFormat,
         },
     };
@@ -86,23 +83,10 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let (source_ignored, destination_ignored) = match (
-            crate::server::filesystem::RequestIgnored::compile(&data.ignored),
-            crate::server::filesystem::RequestIgnored::compile(&data.destination_ignored),
-        ) {
-            (Ok(source), Ok(destination)) => (source, destination),
-            (Err(err), _) | (_, Err(err)) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let source_ignored =
+            crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+        let destination_ignored =
+            crate::routes::token::ignored(&server, &data.destination_ignored, "file not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -117,9 +101,8 @@ mod post {
         }
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(&root, FileType::Dir)
+            && source_ignored
+                .is_ignored_subtree_resolved(&server, &root)
                 .await
         {
             return ApiResponse::error("path not found")
@@ -166,6 +149,16 @@ mod post {
                     &destination_ignored,
                 )
                 .await;
+
+            if destination_filesystem.is_primary_server_fs()
+                && destination_ignored
+                    .is_ignored_subtree_resolved(&destination_server, &destination_path)
+                    .await
+            {
+                return ApiResponse::error("destination path not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
 
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -424,7 +417,6 @@ mod post {
                     {
                         let root = root.clone();
                         let files = data.files.clone();
-                        let server = server.clone();
                         let files_processed = files_processed.clone();
 
                         async move {
@@ -435,12 +427,6 @@ mod post {
                             let (reader, mut writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
 
                             let archive_task = async {
-                                let is_ignored = if filesystem.is_primary_server_fs() {
-                                    server.filesystem.get_ignored().into()
-                                } else {
-                                    Default::default()
-                                };
-
                                 let mut reader = filesystem
                                     .async_read_dir_files_archive(
                                         &root,
@@ -450,7 +436,7 @@ mod post {
                                             state.config.load().system.backups.compression_level
                                         }),
                                         crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed, files_processed),
-                                        is_ignored,
+                                        IsIgnoredFn::default(),
                                     )
                                     .await?;
 

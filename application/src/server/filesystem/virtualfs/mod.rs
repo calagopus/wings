@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     sync::Semaphore,
 };
 
@@ -249,6 +249,25 @@ impl AsyncFileRead {
                 reader: Box::new(file),
             })
         }
+    }
+
+    /// Reads the whole file when it fits in `cap` bytes, both by its size up front
+    /// and by what is actually read.
+    pub async fn read_to_end_capped(
+        &mut self,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>, std::io::Error> {
+        if self.size > cap {
+            return Ok(None);
+        }
+
+        let mut buffer = Vec::with_capacity(self.size as usize);
+        (&mut self.reader)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut buffer)
+            .await?;
+
+        Ok((buffer.len() as u64 <= cap).then_some(buffer))
     }
 
     pub fn headers(&self) -> HeaderMap {
@@ -597,6 +616,22 @@ pub trait AsyncDirectoryStreamWalk {
     }
 }
 
+/// Like [`VirtualReadableFilesystem::async_reachable_metadata`], but keeps `path` for
+/// a directory, which is copied under its own name so each entry is denylist-checked
+/// as it is walked.
+pub async fn resolve_copy_source(
+    filesystem: &(impl VirtualReadableFilesystem + ?Sized),
+    path: &(dyn AsRef<Path> + Send + Sync),
+) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+    let (metadata, resolved) = filesystem.async_reachable_metadata(path).await?;
+
+    if metadata.file_type.is_dir() {
+        Ok((metadata, path.as_ref().to_path_buf()))
+    } else {
+        Ok((metadata, resolved))
+    }
+}
+
 #[async_trait::async_trait]
 pub trait VirtualReadableFilesystem: Send + Sync {
     fn is_primary_server_fs(&self) -> bool {
@@ -627,6 +662,41 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<FileMetadata, anyhow::Error>;
+
+    fn resolve_reachable(
+        &self,
+        _file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        Ok(path.as_ref().to_path_buf())
+    }
+    async fn async_resolve_reachable(
+        &self,
+        _file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        Ok(path.as_ref().to_path_buf())
+    }
+    fn reachable_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+        let metadata = self.metadata(path)?;
+        let resolved = self.resolve_reachable(metadata.file_type, path)?;
+
+        Ok((metadata, resolved))
+    }
+    async fn async_reachable_metadata(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(FileMetadata, PathBuf), anyhow::Error> {
+        let metadata = self.async_metadata(path).await?;
+        let resolved = self
+            .async_resolve_reachable(metadata.file_type, path)
+            .await?;
+
+        Ok((metadata, resolved))
+    }
 
     async fn async_directory_entry(
         &self,

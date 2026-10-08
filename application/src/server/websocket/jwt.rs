@@ -1,5 +1,8 @@
 use super::{WebsocketEvent, WebsocketJwtPayload, WebsocketMessage};
-use crate::server::{permissions::Permission, websocket::ServerWebsocketHandler};
+use crate::server::{
+    permissions::{Permission, TokenVerdict},
+    websocket::ServerWebsocketHandler,
+};
 use axum::extract::ws::Message;
 use compact_str::ToCompactString;
 use std::sync::Arc;
@@ -91,6 +94,30 @@ pub async fn handle_jwt(
                         return Err(JwtError::CloseSocket);
                     }
 
+                    if matches!(
+                        server.user_permissions.set_token_permissions(
+                            jwt.user_uuid,
+                            jwt.base.issued_at,
+                            jwt.permissions.clone(),
+                            jwt.ignored_files.as_deref(),
+                        ),
+                        TokenVerdict::Stale
+                    ) {
+                        tracing::debug!(
+                            server = %server.uuid,
+                            user = %jwt.user_uuid,
+                            "jwt was issued before the last permissions update, rejecting"
+                        );
+
+                        websocket_handler
+                            .send_message(
+                                WebsocketMessage::builder(WebsocketEvent::TokenExpired).build(),
+                            )
+                            .await;
+
+                        return Err(JwtError::Expired);
+                    }
+
                     let mut permissions = Vec::new();
                     for permission in jwt.permissions.iter() {
                         permissions.push(permission.to_str().to_compact_string());
@@ -107,11 +134,6 @@ pub async fn handle_jwt(
                     let has_console_read = jwt
                         .permissions
                         .has_calagopus_permission_or(Permission::ControlReadConsole, true);
-                    server.user_permissions.set_permissions(
-                        jwt.user_uuid,
-                        jwt.permissions.clone(),
-                        jwt.ignored_files.as_deref(),
-                    );
 
                     if websocket_handler
                         .socket_jwt

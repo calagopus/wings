@@ -580,11 +580,15 @@ impl Schedule {
                 status_lock.step = None;
                 drop(status_lock);
 
+                let timestamp = chrono::Utc::now();
+
                 server
                     .websocket
                     .send(
                         WebsocketMessage::builder(WebsocketEvent::ServerScheduleCompleted)
                             .arg(uuid.to_compact_string())
+                            .arg(successful.to_compact_string())
+                            .arg(timestamp.to_rfc3339())
                             .build(),
                     )
                     .ok();
@@ -593,7 +597,7 @@ impl Schedule {
                     uuid,
                     successful,
                     errors,
-                    timestamp: chrono::Utc::now(),
+                    timestamp,
                 });
 
                 server

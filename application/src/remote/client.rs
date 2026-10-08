@@ -106,22 +106,22 @@ impl Client {
         Err(last_err.expect("No attempts were made"))
     }
 
+    fn is_client_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<reqwest::Error>()
+            .is_some_and(|err| err.status().is_some_and(|s| s.is_client_error()))
+            || err
+                .downcast_ref::<super::ApiError>()
+                .is_some_and(|err| err.status.is_client_error())
+    }
+
     fn skip_client_errors(err: &anyhow::Error, attempt: usize) -> bool {
-        if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-            && reqwest_err.status().is_some_and(|s| s.is_client_error())
-            && attempt > 3
-        {
-            return false;
-        }
+        attempt <= 3 || !Self::is_client_error(err)
+    }
 
-        if let Some(api_err) = err.downcast_ref::<super::ApiError>()
-            && api_err.status.is_client_error()
-            && attempt > 3
-        {
-            return false;
-        }
-
-        true
+    /// A rejected login is final, and the client is waiting inside its authentication
+    /// round trip, so only a few attempts are made and only for server or network errors.
+    fn retry_sftp_auth_errors(err: &anyhow::Error, attempt: usize) -> bool {
+        attempt < 3 && !Self::is_client_error(err)
     }
 
     #[tracing::instrument(skip(self, password))]
@@ -135,7 +135,7 @@ impl Client {
 
         self.retry(
             || super::get_sftp_auth(self, r#type, username, password),
-            Self::skip_client_errors,
+            Self::retry_sftp_auth_errors,
         )
         .await
     }

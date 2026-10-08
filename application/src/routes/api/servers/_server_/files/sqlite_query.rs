@@ -76,20 +76,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         if data.query.is_empty() || data.query.len() > sqlite::QUERY_MAX_LENGTH {
             return ApiResponse::error("query length is invalid")
@@ -117,8 +104,8 @@ mod post {
                 .ok();
         }
 
-        match filesystem.async_metadata(&path).await {
-            Ok(metadata) if metadata.file_type.is_file() => {}
+        match filesystem.async_reachable_metadata(&path).await {
+            Ok((metadata, _)) if metadata.file_type.is_file() => {}
             _ => {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
@@ -190,7 +177,7 @@ mod post {
 
         let (connection, interrupt) =
             match tokio::task::spawn_blocking(move || -> Result<_, rusqlite::Error> {
-                let connection = rusqlite::Connection::open_with_flags(&canonical, flags)?;
+                let connection = sqlite::open(&canonical, flags)?;
                 connection.busy_timeout(sqlite::QUERY_BUSY_TIMEOUT)?;
                 let interrupt = connection.get_interrupt_handle();
 
@@ -208,7 +195,7 @@ mod post {
         });
 
         let results = tokio::task::spawn_blocking(move || {
-            sqlite::run_query(&connection, &data.query, max_rows)
+            sqlite::run_query(connection, &data.query, max_rows, &server.sqlite_memory)
         })
         .await?;
         watchdog.abort();

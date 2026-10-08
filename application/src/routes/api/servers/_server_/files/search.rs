@@ -11,6 +11,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{
+            RequestIgnored,
             ignore_list::IgnoreList,
             virtualfs::{
                 DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
@@ -661,18 +662,6 @@ mod post {
                 .await??;
             }
             Payload::V2(data) => {
-                let (root, filesystem) = server
-                    .filesystem
-                    .resolve_readable_fs(&server, Path::new(&data.root))
-                    .await;
-
-                let metadata = filesystem.async_metadata(&root).await;
-                if !metadata.map_or(true, |m| m.file_type.is_dir()) {
-                    return ApiResponse::error("root is not a directory")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-
                 let mut override_builder = OverrideBuilder::new("/");
                 let mut ignore_builder = IgnoreList::builder();
 
@@ -703,7 +692,28 @@ mod post {
                     .as_ref()
                     .is_some_and(|pf| !pf.include.is_empty());
                 let path_includes = Arc::new(override_builder.build()?);
-                let ignored: IsIgnoredFn = ignore_builder.build()?.into();
+                let exclude = ignore_builder.build()?;
+
+                let (root, filesystem) = server
+                    .filesystem
+                    .resolve_readable_fs_ignoring(
+                        &server,
+                        Path::new(&data.root),
+                        &RequestIgnored::from_list(exclude.clone()),
+                    )
+                    .await;
+                let is_ignored = if filesystem.is_primary_server_fs() {
+                    IsIgnoredFn::default()
+                } else {
+                    exclude.into()
+                };
+
+                let metadata = filesystem.async_metadata(&root).await;
+                if !metadata.map_or(true, |m| m.file_type.is_dir()) {
+                    return ApiResponse::error("root is not a directory")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
 
                 let needle = match &data.content_filter {
                     Some(cf) => match Needle::new(&cf.query, cf.case_insensitive) {
@@ -721,7 +731,7 @@ mod post {
                     let listener = listener.clone();
 
                     move || {
-                        let mut walker = filesystem.walk_dir(&*root, ignored)?;
+                        let mut walker = filesystem.walk_dir(&*root, is_ignored)?;
 
                         let result = walker.run_parallel(
                             state.config.load().api.file_search_threads,

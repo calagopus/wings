@@ -15,7 +15,7 @@ mod post {
     use futures::StreamExt;
     use serde::{Deserialize, Serialize};
     use std::path::Path;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -63,20 +63,7 @@ mod post {
         Query(data): Query<Params>,
         body: Body,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let parent = Path::new(&data.file)
             .parent()
@@ -92,6 +79,14 @@ mod post {
             .await;
         let path = root.join(file_name);
 
+        if filesystem.is_primary_server_fs()
+            && ignored.is_ignored_subtree_resolved(&server, parent).await
+        {
+            return ApiResponse::error("parent directory not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
         let content_size: i64 = headers
             .get("Content-Length")
             .and_then(|v| v.to_str().ok())
@@ -100,9 +95,9 @@ mod post {
         let metadata = filesystem.async_metadata(&path).await;
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(
+            && ignored
+                .is_ignored_resolved(
+                    &server,
                     &path,
                     metadata
                         .as_ref()
@@ -128,17 +123,6 @@ mod post {
             0
         };
 
-        if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(parent, FileType::Dir)
-                .await
-        {
-            return ApiResponse::error("parent directory not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
-                .ok();
-        }
-
         filesystem.async_create_dir_all(&root).await?;
 
         if filesystem.is_primary_server_fs()
@@ -163,25 +147,17 @@ mod post {
 
         let captured_before: Option<Vec<u8>> = if track {
             match filesystem.async_read_file(&path, None).await {
-                Ok(mut handle) => {
-                    if handle.size > history.file_size_cap {
+                Ok(mut handle) => match handle.read_to_end_capped(history.file_size_cap).await {
+                    Ok(before) => before,
+                    Err(err) => {
+                        tracing::debug!(
+                            server = %server.uuid,
+                            path = %path.display(),
+                            "diff: failed to read pre-edit content: {err}"
+                        );
                         None
-                    } else {
-                        let mut buf = Vec::with_capacity(handle.size as usize);
-                        match handle.reader.read_to_end(&mut buf).await {
-                            Ok(_) if buf.len() <= history.file_size_cap as usize => Some(buf),
-                            Ok(_) => None,
-                            Err(err) => {
-                                tracing::debug!(
-                                    server = %server.uuid,
-                                    path = %path.display(),
-                                    "diff: failed to read pre-edit content: {err}"
-                                );
-                                None
-                            }
-                        }
                     }
-                }
+                },
                 Err(err) => {
                     tracing::debug!(
                         server = %server.uuid,
@@ -214,54 +190,40 @@ mod post {
 
         if track {
             match filesystem.async_read_file(&path, None).await {
-                Ok(mut handle) => {
-                    if handle.size <= file_size_cap {
-                        let mut buf = Vec::with_capacity(handle.size as usize);
-                        match handle.reader.read_to_end(&mut buf).await {
-                            Ok(_) if buf.len() <= file_size_cap as usize => {
-                                match server
-                                    .diff
-                                    .record_edit(&diff_key, captured_before, buf, data.user)
-                                    .await
-                                {
-                                    Ok(id) => {
-                                        if id != 0 {
-                                            revision_id = Some(id);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            server = %server.uuid,
-                                            path = %diff_key,
-                                            "diff: record_edit failed: {err:#}"
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(_) => {
-                                tracing::debug!(
-                                    server = %server.uuid,
-                                    path = %diff_key,
-                                    "diff: post-write content exceeds file_size_cap; not recorded"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::debug!(
-                                    server = %server.uuid,
-                                    path = %diff_key,
-                                    "diff: failed to read post-edit content: {err}"
-                                );
+                Ok(mut handle) => match handle.read_to_end_capped(file_size_cap).await {
+                    Ok(Some(buf)) => match server
+                        .diff
+                        .record_edit(&diff_key, captured_before, buf, data.user)
+                        .await
+                    {
+                        Ok(id) => {
+                            if id != 0 {
+                                revision_id = Some(id);
                             }
                         }
-                    } else {
+                        Err(err) => {
+                            tracing::warn!(
+                                server = %server.uuid,
+                                path = %diff_key,
+                                "diff: record_edit failed: {err:#}"
+                            );
+                        }
+                    },
+                    Ok(None) => {
                         tracing::debug!(
                             server = %server.uuid,
                             path = %diff_key,
-                            "diff: post-write file exceeds file_size_cap (size {}); not recorded",
-                            handle.size
+                            "diff: post-write content exceeds file_size_cap; not recorded"
                         );
                     }
-                }
+                    Err(err) => {
+                        tracing::debug!(
+                            server = %server.uuid,
+                            path = %diff_key,
+                            "diff: failed to read post-edit content: {err}"
+                        );
+                    }
+                },
                 Err(err) => {
                     tracing::debug!(
                         server = %server.uuid,

@@ -42,20 +42,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -72,10 +59,7 @@ mod post {
         }
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(&root, FileType::Dir)
-                .await
+            && ignored.is_ignored_subtree_resolved(&server, &root).await
         {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -92,9 +76,8 @@ mod post {
             .or_api_error(StatusCode::NOT_FOUND, "target not found")?;
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(&target, target_metadata.file_type)
+            && ignored
+                .is_ignored_resolved(&server, &target, target_metadata.file_type)
                 .await
         {
             return ApiResponse::error("target not found")
@@ -103,13 +86,12 @@ mod post {
         }
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(&link, FileType::File)
+            && ignored
+                .is_ignored_resolved(&server, &link, FileType::File)
                 .await
         {
             return ApiResponse::error("destination not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
+                .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
 

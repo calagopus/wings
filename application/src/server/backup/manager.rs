@@ -446,7 +446,7 @@ impl BackupManager {
             .await;
 
         let result = async {
-            super::validate_dump_extension(extension)?;
+            super::parse_dump_extension(extension)?;
 
             let response = server
                 .app_state

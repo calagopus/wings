@@ -1,4 +1,5 @@
 use crate::{
+    io::compression::{CompressionType, reader::AsyncCompressionReader},
     remote::backups::RawServerBackup,
     server::backup::{Backup, DumpReader},
 };
@@ -41,6 +42,16 @@ async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyho
     }
 
     Ok(Box::new(std::io::Cursor::new(first_byte).chain(reader)))
+}
+
+fn decompress_dump(reader: DumpReader, compression: CompressionType) -> DumpReader {
+    match compression {
+        CompressionType::None => reader,
+        compression => Box::new(AsyncCompressionReader::new_with_async_reader(
+            reader,
+            compression,
+        )),
+    }
 }
 
 async fn probe_backup_directory(config: &crate::config::Config) -> Result<(), anyhow::Error> {
@@ -118,10 +129,17 @@ impl BackupAdapter {
         extension: &str,
         reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
-        super::validate_dump_extension(extension)?;
+        let (extension, compression) = super::parse_dump_extension(extension)?;
         let reader = prepare_dump_reader(reader).await?;
 
-        self.create_from_prepared_stream(state, uuid, extension, reader)
+        // Deduplicating adapters compress chunks themselves, and a compressed
+        // stream defeats their content-defined chunking.
+        let (reader, compression) = match self {
+            Self::Wings | Self::S3 => (reader, compression),
+            _ => (decompress_dump(reader, compression), CompressionType::None),
+        };
+
+        self.create_from_prepared_stream(state, uuid, extension, compression, reader)
             .await
     }
 }
@@ -174,6 +192,44 @@ mod tests {
             let result = reader.read_to_end(&mut output).await;
             assert_eq!(output, b"a");
             assert!(result.is_err_and(|err| err.to_string().contains("source failed")));
+
+            Ok(())
+        })
+    }
+
+    // decompress_dump
+    #[test]
+    fn decompress_dump_passes_uncompressed_through() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let input = b"database dump".as_slice();
+            let mut reader =
+                decompress_dump(Box::new(std::io::Cursor::new(input)), CompressionType::None);
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            assert_eq!(output, input);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn decompress_dump_decodes_gzip() -> Result<(), anyhow::Error> {
+        use std::io::Write;
+
+        tokio_test::block_on(async {
+            let input = b"database dump".repeat(64);
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input)?;
+            let compressed = encoder.finish()?;
+
+            let mut reader = decompress_dump(
+                Box::new(std::io::Cursor::new(compressed)),
+                CompressionType::Gz,
+            );
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            assert_eq!(output, input);
 
             Ok(())
         })

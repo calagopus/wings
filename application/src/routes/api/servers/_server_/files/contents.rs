@@ -81,20 +81,7 @@ mod get {
         ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let parent = Path::new(&data.file)
             .parent()
@@ -118,8 +105,8 @@ mod get {
                 let filesystem = filesystem.clone();
 
                 move || -> Result<FileHead, anyhow::Error> {
-                    let metadata = match filesystem.metadata(&path) {
-                        Ok(metadata) if metadata.file_type.is_file() => metadata,
+                    let metadata = match filesystem.reachable_metadata(&path) {
+                        Ok((metadata, _)) if metadata.file_type.is_file() => metadata,
                         _ => return Ok(FileHead::Missing),
                     };
 
@@ -142,8 +129,15 @@ mod get {
                         return Ok(FileHead::Stream(metadata, file_read.reader, first));
                     }
 
-                    let mut buffer = Vec::with_capacity(file_read.size as usize);
-                    file_read.reader.read_to_end(&mut buffer)?;
+                    let mut buffer =
+                        Vec::with_capacity(file_read.size.min(INLINE_READ_LIMIT + 1) as usize);
+                    (&mut file_read.reader)
+                        .take(INLINE_READ_LIMIT + 1)
+                        .read_to_end(&mut buffer)?;
+
+                    if buffer.len() as u64 > INLINE_READ_LIMIT {
+                        return Ok(FileHead::Stream(metadata, file_read.reader, buffer));
+                    }
 
                     Ok(FileHead::Inline(metadata, buffer))
                 }
@@ -264,7 +258,11 @@ mod get {
         }
 
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match source {
-            StreamSource::Blocking(reader, first) if uncompressed => {
+            StreamSource::Blocking(reader, mut first) if uncompressed => {
+                // the file may have grown since it was stat'ed, the body must still
+                // match Content-Length
+                first.truncate(metadata.size as usize);
+
                 let remaining = metadata.size - first.len() as u64;
                 let body =
                     futures::stream::once(std::future::ready(Ok(bytes::Bytes::from(first)))).chain(

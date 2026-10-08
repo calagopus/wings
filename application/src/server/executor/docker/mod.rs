@@ -19,6 +19,8 @@ use tokio::io::{AsyncWriteExt, ReadBuf};
 
 use super::cgroup;
 pub mod host_mounts;
+#[cfg(unix)]
+pub mod lxcfs;
 
 pub fn split_image_reference(image: &str) -> (&str, &str) {
     match image.rsplit_once(':') {
@@ -594,8 +596,25 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             security_opt.push(format!("apparmor={profile}"));
         }
 
-        let (mounts, binds) =
+        let (mut mounts, binds) =
             split_selinux_binds(self.convert_mounts(config, filesystem, host_mounts).await);
+
+        #[cfg(unix)]
+        if config.load().docker.lxcfs.enabled {
+            let directory = {
+                let config = config.load();
+                config.docker.lxcfs.directory.as_path(&config)
+            };
+
+            match lxcfs::mounts(&directory, host_mounts.is_none()) {
+                Ok(lxcfs_mounts) => mounts.extend(lxcfs_mounts),
+                Err(err) => tracing::warn!(
+                    server = %self.uuid,
+                    "not mounting lxcfs into the container: {:#}",
+                    err
+                ),
+            }
+        }
 
         Ok(bollard::plugin::ContainerCreateBody {
             exposed_ports: Some(self.convert_allocations_exposed()),
@@ -1929,6 +1948,8 @@ impl DockerProcessHandle {
             let mut cached: Option<CachedState> = None;
             let mut last_inspect: Option<std::time::Instant> = None;
             let mut last_running: Option<bool> = None;
+            #[cfg(unix)]
+            let mut lxcfs_stale_reported = false;
 
             let mut tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -1973,6 +1994,25 @@ impl DockerProcessHandle {
                     last_inspect = Some(std::time::Instant::now());
 
                     let state = inspect.state.unwrap_or_default();
+
+                    #[cfg(unix)]
+                    if !lxcfs_stale_reported
+                        && let Some(pid) = state.pid.filter(|pid| *pid > 0)
+                        && inspect.mounts.as_deref().is_some_and(lxcfs::is_mounted)
+                        && lxcfs::is_stale(pid)
+                    {
+                        lxcfs_stale_reported = true;
+                        tracing::warn!(
+                            server = %state_id,
+                            "lxcfs is no longer reachable inside the container, restart the server to remount it"
+                        );
+
+                        if let Some(server) = state_server.upgrade() {
+                            server.log_daemon_error(
+                                "LXCFS stopped running on this node, /proc/meminfo and related files will error until this server is restarted.",
+                            );
+                        }
+                    }
                     let host_config = inspect.host_config.unwrap_or_default();
 
                     cached = Some(CachedState {

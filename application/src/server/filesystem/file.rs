@@ -35,32 +35,67 @@ fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) ->
     false
 }
 
+/// Opens `path` with `options`, runs `check` on the opened file and only then
+/// truncates it when asked, so nothing is lost before the check passes. Returns
+/// the file and its size before truncation.
+fn open_and_check(
+    server: &crate::server::Server,
+    path: &Path,
+    mut options: cap_std::fs::OpenOptions,
+    truncate: bool,
+    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+) -> Result<(std::fs::File, u64), anyhow::Error> {
+    options.truncate(false);
+
+    let file = server.filesystem.open_with(path, options)?;
+    check(&file)?;
+    let previous_size = file
+        .metadata()
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map_or(0, |metadata| metadata.len());
+    if truncate && previous_size > 0 {
+        file.set_len(0)?;
+    }
+
+    Ok((file, previous_size))
+}
+
+fn parent_components(
+    server: &crate::server::Server,
+    destination: &Path,
+) -> Result<Vec<String>, std::io::Error> {
+    let parent_path = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Destination has no parent",
+        )
+    })?;
+
+    Ok(server
+        .filesystem
+        .path_to_components(&server.filesystem.relative_path(parent_path)))
+}
+
 fn open_destination(
     server: &crate::server::Server,
     destination: &Path,
     permissions: Option<PortablePermissions>,
+    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
 ) -> Result<(std::fs::File, u64), anyhow::Error> {
     let mut options = cap_std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(false);
+    options.write(true).create(true);
     #[cfg(unix)]
     if let Some(permissions) = permissions {
         cap_std::fs::OpenOptionsExt::mode(&mut options, permissions.mode().into());
     }
 
-    let file = server.filesystem.open_with(destination, options)?;
-    let metadata = file.metadata().ok();
-    let previous_size = metadata
-        .as_ref()
-        .filter(|metadata| metadata.is_file())
-        .map_or(0, |metadata| metadata.len());
-    if previous_size > 0 {
-        file.set_len(0)?;
-    }
+    let (file, previous_size) = open_and_check(server, destination, options, true, check)?;
 
     if let Some(permissions) = permissions
-        && !metadata
-            .as_ref()
-            .is_some_and(|metadata| has_mode(metadata, permissions))
+        && !file
+            .metadata()
+            .is_ok_and(|metadata| has_mode(&metadata, permissions))
     {
         file.apply_permissions(permissions)?;
     }
@@ -77,29 +112,43 @@ impl ServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        let parent_path = destination.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Destination has no parent",
-            )
-        })?;
+        Self::new_checked(server, destination, permissions, modified, |_| Ok(()))
+    }
 
-        let parent = server
-            .filesystem
-            .path_to_components(&server.filesystem.relative_path(parent_path));
+    /// Like [`Self::new`], but runs `check` on the opened file before it is
+    /// truncated or its permissions and owner are changed.
+    pub fn new_checked(
+        server: crate::server::Server,
+        destination: &Path,
+        permissions: Option<PortablePermissions>,
+        modified: Option<SystemTime>,
+        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+    ) -> Result<Self, anyhow::Error> {
+        let (file, previous_size) = open_destination(&server, destination, permissions, check)?;
 
-        let (file, previous_size) = open_destination(&server, destination, permissions)?;
+        let mut file = Self::wrap(server, destination, file, -(previous_size as i64), 0)?;
+        file.modified = modified;
 
-        Ok(Self {
-            server,
-            parent,
-            file: Some(file),
-            ignorant: false,
-            accumulated_bytes: -(previous_size as i64),
-            modified,
-            current_position: 0,
-            highest_position: 0,
-        })
+        Ok(file)
+    }
+
+    /// Opens `path` with the caller's `options`, running `check` on the opened file
+    /// before it is truncated. Unlike [`Self::new_checked`], the file is left as it
+    /// is unless `truncate` is set, and its permissions and owner are not changed.
+    pub fn open_checked(
+        server: crate::server::Server,
+        path: &Path,
+        options: cap_std::fs::OpenOptions,
+        truncate: bool,
+        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+    ) -> Result<Self, anyhow::Error> {
+        let (file, previous_size) = open_and_check(&server, path, options, truncate, check)?;
+
+        if truncate {
+            Self::wrap(server, path, file, -(previous_size as i64), 0)
+        } else {
+            Self::wrap(server, path, file, 0, previous_size)
+        }
     }
 
     /// Wraps an already opened file, accounting only for what is written past
@@ -115,26 +164,27 @@ impl ServerFile {
         file: std::fs::File,
         initial_size: u64,
     ) -> Result<Self, anyhow::Error> {
-        let parent_path = destination.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Destination has no parent",
-            )
-        })?;
+        Self::wrap(server, destination, file, 0, initial_size)
+    }
 
-        let parent = server
-            .filesystem
-            .path_to_components(&server.filesystem.relative_path(parent_path));
+    fn wrap(
+        server: crate::server::Server,
+        destination: &Path,
+        file: std::fs::File,
+        accumulated_bytes: i64,
+        highest_position: u64,
+    ) -> Result<Self, anyhow::Error> {
+        let parent = parent_components(&server, destination)?;
 
         Ok(Self {
             server,
             parent,
             file: Some(file),
             ignorant: false,
-            accumulated_bytes: 0,
+            accumulated_bytes,
             modified: None,
             current_position: 0,
-            highest_position: initial_size,
+            highest_position,
         })
     }
 
@@ -329,38 +379,30 @@ impl AsyncServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        let parent_path = destination.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Destination has no parent",
-            )
-        })?;
+        Self::new_checked(server, destination, permissions, modified, |_| Ok(())).await
+    }
 
-        let parent = server
-            .filesystem
-            .path_to_components(&server.filesystem.relative_path(parent_path));
-
+    /// Async counterpart of [`ServerFile::new_checked`].
+    pub async fn new_checked(
+        server: crate::server::Server,
+        destination: &Path,
+        permissions: Option<PortablePermissions>,
+        modified: Option<SystemTime>,
+        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static,
+    ) -> Result<Self, anyhow::Error> {
         let (file, previous_size) = tokio::task::spawn_blocking({
             let server = server.clone();
             let destination = destination.to_path_buf();
 
-            move || open_destination(&server, &destination, permissions)
+            move || open_destination(&server, &destination, permissions, check)
         })
         .await??;
         let file = tokio::fs::File::from_std(file);
 
-        Ok(Self {
-            server,
-            parent,
-            file: Some(file),
-            ignorant: false,
-            accumulated_bytes: -(previous_size as i64),
-            allocating_bytes: 0,
-            modified,
-            allocation_in_progress: None,
-            current_position: 0,
-            highest_position: 0,
-        })
+        let mut file = Self::wrap(server, destination, file, -(previous_size as i64), 0)?;
+        file.modified = modified;
+
+        Ok(file)
     }
 
     /// Async counterpart of [`ServerFile::new_file`], with the same `initial_size`
@@ -371,28 +413,29 @@ impl AsyncServerFile {
         file: tokio::fs::File,
         initial_size: u64,
     ) -> Result<Self, anyhow::Error> {
-        let parent_path = destination.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Destination has no parent",
-            )
-        })?;
+        Self::wrap(server, destination, file, 0, initial_size)
+    }
 
-        let parent = server
-            .filesystem
-            .path_to_components(&server.filesystem.relative_path(parent_path));
+    fn wrap(
+        server: crate::server::Server,
+        destination: &Path,
+        file: tokio::fs::File,
+        accumulated_bytes: i64,
+        highest_position: u64,
+    ) -> Result<Self, anyhow::Error> {
+        let parent = parent_components(&server, destination)?;
 
         Ok(Self {
             server,
             parent,
             file: Some(file),
             ignorant: false,
-            accumulated_bytes: 0,
+            accumulated_bytes,
             allocating_bytes: 0,
             modified: None,
             allocation_in_progress: None,
             current_position: 0,
-            highest_position: initial_size,
+            highest_position,
         })
     }
 

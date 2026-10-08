@@ -9,8 +9,26 @@ use axum::{
 };
 use serde::Deserialize;
 
+mod stream;
 mod tcp;
 mod udp;
+#[cfg(target_os = "linux")]
+pub mod unix;
+
+#[cfg(not(target_os = "linux"))]
+pub mod unix {
+    use crate::response::ApiResponse;
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+    };
+
+    pub async fn handle_ws() -> Response {
+        ApiResponse::error("unix socket tunnels are not supported on this platform")
+            .with_status(StatusCode::NOT_IMPLEMENTED)
+            .into_response()
+    }
+}
 
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -52,8 +70,8 @@ pub async fn handle_ws(
 
     match params.protocol {
         Protocol::Tcp => ws
-            .max_message_size(tcp::MAX_MESSAGE_SIZE)
-            .max_frame_size(tcp::MAX_MESSAGE_SIZE)
+            .max_message_size(stream::MAX_MESSAGE_SIZE)
+            .max_frame_size(stream::MAX_MESSAGE_SIZE)
             .on_upgrade(move |socket| tcp::tunnel(socket, target)),
         Protocol::Udp => ws
             .max_message_size(udp::RECV_BUFFER_SIZE)

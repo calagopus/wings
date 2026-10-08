@@ -510,6 +510,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        _compression: crate::io::compression::CompressionType,
         mut reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&state.config).await?;

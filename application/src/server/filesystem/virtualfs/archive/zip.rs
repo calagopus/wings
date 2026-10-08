@@ -7,7 +7,8 @@ use crate::{
     routes::MimeCacheValue,
     server::filesystem::{
         archive::{
-            StreamableArchiveFormat, multi_reader::MultiReader, zip_entry_get_modified_time,
+            StreamableArchiveFormat, ZIP_SYMLINK_MAX_BYTES, multi_reader::MultiReader,
+            zip_entry_get_modified_time, zip_entry_read_symlink_target,
         },
         cap::FileType,
         encode_mode,
@@ -855,19 +856,13 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<PathBuf, anyhow::Error> {
         let mut archive = self.archive.clone();
-        let mut entry = archive.better_by_path(path.as_ref())?;
+        let entry = archive.better_by_path(path.as_ref())?;
 
-        if entry.size() > 1024 {
-            return Err(anyhow::anyhow!(
-                "symlink target size exceeds maximum allowed size"
-            ));
-        }
         if !entry.is_symlink() {
             return Err(anyhow::anyhow!("not a symlink"));
         }
 
-        let mut symlink_target = String::new();
-        entry.read_to_string(&mut symlink_target)?;
+        let symlink_target = zip_entry_read_symlink_target(entry)?;
 
         Ok(PathBuf::from(symlink_target))
     }
@@ -878,11 +873,6 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let mut archive = self.archive.clone();
         let entry = archive.better_by_path(path.as_ref())?;
 
-        if entry.size() > 1024 {
-            return Err(anyhow::anyhow!(
-                "symlink target size exceeds maximum allowed size"
-            ));
-        }
         if !entry.is_symlink() {
             return Err(anyhow::anyhow!("not a symlink"));
         }
@@ -892,10 +882,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let path = path.as_ref().to_path_buf();
         let symlink_target =
             tokio::task::spawn_blocking(move || -> Result<String, anyhow::Error> {
-                let mut entry = archive.better_by_path(&path)?;
-                let mut symlink_target = String::new();
-                entry.read_to_string(&mut symlink_target)?;
-                Ok(symlink_target)
+                let entry = archive.better_by_path(&path)?;
+                Ok(zip_entry_read_symlink_target(entry)?)
             })
             .await??;
 
@@ -1035,10 +1023,12 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                             tar.append_data(&mut entry_header, name, reader)?;
                             progress.increment_files();
-                        } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
+                        } else if entry.is_symlink()
+                            && (1..=ZIP_SYMLINK_MAX_BYTES).contains(&entry.size())
+                        {
                             entry_header.set_entry_type(tar::EntryType::Symlink);
 
-                            let link_name = std::io::read_to_string(entry)?;
+                            let link_name = zip_entry_read_symlink_target(entry)?;
                             tar.append_link(&mut entry_header, name, link_name)?;
                             progress.increment_files();
                         }
@@ -1149,8 +1139,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         };
                         let size = entry.size();
 
-                        if entry.is_symlink() && (1..=2048).contains(&size) {
-                            let link_target = std::io::read_to_string(entry)?;
+                        if entry.is_symlink() && (1..=ZIP_SYMLINK_MAX_BYTES).contains(&size) {
+                            let link_target = zip_entry_read_symlink_target(entry)?;
                             if itaf::spec::validate_name(name).is_ok() {
                                 itaf_enc.add_symlink(name, &link_target, false, &meta)?;
                                 progress.increment_files();
@@ -1210,16 +1200,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                let temp = tempfile::tempdir()?;
-                let state = crate::routes::AppState::mock();
-                state
-                    .config
-                    .mutate_in_place_for_testing()
-                    .system
-                    .data_directory =
-                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-                let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
-                server.filesystem.disk_checker.abort();
+                let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
 
                 let payload = vec![b'x'; crate::BUFFER_SIZE * 4];
                 let mut file = tempfile::tempfile()?;

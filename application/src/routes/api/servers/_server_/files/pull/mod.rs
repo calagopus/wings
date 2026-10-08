@@ -41,7 +41,6 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::cap::FileType,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -88,20 +87,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -116,10 +102,7 @@ mod post {
         }
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(&root, FileType::Dir)
-                .await
+            && ignored.is_ignored_subtree_resolved(&server, &root).await
         {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)

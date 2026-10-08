@@ -8,7 +8,7 @@ mod get {
         io::fixed_reader::AsyncFixedReader,
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::GetState,
-        server::filesystem::{cap::FileType, virtualfs::ByteRange},
+        server::filesystem::virtualfs::ByteRange,
     };
     use axum::{
         extract::Query,
@@ -72,7 +72,14 @@ mod get {
             .file_name()
             .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
-        let (root, filesystem) = server.filesystem.resolve_readable_fs(&server, parent).await;
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "file not found")?;
+
+        let (root, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(&server, parent, &ignored)
+            .await;
         let path = root.join(file_name);
 
         let metadata = match filesystem.async_metadata(&path).await {
@@ -91,31 +98,6 @@ mod get {
                     .ok();
             }
         };
-
-        let ignored = match payload.ignored_files.compile() {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "failed to compile subuser ignored files, denying download: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        if filesystem.is_primary_server_fs()
-            && ignored
-                .as_ref()
-                .is_some_and(|o| o.is_ignored(&path, FileType::File))
-        {
-            return ApiResponse::error("file not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
 
         let range = ByteRange::from_headers(&headers);
         let (mut headers, response) = if filesystem.is_fast() {

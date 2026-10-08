@@ -307,6 +307,7 @@ impl BackupStreamCreateExt for PbsBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        _compression: crate::io::compression::CompressionType,
         reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_pbs_configuration(uuid).await?;

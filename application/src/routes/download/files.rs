@@ -62,9 +62,13 @@ mod get {
 
         let server = crate::routes::token::server(&state, payload.server_uuid).await?;
 
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "directory not found")?;
+
         let (path, filesystem) = server
             .filesystem
-            .resolve_readable_fs(&server, Path::new(&payload.file_path))
+            .resolve_readable_fs_ignoring(&server, Path::new(&payload.file_path), &ignored)
             .await;
 
         let archive_name = generated_archive_name(data.archive_format.extension());
@@ -80,38 +84,10 @@ mod get {
         );
         headers.insert("Content-Type", data.archive_format.mime_type().parse()?);
 
-        let metadata = filesystem.async_symlink_metadata(&path).await;
-        if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir() {
-                return ApiResponse::error("directory not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        } else {
+        if !crate::routes::download::reachable_dir(&*filesystem, &path).await {
             return ApiResponse::error("directory not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
-        }
-
-        let mut ignore = crate::server::filesystem::virtualfs::IsIgnoredFn::default();
-        if filesystem.is_primary_server_fs() {
-            ignore = server.filesystem.get_ignored().into();
-
-            match payload.ignored_files.compile() {
-                Ok(Some(ignored)) => ignore = ignore.merge(ignored.into()),
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        "failed to compile subuser ignored files, denying download: {:#?}",
-                        err
-                    );
-
-                    return ApiResponse::error("directory not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-            }
         }
 
         let reader = filesystem
@@ -121,7 +97,7 @@ mod get {
                 data.archive_format,
                 state.config.load().system.backups.compression_level,
                 crate::server::filesystem::archive::create::ArchiveProgress::default(),
-                ignore,
+                crate::server::filesystem::virtualfs::IsIgnoredFn::default(),
             )
             .await?;
 

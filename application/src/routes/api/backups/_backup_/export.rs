@@ -63,21 +63,6 @@ mod post {
         Path(backup_id): Path<uuid::Uuid>,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    backup = %backup_id,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
         let backup = match state
             .backup_manager
             .find_adapter(&state, data.adapter, backup_id)
@@ -97,6 +82,8 @@ mod post {
             .await
             .or_api_error(StatusCode::NOT_FOUND, "server not found")?;
 
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+
         let parent = data
             .path
             .parent()
@@ -114,13 +101,12 @@ mod post {
         let destination_path = destination_root.join(file_name);
 
         if destination_filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored(&destination_path, FileType::File)
+            && ignored
+                .is_ignored_resolved(&server, &destination_path, FileType::File)
                 .await
         {
             return ApiResponse::error("file not found")
-                .with_status(StatusCode::EXPECTATION_FAILED)
+                .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
 

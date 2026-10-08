@@ -27,6 +27,7 @@ use utoipa::ToSchema;
 
 pub mod create;
 pub mod multi_reader;
+mod tar_budget;
 
 const TAR_CHUNK_BYTES: usize = 1024 * 1024;
 const TAR_IN_FLIGHT_CHUNKS: usize = 64;
@@ -43,6 +44,9 @@ const ZIP_GROUP_MAX_ENTRIES: usize = 512;
 /// Bytes of one directory handed to a zip worker at a time, so a directory of a
 /// few large files is still shared between workers instead of extracted by one.
 const ZIP_GROUP_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest zip symlink entry read as a link target; bigger ones are not symlinks
+/// any real archiver writes, so they are skipped instead of buffered.
+pub const ZIP_SYMLINK_MAX_BYTES: u64 = 2048;
 
 enum TarContent {
     Whole(Vec<u8>, InFlightPermit),
@@ -516,6 +520,22 @@ pub fn zip_entry_get_created_time(
     None
 }
 
+pub fn zip_entry_read_symlink_target(entry: impl Read) -> Result<String, std::io::Error> {
+    let mut target = String::new();
+    entry
+        .take(ZIP_SYMLINK_MAX_BYTES + 1)
+        .read_to_string(&mut target)?;
+
+    if target.len() as u64 > ZIP_SYMLINK_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "symlink target size exceeds maximum allowed size",
+        ));
+    }
+
+    Ok(target)
+}
+
 pub struct Archive {
     pub compression: CompressionType,
     pub archive: ArchiveType,
@@ -689,7 +709,8 @@ impl Archive {
                         total.store(metadata.len(), Ordering::Relaxed);
                     }
 
-                    let mut archive = tar::Archive::new(reader);
+                    let budget = tar_budget::TarMetadataBudget::default();
+                    let mut archive = tar::Archive::new(budget.reader(reader));
                     archive.set_ignore_zeros(true);
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
                     let entries = archive.entries()?;
@@ -741,6 +762,7 @@ impl Archive {
                             }
 
                             let mut entry = entry?;
+                            budget.member(&mut entry)?;
                             let path = entry.path()?;
 
                             let Some(destination_path) =
@@ -968,7 +990,9 @@ impl Archive {
                                     .map(PortablePermissions::from_mode_file),
                                 modified_time: zip_entry_get_modified_time(&entry),
                             });
-                        } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
+                        } else if entry.is_symlink()
+                            && (1..=ZIP_SYMLINK_MAX_BYTES).contains(&entry.size())
+                        {
                             entry_total += entry.size();
                             plan.push(ZipEntryPlan {
                                 index,
@@ -1074,8 +1098,9 @@ impl Archive {
                                             ZipEntryKind::Symlink => {
                                                 let mut zip_entry =
                                                     archive.by_index(entry.index)?;
-                                                let link = std::io::read_to_string(&mut zip_entry)
-                                                    .unwrap_or_default();
+                                                let link =
+                                                    zip_entry_read_symlink_target(&mut zip_entry)
+                                                        .unwrap_or_default();
 
                                                 if let Err(err) = destination_filesystem
                                                     .create_symlink(&link, &entry.path)
@@ -1149,8 +1174,7 @@ impl Archive {
 
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
                     #[cfg(target_os = "linux")]
-                    let archive_path = Path::new("/proc/self/fd")
-                        .join(std::os::fd::AsRawFd::as_raw_fd(&self.file).to_string());
+                    let archive_path = crate::server::filesystem::cap::proc_fd_path(&self.file);
                     #[cfg(not(target_os = "linux"))]
                     let archive_path = {
                         drop(self.file);
@@ -1822,7 +1846,7 @@ impl Archive {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{routes::AppState, server::Server};
+    use crate::server::Server;
 
     // tar_shard
 
@@ -1978,23 +2002,14 @@ mod tests {
 
     impl ExtractFixture {
         async fn new(threads: usize) -> Result<Self, anyhow::Error> {
-            let temp = tempfile::tempdir()?;
-            let state = AppState::mock();
-            {
-                let config = state.config.mutate_in_place_for_testing();
-                config.system.data_directory =
-                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-                config.api.file_decompression_threads = threads;
-            }
-
-            let server = Server::mock(uuid::Uuid::new_v4(), Arc::clone(&state));
-            server.filesystem.disk_checker.abort();
-
+            let (temp, server) = Server::mock_in_tempdir().await;
+            server
+                .app_state
+                .config
+                .mutate_in_place_for_testing()
+                .api
+                .file_decompression_threads = threads;
             let root = server.filesystem.base_path.to_path_buf();
-            std::fs::create_dir_all(&root)?;
-
-            let cap = crate::server::filesystem::cap::CapFilesystem::new(&root).await?;
-            server.filesystem.inner.store(Some(cap.get_inner()?));
 
             Ok(Self {
                 server,
@@ -2369,6 +2384,51 @@ mod tests {
         assert_eq!(
             resolve_entry_path(Path::new(""), Path::new("/etc/passwd")),
             None
+        );
+    }
+
+    // zip_entry_read_symlink_target
+
+    #[test]
+    fn zip_entry_read_symlink_target_returns_targets_up_to_the_limit() {
+        assert_eq!(
+            zip_entry_read_symlink_target("../world/région.dat".as_bytes())
+                .map_err(|err| err.kind()),
+            Ok("../world/région.dat".to_string())
+        );
+
+        let exact = "a".repeat(ZIP_SYMLINK_MAX_BYTES as usize);
+
+        assert_eq!(
+            zip_entry_read_symlink_target(exact.as_bytes()).map_err(|err| err.kind()),
+            Ok(exact)
+        );
+    }
+
+    #[test]
+    fn zip_entry_read_symlink_target_rejects_targets_over_the_limit() {
+        let long = "a".repeat(ZIP_SYMLINK_MAX_BYTES as usize + 1);
+
+        assert_eq!(
+            zip_entry_read_symlink_target(long.as_bytes()).map_err(|err| err.kind()),
+            Err(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn zip_entry_read_symlink_target_stops_reading_an_oversized_stream() {
+        let total = 1024 * 1024;
+        let mut source = std::io::repeat(b'a').take(total);
+
+        assert_eq!(
+            zip_entry_read_symlink_target(&mut source).map_err(|err| err.kind()),
+            Err(std::io::ErrorKind::InvalidData)
+        );
+
+        let consumed = total - source.limit();
+        assert!(
+            consumed <= 64 * 1024,
+            "read {consumed} bytes of a {total} byte stream"
         );
     }
 }

@@ -161,6 +161,35 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         }
     }
 
+    fn resolve_reachable(
+        &self,
+        file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        match self.inner.resolve_reachable(file_type, path) {
+            Ok(p) => Ok(p),
+            Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(path.as_ref().to_path_buf()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn async_resolve_reachable(
+        &self,
+        file_type: FileType,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<PathBuf, anyhow::Error> {
+        match self.inner.async_resolve_reachable(file_type, path).await {
+            Ok(p) => Ok(p),
+            Err(err) => {
+                if self.async_is_virtual_dir(path.as_ref()).await {
+                    Ok(path.as_ref().to_path_buf())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
     async fn async_directory_entry(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),

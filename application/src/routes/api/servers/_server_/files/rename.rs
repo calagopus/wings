@@ -6,7 +6,6 @@ mod put {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
-    use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
@@ -47,20 +46,7 @@ mod put {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -89,16 +75,23 @@ mod put {
                 continue;
             }
 
-            let from_metadata = match filesystem.async_metadata(&from).await {
+            let from_metadata = match filesystem.async_symlink_metadata(&from).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
 
+            if filesystem.is_primary_server_fs()
+                && ignored
+                    .is_ignored_resolved_parent(&server, &from, from_metadata.file_type)
+                    .await
+            {
+                continue;
+            }
+
             if filesystem.async_metadata(&to).await.is_ok()
                 || (filesystem.is_primary_server_fs()
-                    && server
-                        .filesystem
-                        .async_is_ignored(&to, from_metadata.file_type)
+                    && ignored
+                        .is_ignored_resolved(&server, &to, from_metadata.file_type)
                         .await)
             {
                 continue;

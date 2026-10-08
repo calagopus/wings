@@ -7,16 +7,13 @@ mod tests {
     use super::{
         ddup_bak::VirtualDdupBakArchive, seven_zip::VirtualSevenZipArchive, zip::VirtualZipArchive,
     };
-    use crate::{
-        routes::AppState,
-        server::{
-            Server,
-            filesystem::{
-                archive::multi_reader::MultiReader,
-                virtualfs::{
-                    DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
-                    VirtualWalkEntry,
-                },
+    use crate::server::{
+        Server,
+        filesystem::{
+            archive::multi_reader::MultiReader,
+            virtualfs::{
+                DirectoryWalkFilterFn, DirectoryWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
+                VirtualWalkEntry,
             },
         },
     };
@@ -34,16 +31,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(15), async {
-                let temp = tempfile::tempdir()?;
-                let state = AppState::mock();
-                state
-                    .config
-                    .mutate_in_place_for_testing()
-                    .system
-                    .data_directory =
-                    crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-                let server = Server::mock(uuid::Uuid::new_v4(), state);
-                server.filesystem.disk_checker.abort();
+                let (temp, server) = Server::mock_in_tempdir().await;
 
                 let mut zip = zip::ZipWriter::new(tempfile::tempfile()?);
                 zip.start_file("nested/data.bin", zip::write::SimpleFileOptions::default())?;
@@ -174,16 +162,7 @@ mod tests {
             .expect("creating archive listing test runtime failed");
 
         let result = runtime.block_on(async {
-            let temp = tempfile::tempdir()?;
-            let state = AppState::mock();
-            state
-                .config
-                .mutate_in_place_for_testing()
-                .system
-                .data_directory =
-                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-            let server = Server::mock(uuid::Uuid::new_v4(), state);
-            server.filesystem.disk_checker.abort();
+            let (temp, server) = Server::mock_in_tempdir().await;
 
             let mut zip = zip::ZipWriter::new(tempfile::tempfile()?);
             for name in ["a.txt", "b.txt", "c.txt"] {

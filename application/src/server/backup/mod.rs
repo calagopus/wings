@@ -1,4 +1,5 @@
 use crate::{
+    io::compression::CompressionType,
     remote::backups::RawServerBackup,
     response::ApiResponse,
     server::filesystem::{
@@ -64,6 +65,20 @@ pub fn validate_dump_extension(extension: &str) -> Result<(), anyhow::Error> {
     } else {
         Err(anyhow::anyhow!("unsupported database dump extension"))
     }
+}
+
+/// Splits a dump extension such as `sql.gz` into its base extension and the
+/// compression the dump source already applied.
+pub fn parse_dump_extension(extension: &str) -> Result<(&str, CompressionType), anyhow::Error> {
+    let compression = CompressionType::from_file_name(extension);
+    let base = extension
+        .strip_suffix(adapters::wings::WingsBackupFile::compression_suffix(
+            compression,
+        ))
+        .unwrap_or(extension);
+    validate_dump_extension(base)?;
+
+    Ok((base, compression))
 }
 
 /// Dispatch surface of a backup instance; lets [`Backup`] forward to whichever adapter it holds.
@@ -145,12 +160,13 @@ macro_rules! backup_adapters {
                 state: &crate::routes::State,
                 uuid: uuid::Uuid,
                 extension: &str,
+                compression: CompressionType,
                 reader: DumpReader,
             ) -> Result<RawServerBackup, anyhow::Error> {
                 match self {
                     $(Self::$variant => {
                         <$backup as BackupStreamCreateExt>::create_from_stream(
-                            state, uuid, extension, reader,
+                            state, uuid, extension, compression, reader,
                         )
                         .await
                     })*
@@ -312,10 +328,12 @@ pub trait BackupCreateExt {
 
 #[async_trait::async_trait]
 pub trait BackupStreamCreateExt {
+    /// `compression` is the compression `reader` is already encoded with.
     async fn create_from_stream(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        compression: CompressionType,
         reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error>;
 }
@@ -433,6 +451,41 @@ mod tests {
                 adapters::wings::WingsBackupFile::parse_dump(file_name).is_none(),
                 "{file_name}"
             );
+        }
+    }
+
+    // parse_dump_extension
+    #[test]
+    fn parse_dump_extension_splits_every_base_and_compression() -> Result<(), anyhow::Error> {
+        let suffixes = [
+            ("", CompressionType::None),
+            (".gz", CompressionType::Gz),
+            (".xz", CompressionType::Xz),
+            (".lz", CompressionType::Lzip),
+            (".bz2", CompressionType::Bz2),
+            (".lz4", CompressionType::Lz4),
+            (".zst", CompressionType::Zstd),
+        ];
+        assert_eq!(suffixes.len(), CompressionType::variants().len());
+
+        for base in ["sql", "archive", "rdb", "dump"] {
+            for (suffix, compression) in suffixes {
+                let extension = format!("{base}{suffix}");
+                assert_eq!(
+                    parse_dump_extension(&extension)?,
+                    (base, compression),
+                    "{extension}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_dump_extension_rejects_unknown_and_unsafe() {
+        for extension in ["", "gz", "sql.gz.gz", "tar.gz", "sql.part", "../sql.gz"] {
+            assert!(parse_dump_extension(extension).is_err(), "{extension}");
         }
     }
 

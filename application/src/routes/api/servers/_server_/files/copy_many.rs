@@ -10,6 +10,7 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::virtualfs::resolve_copy_source,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -64,20 +65,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let mut files = Vec::with_capacity(data.files.len());
         let mut skipped = Vec::new();
@@ -182,10 +170,11 @@ mod post {
                                 continue;
                             }
 
-                            let metadata = match filesystem.async_metadata(&from).await {
-                                Ok(metadata) => metadata,
-                                Err(_) => continue,
-                            };
+                            let (metadata, from) =
+                                match resolve_copy_source(&*filesystem, &from).await {
+                                    Ok(source) => source,
+                                    Err(_) => continue,
+                                };
 
                             let to_parent = match to.parent() {
                                 Some(parent) => parent,
@@ -202,9 +191,8 @@ mod post {
                                 .await;
 
                             if destination_filesystem.is_primary_server_fs()
-                                && server
-                                    .filesystem
-                                    .async_is_ignored(&to, metadata.file_type)
+                                && ignored
+                                    .is_ignored_resolved(&server, &to, metadata.file_type)
                                     .await
                             {
                                 continue;

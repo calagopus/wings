@@ -239,6 +239,31 @@ impl WalkEntry {
             }
         }
     }
+
+    /// Changes the owner of the entry itself, relative to the directory it was
+    /// listed from, without following it if it is a symlink.
+    #[cfg(target_os = "linux")]
+    pub fn lchown(&self, uid: rustix::fs::Uid, gid: rustix::fs::Gid) -> Result<(), std::io::Error> {
+        match &self.source {
+            StatSource::Entry(entry) => {
+                use cap_std::fs::OpenOptionsExt;
+
+                let file =
+                    entry.open_with(cap_std::fs::OpenOptions::new().read(true).custom_flags(
+                        (rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+                    ))?;
+
+                Ok(rustix::fs::chownat(
+                    &file,
+                    "",
+                    Some(uid),
+                    Some(gid),
+                    rustix::fs::AtFlags::EMPTY_PATH,
+                )?)
+            }
+            StatSource::Path(cap_filesystem) => cap_filesystem.lchown(&self.path, uid, gid),
+        }
+    }
 }
 
 pub struct AsyncWalkDir {

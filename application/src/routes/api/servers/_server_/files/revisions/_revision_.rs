@@ -49,20 +49,7 @@ mod get {
         Path((_server, revision_id)): Path<(uuid::Uuid, i64)>,
         Query(data): Query<Params>,
     ) -> ApiResponseResult {
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("revision not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "revision not found")?;
 
         let revision_path = server
             .diff
@@ -71,13 +58,9 @@ mod get {
             .or_api_error(StatusCode::NOT_FOUND, "revision not found")?;
         let revision_path = std::path::Path::new(&revision_path);
 
-        if server
-            .filesystem
-            .async_is_ignored(revision_path, FileType::File)
+        if ignored
+            .is_ignored(&server, revision_path, FileType::File)
             .await
-            || ignored
-                .is_ignored(&server, revision_path, FileType::File)
-                .await
         {
             return ApiResponse::error("revision not found")
                 .with_status(StatusCode::NOT_FOUND)

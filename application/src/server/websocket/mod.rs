@@ -1,4 +1,4 @@
-use super::permissions::{Permission, Permissions};
+use super::permissions::{Permission, Permissions, UserPermissionsMap};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use compact_str::ToCompactString;
 use futures::{SinkExt, stream::SplitSink};
@@ -36,6 +36,29 @@ pub struct WebsocketJwtPayload {
     pub server_uuid: uuid::Uuid,
     pub permissions: Permissions,
     pub ignored_files: Option<Vec<compact_str::CompactString>>,
+}
+
+impl WebsocketJwtPayload {
+    fn has_live_permission(
+        &self,
+        user_permissions: &UserPermissionsMap,
+        permission: Permission,
+    ) -> bool {
+        user_permissions.has_permission(self.user_uuid, permission)
+            && self.permissions.has_permission(permission)
+    }
+
+    fn has_live_calagopus_permission_or(
+        &self,
+        user_permissions: &UserPermissionsMap,
+        permission: Permission,
+        default: bool,
+    ) -> bool {
+        user_permissions.has_calagopus_permission_or(self.user_uuid, permission, default)
+            && self
+                .permissions
+                .has_calagopus_permission_or(permission, default)
+    }
 }
 
 #[derive(Debug, Clone, Copy, ToSchema, Deserialize, Serialize)]
@@ -457,22 +480,20 @@ impl ServerWebsocketHandler {
         }
     }
 
-    async fn get_server(&self) -> Result<(uuid::Uuid, crate::server::Server), anyhow::Error> {
+    async fn get_validated_jwt(&self) -> Result<Arc<WebsocketJwtPayload>, anyhow::Error> {
         let jwt = self.get_jwt().await?;
 
         if let Err(err) = jwt.base.validate(&self.state.config.jwt, Some("websocket")) {
             return Err(anyhow::anyhow!("invalid token: {err}"));
         }
 
-        Ok((jwt.user_uuid, self.server.clone()))
+        Ok(jwt)
     }
 
     async fn has_permission(&self, permission: Permission) -> Result<bool, anyhow::Error> {
-        let (user_uuid, server) = self.get_server().await?;
+        let jwt = self.get_validated_jwt().await?;
 
-        Ok(server
-            .user_permissions
-            .has_permission(user_uuid, permission))
+        Ok(jwt.has_live_permission(&self.server.user_permissions, permission))
     }
 
     async fn has_calagopus_permission_or(
@@ -480,32 +501,37 @@ impl ServerWebsocketHandler {
         permission: Permission,
         default: bool,
     ) -> Result<bool, anyhow::Error> {
-        let (user_uuid, server) = self.get_server().await?;
+        let jwt = self.get_validated_jwt().await?;
 
-        Ok(server
-            .user_permissions
-            .has_calagopus_permission_or(user_uuid, permission, default))
+        Ok(
+            jwt.has_live_calagopus_permission_or(
+                &self.server.user_permissions,
+                permission,
+                default,
+            ),
+        )
     }
 
     async fn filter_upload_entries(
         &self,
         message: WebsocketMessage,
     ) -> Result<WebsocketMessage, anyhow::Error> {
-        let (user_uuid, server) = self.get_server().await?;
+        let user_uuid = self.get_validated_jwt().await?.user_uuid;
 
-        if !server.user_permissions.has_ignored_files(user_uuid) {
+        if !self.server.user_permissions.has_ignored_files(user_uuid) {
             return Ok(message);
         }
 
-        let entries: Vec<_> = server
+        let entries: Vec<_> = self
+            .server
             .filesystem
             .uploads
-            .entries(&server.filesystem)
+            .entries(&self.server.filesystem)
             .await
             .into_iter()
             .filter(|entry| {
-                !server.user_permissions.is_ignored(
-                    &server,
+                !self.server.user_permissions.is_ignored(
+                    &self.server,
                     user_uuid,
                     std::path::Path::new(entry.directory.as_str()).join(entry.target_name.as_str()),
                     crate::server::filesystem::cap::FileType::File,
@@ -604,5 +630,148 @@ impl ServerWebsocketHandler {
             self.send_error("An unexpected error occurred. Please contact an Administrator.")
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn token(user: uuid::Uuid, permissions: &[&str]) -> WebsocketJwtPayload {
+        serde_json::from_value(json!({
+            "iss": "panel",
+            "aud": ["wings"],
+            "jti": "test",
+            "user_uuid": user,
+            "server_uuid": uuid::Uuid::new_v4(),
+            "permissions": permissions,
+        }))
+        .unwrap()
+    }
+
+    // WebsocketJwtPayload
+
+    #[test]
+    fn broader_map_entry_from_another_session_does_not_widen_token() {
+        tokio_test::block_on(async {
+            let map = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            map.grant(
+                user,
+                &[
+                    Permission::All,
+                    Permission::MetaCalagopus,
+                    Permission::WebsocketConnect,
+                ],
+            );
+            let jwt = token(
+                user,
+                &["meta.calagopus", "websocket.connect", "control.console"],
+            );
+
+            assert!(!jwt.has_live_permission(&map, Permission::FileReadContent));
+            assert!(!jwt.has_live_calagopus_permission_or(
+                &map,
+                Permission::ControlReadConsole,
+                true
+            ));
+            assert!(jwt.has_live_permission(&map, Permission::ControlConsole));
+        });
+    }
+
+    #[test]
+    fn token_and_map_agreeing_grant_normally() {
+        tokio_test::block_on(async {
+            let map = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            map.grant(
+                user,
+                &[
+                    Permission::All,
+                    Permission::MetaCalagopus,
+                    Permission::WebsocketConnect,
+                ],
+            );
+            let jwt = token(user, &["*", "meta.calagopus", "websocket.connect"]);
+
+            assert!(jwt.has_live_permission(&map, Permission::FileReadContent));
+            assert!(jwt.has_live_permission(&map, Permission::FileUpdate));
+            assert!(jwt.has_live_calagopus_permission_or(
+                &map,
+                Permission::ControlReadConsole,
+                false
+            ));
+        });
+    }
+
+    #[test]
+    fn panel_downgrade_in_map_narrows_token() {
+        tokio_test::block_on(async {
+            let map = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let jwt = token(user, &["*", "meta.calagopus", "websocket.connect"]);
+            map.grant(
+                user,
+                &[
+                    Permission::All,
+                    Permission::MetaCalagopus,
+                    Permission::WebsocketConnect,
+                ],
+            );
+            assert!(jwt.has_live_permission(&map, Permission::FileUpdate));
+
+            map.grant(
+                user,
+                &[Permission::MetaCalagopus, Permission::WebsocketConnect],
+            );
+
+            assert!(!jwt.has_live_permission(&map, Permission::FileUpdate));
+            assert!(!jwt.has_live_calagopus_permission_or(
+                &map,
+                Permission::ControlReadConsole,
+                true
+            ));
+            assert!(jwt.has_live_permission(&map, Permission::WebsocketConnect));
+        });
+    }
+
+    #[test]
+    fn map_entry_of_another_user_does_not_count() {
+        tokio_test::block_on(async {
+            let map = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            map.grant(
+                uuid::Uuid::new_v4(),
+                &[Permission::All, Permission::MetaCalagopus],
+            );
+            let jwt = token(user, &["*", "meta.calagopus"]);
+
+            assert!(!jwt.has_live_permission(&map, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn pterodactyl_token_falls_back_to_default_for_console() {
+        tokio_test::block_on(async {
+            let map = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            map.grant(
+                user,
+                &[Permission::WebsocketConnect, Permission::ControlConsole],
+            );
+            let jwt = token(user, &["websocket.connect", "control.console"]);
+
+            assert!(jwt.has_live_calagopus_permission_or(
+                &map,
+                Permission::ControlReadConsole,
+                true
+            ));
+            assert!(!jwt.has_live_calagopus_permission_or(
+                &map,
+                Permission::ControlReadConsole,
+                false
+            ));
+        });
     }
 }

@@ -108,13 +108,7 @@ impl WingsBackupFile {
             return None;
         }
 
-        let compression = CompressionType::from_file_name(rest);
-        let extension = rest
-            .strip_suffix(Self::compression_suffix(compression))
-            .unwrap_or(rest);
-        if crate::server::backup::validate_dump_extension(extension).is_err() {
-            return None;
-        }
+        let (extension, compression) = crate::server::backup::parse_dump_extension(rest).ok()?;
 
         Some(Self::Dump {
             extension: extension.into(),
@@ -144,6 +138,20 @@ impl WingsBackup {
                 "{uuid}.{extension}{}",
                 WingsBackupFile::compression_suffix(compression)
             ))
+    }
+
+    /// Keeps the source encoding when it already matches the target or when no
+    /// compression is configured, so dumps are never compressed twice.
+    #[inline]
+    fn dump_stored_compression(
+        source: CompressionType,
+        target: CompressionType,
+    ) -> CompressionType {
+        if target == CompressionType::None {
+            source
+        } else {
+            target
+        }
     }
 
     async fn find_dump_file(
@@ -243,10 +251,11 @@ impl BackupStreamCreateExt for WingsBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
+        source_compression: CompressionType,
         reader: DumpReader,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let config = state.config.load();
-        let compression = config
+        let target_compression = config
             .system
             .backups
             .wings
@@ -256,6 +265,16 @@ impl BackupStreamCreateExt for WingsBackup {
         let threads = config.system.backups.wings.create_threads;
         let write_limit = config.system.backups.write_limit.as_bytes();
         drop(config);
+
+        let compression = Self::dump_stored_compression(source_compression, target_compression);
+        let (reader, write_compression) = if compression == source_compression {
+            (reader, CompressionType::None)
+        } else {
+            (
+                super::decompress_dump(reader, source_compression),
+                compression,
+            )
+        };
 
         let file_name = Self::get_dump_file_name(&state.config, uuid, extension, compression);
         let part_file_name = file_name.with_extension(format!(
@@ -274,7 +293,7 @@ impl BackupStreamCreateExt for WingsBackup {
         let write_result = tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
             let writer = LimitedWriter::new_with_bytes_per_second(file, write_limit);
             let mut writer =
-                CompressionWriter::new(writer, compression, compression_level, threads)?;
+                CompressionWriter::new(writer, write_compression, compression_level, threads)?;
             let mut reader = tokio_util::io::SyncIoBridge::new(reader);
 
             crate::io::copy(&mut reader, &mut writer)?;
@@ -1242,5 +1261,35 @@ impl BackupCleanExt for WingsBackup {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // WingsBackup::dump_stored_compression
+    #[test]
+    fn dump_stored_compression_never_double_compresses() {
+        assert_eq!(
+            WingsBackup::dump_stored_compression(CompressionType::Gz, CompressionType::None),
+            CompressionType::Gz
+        );
+        assert_eq!(
+            WingsBackup::dump_stored_compression(CompressionType::None, CompressionType::None),
+            CompressionType::None
+        );
+        assert_eq!(
+            WingsBackup::dump_stored_compression(CompressionType::Zstd, CompressionType::Zstd),
+            CompressionType::Zstd
+        );
+        assert_eq!(
+            WingsBackup::dump_stored_compression(CompressionType::Gz, CompressionType::Zstd),
+            CompressionType::Zstd
+        );
+        assert_eq!(
+            WingsBackup::dump_stored_compression(CompressionType::None, CompressionType::Xz),
+            CompressionType::Xz
+        );
     }
 }

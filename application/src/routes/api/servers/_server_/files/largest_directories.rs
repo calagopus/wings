@@ -7,7 +7,6 @@ mod get {
         routes::{ApiError, api::servers::_server_::GetServer},
         server::filesystem::{
             cap::FileType,
-            ignore_list::IgnoreList,
             virtualfs::{IgnoreVerdict, IsIgnoredFn},
         },
     };
@@ -46,24 +45,7 @@ mod get {
         ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
-        let ignore = if data.ignored.is_empty() {
-            None
-        } else {
-            match IgnoreList::try_from_lines(data.ignored.iter()) {
-                Ok(ignore) => Some(ignore),
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                        err
-                    );
-
-                    return ApiResponse::error("directory not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "directory not found")?;
 
         let (root, filesystem) = server
             .filesystem
@@ -77,8 +59,8 @@ mod get {
         }
 
         let is_ignored = IsIgnoredFn::from(server.filesystem.get_ignored());
-        let is_ignored = match ignore {
-            Some(ignore) => is_ignored.merge(IsIgnoredFn::from(ignore)),
+        let is_ignored = match ignored.filter(&server) {
+            Some(ignored) => is_ignored.merge(ignored),
             None => is_ignored,
         };
 

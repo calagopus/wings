@@ -86,20 +86,7 @@ mod get {
                 .ok();
         }
 
-        let ignored = match crate::server::filesystem::RequestIgnored::compile(&data.ignored) {
-            Ok(ignored) => ignored,
-            Err(err) => {
-                tracing::error!(
-                    server = %server.uuid,
-                    "rejecting request, subuser ignored files cannot be compiled: {:#?}",
-                    err
-                );
-
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
         let parent = Path::new(&data.file)
             .parent()
@@ -115,20 +102,14 @@ mod get {
             .await;
         let path = root.join(file_name);
 
-        match filesystem.async_metadata(&path).await {
-            Ok(metadata) => {
-                if !metadata.file_type.is_file() {
-                    return ApiResponse::error("file not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-            }
-            Err(_) => {
+        match filesystem.async_reachable_metadata(&path).await {
+            Ok((metadata, _)) if metadata.file_type.is_file() => {}
+            _ => {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
                     .ok();
             }
-        };
+        }
 
         let file_read = filesystem.async_read_file(&path, None).await?;
         let mut reader = BufReader::new(file_read.reader);
