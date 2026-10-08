@@ -1055,3 +1055,114 @@ fn allocated_vmids_include_every_guest_type() {
     assert!(used.contains(&202));
     assert_eq!(PveCli::first_free_vmid_at_or_above(200, &used), Some(203));
 }
+
+#[test]
+fn normalizes_gzip_oci_layers_for_proxmox_diff_ids() {
+    use flate2::{Compression, write::GzEncoder};
+    use sha2::{Digest, Sha256};
+    use std::io::{Cursor, Write};
+
+    fn append(builder: &mut tar::Builder<std::fs::File>, path: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(bytes))
+            .expect("append tar entry");
+    }
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    let path = directory.path().join("image.tar");
+    let layer = b"uncompressed OCI layer contents";
+    let diff_id = hex::encode(Sha256::digest(layer));
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(layer).expect("compress layer");
+    let compressed = encoder.finish().expect("finish compression");
+    let compressed_digest = hex::encode(Sha256::digest(&compressed));
+    let config = serde_json::json!({"rootfs": {"type": "layers", "diff_ids": [format!("sha256:{diff_id}")]}});
+    let config = serde_json::to_vec(&config).expect("encode config");
+    let config_digest = hex::encode(Sha256::digest(&config));
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": format!("sha256:{config_digest}"), "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": format!("sha256:{compressed_digest}"), "size": compressed.len()}]
+    });
+    let manifest = serde_json::to_vec(&manifest).expect("encode manifest");
+    let manifest_digest = hex::encode(Sha256::digest(&manifest));
+    let index = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": format!("sha256:{manifest_digest}"), "size": manifest.len()}]})).expect("encode index");
+    let file = std::fs::File::create(&path).expect("create archive");
+    let mut builder = tar::Builder::new(file);
+    append(
+        &mut builder,
+        "oci-layout",
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    );
+    append(
+        &mut builder,
+        &format!("blobs/sha256/{config_digest}"),
+        &config,
+    );
+    append(
+        &mut builder,
+        &format!("blobs/sha256/{compressed_digest}"),
+        &compressed,
+    );
+    append(
+        &mut builder,
+        &format!("blobs/sha256/{manifest_digest}"),
+        &manifest,
+    );
+    append(&mut builder, "index.json", &index);
+    builder.finish().expect("finish archive");
+
+    PveCli::normalize_oci_template(path.clone()).expect("normalize OCI archive");
+    let mut archive =
+        tar::Archive::new(std::fs::File::open(path).expect("open normalized archive"));
+    let mut normalized_index = None;
+    let mut blobs = std::collections::HashMap::new();
+    for entry in archive.entries().expect("entries") {
+        let mut entry = entry.expect("entry");
+        let name = entry.path().expect("path").to_string_lossy().into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("read entry");
+        if name == "index.json" {
+            normalized_index = Some(bytes);
+        } else {
+            blobs.insert(name, bytes);
+        }
+    }
+    let index: serde_json::Value =
+        serde_json::from_slice(&normalized_index.expect("index")).expect("parse index");
+    let manifest_digest = index
+        .pointer("/manifests/0/digest")
+        .and_then(serde_json::Value::as_str)
+        .expect("manifest digest")
+        .strip_prefix("sha256:")
+        .expect("sha digest");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        blobs
+            .get(&format!("blobs/sha256/{manifest_digest}"))
+            .expect("manifest blob"),
+    )
+    .expect("parse manifest");
+    let expected_digest = format!("sha256:{diff_id}");
+    assert_eq!(
+        manifest
+            .pointer("/layers/0/digest")
+            .and_then(serde_json::Value::as_str),
+        Some(expected_digest.as_str())
+    );
+    assert_eq!(
+        manifest
+            .pointer("/layers/0/mediaType")
+            .and_then(serde_json::Value::as_str),
+        Some("application/vnd.oci.image.layer.v1.tar")
+    );
+    assert_eq!(
+        blobs
+            .get(&format!("blobs/sha256/{diff_id}"))
+            .map(Vec::as_slice),
+        Some(layer.as_slice())
+    );
+}
