@@ -327,3 +327,7 @@ ignore_panel_wings_upgrades: false
 ## Star History
 
 ![Star History Chart](https://api.star-history.com/chart?repos=calagopus/wings&type=date&legend=top-left&sealed_token=B2O-QGHUHAa_2R6TXAtmVmA-ASHkIyhBD3Rm6jlD9mOeO9XJsHW0uBvsZ-5zINucUHJPH5c29w8c7lL_2Kr7tb5770-KK58lG2pGrET0ksegRMrP1IEbft05EdOtyO6RAUCo1FCK5gnNscF6lwXhRp5LLQd08n2sZgUisdnct1irxGRvQmzUx9o-Bk4o)
+
+## Experimental Incus runtime
+
+An Incus 7.0 LTS executor is available for development and disposable-node testing. See [configuration, limitations, and validation](docs/incus.md) before enabling it. Docker remains the default.

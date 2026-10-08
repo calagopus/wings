@@ -177,7 +177,7 @@ async fn extract_binary(
     .await?
 }
 
-fn render_config(
+pub(super) fn render_config(
     manager: &TundraManager,
     tunnel_port: u16,
     metrics_port: u16,
@@ -199,7 +199,7 @@ fn render_config(
     .map_err(Into::into)
 }
 
-fn sync_config(path: &Path, rendered: &str) -> Result<bool, anyhow::Error> {
+pub(super) fn sync_config(path: &Path, rendered: &str) -> Result<bool, anyhow::Error> {
     if std::fs::read_to_string(path).is_ok_and(|current| current == rendered) {
         return Ok(false);
     }
@@ -441,7 +441,11 @@ impl Applied {
 }
 
 pub async fn stop(manager: &TundraManager) -> Result<(), anyhow::Error> {
-    let docker = manager.docker();
+    #[cfg(target_os = "linux")]
+    if manager.docker.is_none() {
+        return super::incus::stop(manager).await;
+    }
+    let docker = manager.docker()?;
     let inspect = match docker.inspect_container(CONTAINER_NAME, None).await {
         Ok(inspect) => inspect,
         Err(bollard::errors::Error::DockerResponseServerError {
@@ -473,6 +477,10 @@ pub async fn stop(manager: &TundraManager) -> Result<(), anyhow::Error> {
 }
 
 pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow::Error> {
+    #[cfg(target_os = "linux")]
+    if manager.docker.is_none() {
+        return super::incus::ensure(state, manager).await;
+    }
     if !manager.serving() {
         return Ok(());
     }
@@ -501,7 +509,7 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
         .join("hosts");
 
     let image = config.tundra.image.clone();
-    let docker = manager.docker();
+    let docker = manager.docker()?;
     let desired = create_body(state, manager, &image);
     drop(config);
 

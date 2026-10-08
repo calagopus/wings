@@ -1023,6 +1023,13 @@ impl Server {
                 });
             }
             Err(err) => {
+                #[cfg(target_os = "linux")]
+                if err
+                    .downcast_ref::<executor::incus::RecoveryError>()
+                    .is_some()
+                {
+                    return Err(err);
+                }
                 tracing::debug!(server = %self.uuid, "no running container to attach to: {}", err);
             }
         }
@@ -1673,13 +1680,12 @@ impl Server {
             let server = self.clone();
 
             async move {
-                server.diff.destroy().await;
-                server.filesystem.destroy().await;
-                server.filesystem.close();
-
                 if let Some(installer) = server.installer.read().await.as_ref() {
                     installer.abort();
                 }
+                server.diff.destroy().await;
+                server.filesystem.destroy().await;
+                server.filesystem.close();
             }
         });
     }

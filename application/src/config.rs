@@ -723,9 +723,69 @@ impl From<String> for SystemPath {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBackend {
+    #[default]
+    Docker,
+    Incus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeConfiguration {
+    pub backend: RuntimeBackend,
+    pub incus: IncusRuntime,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct IncusRuntime {
+    pub socket: String,
+    pub project: String,
+    pub storage_pool: String,
+    pub storage_driver: String,
+    pub storage_config: BTreeMap<String, String>,
+    pub network: String,
+    pub ipv4_address: String,
+    #[schema(value_type = Vec<String>)]
+    pub listen_addresses: Vec<std::net::IpAddr>,
+    pub incus_path: String,
+    pub skopeo_path: String,
+    pub operation_timeout_seconds: u64,
+    pub image_import_timeout_seconds: u64,
+    pub max_concurrent_imports: usize,
+    pub image_cache_retention_days: u32,
+    pub root_disk_size: String,
+}
+
+impl Default for IncusRuntime {
+    fn default() -> Self {
+        Self {
+            socket: "/var/lib/incus/unix.socket".into(),
+            project: "wings".into(),
+            storage_pool: "wings".into(),
+            storage_driver: "dir".into(),
+            storage_config: BTreeMap::new(),
+            network: "wingsbr0".into(),
+            ipv4_address: "10.76.0.1/16".into(),
+            listen_addresses: Vec::new(),
+            incus_path: "incus".into(),
+            skopeo_path: "skopeo".into(),
+            operation_timeout_seconds: 120,
+            image_import_timeout_seconds: 1800,
+            max_concurrent_imports: 2,
+            image_cache_retention_days: 30,
+            root_disk_size: "10GiB".into(),
+        }
+    }
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
+        #[serde(default)]
+        pub runtime: RuntimeConfiguration,
         #[serde(default)]
         pub debug: bool,
         #[serde(default = "app_name")]
@@ -1249,7 +1309,7 @@ nestify::nest! {
             pub domainname: String,
             #[serde(default)]
             #[schema(inline)]
-            pub registries: HashMap<String, #[derive(ToSchema, Deserialize, Serialize)] pub struct DockerRegistryConfiguration {
+            pub registries: HashMap<String, #[derive(Clone, ToSchema, Deserialize, Serialize)] pub struct DockerRegistryConfiguration {
                 pub username: String,
                 pub password: String,
             }>,
@@ -1745,6 +1805,10 @@ impl Config {
         }
         let (new, _) = crate::env_overrides::apply_to_config(new)?;
         Self::validate_inner(&new)?;
+        anyhow::ensure!(
+            self.load().runtime == new.runtime,
+            "runtime configuration changes require a Wings restart"
+        );
         Self::save_to(&self.path, &new)?;
 
         let old_debug = self.load().debug;

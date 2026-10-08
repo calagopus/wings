@@ -2750,6 +2750,13 @@ async fn find_running_container(
 
 #[async_trait::async_trait]
 impl super::ServerExecutor for DockerExecutor {
+    async fn reconcile_firewall(
+        &self,
+        servers: &[crate::remote::servers::RawServer],
+    ) -> Result<(), anyhow::Error> {
+        DockerExecutor::reconcile_firewall(self, servers).await
+    }
+
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.app_config.ensure_docker_network(&self.docker).await?;
         self.firewall.boot().await?;

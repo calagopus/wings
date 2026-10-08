@@ -13,6 +13,8 @@ use tundra_common::state::Snapshot;
 pub mod ca;
 pub mod daemon;
 pub mod hub;
+#[cfg(target_os = "linux")]
+mod incus;
 pub mod shim;
 
 const SOCKET_DIRECTORY: &str = "run";
@@ -71,7 +73,9 @@ pub struct TundraManager {
     pub data_dir: PathBuf,
     pub hub: hub::Hub,
     ca: ca::LocalCa,
-    docker: Arc<bollard::Docker>,
+    docker: Option<Arc<bollard::Docker>>,
+    #[cfg(target_os = "linux")]
+    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     token: parking_lot::RwLock<String>,
 
     control: parking_lot::Mutex<ControlState>,
@@ -88,7 +92,7 @@ pub struct TundraManager {
 impl TundraManager {
     pub fn create(
         config: &crate::config::Config,
-        docker: Arc<bollard::Docker>,
+        docker: Option<Arc<bollard::Docker>>,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let cfg = config.load();
         let data_dir = cfg.tundra.data_directory.as_path(&cfg);
@@ -105,6 +109,8 @@ impl TundraManager {
             hub: hub::Hub::default(),
             ca,
             docker,
+            #[cfg(target_os = "linux")]
+            child: tokio::sync::Mutex::new(None),
             token: parking_lot::RwLock::new(token),
             control: parking_lot::Mutex::new(ControlState {
                 cached: None,
@@ -134,8 +140,10 @@ impl TundraManager {
     }
 
     #[inline]
-    pub fn docker(&self) -> Arc<bollard::Docker> {
-        Arc::clone(&self.docker)
+    pub fn docker(&self) -> Result<Arc<bollard::Docker>, anyhow::Error> {
+        self.docker
+            .clone()
+            .context("Tundra Docker provider is unavailable")
     }
 
     #[inline]
@@ -395,7 +403,11 @@ mod tests {
             data_dir: dir.to_path_buf(),
             hub: hub::Hub::default(),
             ca: ca::LocalCa::load_or_create(dir).unwrap(),
-            docker: Arc::new(bollard::Docker::connect_with_local_defaults().unwrap()),
+            docker: Some(Arc::new(
+                bollard::Docker::connect_with_local_defaults().unwrap(),
+            )),
+            #[cfg(target_os = "linux")]
+            child: tokio::sync::Mutex::new(None),
             token: parking_lot::RwLock::new(String::new()),
             control: parking_lot::Mutex::new(ControlState {
                 cached: None,

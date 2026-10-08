@@ -355,7 +355,7 @@ dependencies = [
  "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2805,6 +2805,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3831,6 +3840,7 @@ checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
  "aws-lc-rs",
  "pem 4.0.0",
+ "ring",
  "rustls-pki-types",
  "time",
  "x509-parser",
@@ -5196,7 +5206,23 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite",
+ "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.30.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5380,10 +5406,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "chrono",
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]
@@ -5393,6 +5423,24 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tundra-common"
+version = "1.0.1"
+source = "git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a#f045f5861da0cf9d3df5d3e11b0b384af325147a"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "compact_str",
+ "ed25519-dalek",
+ "hex",
+ "jsonwebtoken",
+ "postcard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
 
 [[package]]
 name = "tundra-common"
@@ -5413,6 +5461,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "tundra-node"
+version = "1.0.1"
+source = "git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a#f045f5861da0cf9d3df5d3e11b0b384af325147a"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "bollard",
+ "bytes",
+ "compact_str",
+ "futures",
+ "hex",
+ "nix 0.31.3",
+ "parking_lot",
+ "postcard",
+ "quinn",
+ "rand 0.10.3",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2",
+ "socket2",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
+ "tundra-common 1.0.1 (git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a)",
+ "uuid",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5425,6 +5508,24 @@ dependencies = [
  "log",
  "rand 0.9.5",
  "sha1 0.10.7",
+ "thiserror",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
+ "log",
+ "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.11.0",
  "thiserror",
 ]
 
@@ -5525,7 +5626,7 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -5769,6 +5870,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -6195,13 +6305,15 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-test",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml_edit",
  "tower-http 0.7.1",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "tundra-common",
+ "tundra-common 1.0.1 (git+https://github.com/calagopus/tundra.git)",
+ "tundra-node",
  "unrar",
  "ureq",
  "url",
@@ -6271,6 +6383,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror",
  "time",

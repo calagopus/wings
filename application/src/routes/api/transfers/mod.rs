@@ -272,7 +272,7 @@ mod post {
                                                         Some(PortablePermissions::from_mode_file(meta.mode)),
                                                         Some(meta.modified),
                                                     )?
-                                                    .ignorant();
+                                                    .with_transfer_limits();
 
                                                 crate::io::copy_shared(
                                                     &mut read_buffer,
@@ -420,7 +420,7 @@ mod post {
                                                         .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
                                                         .ok(),
                                                 )?
-                                                .ignorant();
+                                                .with_transfer_limits();
 
                                                 crate::io::copy_shared(
                                                     &mut read_buffer,

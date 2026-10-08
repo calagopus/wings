@@ -96,6 +96,7 @@ impl ServerManager {
                                     error = %err,
                                     "failed to attach server container"
                                 );
+                                return;
                             }
                         }
 

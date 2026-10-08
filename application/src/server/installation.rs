@@ -213,14 +213,24 @@ impl ServerInstaller {
         interval
     }
 
-    async fn evaluate_install_result(&self, oom_killed: bool) {
-        let reason = if oom_killed {
+    async fn evaluate_install_result(&self, exit_code: i32, oom_killed: bool) {
+        let mut reason = if oom_killed {
             Some(compact_str::CompactString::const_new(
                 "installation container ran out of memory",
             ))
         } else {
             Self::read_install_status(&Self::get_install_status_path(&self.server)).await
         };
+
+        if reason.is_none()
+            && self.server.app_state.config.load().runtime.backend
+                == crate::config::RuntimeBackend::Incus
+            && exit_code != 0
+        {
+            reason = Some(compact_str::format_compact!(
+                "Incus installation process exited with code {exit_code}"
+            ));
+        }
 
         if let Some(reason) = reason {
             tracing::warn!(
@@ -536,7 +546,7 @@ impl ServerInstaller {
                                                     Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running || !stdout_open => {
                                                         tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
 
-                                                        installer.evaluate_install_result(oom_killed).await;
+                                                        installer.evaluate_install_result(exit_code, oom_killed).await;
                                                         break;
                                                     }
                                                     None => break,
@@ -697,7 +707,7 @@ impl ServerInstaller {
                                                     Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) => {
                                                         tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
 
-                                                        installer.evaluate_install_result(oom_killed).await;
+                                                        installer.evaluate_install_result(exit_code, oom_killed).await;
                                                         break;
                                                     }
                                                     None => {

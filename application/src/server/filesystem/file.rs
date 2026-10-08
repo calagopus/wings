@@ -194,6 +194,16 @@ impl ServerFile {
         self
     }
 
+    pub fn with_transfer_limits(self) -> Self {
+        if self.server.app_state.config.load().runtime.backend
+            == crate::config::RuntimeBackend::Incus
+        {
+            self
+        } else {
+            self.ignorant()
+        }
+    }
+
     pub fn sync_all(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
