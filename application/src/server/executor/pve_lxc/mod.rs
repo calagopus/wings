@@ -1503,7 +1503,7 @@ impl PveLxcExecutor {
             &helper_wrapper_path,
             r#"#!/bin/sh
 attempt=0
-while [ "$attempt" -lt 120 ]; do
+while [ "$attempt" -lt 480 ]; do
     if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
         "$@"
         status=$?
