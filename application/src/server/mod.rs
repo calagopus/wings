@@ -447,6 +447,13 @@ impl Server {
                         None => break,
                     };
 
+                    #[cfg(unix)]
+                    if let Some(tundra) = server.app_state.tundra.as_ref()
+                        && tundra.hub.connected()
+                    {
+                        tundra.rebroadcast();
+                    }
+
                     if !server.filesystem.write_tracking_active() {
                         server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
                     }

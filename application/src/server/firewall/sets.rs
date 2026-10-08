@@ -122,6 +122,45 @@ async fn fingerprint(
     }))
 }
 
+pub async fn read_source_file(
+    filesystem: &crate::server::filesystem::cap::CapFilesystem,
+    path: &Path,
+    limits: SourceFileLimits,
+) -> Result<(Vec<cidr::IpCidr>, LoadStats), LoadError> {
+    let file = filesystem.async_open(path).await?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut entries = Vec::new();
+    let mut stats = LoadStats::default();
+    let mut bytes: u64 = 0;
+
+    while let Some(line) = lines.next_line().await? {
+        bytes += line.len() as u64 + 1;
+        if bytes > limits.max_bytes {
+            return Err(LoadError::TooLarge {
+                max_bytes: limits.max_bytes,
+            });
+        }
+
+        match parse_line(&line) {
+            None => {}
+            Some(Err(())) => stats.invalid += 1,
+            Some(Ok(entry)) => {
+                stats.entries += 1;
+                if stats.entries > limits.max_entries {
+                    return Err(LoadError::TooManyEntries {
+                        max_entries: limits.max_entries,
+                    });
+                }
+                entries.push(entry);
+            }
+        }
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok((entries, stats))
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoadStats {
     pub entries: usize,

@@ -743,7 +743,7 @@ impl ServerConfiguration {
             ),
         };
 
-        if self.build.oom_disabled && crate::server::executor::docker::cgroup::is_unified() {
+        if self.build.oom_disabled && crate::server::executor::cgroup::is_unified() {
             tracing::warn!(
                 server = %self.uuid,
                 "oom_disabled is set, but the container engine discards it on cgroup v2 hosts"

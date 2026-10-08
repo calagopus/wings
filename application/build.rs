@@ -191,6 +191,8 @@ fn handle_git_info() {
         {
             git_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
         }
+    } else {
+        println!("cargo:rustc-env=CARGO_GIT_BRANCH=unknown");
     }
     println!("cargo:rustc-env=CARGO_GIT_COMMIT={git_hash}");
 }
