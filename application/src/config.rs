@@ -2329,6 +2329,72 @@ impl Config {
         path(&cfg).as_path(&cfg)
     }
 
+    pub async fn create_docker_network(
+        client: &bollard::Docker,
+        cfg: &InnerConfig,
+    ) -> Result<(), bollard::errors::Error> {
+        let mut ipam_config = Vec::new();
+
+        if cfg.docker.network.interfaces.v4.enabled {
+            ipam_config.push(bollard::models::IpamConfig {
+                subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
+                gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
+                ..Default::default()
+            });
+        }
+        if cfg.docker.network.interfaces.v6.enabled {
+            ipam_config.push(bollard::models::IpamConfig {
+                subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
+                gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
+                ..Default::default()
+            });
+        }
+
+        client
+            .create_network(bollard::plugin::NetworkCreateRequest {
+                name: cfg.docker.network.name.to_string(),
+                driver: Some(cfg.docker.network.driver.to_string()),
+                enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
+                enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
+                internal: Some(cfg.docker.network.is_internal),
+                ipam: Some(bollard::models::Ipam {
+                    config: Some(ipam_config),
+                    ..Default::default()
+                }),
+                options: Some(HashMap::from([
+                    ("encryption".to_string(), "false".to_string()),
+                    (
+                        "com.docker.network.bridge.default_bridge".to_string(),
+                        "false".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.enable_icc".to_string(),
+                        cfg.docker.network.enable_icc.to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.enable_ip_masquerade".to_string(),
+                        "true".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.host_binding_ipv4".to_string(),
+                        "0.0.0.0".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.name".to_string(),
+                        cfg.docker.network.name.to_string(),
+                    ),
+                    (
+                        "com.docker.network.driver.mtu".to_string(),
+                        cfg.docker.network.network_mtu.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn ensure_docker_network(
         &self,
         client: &bollard::Docker,
@@ -2337,72 +2403,6 @@ impl Config {
         let network = client.inspect_network(&network_name, None).await;
 
         if network.is_err() {
-            async fn create_network(
-                client: &bollard::Docker,
-                cfg: &InnerConfig,
-            ) -> Result<(), bollard::errors::Error> {
-                let mut ipam_config = Vec::new();
-
-                if cfg.docker.network.interfaces.v4.enabled {
-                    ipam_config.push(bollard::models::IpamConfig {
-                        subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
-                        gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
-                        ..Default::default()
-                    });
-                }
-                if cfg.docker.network.interfaces.v6.enabled {
-                    ipam_config.push(bollard::models::IpamConfig {
-                        subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
-                        gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
-                        ..Default::default()
-                    });
-                }
-
-                client
-                    .create_network(bollard::plugin::NetworkCreateRequest {
-                        name: cfg.docker.network.name.to_string(),
-                        driver: Some(cfg.docker.network.driver.to_string()),
-                        enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
-                        enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
-                        internal: Some(cfg.docker.network.is_internal),
-                        ipam: Some(bollard::models::Ipam {
-                            config: Some(ipam_config),
-                            ..Default::default()
-                        }),
-                        options: Some(HashMap::from([
-                            ("encryption".to_string(), "false".to_string()),
-                            (
-                                "com.docker.network.bridge.default_bridge".to_string(),
-                                "false".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.enable_icc".to_string(),
-                                cfg.docker.network.enable_icc.to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.enable_ip_masquerade".to_string(),
-                                "true".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.host_binding_ipv4".to_string(),
-                                "0.0.0.0".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.name".to_string(),
-                                cfg.docker.network.name.to_string(),
-                            ),
-                            (
-                                "com.docker.network.driver.mtu".to_string(),
-                                cfg.docker.network.network_mtu.to_string(),
-                            ),
-                        ])),
-                        ..Default::default()
-                    })
-                    .await?;
-
-                Ok(())
-            }
-
             if !self.load().docker.network.interfaces.v4.enabled
                 && !self.load().docker.network.interfaces.v6.enabled
             {
@@ -2412,7 +2412,7 @@ impl Config {
                 ));
             }
 
-            let initial_result = create_network(client, &self.load()).await;
+            let initial_result = Self::create_docker_network(client, &self.load()).await;
             match initial_result {
                 Ok(_) => {
                     tracing::info!("created docker network {}", self.load().docker.network.name);
@@ -2479,7 +2479,7 @@ impl Config {
                                 increment_ip_or_cidr(&m.docker.network.interfaces.v6.gateway);
                         }
 
-                        if let Err(err) = create_network(client, &self.load()).await {
+                        if let Err(err) = Self::create_docker_network(client, &self.load()).await {
                             tracing::warn!("failed to create docker network, trying again...");
                             tracing::error!("failed to create docker network: {:?}", err);
                         } else {

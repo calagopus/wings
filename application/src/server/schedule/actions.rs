@@ -635,7 +635,10 @@ impl ScheduleAction {
                             timestamp: chrono::Utc::now(),
                         });
                     }
-                    Err(crate::server::PowerActionError::User(message)) => {
+                    Err(
+                        crate::server::PowerActionError::User(message)
+                        | crate::server::PowerActionError::Reported(message),
+                    ) => {
                         return Err(crate::utils::lowercase_first_ascii(message));
                     }
                     Err(crate::server::PowerActionError::Internal(_)) => {

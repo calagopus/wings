@@ -320,6 +320,16 @@ impl TargetedWebsocketMessage {
                 .all(|perm| permissions.has_permission(*perm))
     }
 
+    pub fn matches_user(
+        &self,
+        user_uuid: &uuid::Uuid,
+        has_permission: impl Fn(Permission) -> bool,
+    ) -> bool {
+        self.connection_uuids.is_empty()
+            && (self.user_uuids.is_empty() || self.user_uuids.contains(user_uuid))
+            && self.permissions.iter().all(|perm| has_permission(*perm))
+    }
+
     #[inline]
     pub fn into_message(self) -> WebsocketMessage {
         self.message

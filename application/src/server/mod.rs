@@ -37,8 +37,28 @@ pub mod websocket;
 
 pub enum PowerActionError {
     User(std::borrow::Cow<'static, str>),
+    Reported(std::borrow::Cow<'static, str>),
     Internal(anyhow::Error),
 }
+
+struct ConsoleReported {
+    line: std::borrow::Cow<'static, str>,
+    err: anyhow::Error,
+}
+
+impl std::fmt::Display for ConsoleReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+impl std::fmt::Debug for ConsoleReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.err, f)
+    }
+}
+
+impl std::error::Error for ConsoleReported {}
 
 pub struct InnerServer {
     pub uuid: uuid::Uuid,
@@ -156,6 +176,47 @@ impl InnerServer {
                 .paint(message)
                 .to_compact_string(),
         );
+    }
+
+    pub fn log_daemon_admin_error(&self, message: &str, details: &str) {
+        self.log_daemon_error(message);
+
+        let mut permissions = permissions::Permissions::default();
+        permissions.insert(permissions::Permission::AdminWebsocketErrors);
+
+        self.targeted_websocket
+            .send(websocket::TargetedWebsocketMessage::new(
+                std::collections::HashSet::new(),
+                permissions,
+                self.get_daemon_error(details),
+            ))
+            .ok();
+    }
+
+    fn report_power_error(
+        &self,
+        action: crate::models::ServerPowerAction,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        let line = match err.downcast_ref::<&'static str>() {
+            Some(message) => {
+                self.log_daemon_error(message);
+                std::borrow::Cow::Borrowed(*message)
+            }
+            None => {
+                let line = format!(
+                    "Failed to {} the server. Please contact an Administrator.",
+                    action.to_str()
+                );
+                self.log_daemon_admin_error(
+                    &line,
+                    &format!("Failed to {} the server: {err:#}", action.to_str()),
+                );
+                std::borrow::Cow::Owned(line)
+            }
+        };
+
+        anyhow::Error::new(ConsoleReported { line, err })
     }
 
     pub fn get_daemon_error(&self, message: &str) -> websocket::WebsocketMessage {
@@ -1310,7 +1371,7 @@ impl Server {
                             "Another power action is currently being processed for this server, please try again later."
                         ))
                     },
-                    Err(err) => Err(err),
+                    Err(err) => Err(server.report_power_error(crate::models::ServerPowerAction::Start, err)),
                 }
         })
         .await?
@@ -1333,16 +1394,20 @@ impl Server {
 
         let server = self.clone();
         tokio::spawn(async move {
-            server.stopping.store(true, Ordering::SeqCst);
-            if process_handle.kill().await.is_ok() {
-                if !skip_schedules {
-                    server
-                        .schedules
-                        .execute_power_action_trigger(crate::models::ServerPowerAction::Kill)
-                        .await;
-                }
-                server.reset_state().await;
+            let was_stopping = server.stopping.swap(true, Ordering::SeqCst);
+            if let Err(err) = process_handle.kill().await {
+                server.stopping.store(was_stopping, Ordering::SeqCst);
+
+                return Err(server.report_power_error(crate::models::ServerPowerAction::Kill, err));
             }
+
+            if !skip_schedules {
+                server
+                    .schedules
+                    .execute_power_action_trigger(crate::models::ServerPowerAction::Kill)
+                    .await;
+            }
+            server.reset_state().await;
 
             Ok(())
         })
@@ -1491,13 +1556,7 @@ impl Server {
                         server = %server.uuid,
                         "kill timeout reached during restart, killing server"
                     );
-                    if let Err(err) = server.kill(true).await {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to kill server during restart: {}",
-                            err
-                        );
-                    }
+                    server.kill(true).await?;
                 }
             } else {
                 server.start(aquire_timeout, true).await?;
@@ -1612,9 +1671,19 @@ impl Server {
             return Err(PowerActionError::User(message.into()));
         }
 
-        self.power_action(action, None)
-            .await
-            .map_err(|err| match err.downcast::<&str>() {
+        self.power_action(action, None).await.map_err(|err| {
+            if let Some(reported) = err.downcast_ref::<ConsoleReported>() {
+                tracing::error!(
+                    server = %self.uuid,
+                    "failed to {} server: {:#?}",
+                    action.to_str(),
+                    reported
+                );
+
+                return PowerActionError::Reported(reported.line.clone());
+            }
+
+            match err.downcast::<&str>() {
                 Ok(message) => PowerActionError::User(message.into()),
                 Err(err) => {
                     tracing::error!(
@@ -1626,7 +1695,8 @@ impl Server {
 
                     PowerActionError::Internal(err)
                 }
-            })
+            }
+        })
     }
 
     pub async fn destroy_container(&self) {
@@ -1845,6 +1915,9 @@ mod tests {
             match server.checked_power_action(action).await {
                 Err(PowerActionError::User(message)) => message.into_owned(),
                 Err(PowerActionError::Internal(err)) => panic!("{action:?}: internal error {err}"),
+                Err(PowerActionError::Reported(message)) => {
+                    panic!("{action:?}: reported error {message}")
+                }
                 Ok(()) => panic!("{action:?}: unexpectedly executed"),
             }
         }

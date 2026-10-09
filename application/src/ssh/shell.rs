@@ -111,12 +111,25 @@ impl ShellSession {
                         });
                     }
                     Err(PowerActionError::User(message)) => writeln(&message).await,
-                    Err(PowerActionError::Internal(_)) => {
-                        writeln(&format!(
-                            "An unexpected error occurred while trying to {} the server. Please contact an Administrator.",
-                            action.to_str()
-                        ))
-                        .await;
+                    Err(PowerActionError::Reported(message)) => {
+                        if !can_read_console(&self.server, self.user_uuid) {
+                            writeln(&message).await;
+                        }
+                    }
+                    Err(PowerActionError::Internal(err)) => {
+                        if self.has_permission(Permission::AdminWebsocketErrors) {
+                            writeln(&format!(
+                                "Failed to {} the server: {err:#}",
+                                action.to_str()
+                            ))
+                            .await;
+                        } else {
+                            writeln(&format!(
+                                "An unexpected error occurred while trying to {} the server. Please contact an Administrator.",
+                                action.to_str()
+                            ))
+                            .await;
+                        }
                     }
                 }
             }
@@ -545,7 +558,7 @@ impl ShellSession {
                     .unwrap_or_default();
             }
 
-            let futures: [Pin<Box<dyn Future<Output = ()> + Send>>; 2] = [
+            let futures: [Pin<Box<dyn Future<Output = ()> + Send>>; 3] = [
                 {
                     let mut receiver = self.server.websocket.subscribe();
                     let state = Arc::clone(&self.state);
@@ -637,6 +650,53 @@ impl ShellSession {
                                     tracing::debug!(
                                         server = %server.uuid,
                                         "websocket lagged behind, messages dropped"
+                                    );
+                                }
+                            }
+                        }
+                    })
+                },
+                {
+                    let mut receiver = self.server.targeted_websocket.subscribe();
+                    let server = self.server.clone();
+                    let user_uuid = self.user_uuid;
+                    let mut writer = writer.make_writer();
+
+                    Box::pin(async move {
+                        loop {
+                            match receiver.recv().await {
+                                Ok(message) => {
+                                    if !message.matches_user(&user_uuid, |permission| {
+                                        server
+                                            .user_permissions
+                                            .has_permission(user_uuid, permission)
+                                    }) {
+                                        continue;
+                                    }
+
+                                    let message = message.into_message();
+                                    if matches!(message.event, WebsocketEvent::ServerDaemonMessage)
+                                    {
+                                        writer
+                                            .write_all(
+                                                format!("{}\r\n\x1b[2K", message.args.join(" "))
+                                                    .as_bytes(),
+                                            )
+                                            .await
+                                            .unwrap_or_default();
+                                    }
+                                }
+                                Err(RecvError::Closed) => {
+                                    tracing::debug!(
+                                        server = %server.uuid,
+                                        "targeted websocket channel closed, stopping listener"
+                                    );
+                                    break;
+                                }
+                                Err(RecvError::Lagged(_)) => {
+                                    tracing::debug!(
+                                        server = %server.uuid,
+                                        "targeted websocket lagged behind, messages dropped"
                                     );
                                 }
                             }

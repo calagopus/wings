@@ -2068,6 +2068,12 @@ impl DockerProcessHandle {
                     Some(bollard::plugin::ContainerStateStatusEnum::PAUSED) => {
                         super::ProcessStatus::Paused
                     }
+                    _ if state
+                        .started_at
+                        .is_none_or(|started_at| started_at.timestamp() <= 0) =>
+                    {
+                        continue;
+                    }
                     _ => {
                         if publish_resource_usage {
                             state_usage.send_modify(|usage| usage.uptime = 0);
@@ -2141,6 +2147,77 @@ impl DockerProcessHandle {
     }
 
     #[inline]
+    async fn start_container(&self) -> Result<(), anyhow::Error> {
+        static NETWORK_RECREATIONS: tokio::sync::Mutex<u64> = tokio::sync::Mutex::const_new(0);
+
+        let generation = *NETWORK_RECREATIONS.lock().await;
+        let err = match self.docker.start_container(&self.container_id, None).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        let network_name = self.app_config.load().docker.network.name.clone();
+        let uses_network = self
+            .docker
+            .inspect_container_settled(&self.container_id, None)
+            .await
+            .ok()
+            .and_then(|inspect| inspect.host_config?.network_mode)
+            .is_some_and(|network_mode| network_mode == network_name);
+        if !uses_network {
+            return Err(err.into());
+        }
+
+        let mut recreations = NETWORK_RECREATIONS.lock().await;
+        if *recreations == generation {
+            if !matches!(
+                self.docker.inspect_network(&network_name, None).await,
+                Err(DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ) {
+                return Err(err.into());
+            }
+
+            tracing::warn!(
+                network = %network_name,
+                "docker network is missing, recreating it"
+            );
+
+            match crate::config::Config::create_docker_network(
+                &self.docker,
+                &self.app_config.load(),
+            )
+            .await
+            {
+                Ok(())
+                | Err(DockerResponseServerError {
+                    status_code: 409, ..
+                }) => {}
+                Err(create_err) => {
+                    return Err(anyhow::anyhow!(
+                        "{err}, recreating the missing docker network {network_name} failed: {create_err}"
+                    ));
+                }
+            }
+
+            *recreations += 1;
+
+            if let Ok(server) = self.get_server() {
+                server.log_daemon(compact_str::format_compact!(
+                    "Recreated the missing docker network {network_name}."
+                ));
+            }
+        }
+        drop(recreations);
+
+        self.docker
+            .start_container(&self.container_id, None)
+            .await
+            .map_err(Into::into)
+    }
+
     fn get_server(&self) -> Result<Arc<super::super::InnerServer>, anyhow::Error> {
         self.server
             .upgrade()
@@ -2563,9 +2640,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        self.docker
-            .start_container(&self.container_id, None)
-            .await?;
+        self.start_container().await?;
 
         if let Ok(server) = self.get_server() {
             if self.shape_bandwidth
@@ -2653,7 +2728,8 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn kill(&self) -> Result<(), anyhow::Error> {
-        self.docker
+        match self
+            .docker
             .kill_container(
                 &self.container_id,
                 Some(bollard::query_parameters::KillContainerOptions {
@@ -2661,7 +2737,14 @@ impl super::ProcessHandle for DockerProcessHandle {
                 }),
             )
             .await
-            .map_err(Into::into)
+        {
+            Ok(())
+            | Err(DockerResponseServerError {
+                status_code: 404 | 409,
+                ..
+            }) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

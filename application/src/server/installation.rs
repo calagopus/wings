@@ -289,6 +289,17 @@ impl ServerInstaller {
         self.abort_notify.notify_one();
     }
 
+    async fn fail_installing(&self, err: &anyhow::Error) -> Result<(), anyhow::Error> {
+        let reason = compact_str::format_compact!("{err:#}");
+
+        self.server.log_daemon_install(compact_str::format_compact!(
+            "Installation failed: {reason}"
+        ));
+        *self.failure_reason.lock().await = Some(reason);
+
+        self.unset_installing(false).await
+    }
+
     pub async fn unset_installing(&self, successful: bool) -> Result<(), anyhow::Error> {
         self.server.set_installing(false).await;
         self.server.installer.write().await.take();
@@ -402,7 +413,7 @@ impl ServerInstaller {
                 {
                     Ok(container_script) => Arc::new(container_script),
                     Err(err) => {
-                        self.unset_installing(false).await?;
+                        self.fail_installing(&err).await?;
                         return Err(err);
                     }
                 };
@@ -414,10 +425,10 @@ impl ServerInstaller {
                             .replace(Arc::clone(&container_script));
                     }
                     None => {
-                        self.unset_installing(false).await?;
-                        return Err(anyhow::anyhow!(
-                            "unable to get mutable reference to server installer"
-                        ));
+                        let err =
+                            anyhow::anyhow!("unable to get mutable reference to server installer");
+                        self.fail_installing(&err).await?;
+                        return Err(err);
                     }
                 }
 
@@ -450,7 +461,7 @@ impl ServerInstaller {
                     {
                         Ok(r) => r,
                         Err(err) => {
-                            installer.unset_installing(false).await?;
+                            installer.fail_installing(&err).await?;
                             return Err(err);
                         }
                     };
@@ -464,7 +475,7 @@ impl ServerInstaller {
                     {
                         Ok(rx) => rx,
                         Err(err) => {
-                            installer.unset_installing(false).await?;
+                            installer.fail_installing(&err).await?;
                             return Err(err);
                         }
                     };
@@ -552,18 +563,20 @@ impl ServerInstaller {
                         ) => match result {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "failed to start installation container: {}",
+                                let err = anyhow::anyhow!(
+                                    "failed to start installation container: {:#}",
                                     err
-                                ));
+                                );
+                                installer.fail_installing(&err).await?;
+                                return Err(err);
                             }
                             Err(err) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "timeout while waiting for installation: {:#?}",
+                                let err = anyhow::anyhow!(
+                                    "timeout while waiting for installation: {:#}",
                                     err
-                                ));
+                                );
+                                installer.fail_installing(&err).await?;
+                                return Err(err);
                             }
                         },
                         _ = installer.abort_notify.notified() => {
@@ -626,7 +639,7 @@ impl ServerInstaller {
         {
             Ok(rx) => rx,
             Err(err) => {
-                self.unset_installing(false).await?;
+                self.fail_installing(&err).await?;
                 return Err(err);
             }
         };
@@ -716,18 +729,20 @@ impl ServerInstaller {
                         ) => match result {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "failed during installation container streaming: {}",
+                                let err = anyhow::anyhow!(
+                                    "failed during installation container streaming: {:#}",
                                     err
-                                ));
+                                );
+                                installer.fail_installing(&err).await?;
+                                return Err(err);
                             }
                             Err(err) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "timeout while waiting for installation: {:#?}",
+                                let err = anyhow::anyhow!(
+                                    "timeout while waiting for installation: {:#}",
                                     err
-                                ));
+                                );
+                                installer.fail_installing(&err).await?;
+                                return Err(err);
                             }
                         },
                         _ = installer.abort_notify.notified() => {

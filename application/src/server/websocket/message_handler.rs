@@ -147,6 +147,15 @@ pub async fn handle_message(
                 Err(PowerActionError::User(message)) => {
                     websocket_handler.send_error(message).await;
                 }
+                Err(PowerActionError::Reported(message)) => {
+                    if !websocket_handler
+                        .has_calagopus_permission_or(Permission::ControlReadConsole, true)
+                        .await
+                        .is_ok_and(|can_read| can_read)
+                    {
+                        websocket_handler.send_error(message).await;
+                    }
+                }
                 Err(PowerActionError::Internal(err)) => {
                     websocket_handler.send_admin_error(err).await;
                 }
