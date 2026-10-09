@@ -329,7 +329,7 @@ impl StatFiles {
             let Some((iface, counters)) = line.split_once(':') else {
                 continue;
             };
-            if iface.trim() == "lo" {
+            if matches!(iface.trim(), "lo" | crate::server::bandwidth::IFB_DEVICE) {
                 continue;
             }
 
@@ -659,6 +659,18 @@ mod tests {
         assert_eq!(
             StatFiles::parse_net_dev(net_dev),
             Some((5500, 55, 7700, 77))
+        );
+    }
+
+    #[test]
+    fn parse_net_dev_skips_the_bandwidth_ifb_device() {
+        let net_dev = "h1\nh2\n\
+              eth0:    5000      50    0    0    0     0          0         0     7000      70    0    0    0     0       0          0\n\
+          wings-dl:    5000      50    0    0    0     0          0         0     5000      50    0    0    0     0       0          0\n";
+
+        assert_eq!(
+            StatFiles::parse_net_dev(net_dev),
+            Some((5000, 50, 7000, 70))
         );
     }
 

@@ -330,6 +330,8 @@ nestify::nest! {
             pub disk_space: u64,
             pub threads: Option<compact_str::CompactString>,
             pub oom_disabled: bool,
+            #[serde(default)]
+            pub bandwidth: crate::server::bandwidth::limits::BandwidthLimits,
         },
         pub mounts: Vec<Mount>,
         #[serde(default)]
@@ -486,6 +488,7 @@ impl ServerConfiguration {
                 disk_space: 10240,
                 threads: None,
                 oom_disabled: false,
+                bandwidth: crate::server::bandwidth::limits::BandwidthLimits::default(),
             },
             mounts: Vec::new(),
             devices: Vec::new(),

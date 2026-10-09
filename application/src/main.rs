@@ -1069,6 +1069,12 @@ async fn main_rt() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(server::bandwidth::HELPER_ARG.as_ref()) {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        std::process::exit(server::bandwidth::helper_main(&args));
+    }
+
     let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     tokio::runtime::Builder::new_multi_thread()

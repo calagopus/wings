@@ -59,7 +59,7 @@ dialoguer = { version = "0.12.0", default-features = false }
 sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "network", "system", "user"] }
 crc32fast = { workspace = true }
 cap-std = "4.0.0"
-rustix = { version = "1.0.7", features = ["fs", "process", "net"] }
+rustix = { version = "1.0.7", features = ["fs", "process", "net", "thread"] }
 cidr = { version = "0.3.1", features = ["serde"] }
 hickory-resolver = { workspace = true }
 constant_time_eq = "0.6.0"
@@ -109,6 +109,8 @@ time = "0.3.55"
 tikv-jemallocator = "0.6.0"
 ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26.4"
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.33.0"
 
 [target.'cfg(target_arch = "riscv64gc")'.dependencies]
 libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues

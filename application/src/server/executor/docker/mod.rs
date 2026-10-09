@@ -1493,6 +1493,7 @@ struct DockerProcessHandle {
 
     resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
     publish_resource_usage: bool,
+    shape_bandwidth: bool,
     cfs_lock: Arc<tokio::sync::Mutex<()>>,
     boosted_limit_percent: Arc<AtomicU32>,
     stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1516,6 +1517,7 @@ impl DockerProcessHandle {
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
         attach_stdin: bool,
+        shape_bandwidth: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -1812,7 +1814,9 @@ impl DockerProcessHandle {
                             network: stats.networks.as_ref().and_then(|networks| {
                                 let mut totals: Option<(u64, u64, u64, u64)> = None;
 
-                                for net in networks.values() {
+                                for (_, net) in networks.iter().filter(|(name, _)| {
+                                    *name != crate::server::bandwidth::IFB_DEVICE
+                                }) {
                                     let total = totals.get_or_insert((0, 0, 0, 0));
                                     total.0 = total.0.saturating_add(net.rx_bytes.unwrap_or(0));
                                     total.1 = total.1.saturating_add(net.rx_packets.unwrap_or(0));
@@ -2124,6 +2128,7 @@ impl DockerProcessHandle {
             firewall,
             resource_usage,
             publish_resource_usage,
+            shape_bandwidth,
             cfs_lock,
             boosted_limit_percent,
             stdin_tx,
@@ -2173,6 +2178,25 @@ impl DockerProcessHandle {
                 server = %spec.server,
                 "failed to sync firewall rules: {err:#}"
             );
+        }
+    }
+
+    async fn apply_bandwidth(
+        docker: &bollard::Docker,
+        app_config: &crate::config::Config,
+        container_id: &str,
+        server: &super::super::InnerServer,
+    ) -> Result<(), anyhow::Error> {
+        let _guard = server.bandwidth_lock.lock().await;
+        let limits = server.configuration.read().await.build.bandwidth;
+
+        match crate::server::bandwidth::apply(app_config, docker, container_id, limits).await {
+            Err(err) if !limits.is_limited() => {
+                tracing::warn!(server = %server.uuid, "failed to clear bandwidth limits: {err:#}");
+
+                Ok(())
+            }
+            result => result,
         }
     }
 
@@ -2527,6 +2551,14 @@ impl super::ProcessHandle for DockerProcessHandle {
             .apply_cfs_burst(&self.container_id, &self.app_config)
             .await;
 
+        if self.shape_bandwidth
+            && let Err(err) =
+                Self::apply_bandwidth(&self.docker, &self.app_config, &self.container_id, &server)
+                    .await
+        {
+            tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
+        }
+
         Ok(())
     }
 
@@ -2536,6 +2568,19 @@ impl super::ProcessHandle for DockerProcessHandle {
             .await?;
 
         if let Ok(server) = self.get_server() {
+            if self.shape_bandwidth
+                && let Err(err) = Self::apply_bandwidth(
+                    &self.docker,
+                    &self.app_config,
+                    &self.container_id,
+                    &server,
+                )
+                .await
+            {
+                self.kill().await.ok();
+                return Err(err.context("failed to apply bandwidth limits"));
+            }
+
             Self::sync_firewall(
                 &self.docker,
                 &*self.firewall,
@@ -2835,6 +2880,14 @@ impl super::ServerExecutor for DockerExecutor {
             }
         }
 
+        let bandwidth = server.configuration.read().await.build.bandwidth;
+        if self.app_config.load().docker.bandwidth.enabled
+            && bandwidth.is_limited()
+            && let Err(err) = crate::server::bandwidth::ready(&self.app_config).await
+        {
+            return Err(err.context("failed to apply bandwidth limits"));
+        }
+
         let container = self
             .docker
             .create_container(
@@ -2856,6 +2909,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
+                true,
                 true,
                 true,
             )
@@ -2890,6 +2944,17 @@ impl super::ServerExecutor for DockerExecutor {
             .apply_cfs_burst(&container_id, &self.app_config)
             .await;
 
+        if let Err(err) = DockerProcessHandle::apply_bandwidth(
+            &self.docker,
+            &self.app_config,
+            &container_id,
+            server,
+        )
+        .await
+        {
+            tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
+        }
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             DockerProcessHandle::new(
@@ -2900,6 +2965,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
+                true,
                 true,
                 true,
             )
@@ -3069,6 +3135,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                false,
             )
             .await?,
         );
@@ -3104,6 +3171,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                false,
             )
             .await?,
         );
@@ -3233,6 +3301,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.firewall),
                 Arc::clone(&self.stats_sampler),
                 status_tx,
+                false,
                 false,
                 false,
             )

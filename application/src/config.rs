@@ -551,6 +551,9 @@ fn docker_numa_memory_binding() -> bool {
 fn docker_cpu_period() -> u64 {
     100000
 }
+fn docker_bandwidth_enabled() -> bool {
+    true
+}
 fn docker_cfs_burst_enabled() -> bool {
     true
 }
@@ -1243,6 +1246,13 @@ nestify::nest! {
                 pub source_file_max_entries: u64,
                 #[serde(default = "docker_firewall_source_file_max_bytes")]
                 pub source_file_max_bytes: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub bandwidth: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerBandwidth {
+                #[serde(default = "docker_bandwidth_enabled")]
+                pub enabled: bool,
             },
 
             #[serde(default)]
