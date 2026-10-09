@@ -808,27 +808,25 @@ impl ServerConfiguration {
         let mut environment = self.environment.clone();
         environment.reserve(5);
 
-        environment.insert(
-            "TZ".into(),
+        environment.entry("TZ".into()).or_insert_with(|| {
             serde_json::Value::String(self.container.timezone.as_ref().map_or_else(
                 || config.load().system.timezone.to_string(),
                 |tz| tz.to_string(),
-            )),
-        );
-        environment.insert(
-            "STARTUP".into(),
-            serde_json::Value::String(self.invocation.to_string()),
-        );
-        environment.insert(
-            "SERVER_MEMORY".into(),
-            serde_json::Value::from(self.build.memory_limit),
-        );
+            ))
+        });
+        environment
+            .entry("STARTUP".into())
+            .or_insert_with(|| serde_json::Value::String(self.invocation.to_string()));
+        environment
+            .entry("SERVER_MEMORY".into())
+            .or_insert_with(|| serde_json::Value::from(self.build.memory_limit));
         if let Some(default) = &self.allocations.default {
-            environment.insert(
-                "SERVER_IP".into(),
-                serde_json::Value::String(default.ip.to_string()),
-            );
-            environment.insert("SERVER_PORT".into(), serde_json::Value::from(default.port));
+            environment
+                .entry("SERVER_IP".into())
+                .or_insert_with(|| serde_json::Value::String(default.ip.to_string()));
+            environment
+                .entry("SERVER_PORT".into())
+                .or_insert_with(|| serde_json::Value::from(default.port));
         }
 
         environment
