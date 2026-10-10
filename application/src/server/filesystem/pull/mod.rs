@@ -18,6 +18,8 @@ use crate::net::{host_to_ip, is_blocked_ip};
 
 const MAX_REDIRECTS: usize = 10;
 
+mod parallel;
+
 static DOWNLOAD_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 fn blocked_cidrs(config: &crate::config::InnerConfig) -> &Vec<cidr::IpCidr> {
@@ -136,6 +138,7 @@ impl PullQueryResponse {
 pub struct Download {
     pub progress: Arc<AtomicU64>,
     pub total: u64,
+    pub accept_ranges: bool,
     pub destination: PathBuf,
     pub server: crate::server::Server,
     pub filesystem: Arc<dyn VirtualWritableFilesystem>,
@@ -227,8 +230,11 @@ impl Download {
             return Err(anyhow::anyhow!("file not found"));
         }
 
+        let accept_ranges = parallel::server_supports_ranges(response.headers());
+
         Ok(Self {
             progress: Arc::new(AtomicU64::new(0)),
+            accept_ranges,
             total: response.content_length().unwrap_or_else(|| {
                 response
                     .headers()
@@ -262,6 +268,16 @@ impl Download {
             .take()
             .ok_or_else(|| anyhow::anyhow!("response already taken"))?;
 
+        let self_accept_ranges = self.accept_ranges;
+        let self_total = self.total;
+
+        let parallel_ctx = ParallelContext {
+            config: Arc::clone(&server.app_state.config),
+            url: response.url().clone(),
+            progress: Arc::clone(&progress),
+            total: self_total,
+        };
+
         let (identifier, task) = self
             .server
             .filesystem
@@ -275,6 +291,17 @@ impl Download {
                 },
                 async move {
                     let mut run_inner = async || -> Result<(), anyhow::Error> {
+                        // Large pulls from range-supporting servers go out as
+                        // parallel ranged segments; everything else keeps the
+                        // simple sequential path.
+                        if self_accept_ranges && self_total >= parallel::MIN_PARALLEL_SIZE {
+                            return download_parallel(
+                                &parallel_ctx,
+                                &destination,
+                            )
+                            .await;
+                        }
+
                         let mut writer = filesystem.async_create_file(&destination).await?;
 
                         while let Some(chunk) =
@@ -313,5 +340,104 @@ impl Download {
             .await?;
 
         Ok((identifier, task))
+    }
+}
+
+
+/// Everything `download_parallel` needs that isn't derivable inside it.
+struct ParallelContext {
+    config: Arc<crate::config::Config>,
+    url: reqwest::Url,
+    progress: Arc<AtomicU64>,
+    total: u64,
+}
+
+/// Download a file as parallel ranged segments, then concatenate the parts in
+/// order into `destination`. Progress feeds the same counter the operations
+/// system tracks so panel UIs need no changes. Any segment failure aborts the
+/// whole pull (parts are cleaned up); the route caller may retry sequentially.
+#[allow(clippy::too_many_arguments)]
+async fn download_parallel(
+    ctx: &ParallelContext,
+    destination: &Path,
+) -> Result<(), anyhow::Error> {
+    let client = get_download_client(&ctx.config)?;
+    let count = parallel::segment_count_for(ctx.total);
+    let segments = parallel::plan_segments(ctx.total, count);
+
+    let mut part_paths: Vec<PathBuf> = Vec::with_capacity(segments.len());
+    for (i, _seg) in segments.iter().enumerate() {
+        let mut name = destination.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".part{}", i));
+        part_paths.push(destination.with_file_name(name));
+    }
+
+    let mut handles = Vec::with_capacity(segments.len());
+    for ((i, seg), part) in segments.iter().enumerate().zip(part_paths.iter()) {
+        let client = Arc::clone(&client);
+        let url = ctx.url.clone();
+        let progress = Arc::clone(&ctx.progress);
+        let part = part.clone();
+        let seg = parallel::Segment { start: seg.start, end: seg.end };
+
+        handles.push(tokio::spawn(async move {
+            parallel::download_segment(&client, &url, &seg, &part, &progress)
+                .await
+                .map(|r| (i, r.bytes))
+        }));
+    }
+
+    let mut bytes_written = 0u64;
+    let results = futures::future::join_all(handles).await;
+    for result in results {
+        match result {
+            Ok(Ok((_, bytes))) => bytes_written += bytes,
+            Ok(Err(err)) => {
+                cleanup_parts(&part_paths).await;
+                return Err(anyhow::anyhow!("parallel pull segment failed: {:#}", err));
+            }
+            Err(join_err) => {
+                cleanup_parts(&part_paths).await;
+                return Err(anyhow::anyhow!("parallel pull task failed: {join_err}"));
+            }
+        }
+    }
+
+    // Concatenate parts in order into the destination.
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut writer = tokio::fs::File::create(destination)
+        .await
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    for part in &part_paths {
+        let data = tokio::fs::read(part)
+            .await
+            .with_context(|| format!("failed to read segment {}", part.display()))?;
+        writer.write_all(&data).await?;
+    }
+    writer.flush().await?;
+    writer.shutdown().await?;
+
+    // Verify total bytes match the expected content length before declaring success.
+    if ctx.total > 0 && bytes_written != ctx.total {
+        cleanup_parts(&part_paths).await;
+        anyhow::bail!(
+            "parallel pull size mismatch: got {} bytes, expected {}",
+            bytes_written,
+            ctx.total
+        );
+    }
+
+    cleanup_parts(&part_paths).await;
+    Ok(())
+}
+
+async fn cleanup_parts(parts: &[PathBuf]) {
+    for part in parts {
+        let _ = tokio::fs::remove_file(part).await;
     }
 }
