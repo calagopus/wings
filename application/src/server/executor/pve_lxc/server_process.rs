@@ -19,6 +19,10 @@ pub(super) struct PveProcessHandle {
 
 impl PveProcessHandle {
     const EXIT_STATUS_FILE: &'static str = ".wings-exit-status";
+    // PVE's host-managed DHCP can lag CT init by several minutes during
+    // replacement starts. Keep the entrypoint alive for four real minutes.
+    pub(super) const DHCP_ROUTE_WAIT_INTERVAL_MILLIS: u32 = 250;
+    pub(super) const DHCP_ROUTE_WAIT_ATTEMPTS: u32 = 1920;
 
     pub(super) fn observed_status(
         status: cli::ContainerStatus,
@@ -818,14 +822,14 @@ impl PveProcessHandle {
                 stage_directory.join(Self::managed_file_stage_name(entrypoint_target)?);
             let entrypoint_script = r#"#!/bin/sh
 attempt=0
-while [ "$attempt" -lt 480 ]; do
+while [ "$attempt" -lt __WINGS_DHCP_WAIT_ATTEMPTS__ ]; do
     if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
         break
     fi
     attempt=$((attempt + 1))
     sleep 0.25
 done
-if [ "$attempt" -ge 480 ]; then
+if [ "$attempt" -ge __WINGS_DHCP_WAIT_ATTEMPTS__ ]; then
     echo 'timed out waiting for Proxmox DHCP' >&2
     exit 1
 fi
@@ -890,6 +894,10 @@ temporary="${marker}.tmp.$$"
 mv -f "$temporary" "$marker"
 exit "$status"
 "#
+            .replace(
+                "__WINGS_DHCP_WAIT_ATTEMPTS__",
+                &Self::DHCP_ROUTE_WAIT_ATTEMPTS.to_string(),
+            )
             .replace(
                 "__WINGS_EXIT_STATUS_PATH__",
                 &format!(

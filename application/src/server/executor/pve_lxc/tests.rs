@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn dhcp_route_wait_allows_the_configured_four_minutes() {
+    assert_eq!(PveProcessHandle::DHCP_ROUTE_WAIT_INTERVAL_MILLIS, 250);
+    assert_eq!(PveProcessHandle::DHCP_ROUTE_WAIT_ATTEMPTS, 1920);
+    assert_eq!(
+        u64::from(PveProcessHandle::DHCP_ROUTE_WAIT_INTERVAL_MILLIS)
+            * u64::from(PveProcessHandle::DHCP_ROUTE_WAIT_ATTEMPTS),
+        480_000
+    );
+}
+
+#[test]
 fn successful_start_followed_by_first_stopped_probe_emits_stopped() {
     let mut seen_running = false;
     let status = PveProcessHandle::observed_status(

@@ -1,5 +1,21 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_runner_captures_stdout_and_stderr_after_spawn() {
+    let args = vec![
+        "-c".to_string(),
+        "printf stdout-value; printf stderr-value >&2".to_string(),
+    ];
+
+    let output = PveCli::run(std::path::Path::new("/bin/sh"), &args)
+        .await
+        .expect("command should succeed");
+
+    assert_eq!(output.stdout, b"stdout-value");
+    assert_eq!(output.stderr, b"stderr-value");
+}
+
 #[test]
 fn create_arguments_leave_data_mount_for_post_create_configuration() {
     let args = PveCli::create_args(&CreateContainerSpec {

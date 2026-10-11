@@ -424,13 +424,66 @@ impl PveCli {
         Ok(Some(1 + (u64::from(weight) - 10) * 9999 / 990))
     }
 
+    #[cfg(target_os = "linux")]
+    fn isolate_command_process_group(command: &mut tokio::process::Command) {
+        use std::os::unix::process::CommandExt;
+
+        // Proxmox's `pct` client starts a task subprocess. `kill_on_drop` only
+        // kills the direct client, which used to leave its task child holding
+        // pve-config-<vmid>.lock after a Wings timeout or restart. A dedicated
+        // session makes the client's PID the process-group leader so timeout
+        // cleanup can terminate the complete task tree.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn terminate_command_process_group(pid: u32) {
+        use rustix::process::{Pid, Signal, kill_process_group};
+
+        let Some(group) = Pid::from_raw(pid as i32) else {
+            return;
+        };
+        let _ = kill_process_group(group, Signal::TERM);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+
     async fn run(program: &std::path::Path, args: &[String]) -> Result<Output, anyhow::Error> {
         let mut command = tokio::process::Command::new(program);
-        command.args(args).kill_on_drop(true);
-        let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
-            .await
-            .with_context(|| format!("timed out executing {}", program.display()))?
+        // `wait_with_output` only captures streams explicitly piped before
+        // `spawn`; unlike `Command::output`, bare `spawn` inherits them.
+        // PVE commands emit JSON on stdout, which must not leak to journald
+        // or be lost before the caller parses it.
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        Self::isolate_command_process_group(&mut command);
+
+        let child = command
+            .spawn()
             .with_context(|| format!("failed to execute {}", program.display()))?;
+        let pid = child.id();
+        let output = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
+            Ok(result) => {
+                result.with_context(|| format!("failed to execute {}", program.display()))?
+            }
+            Err(_) => {
+                #[cfg(target_os = "linux")]
+                if let Some(pid) = pid {
+                    Self::terminate_command_process_group(pid).await;
+                }
+                return Err(anyhow::anyhow!("timed out executing {}", program.display()));
+            }
+        };
 
         if output.status.success() {
             return Ok(output);
