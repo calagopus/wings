@@ -828,7 +828,12 @@ impl PveCli {
             .to_string())
     }
 
-    pub async fn next_vmid(&self) -> Result<u32, anyhow::Error> {
+    pub async fn next_vmid(&self, min_vmid: u32) -> Result<u32, anyhow::Error> {
+        if !(100..=999_999_999).contains(&min_vmid) {
+            anyhow::bail!(
+                "Proxmox minimum VMID must be between 100 and 999999999, got {min_vmid}"
+            );
+        }
         let args = vec![
             "get".to_string(),
             "/cluster/nextid".to_string(),
@@ -842,7 +847,77 @@ impl PveCli {
             .as_u64()
             .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
             .context("Proxmox nextid response was not a VMID")?;
-        u32::try_from(raw).context("Proxmox nextid response exceeded the VMID range")
+        let raw = u32::try_from(raw).context("Proxmox nextid response exceeded the VMID range")?;
+        if raw >= min_vmid {
+            return Ok(raw);
+        }
+
+        // `/cluster/nextid` tracks the lowest free ID cluster-wide, which can
+        // sit below the Wings floor. Scan for the first free ID at or above
+        // the floor instead of squatting a low ID reserved for infrastructure.
+        // VMIDs are shared across QEMU and LXC guests, so every `vmid` in the
+        // inventory counts, not just LXC rows.
+        let used = self.allocated_vmids().await?;
+        Self::first_free_vmid_at_or_above(min_vmid, &used).with_context(|| {
+            format!("Proxmox VMID range above the minimum {min_vmid} is exhausted")
+        })
+    }
+
+    fn first_free_vmid_at_or_above(
+        min_vmid: u32,
+        used: &std::collections::HashSet<u32>,
+    ) -> Option<u32> {
+        let mut sorted: Vec<u32> = used.iter().copied().filter(|id| *id >= min_vmid).collect();
+        sorted.sort_unstable();
+        let mut candidate = min_vmid;
+        for id in sorted {
+            if id == candidate {
+                candidate = candidate.checked_add(1)?;
+            } else if id > candidate {
+                break;
+            }
+            if candidate > 999_999_999 {
+                return None;
+            }
+        }
+        (candidate <= 999_999_999).then_some(candidate)
+    }
+
+    /// Every VMID in use cluster-wide, across all guest types. VMIDs are a
+    /// single shared namespace in Proxmox, so a QEMU VM squats the ID for LXC
+    /// too.
+    async fn allocated_vmids(&self) -> Result<std::collections::HashSet<u32>, anyhow::Error> {
+        let args = vec![
+            "get".to_string(),
+            "/cluster/resources".to_string(),
+            "--type".to_string(),
+            "vm".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ];
+        let output = Self::run(&self.pvesh_path, &args).await?;
+        Self::parse_allocated_vmids(&output.stdout)
+    }
+
+    fn parse_allocated_vmids(
+        output: &[u8],
+    ) -> Result<std::collections::HashSet<u32>, anyhow::Error> {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(output)
+            .context("failed to parse Proxmox cluster resources response")?;
+        let mut used = std::collections::HashSet::new();
+        for row in rows {
+            let Some(raw) = row.get("vmid").and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            }) else {
+                continue;
+            };
+            if let Ok(vmid) = u32::try_from(raw) {
+                used.insert(vmid);
+            }
+        }
+        Ok(used)
     }
 
     /// Serialize the advisory `nextid` lookup and the following create on this

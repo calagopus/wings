@@ -54,6 +54,21 @@ if [[ ! "$vmid" =~ ^[0-9]+$ || "$vmid" -le 0 ]]; then
   echo "error: Proxmox returned an invalid next VMID: ${vmid:-empty}" >&2
   exit 1
 fi
+# Mirror runtime.pve_lxc.min_vmid so the disposable CT does not squat a low
+# ID reserved for infrastructure. Override with MIN_VMID=100 to test the floor.
+min_vmid="${MIN_VMID:-200}"
+if [[ ! "$min_vmid" =~ ^[0-9]+$ || "$min_vmid" -lt 100 ]]; then
+  echo "error: MIN_VMID must be a VMID at or above 100, got ${min_vmid:-empty}" >&2
+  exit 1
+fi
+if [[ "$vmid" -lt "$min_vmid" ]]; then
+  used_vmids="$(pvesh get /cluster/resources --type vm --output-format json | perl -ne 'while (/\"vmid\"\s*:\s*\"?(\d+)\"?/g) { print "$1\n" }' | sort -n -u)"
+  candidate="$min_vmid"
+  while printf '%s\n' "$used_vmids" | grep -qx "$candidate"; do
+    candidate=$((candidate + 1))
+  done
+  vmid="$candidate"
+fi
 server_uuid="$(cat /proc/sys/kernel/random/uuid)"
 run_tag="calagopus-smoke"
 server_tag="calagopus-server-${server_uuid}"
