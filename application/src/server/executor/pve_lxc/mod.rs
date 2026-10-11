@@ -1818,9 +1818,10 @@ exit 1
             final_tags.clone()
         };
         let mut created = None;
+        let min_vmid = self.app_config.load().runtime.pve_lxc.min_vmid;
         for _ in 0..3 {
             let _vmid_lock = self.cli.lock_vmid_allocation().await?;
-            let vmid = self.cli.next_vmid().await?;
+            let vmid = self.cli.next_vmid(min_vmid).await?;
             let create = cli::CreateContainerSpec {
                 vmid,
                 template: template.volid.clone(),
@@ -1911,11 +1912,13 @@ impl ServerExecutor for PveLxcExecutor {
             .await
             .context("failed to initialize Proxmox LXC host firewall")?;
 
-        let next_vmid = self.cli.next_vmid().await?;
+        let min_vmid = self.app_config.load().runtime.pve_lxc.min_vmid;
+        let next_vmid = self.cli.next_vmid(min_vmid).await?;
         tracing::info!(
             pve_version = %raw_version,
             node = %node,
             next_vmid,
+            min_vmid,
             "Proxmox VE LXC runtime is available"
         );
 
@@ -2294,9 +2297,10 @@ impl ServerExecutor for PveLxcExecutor {
         })?;
 
         let mut created_vmid = None;
+        let min_vmid = self.app_config.load().runtime.pve_lxc.min_vmid;
         for _ in 0..3 {
             let _vmid_lock = self.cli.lock_vmid_allocation().await?;
-            let vmid = self.cli.next_vmid().await?;
+            let vmid = self.cli.next_vmid(min_vmid).await?;
             match self
                 .create_helper_container(
                     server,
@@ -2466,9 +2470,10 @@ impl ServerExecutor for PveLxcExecutor {
         }
 
         let mut created_vmid = None;
+        let min_vmid = self.app_config.load().runtime.pve_lxc.min_vmid;
         for _ in 0..3 {
             let _vmid_lock = self.cli.lock_vmid_allocation().await?;
-            let vmid = self.cli.next_vmid().await?;
+            let vmid = self.cli.next_vmid(min_vmid).await?;
             match self
                 .create_helper_container(
                     server,
