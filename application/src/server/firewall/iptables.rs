@@ -775,6 +775,7 @@ mod tests {
     fn rules() -> BTreeMap<uuid::Uuid, Vec<ConcreteRule>> {
         let spec = FirewallServerSpec {
             server: uuid::Uuid::from_str("abcdef12-3456-7890-abcd-ef1234567890").unwrap(),
+            target: None,
             bindings: vec![
                 FirewallBinding {
                     ip: Some("192.168.1.5".parse().unwrap()),

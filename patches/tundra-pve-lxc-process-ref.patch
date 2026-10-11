@@ -1,0 +1,169 @@
+From 14667f635b0fcf263d2de44f03d92fae6e7bf9e6 Mon Sep 17 00:00:00 2001
+From: Philip Ulrich <philip@ulrich.life>
+Date: Tue, 29 Sep 2026 10:53:42 -0400
+Subject: [PATCH] support process-backed containers in tundra node
+
+---
+ tundra-node/build.rs           |  2 ++
+ tundra-node/src/main.rs        |  2 +-
+ tundra-node/src/node/docker.rs | 60 ++++++++++++++++++++++++++++++++++
+ tundra-node/src/node/mod.rs    | 18 +++++++---
+ tundra-node/src/metrics.rs     |  1 +
+ 5 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/tundra-node/build.rs b/tundra-node/build.rs
+index 729a5c7..514bc95 100644
+--- a/tundra-node/build.rs
++++ b/tundra-node/build.rs
+@@ -46,6 +46,8 @@ fn handle_git_info() {
+         {
+             git_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+         }
++    } else {
++        println!("cargo:rustc-env=CARGO_GIT_BRANCH=unknown");
+     }
+     println!("cargo:rustc-env=CARGO_GIT_COMMIT={git_hash}");
+ }
+diff --git a/tundra-node/src/main.rs b/tundra-node/src/main.rs
+index 4d64e8e..24bfd67 100644
+--- a/tundra-node/src/main.rs
++++ b/tundra-node/src/main.rs
+@@ -108,7 +108,7 @@ async fn main() -> Result<(), anyhow::Error> {
+         Ok(d) => Some(d),
+         Err(err) => {
+             tracing::warn!(
+-                "docker is unavailable, no containers will be adopted: {:?}",
++                "docker is unavailable; Docker container references cannot be adopted, but process-backed references remain available: {:?}",
+                 err
+             );
+             None
+diff --git a/tundra-node/src/node/docker.rs b/tundra-node/src/node/docker.rs
+index 3054d12..7917fca 100644
+--- a/tundra-node/src/node/docker.rs
++++ b/tundra-node/src/node/docker.rs
+@@ -6,6 +6,8 @@ use bollard::{
+ use futures::{Stream, StreamExt};
+ use std::{collections::HashMap, net::Ipv4Addr, path::PathBuf, pin::Pin};
+ 
++pub const PROCESS_REF_PREFIX: &str = "pid:";
++
+ fn classify(msg: bollard::models::EventMessage) -> Option<ContainerEvent> {
+     let actor = msg.actor?;
+     let id = actor.id?;
+@@ -52,6 +54,48 @@ pub struct ContainerInfo {
+     pub hosts_path: PathBuf,
+ }
+ 
++impl ContainerInfo {
++    /// Adopt a container described by its init PID instead of a Docker object.
++    /// Wings uses this for runtimes such as Proxmox LXC.
++    pub fn from_process_ref(
++        container_ref: &str,
++        dial_addr: Option<&str>,
++    ) -> Result<Option<Self>, anyhow::Error> {
++        let Some(raw_pid) = container_ref.strip_prefix(PROCESS_REF_PREFIX) else {
++            return Ok(None);
++        };
++        let pid: i32 = raw_pid.parse().context(format!(
++            "invalid process container reference {container_ref}"
++        ))?;
++        if pid <= 0 {
++            return Err(anyhow::anyhow!(
++                "process container reference {container_ref} has an invalid PID"
++            ));
++        }
++
++        let running = PathBuf::from(format!("/proc/{pid}/ns/net")).exists();
++        let ip = dial_addr.and_then(|dial| {
++            dial.parse::<std::net::SocketAddr>()
++                .map(|address| address.ip())
++                .or_else(|_| dial.parse::<std::net::IpAddr>())
++                .ok()
++                .and_then(|address| match address {
++                    std::net::IpAddr::V4(address) => Some(address),
++                    std::net::IpAddr::V6(_) => None,
++                })
++        });
++
++        Ok(Some(Self {
++            id: container_ref.to_owned(),
++            pid,
++            running,
++            ip,
++            // Process-backed runtimes configure a control-plane hosts template.
++            hosts_path: PathBuf::new(),
++        }))
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ContainerEvent {
+     Started { id: String, name: Option<String> },
+@@ -136,6 +180,22 @@ mod tests {
+     use super::*;
+     use bollard::models::{EndpointSettings, EventActor, EventMessage};
+ 
++    #[test]
++    fn process_references_are_runtime_neutral() {
++        let reference = format!("pid:{}", std::process::id());
++        let info = ContainerInfo::from_process_ref(&reference, Some("10.70.0.58:25565"))
++            .unwrap()
++            .unwrap();
++        assert!(info.running);
++        assert_eq!(info.pid, std::process::id() as i32);
++        assert_eq!(info.ip, Some(Ipv4Addr::new(10, 70, 0, 58)));
++        assert!(
++            ContainerInfo::from_process_ref("docker-id", None)
++                .unwrap()
++                .is_none()
++        );
++    }
++
+     fn endpoint(ip: &str) -> EndpointSettings {
+         EndpointSettings {
+             ip_address: Some(ip.to_owned()),
+diff --git a/tundra-node/src/node/mod.rs b/tundra-node/src/node/mod.rs
+index 56f4f35..d737afb 100644
+--- a/tundra-node/src/node/mod.rs
++++ b/tundra-node/src/node/mod.rs
+@@ -387,17 +387,25 @@ impl Node {
+     }
+ 
+     pub async fn refresh_containers(&self, index: &SnapshotIndex) {
+-        let Some(docker) = &self.docker else {
+-            return;
+-        };
+-
+         let mut found = HashMap::new();
+         for server in index.servers_on(&self.uuid) {
+             let Some(entry) = index.server(server) else {
+                 continue;
+             };
+ 
+-            match docker.inspect(&entry.container_ref).await {
++            let inspected = match docker::ContainerInfo::from_process_ref(
++                &entry.container_ref,
++                entry.dial_addr.as_deref(),
++            ) {
++                Ok(Some(info)) => Ok(info),
++                Ok(None) => match &self.docker {
++                    Some(docker) => docker.inspect(&entry.container_ref).await,
++                    None => continue,
++                },
++                Err(err) => Err(err),
++            };
++
++            match inspected {
+                 Ok(info) if info.running => {
+                     found.insert(*server, info);
+                 }
+diff --git a/tundra-node/src/metrics.rs b/tundra-node/src/metrics.rs
+--- a/tundra-node/src/metrics.rs
++++ b/tundra-node/src/metrics.rs
+@@ -284,3 +284,4 @@ impl Metrics {
+         json!({
+             "applied": self.applied,
++            "capabilities": ["process_container_refs"],
+             "node": {
+-- 
+2.50.1 (Apple Git-155)

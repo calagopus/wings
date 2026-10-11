@@ -133,11 +133,19 @@ pub struct FirewallBinding {
 
 pub struct FirewallServerSpec {
     pub server: uuid::Uuid,
+    /// Runtime-specific destination for backends which attach policy to a
+    /// workload instead of the host forwarding path.
+    pub target: Option<FirewallTarget>,
     pub bindings: Vec<FirewallBinding>,
     pub container_ports: Vec<u16>,
     pub container_ips: Vec<IpAddr>,
     pub rules: Vec<FirewallRule>,
     pub files: Option<sets::FirewallFileAccess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirewallTarget {
+    ProxmoxLxc { vmid: u32, interface: String },
 }
 
 impl FirewallServerSpec {
@@ -299,6 +307,99 @@ pub trait FirewallBackend: Send + Sync {
     async fn clear(&self, server: uuid::Uuid) -> Result<(), anyhow::Error>;
 
     async fn reconcile(&self, specs: &[FirewallServerSpec]) -> Result<(), anyhow::Error>;
+}
+
+pub async fn create_host_local_with(
+    backend: FirewallBackendKind,
+    limits: sets::SourceFileLimits,
+) -> Arc<dyn FirewallBackend> {
+    if backend == FirewallBackendKind::Disabled {
+        return Arc::new(noop::NoopFirewall::new(false));
+    }
+
+    if !cfg!(target_os = "linux") {
+        if backend != FirewallBackendKind::Auto {
+            tracing::warn!(
+                "docker.firewall.backend is set to {:?}, but host-local server firewalls are only supported on linux",
+                backend
+            );
+        }
+
+        return Arc::new(noop::NoopFirewall::new(true));
+    }
+
+    if std::path::Path::new("/.dockerenv").exists() || std::env::var("OCI_CONTAINER").is_ok() {
+        tracing::warn!(
+            "host-local server firewalls require Wings to run in the host network namespace; containerized Wings is not supported for this runtime"
+        );
+
+        return Arc::new(noop::NoopFirewall::new(true));
+    }
+
+    let runner = CommandRunner::Local;
+    match backend {
+        FirewallBackendKind::Nftables => {
+            warn_bridge_nf(&runner).await;
+            Arc::new(nftables::NftablesFirewall::new(Vec::new(), runner, limits))
+        }
+        FirewallBackendKind::Iptables => {
+            warn_bridge_nf(&runner).await;
+            Arc::new(iptables::IptablesFirewall::new(Vec::new(), runner, limits).await)
+        }
+        FirewallBackendKind::Container => {
+            tracing::warn!(
+                "the container firewall backend is only available with the Docker runtime; host-local server firewall rules will not be applied"
+            );
+            Arc::new(noop::NoopFirewall::new(true))
+        }
+        FirewallBackendKind::Auto => {
+            if runner
+                .run(
+                    "nft",
+                    &["--check", "-f", "-"],
+                    Some(b"add table inet wings\n"),
+                )
+                .await
+                .is_ok()
+            {
+                tracing::info!("using nftables host-local server firewall backend");
+                warn_bridge_nf(&runner).await;
+
+                Arc::new(nftables::NftablesFirewall::new(Vec::new(), runner, limits))
+            } else if runner
+                .run("iptables", &["-w", "-S", "FORWARD"], None)
+                .await
+                .is_ok()
+            {
+                tracing::info!("using iptables host-local server firewall backend");
+                warn_bridge_nf(&runner).await;
+
+                Arc::new(iptables::IptablesFirewall::new(Vec::new(), runner, limits).await)
+            } else {
+                tracing::warn!(
+                    "neither nftables nor iptables are usable on this host, host-local server firewall rules will not be applied"
+                );
+
+                Arc::new(noop::NoopFirewall::new(true))
+            }
+        }
+        FirewallBackendKind::Disabled => Arc::new(noop::NoopFirewall::new(false)),
+    }
+}
+
+/// Removes Wings-owned host firewall state after another backend has committed
+/// its replacement policy. Both host implementations are checked because the
+/// previously selected `auto` backend may differ from the one usable now.
+pub async fn clear_host_local(limits: sets::SourceFileLimits) {
+    let nftables = nftables::NftablesFirewall::new(Vec::new(), CommandRunner::Local, limits);
+    if let Err(error) = nftables.reconcile(&[]).await {
+        tracing::debug!("failed to clear stale Wings nftables policy: {error:#}");
+    }
+
+    let iptables = iptables::IptablesFirewall::new(Vec::new(), CommandRunner::Local, limits).await;
+    if let Err(error) = iptables.reconcile(&[]).await {
+        tracing::debug!("failed to clear stale Wings iptables policy: {error:#}");
+    }
 }
 
 pub async fn create(
@@ -681,6 +782,7 @@ mod tests {
     fn spec(bindings: Vec<FirewallBinding>, rules: Vec<FirewallRule>) -> FirewallServerSpec {
         FirewallServerSpec {
             server: uuid::Uuid::new_v4(),
+            target: None,
             bindings,
             container_ports: Vec::new(),
             container_ips: Vec::new(),
