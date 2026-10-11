@@ -8,7 +8,7 @@ edition = "2024"
 tempfile = "3.27.0"
 unrar = { path = "../unrar-rs" }
 pbs-client = { path = "../pbs-client" }
-tundra-common = { git = "https://github.com/calagopus/tundra.git", rev = "ccb05e1406232f8c39f05a984133277026cd79d6" }
+tundra-common = { git = "https://github.com/calagopus/tundra.git" }
 tracing = { version = "0.1.41", features = ["max_level_debug"] }
 tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 tracing-appender = "0.2.3"
