@@ -193,10 +193,25 @@ pub struct PveLxcExecutor {
     firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
     stats_sampler: Arc<super::cgroup::StatsSampler>,
     node: OnceLock<String>,
-    template_provisioning: tokio::sync::Mutex<()>,
+    template_provisioning: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl PveLxcExecutor {
+    const DATA_MOUNT_TARGET: &'static str = "/home/container";
+
+    pub(super) fn pids_limit(config: &crate::config::Config) -> Option<u64> {
+        let config = config.load();
+        match config
+            .runtime
+            .pve_lxc
+            .pids_limit
+            .unwrap_or(config.docker.container_pid_limit)
+        {
+            0 => None,
+            limit => Some(limit),
+        }
+    }
+
     fn image_cache_max_age(config: &crate::config::InnerConfig) -> std::time::Duration {
         let cache = config.docker.registry_image_fetch_cache;
         if cache.enabled {
@@ -204,6 +219,23 @@ impl PveLxcExecutor {
         } else {
             std::time::Duration::ZERO
         }
+    }
+
+    async fn template_provisioning_lock(
+        &self,
+        node: &str,
+        storage: &str,
+        image: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{node}\0{storage}\0{image}");
+        let mut locks = self.template_provisioning.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     fn network_option(
@@ -321,7 +353,7 @@ impl PveLxcExecutor {
             firewall,
             stats_sampler: Arc::new(super::cgroup::StatsSampler::default()),
             node: OnceLock::new(),
-            template_provisioning: tokio::sync::Mutex::new(()),
+            template_provisioning: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -862,27 +894,38 @@ impl PveLxcExecutor {
 
     fn edge_forwarding_config(
         app_config: &crate::config::Config,
-    ) -> Result<Option<(String, String, String)>, anyhow::Error> {
+    ) -> Result<Option<(String, String, String, String)>, anyhow::Error> {
         let config = app_config.load();
         let pve = &config.runtime.pve_lxc;
         let interface = pve.edge_wireguard_interface.trim().to_string();
+        let user = pve.edge_ssh_user.trim().to_string();
         let identity_path = pve.edge_ssh_identity_path.trim().to_string();
         let known_hosts_path = pve.edge_known_hosts_path.trim().to_string();
         if identity_path.is_empty() && known_hosts_path.is_empty() {
             return Ok(None);
         }
-        if interface.is_empty() || identity_path.is_empty() || known_hosts_path.is_empty() {
+        if interface.is_empty()
+            || user.is_empty()
+            || identity_path.is_empty()
+            || known_hosts_path.is_empty()
+        {
             return Err(anyhow::anyhow!(
-                "Proxmox edge forwarding requires edge_wireguard_interface, edge_ssh_identity_path, and edge_known_hosts_path"
+                "Proxmox edge forwarding requires edge_wireguard_interface, edge_ssh_user, edge_ssh_identity_path, and edge_known_hosts_path"
             ));
         }
-        Ok(Some((interface, identity_path, known_hosts_path)))
+        if !user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            anyhow::bail!("Proxmox edge SSH user contains unsupported characters: {user}");
+        }
+        Ok(Some((interface, user, identity_path, known_hosts_path)))
     }
 
     async fn validate_edge_forwarding_config(
         app_config: &crate::config::Config,
     ) -> Result<(), anyhow::Error> {
-        let Some((_, identity_path, _)) = Self::edge_forwarding_config(app_config)? else {
+        let Some((_, _, identity_path, _)) = Self::edge_forwarding_config(app_config)? else {
             return Ok(());
         };
         #[cfg(unix)]
@@ -959,6 +1002,7 @@ impl PveLxcExecutor {
 
     async fn edge_ssh(
         host: Ipv4Addr,
+        user: &str,
         identity_path: &str,
         known_hosts_path: &str,
         server: uuid::Uuid,
@@ -980,7 +1024,7 @@ impl PveLxcExecutor {
                 "StrictHostKeyChecking=yes",
                 "-o",
                 &format!("UserKnownHostsFile={known_hosts_path}"),
-                &format!("root@{host}"),
+                &format!("{user}@{host}"),
                 action,
                 &server.to_string(),
             ])
@@ -1025,7 +1069,7 @@ impl PveLxcExecutor {
         public_ip: Option<Ipv4Addr>,
         payload: Option<serde_json::Value>,
     ) -> Result<(), anyhow::Error> {
-        let Some((interface, identity_path, known_hosts_path)) =
+        let Some((interface, user, identity_path, known_hosts_path)) =
             Self::edge_forwarding_config(app_config)?
         else {
             return Ok(());
@@ -1034,6 +1078,7 @@ impl PveLxcExecutor {
         for peer in &peers {
             Self::edge_ssh(
                 peer.tunnel_ip,
+                &user,
                 &identity_path,
                 &known_hosts_path,
                 server,
@@ -1053,6 +1098,7 @@ impl PveLxcExecutor {
                 })?;
             Self::edge_ssh(
                 peer.tunnel_ip,
+                &user,
                 &identity_path,
                 &known_hosts_path,
                 server,
@@ -1158,7 +1204,7 @@ impl PveLxcExecutor {
             let mut mounts = Vec::with_capacity(configured_mounts.len() + 2);
             mounts.push((
                 server.filesystem.get_base_fs_mount_path().await,
-                "/home/container".to_string(),
+                Self::DATA_MOUNT_TARGET.to_string(),
                 false,
             ));
 
@@ -1395,7 +1441,10 @@ impl PveLxcExecutor {
         };
 
         let template = {
-            let _template = self.template_provisioning.lock().await;
+            let template_lock = self
+                .template_provisioning_lock(&node, &template_storage, &image)
+                .await;
+            let _template = template_lock.lock().await;
             self.cli
                 .ensure_oci_template(&node, &template_storage, &image, image_cache_max_age)
                 .await?
@@ -1503,10 +1552,7 @@ exit 1
         let (pids_limit, io_weight) = {
             let configuration = server.configuration.read().await;
             (
-                match self.app_config.load().docker.container_pid_limit {
-                    0 => None,
-                    limit => Some(limit),
-                },
+                Self::pids_limit(&self.app_config),
                 PveCli::cgroup2_io_weight(configuration.build.io_weight)?,
             )
         };
@@ -1516,7 +1562,7 @@ exit 1
             halt_signal: None,
             init_command: Some(init_command),
             console_logfile: Some(log_path.to_string()),
-            cpuset_cpus: None,
+            cpuset_cpus: resources.cpuset_cpus.clone(),
             pids_limit,
             io_weight,
             memory_unlimited: resources.memory_unlimited,
@@ -1619,7 +1665,10 @@ exit 1
         };
 
         let template = {
-            let _template = self.template_provisioning.lock().await;
+            let template_lock = self
+                .template_provisioning_lock(&node, &template_storage, &image)
+                .await;
+            let _template = template_lock.lock().await;
             self.cli
                 .ensure_oci_template(&node, &template_storage, &image, image_cache_max_age)
                 .await?
@@ -1770,6 +1819,7 @@ exit 1
         };
         let mut created = None;
         for _ in 0..3 {
+            let _vmid_lock = self.cli.lock_vmid_allocation().await?;
             let vmid = self.cli.next_vmid().await?;
             let create = cli::CreateContainerSpec {
                 vmid,
@@ -1876,37 +1926,46 @@ impl ServerExecutor for PveLxcExecutor {
         &self,
         servers: &[crate::remote::servers::RawServer],
     ) -> Result<(), anyhow::Error> {
+        let node = self
+            .node
+            .get()
+            .context("Proxmox VE LXC runtime has not been booted")?;
+        let tag_prefix = self.app_config.load().runtime.pve_lxc.tag_prefix.clone();
+        let containers = self.cli.list_containers().await?;
         let mut specs = Vec::with_capacity(servers.len());
         for server in servers {
-            let addresses = self
-                .server_addresses(server.settings.uuid)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve Proxmox LXC addresses while reconciling firewall for {}",
-                        server.settings.uuid
-                    )
-                })?;
-            let container = self.server_container(server.settings.uuid).await?;
+            let container =
+                Self::owned_server_container(&containers, node, &tag_prefix, server.settings.uuid)?;
+            let running = container
+                .as_ref()
+                .is_some_and(|container| container.status == Some(cli::ContainerStatus::Running));
+            let addresses = if let Some(container) = container.as_ref().filter(|_| running) {
+                PveCli::container_addresses(
+                    &self
+                        .cli
+                        .interfaces(&container.node, container.vmid)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to resolve Proxmox LXC addresses while reconciling firewall for {}",
+                                server.settings.uuid
+                            )
+                        })?,
+                )
+            } else {
+                Vec::new()
+            };
             let mut spec = Self::firewall_spec(
                 &server.settings,
                 addresses,
                 container.as_ref().map(|container| container.vmid),
             );
 
-            if !server.settings.firewall.is_empty() && spec.container_ips.is_empty() {
-                let running = self
-                    .server_container(server.settings.uuid)
-                    .await?
-                    .is_some_and(|container| {
-                        container.status == Some(cli::ContainerStatus::Running)
-                    });
-                if running {
-                    return Err(anyhow::anyhow!(
-                        "running Proxmox LXC server {} has no usable bridged address; refusing to reconcile configured firewall rules without a destination",
-                        server.settings.uuid
-                    ));
-                }
+            if !server.settings.firewall.is_empty() && spec.container_ips.is_empty() && running {
+                return Err(anyhow::anyhow!(
+                    "running Proxmox LXC server {} has no usable bridged address; refusing to reconcile configured firewall rules without a destination",
+                    server.settings.uuid
+                ));
             }
 
             if spec.references_files() {
@@ -2236,6 +2295,7 @@ impl ServerExecutor for PveLxcExecutor {
 
         let mut created_vmid = None;
         for _ in 0..3 {
+            let _vmid_lock = self.cli.lock_vmid_allocation().await?;
             let vmid = self.cli.next_vmid().await?;
             match self
                 .create_helper_container(
@@ -2243,7 +2303,7 @@ impl ServerExecutor for PveLxcExecutor {
                     script,
                     Self::INSTALLER_HELPER_ROLE,
                     vmid,
-                    resources,
+                    resources.clone(),
                     environment.clone(),
                     &staging_path,
                     "/mnt/install",
@@ -2407,6 +2467,7 @@ impl ServerExecutor for PveLxcExecutor {
 
         let mut created_vmid = None;
         for _ in 0..3 {
+            let _vmid_lock = self.cli.lock_vmid_allocation().await?;
             let vmid = self.cli.next_vmid().await?;
             match self
                 .create_helper_container(
@@ -2414,7 +2475,7 @@ impl ServerExecutor for PveLxcExecutor {
                     script,
                     Self::SCRIPT_HELPER_ROLE,
                     vmid,
-                    resources,
+                    resources.clone(),
                     environment.clone(),
                     &staging_path,
                     "/mnt/script",
@@ -2522,17 +2583,24 @@ impl ServerExecutor for PveLxcExecutor {
             })
             .collect::<Vec<_>>();
 
+        let runtime_statuses = match self.cli.node_runtime_statuses(node).await {
+            Ok(statuses) => statuses
+                .into_iter()
+                .map(|status| (status.vmid, status))
+                .collect::<HashMap<_, _>>(),
+            Err(error) => {
+                tracing::error!("failed to list Proxmox LXC runtime status: {error:#}");
+                return HashMap::new();
+            }
+        };
+
         let mut references = HashMap::new();
         for (server_uuid, container) in owned {
             if container.status != Some(cli::ContainerStatus::Running) {
                 continue;
             }
-            match self
-                .cli
-                .runtime_status(&container.node, container.vmid)
-                .await
-            {
-                Ok(status) if status.status == cli::ContainerStatus::Running => {
+            match runtime_statuses.get(&container.vmid) {
+                Some(status) if status.status == cli::ContainerStatus::Running => {
                     if let Some(pid) = status.pid.filter(|pid| *pid > 0) {
                         references.insert(server_uuid, format!("pid:{pid}"));
                     } else {
@@ -2543,11 +2611,11 @@ impl ServerExecutor for PveLxcExecutor {
                         );
                     }
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
+                Some(_) => {}
+                None => tracing::warn!(
                     server = %server_uuid,
                     vmid = container.vmid,
-                    "failed to resolve Proxmox LXC init PID for private networking: {error:#}"
+                    "Proxmox node inventory omitted an LXC needed for private networking"
                 ),
             }
         }
@@ -2577,6 +2645,13 @@ impl ServerExecutor for PveLxcExecutor {
 
         let mut containers = self.cli.list_containers().await?;
         containers.sort_unstable_by_key(|container| container.vmid);
+        let runtime_statuses = self
+            .cli
+            .node_runtime_statuses(node)
+            .await?
+            .into_iter()
+            .map(|status| (status.vmid, status))
+            .collect::<HashMap<_, _>>();
 
         for container in containers.into_iter().filter(|container| {
             container.node == *node && container.status == Some(cli::ContainerStatus::Running)
@@ -2599,16 +2674,12 @@ impl ServerExecutor for PveLxcExecutor {
                 continue;
             }
 
-            let runtime = match self
-                .cli
-                .runtime_status(&container.node, container.vmid)
-                .await
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
+            let runtime = match runtime_statuses.get(&container.vmid) {
+                Some(runtime) => runtime,
+                None => {
                     tracing::warn!(
                         vmid = container.vmid,
-                        "skipping Proxmox LXC during used-port discovery after runtime lookup failed: {error:#}"
+                        "skipping Proxmox LXC omitted from the node runtime inventory"
                     );
                     continue;
                 }

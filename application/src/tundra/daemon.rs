@@ -615,7 +615,7 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     let source = config.tundra.binary.as_path(&config);
     let source_image = config.tundra.source_image.clone();
     let metrics_port = config.tundra.metrics_port;
-    let hosts_path = match config.runtime.backend {
+    let hosts_path = match state.config.active_runtime_backend() {
         crate::config::RuntimeBackend::PveLxc => config
             .runtime
             .pve_lxc

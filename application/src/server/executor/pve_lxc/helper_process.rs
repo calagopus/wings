@@ -6,8 +6,10 @@ pub(super) struct PveHelperProcessHandle {
     log_path: PathBuf,
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     stdout_ratelimited_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
+    console_task: tokio::task::JoinHandle<()>,
 }
 
 impl PveHelperProcessHandle {
@@ -39,6 +41,7 @@ impl PveHelperProcessHandle {
         let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<
             Arc<compact_str::CompactString>,
         >(websocket_log_count * 2);
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
 
         let started = Arc::new(AtomicBool::new(already_started));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -236,20 +239,92 @@ impl PveHelperProcessHandle {
             }
         });
 
+        let console_cli = cli.clone();
+        let console_started = Arc::clone(&started);
+        let console_cancelled = Arc::clone(&cancelled);
+        let console_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            loop {
+                if console_cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                if !console_started.load(Ordering::Acquire)
+                    || !matches!(
+                        console_cli.status(vmid).await,
+                        Ok(cli::ContainerStatus::Running)
+                    )
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+
+                let session = match console_cli.spawn_console(vmid) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::warn!(vmid, "failed to attach Proxmox helper console: {error:#}");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                let cli::ConsoleSession {
+                    mut child,
+                    mut reader,
+                    mut writer,
+                } = session;
+
+                loop {
+                    tokio::select! {
+                        read = reader.read(&mut buffer) => {
+                            match read {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(vmid, "failed to drain Proxmox helper console: {error:#}");
+                                    break;
+                                }
+                            }
+                        }
+                        data = stdin_rx.recv() => {
+                            let Some(data) = data else {
+                                child.start_kill().ok();
+                                return;
+                            };
+                            let data = PveProcessHandle::normalize_console_input(data);
+                            if let Err(error) = writer.write_all(&data).await {
+                                tracing::warn!(vmid, "failed to write Proxmox helper stdin: {error:#}");
+                                break;
+                            }
+                        }
+                        result = child.wait() => {
+                            if let Err(error) = result {
+                                tracing::warn!(vmid, "failed waiting for Proxmox helper console: {error:#}");
+                            }
+                            break;
+                        }
+                    }
+                }
+                child.start_kill().ok();
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+
         Ok(Self {
             vmid,
             cli,
             log_path,
             started,
             cancelled,
+            stdin_tx,
             stdout_ratelimited_rx,
             stdout_rx,
+            console_task,
         })
     }
 }
 
 impl Drop for PveHelperProcessHandle {
     fn drop(&mut self) {
+        self.console_task.abort();
         if !self.started.load(Ordering::Acquire) {
             self.cancelled.store(true, Ordering::Release);
         }
@@ -270,10 +345,8 @@ impl ProcessHandle for PveHelperProcessHandle {
         }
     }
 
-    async fn send_stdin(&self, _data: Vec<u8>) -> Result<(), anyhow::Error> {
-        Err(anyhow::anyhow!(
-            "stdin is not supported for Proxmox helper containers"
-        ))
+    async fn send_stdin(&self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+        self.stdin_tx.send(data).await.map_err(anyhow::Error::from)
     }
 
     async fn subscribe_stdout_lines_ratelimited(

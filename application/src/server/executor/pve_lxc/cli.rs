@@ -122,7 +122,7 @@ pub struct ContainerOciUser {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerResources {
     pub memory_mib: u64,
     pub swap_mib: u64,
@@ -130,6 +130,7 @@ pub struct ContainerResources {
     pub swap_unlimited: bool,
     pub cpu_limit_percent: Option<u64>,
     pub cores: Option<u64>,
+    pub cpuset_cpus: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +211,13 @@ pub struct ContainerRuntimeStatus {
     pub status: ContainerStatus,
     pub pid: Option<i64>,
     pub uptime_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeContainerRuntimeStatus {
+    pub vmid: u32,
+    pub status: ContainerStatus,
+    pub pid: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,9 +332,9 @@ impl PveCli {
             value => Some(u64::try_from(value).context("server CPU limit exceeded u64")?),
         };
 
-        let _cpuset_cpus = threads
+        let cpuset = threads
             .filter(|threads| !threads.trim().is_empty())
-            .map(Self::normalize_cpuset)
+            .map(Self::normalize_cpuset_with_count)
             .transpose()?;
 
         Ok(ContainerResources {
@@ -335,16 +343,22 @@ impl PveCli {
             memory_unlimited,
             swap_unlimited,
             cpu_limit_percent,
-            cores: None,
+            cores: cpuset.as_ref().map(|(_, count)| *count),
+            cpuset_cpus: cpuset.map(|(cpuset, _)| cpuset),
         })
     }
 
     pub(crate) fn normalize_cpuset(value: &str) -> Result<String, anyhow::Error> {
+        Self::normalize_cpuset_with_count(value).map(|(cpuset, _)| cpuset)
+    }
+
+    fn normalize_cpuset_with_count(value: &str) -> Result<(String, u64), anyhow::Error> {
         let value = value.trim();
         if value.is_empty() {
             return Err(anyhow::anyhow!("CPU set cannot be empty"));
         }
 
+        let mut ranges = Vec::new();
         for part in value.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -364,10 +378,32 @@ impl PveCli {
                 if end < start {
                     return Err(anyhow::anyhow!("invalid descending CPU set range: {part}"));
                 }
+                ranges.push((start, end));
+            } else {
+                ranges.push((start, start));
             }
         }
 
-        Ok(value.to_string())
+        ranges.sort_unstable();
+        let mut count = 0u64;
+        let mut merged: Option<(u32, u32)> = None;
+        for (start, end) in ranges {
+            match merged {
+                Some((merged_start, merged_end)) if start <= merged_end.saturating_add(1) => {
+                    merged = Some((merged_start, merged_end.max(end)));
+                }
+                Some((merged_start, merged_end)) => {
+                    count = count.saturating_add(u64::from(merged_end - merged_start) + 1);
+                    merged = Some((start, end));
+                }
+                None => merged = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = merged {
+            count = count.saturating_add(u64::from(end - start) + 1);
+        }
+
+        Ok((value.to_string(), count))
     }
 
     pub(crate) fn cgroup2_io_weight(weight: Option<u16>) -> Result<Option<u64>, anyhow::Error> {
@@ -443,6 +479,60 @@ impl PveCli {
             output.status,
             stderr.trim()
         ))
+    }
+
+    async fn run_perl_helper(
+        &self,
+        name: &str,
+        script: &str,
+        input: &[u8],
+    ) -> Result<Output, anyhow::Error> {
+        let directory = Path::new("/run/calagopus-wings/pve-helpers");
+        tokio::fs::create_dir_all(directory)
+            .await
+            .context("failed to create Proxmox helper script directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .await
+                .context("failed to secure Proxmox helper script directory")?;
+        }
+
+        let path = directory.join(format!("{name}-{}.pl", uuid::Uuid::new_v4()));
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .context("failed to create Proxmox helper script")?;
+        file.write_all(script.as_bytes())
+            .await
+            .context("failed to write Proxmox helper script")?;
+        file.flush()
+            .await
+            .context("failed to flush Proxmox helper script")?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .context("failed to secure Proxmox helper script")?;
+        }
+
+        let result = Self::run_with_stdin(
+            &self.perl_path,
+            &[path.to_string_lossy().into_owned()],
+            input,
+        )
+        .await;
+        if let Err(error) = tokio::fs::remove_file(&path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), "failed to remove Proxmox helper script: {error}");
+        }
+        result
     }
 
     fn runtime_config_payload(spec: &RuntimeConfigSpec) -> Result<Vec<u8>, anyhow::Error> {
@@ -630,12 +720,8 @@ impl PveCli {
         spec: &RuntimeConfigSpec,
     ) -> Result<(), anyhow::Error> {
         let payload = Self::runtime_config_payload(spec)?;
-        Self::run_with_stdin(
-            &self.perl_path,
-            &["-e".to_string(), APPLY_RUNTIME_CONFIG_PERL.to_string()],
-            &payload,
-        )
-        .await?;
+        self.run_perl_helper("runtime-config", APPLY_RUNTIME_CONFIG_PERL, &payload)
+            .await?;
         Ok(())
     }
 
@@ -644,12 +730,8 @@ impl PveCli {
         spec: &FirewallPolicySpec,
     ) -> Result<(), anyhow::Error> {
         let payload = serde_json::to_vec(spec).context("failed to serialize Proxmox firewall")?;
-        Self::run_with_stdin(
-            &self.perl_path,
-            &["-e".to_string(), APPLY_FIREWALL_CONFIG_PERL.to_string()],
-            &payload,
-        )
-        .await?;
+        self.run_perl_helper("firewall-config", APPLY_FIREWALL_CONFIG_PERL, &payload)
+            .await?;
         Ok(())
     }
 
@@ -761,6 +843,26 @@ impl PveCli {
             .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
             .context("Proxmox nextid response was not a VMID")?;
         u32::try_from(raw).context("Proxmox nextid response exceeded the VMID range")
+    }
+
+    /// Serialize the advisory `nextid` lookup and the following create on this
+    /// PVE host. The PVE create operation remains the final cluster-wide
+    /// authority, so callers still retry a reported VMID collision.
+    pub async fn lock_vmid_allocation(&self) -> Result<std::fs::File, anyhow::Error> {
+        tokio::task::spawn_blocking(|| {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open("/run/lock/calagopus-wings-pve-vmid.lock")
+                .context("failed to open Proxmox VMID allocation lock")?;
+            lock.lock()
+                .context("failed to acquire Proxmox VMID allocation lock")?;
+            Ok(lock)
+        })
+        .await
+        .context("Proxmox VMID allocation lock task failed")?
     }
 
     pub async fn local_node(&self) -> Result<String, anyhow::Error> {
@@ -908,6 +1010,52 @@ impl PveCli {
     ) -> Result<ContainerRuntimeStatus, anyhow::Error> {
         let output = Self::run(&self.pvesh_path, &Self::runtime_status_args(node, vmid)).await?;
         Self::parse_runtime_status(&output.stdout)
+    }
+
+    pub async fn node_runtime_statuses(
+        &self,
+        node: &str,
+    ) -> Result<Vec<NodeContainerRuntimeStatus>, anyhow::Error> {
+        let output = Self::run(
+            &self.pvesh_path,
+            &[
+                "get".to_string(),
+                format!("/nodes/{node}/lxc"),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ],
+        )
+        .await?;
+        Self::parse_node_runtime_statuses(&output.stdout)
+    }
+
+    fn parse_node_runtime_statuses(
+        output: &[u8],
+    ) -> Result<Vec<NodeContainerRuntimeStatus>, anyhow::Error> {
+        let value: serde_json::Value = serde_json::from_slice(output)
+            .context("failed to parse Proxmox node LXC status response")?;
+        let entries = value
+            .as_array()
+            .context("Proxmox node LXC status response was not an array")?;
+        entries
+            .iter()
+            .map(|entry| {
+                let vmid = entry
+                    .get("vmid")
+                    .and_then(serde_json::Value::as_u64)
+                    .context("Proxmox node LXC status omitted VMID")?;
+                Ok(NodeContainerRuntimeStatus {
+                    vmid: u32::try_from(vmid).context("Proxmox LXC VMID exceeded u32")?,
+                    status: ContainerStatus::parse(
+                        entry
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .context("Proxmox node LXC status omitted state")?,
+                    )?,
+                    pid: entry.get("pid").and_then(serde_json::Value::as_i64),
+                })
+            })
+            .collect()
     }
 
     fn parse_runtime_status(output: &[u8]) -> Result<ContainerRuntimeStatus, anyhow::Error> {
@@ -1556,6 +1704,8 @@ impl PveCli {
 
         if let Some(cores) = resources.cores {
             args.extend(["--cores".to_string(), cores.to_string()]);
+        } else {
+            args.extend(["--delete".to_string(), "cores".to_string()]);
         }
 
         args

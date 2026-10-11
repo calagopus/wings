@@ -357,7 +357,9 @@ PVE::LXC::Config->lock_config($vmid, sub {
                 && $_->[0] ne 'lxc.environment.runtime'
                 && $_->[0] ne 'lxc.signal.halt'
                 && $_->[0] ne 'lxc.init.cmd'
-                && $_->[0] ne 'lxc.console.logfile');
+                && $_->[0] ne 'lxc.console.logfile'
+                && $_->[0] ne 'lxc.cgroup2.memory.max'
+                && $_->[0] ne 'lxc.cgroup2.memory.swap.max');
         if ($keep && ref($_) eq 'ARRAY' && @$_ >= 2 && $_->[0] eq 'lxc.mount.entry') {
             my $target = mount_target($_->[1]);
             $keep = 0 if defined($target) && $target eq 'etc/hosts';
@@ -370,6 +372,8 @@ PVE::LXC::Config->lock_config($vmid, sub {
     push @lxc, ['lxc.signal.halt', 'SIGTERM'];
     push @lxc, ['lxc.init.cmd', '/bin/sh /home/container/runtime-wrapper.sh'];
     push @lxc, ['lxc.console.logfile', $console_log];
+    push @lxc, ['lxc.cgroup2.memory.max', 'max'];
+    push @lxc, ['lxc.cgroup2.memory.swap.max', 'max'];
     push @lxc, [
         'lxc.mount.entry',
         "$managed_hosts etc/hosts none bind,ro,create=file 0 0",
@@ -430,7 +434,7 @@ start_ct() {
 }
 
 verify_runtime_contracts() {
-  local attempt
+  local attempt runtime_json pid cgroup_path memory_max swap_max
   configure_runtime_contracts
   start_ct
 
@@ -459,6 +463,27 @@ verify_runtime_contracts() {
     exit 1
   fi
   echo "managed file bind: /etc/hosts is visible and read-only"
+
+  runtime_json="$(pvesh get "/nodes/${node}/lxc/${vmid}/status/current" --output-format json)"
+  pid="$(printf '%s' "$runtime_json" | json_field pid)"
+  cgroup_path="$(awk -F: '$1 == "0" {print $3; exit}' "/proc/${pid}/cgroup")"
+  if [[ -z "$cgroup_path" ]]; then
+    echo "error: the live PVE smoke test requires a cgroup v2 host" >&2
+    exit 1
+  fi
+  memory_max="$(cat "/sys/fs/cgroup${cgroup_path}/memory.max")"
+  swap_max="$(cat "/sys/fs/cgroup${cgroup_path}/memory.swap.max")"
+  if [[ "$memory_max" != "max" || "$swap_max" != "max" ]]; then
+    echo "error: PVE did not preserve unlimited cgroup2 memory settings on start" >&2
+    echo "memory.max=$memory_max memory.swap.max=$swap_max" >&2
+    exit 1
+  fi
+  if ! pct config "$vmid" | grep -Fq 'lxc.cgroup2.memory.max: max' \
+      || ! pct config "$vmid" | grep -Fq 'lxc.cgroup2.memory.swap.max: max'; then
+    echo "error: PVE dropped unlimited cgroup2 memory settings from CT config" >&2
+    exit 1
+  fi
+  echo "cgroup2: PVE preserved memory.max=max and memory.swap.max=max after start"
 
   verify_running_contracts
 
