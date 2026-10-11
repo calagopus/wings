@@ -1,6 +1,9 @@
 use anyhow::Context;
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
+    io::{Read, Write},
     net::IpAddr,
     path::{Component, Path, PathBuf},
     process::Output,
@@ -830,9 +833,7 @@ impl PveCli {
 
     pub async fn next_vmid(&self, min_vmid: u32) -> Result<u32, anyhow::Error> {
         if !(100..=999_999_999).contains(&min_vmid) {
-            anyhow::bail!(
-                "Proxmox minimum VMID must be between 100 and 999999999, got {min_vmid}"
-            );
+            anyhow::bail!("Proxmox minimum VMID must be between 100 and 999999999, got {min_vmid}");
         }
         let args = vec![
             "get".to_string(),
@@ -1328,6 +1329,243 @@ impl PveCli {
         Ok(path.into())
     }
 
+    /// Rewrites OCI gzip layers to the uncompressed representation expected by
+    /// Proxmox's LXC image importer. OCI `rootfs.diff_ids` are hashes of the
+    /// uncompressed layer tar streams, whereas some registry pulls retain gzip
+    /// blobs and PVE currently resolves `diff_ids` as blob names.
+    fn normalize_oci_template(path: PathBuf) -> Result<(), anyhow::Error> {
+        let source = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open OCI template {}", path.display()))?;
+        let mut archive = tar::Archive::new(source);
+        let mut index = None;
+        let mut manifests = HashMap::new();
+        let mut configs = HashMap::new();
+        for entry in archive
+            .entries()
+            .context("failed to enumerate OCI template")?
+        {
+            let mut entry = entry.context("failed to read OCI template entry")?;
+            let name = entry.path()?.to_string_lossy().into_owned();
+            // Index, manifest, and config blobs are tiny JSON documents. Never
+            // buffer the multi-gigabyte layer blobs during metadata discovery.
+            if name != "index.json"
+                && (!name.starts_with("blobs/sha256/") || entry.size() > 4 * 1024 * 1024)
+            {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            if name == "index.json" {
+                index = Some(
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .context("failed to parse OCI template index.json")?,
+                );
+            } else if name.starts_with("blobs/sha256/") {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if value.get("schemaVersion").is_some() && value.get("layers").is_some() {
+                        manifests.insert(name, value);
+                    } else if value.get("rootfs").is_some() {
+                        configs.insert(name, value);
+                    }
+                }
+            }
+        }
+        let mut index = index.context("OCI template did not contain index.json")?;
+        let manifest_digest = index
+            .pointer("/manifests/0/digest")
+            .and_then(serde_json::Value::as_str)
+            .context("OCI template index did not include a manifest digest")?
+            .strip_prefix("sha256:")
+            .context("OCI template manifest digest was not sha256")?;
+        let old_manifest_path = format!("blobs/sha256/{manifest_digest}");
+        let mut manifest = manifests
+            .remove(&old_manifest_path)
+            .context("OCI template did not contain its indexed manifest")?;
+        let config_digest = manifest
+            .pointer("/config/digest")
+            .and_then(serde_json::Value::as_str)
+            .context("OCI manifest did not include a config digest")?
+            .strip_prefix("sha256:")
+            .context("OCI config digest was not sha256")?;
+        let config = configs
+            .remove(&format!("blobs/sha256/{config_digest}"))
+            .context("OCI template did not contain its config blob")?;
+        let diff_ids = config
+            .pointer("/rootfs/diff_ids")
+            .and_then(serde_json::Value::as_array)
+            .context("OCI config did not include rootfs.diff_ids")?;
+        let layer_specs = manifest
+            .get("layers")
+            .and_then(serde_json::Value::as_array)
+            .context("OCI manifest did not include layers")?;
+        if layer_specs.len() != diff_ids.len() {
+            return Err(anyhow::anyhow!(
+                "OCI manifest layer count did not match rootfs.diff_ids"
+            ));
+        }
+        let layer_specs: Vec<(String, String, bool)> = layer_specs
+            .iter()
+            .zip(diff_ids)
+            .map(|(layer, diff_id)| {
+                let digest = layer
+                    .get("digest")
+                    .and_then(serde_json::Value::as_str)
+                    .context("OCI layer did not include a digest")?
+                    .strip_prefix("sha256:")
+                    .context("OCI layer digest was not sha256")?;
+                let expected = diff_id
+                    .as_str()
+                    .context("OCI diff_id was not a string")?
+                    .strip_prefix("sha256:")
+                    .context("OCI diff_id was not sha256")?;
+                let media_type = layer
+                    .get("mediaType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                Ok((
+                    format!("blobs/sha256/{digest}"),
+                    expected.to_string(),
+                    media_type.ends_with("+gzip") || media_type.ends_with(".gzip"),
+                ))
+            })
+            .collect::<Result<_, anyhow::Error>>()?;
+
+        let scratch =
+            tempfile::tempdir().context("failed to create OCI normalization scratch directory")?;
+        let replacements: HashMap<String, (String, PathBuf, bool)> = layer_specs
+            .into_iter()
+            .map(|(name, expected, gzip)| {
+                (
+                    name,
+                    (expected.clone(), scratch.path().join(&expected), gzip),
+                )
+            })
+            .collect();
+
+        let source = std::fs::File::open(&path)
+            .with_context(|| format!("failed to reopen OCI template {}", path.display()))?;
+        let mut archive = tar::Archive::new(source);
+        for entry in archive
+            .entries()
+            .context("failed to enumerate OCI layers")?
+        {
+            let entry = entry.context("failed to read OCI layer entry")?;
+            let name = entry.path()?.to_string_lossy().into_owned();
+            let Some((expected, replacement, gzip)) = replacements.get(&name) else {
+                continue;
+            };
+            let mut hasher = Sha256::new();
+            let mut output = std::fs::File::create(replacement).with_context(|| {
+                format!(
+                    "failed to create normalized OCI layer {}",
+                    replacement.display()
+                )
+            })?;
+            let mut reader: Box<dyn Read> = if *gzip {
+                Box::new(GzDecoder::new(entry))
+            } else {
+                Box::new(entry)
+            };
+            let mut buffer = [0u8; 1024 * 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+                output.write_all(&buffer[..count])?;
+            }
+            let actual = hex::encode(hasher.finalize());
+            if actual != *expected {
+                return Err(anyhow::anyhow!(
+                    "OCI layer diff_id mismatch: expected sha256:{expected}, got sha256:{actual}"
+                ));
+            }
+        }
+        if replacements
+            .values()
+            .any(|(_, replacement, _)| !replacement.is_file())
+        {
+            return Err(anyhow::anyhow!(
+                "OCI template was missing one or more layer blobs"
+            ));
+        }
+        let layers = manifest
+            .get_mut("layers")
+            .and_then(serde_json::Value::as_array_mut)
+            .context("OCI manifest did not include layers")?;
+        for (position, layer) in layers.iter_mut().enumerate() {
+            let expected = diff_ids[position].as_str().unwrap_or_default();
+            let (_, replacement, _) = replacements
+                .values()
+                .find(|(digest, _, _)| expected == format!("sha256:{digest}"))
+                .context("normalized OCI layer replacement was missing")?;
+            layer["digest"] = serde_json::Value::String(expected.to_string());
+            layer["size"] = serde_json::Value::from(std::fs::metadata(replacement)?.len());
+            layer["mediaType"] =
+                serde_json::Value::String("application/vnd.oci.image.layer.v1.tar".to_string());
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        let new_manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
+        index["manifests"][0]["digest"] =
+            serde_json::Value::String(format!("sha256:{new_manifest_digest}"));
+        index["manifests"][0]["size"] = serde_json::Value::from(manifest_bytes.len());
+        let index_bytes = serde_json::to_vec(&index)?;
+        let temporary = path.with_extension("tar.normalize-tmp");
+        let output = std::fs::File::create(&temporary).with_context(|| {
+            format!(
+                "failed to create normalized OCI template {}",
+                temporary.display()
+            )
+        })?;
+        let mut builder = tar::Builder::new(output);
+        let source = std::fs::File::open(&path)?;
+        let mut archive = tar::Archive::new(source);
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let name = entry.path()?.to_string_lossy().into_owned();
+            if name == "index.json" || name == old_manifest_path || replacements.contains_key(&name)
+            {
+                continue;
+            }
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let mut header = entry.header().clone();
+            builder.append_data(&mut header, name, &mut entry)?;
+        }
+        for (expected, replacement, _) in replacements.values() {
+            let mut layer = std::fs::File::open(replacement)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(std::fs::metadata(replacement)?.len());
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, format!("blobs/sha256/{expected}"), &mut layer)?;
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(
+            &mut header,
+            format!("blobs/sha256/{new_manifest_digest}"),
+            manifest_bytes.as_slice(),
+        )?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(index_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, "index.json", index_bytes.as_slice())?;
+        builder.finish()?;
+        std::fs::rename(&temporary, &path).with_context(|| {
+            format!(
+                "failed to atomically install normalized OCI template {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     async fn template_revision(&self, volid: &str) -> Result<String, anyhow::Error> {
         let path = self.template_path(volid).await?;
         tokio::task::spawn_blocking(move || {
@@ -1551,6 +1789,10 @@ impl PveCli {
             })
             .await?;
         self.wait_for_task(node, &upid).await?;
+        let path = self.template_path(&volid).await?;
+        tokio::task::spawn_blocking(move || Self::normalize_oci_template(path))
+            .await
+            .context("OCI template normalization task failed")??;
 
         let exists = self
             .list_storage_content(node, storage)
