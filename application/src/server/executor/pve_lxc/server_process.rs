@@ -816,9 +816,7 @@ impl PveProcessHandle {
             let entrypoint_target = "/calagopus-entrypoint";
             let entrypoint_source =
                 stage_directory.join(Self::managed_file_stage_name(entrypoint_target)?);
-            tokio::fs::write(
-                &entrypoint_source,
-                r#"#!/bin/sh
+            let entrypoint_script = r#"#!/bin/sh
 attempt=0
 while [ "$attempt" -lt 120 ]; do
     if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
@@ -846,9 +844,14 @@ read_oom_kills() {
 }
 
 child=0
+child_group=0
 forward_signal() {
     if [ "$child" -gt 0 ]; then
-        kill "-$1" "$child" 2>/dev/null || true
+        if [ "$child_group" -eq 1 ]; then
+            kill "-$1" "-$child" 2>/dev/null || true
+        else
+            kill "-$1" "$child" 2>/dev/null || true
+        fi
     fi
 }
 trap 'forward_signal HUP' HUP
@@ -858,7 +861,12 @@ trap 'forward_signal ABRT' ABRT
 trap 'forward_signal TERM' TERM
 
 oom_before=$(read_oom_kills)
-"$@" <&0 &
+if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" <&0 &
+    child_group=1
+else
+    "$@" <&0 &
+fi
 child=$!
 while :; do
     wait "$child"
@@ -873,7 +881,7 @@ if [ "$oom_after" -gt "$oom_before" ]; then
     oom_killed=1
 fi
 
-marker=/home/container/.wings-exit-status
+marker=__WINGS_EXIT_STATUS_PATH__
 temporary="${marker}.tmp.$$"
 (
     umask 077
@@ -881,10 +889,18 @@ temporary="${marker}.tmp.$$"
 )
 mv -f "$temporary" "$marker"
 exit "$status"
-"#,
-            )
-            .await
-            .context("failed to stage Proxmox network-ready entrypoint")?;
+"#
+            .replace(
+                "__WINGS_EXIT_STATUS_PATH__",
+                &format!(
+                    "{}/{}",
+                    PveLxcExecutor::DATA_MOUNT_TARGET,
+                    Self::EXIT_STATUS_FILE
+                ),
+            );
+            tokio::fs::write(&entrypoint_source, entrypoint_script)
+                .await
+                .context("failed to stage Proxmox network-ready entrypoint")?;
             tokio::fs::set_permissions(&entrypoint_source, std::fs::Permissions::from_mode(0o755))
                 .await
                 .context("failed to make Proxmox network-ready entrypoint executable")?;
@@ -931,22 +947,13 @@ exit "$status"
             (
                 configuration.environment(app_config),
                 configuration.entrypoint.clone(),
-                configuration
-                    .build
-                    .threads
-                    .as_deref()
-                    .filter(|threads| !threads.trim().is_empty())
-                    .map(PveCli::normalize_cpuset)
-                    .transpose()?,
+                resources.cpuset_cpus.clone(),
                 PveCli::cgroup2_io_weight(configuration.build.io_weight)?,
                 resources.memory_unlimited,
                 resources.swap_unlimited,
             )
         };
-        let pids_limit = match app_config.load().docker.container_pid_limit {
-            0 => None,
-            limit => Some(limit),
-        };
+        let pids_limit = PveLxcExecutor::pids_limit(app_config);
         let managed_file_mounts = Self::managed_file_mounts(server, app_config).await?;
         let process = server.process_configuration.read().await;
         let halt_signal = Self::halt_signal(&process.stop.r#type, process.stop.value.as_deref());
@@ -1227,14 +1234,34 @@ impl ProcessHandle for PveProcessHandle {
     async fn kill(&self) -> Result<(), anyhow::Error> {
         let server = self.get_server()?;
         let exit_status_path = Self::exit_status_path(&server);
-        tokio::fs::write(&exit_status_path, "exit_code=137\noom_killed=0\n")
+        if self.cli.status(self.vmid).await? == cli::ContainerStatus::Stopped {
+            return Ok(());
+        }
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&exit_status_path)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to record forced Proxmox LXC exit status {}",
-                    exit_status_path.display()
-                )
-            })?;
+        {
+            Ok(mut marker) => marker
+                .write_all(b"exit_code=137\noom_killed=0\n")
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to record forced Proxmox LXC exit status {}",
+                        exit_status_path.display()
+                    )
+                })?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create forced Proxmox LXC exit status {}",
+                        exit_status_path.display()
+                    )
+                });
+            }
+        }
         self.cli.stop(self.vmid).await
     }
 }

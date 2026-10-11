@@ -557,3 +557,50 @@ fn device_permissions_require_exact_pve_devn_semantics() {
     );
     assert!(PveLxcExecutor::device_deny_write("rwx", path).is_err());
 }
+
+#[tokio::test]
+async fn lxc_pid_limit_overrides_the_legacy_docker_setting() {
+    let config = crate::config::Config::mock();
+    config
+        .mutate_in_place_for_testing()
+        .docker
+        .container_pid_limit = 256;
+    assert_eq!(PveLxcExecutor::pids_limit(&config), Some(256));
+
+    config
+        .mutate_in_place_for_testing()
+        .runtime
+        .pve_lxc
+        .pids_limit = Some(1024);
+    assert_eq!(PveLxcExecutor::pids_limit(&config), Some(1024));
+
+    config
+        .mutate_in_place_for_testing()
+        .runtime
+        .pve_lxc
+        .pids_limit = Some(0);
+    assert_eq!(PveLxcExecutor::pids_limit(&config), None);
+}
+
+#[tokio::test]
+async fn edge_ssh_user_is_configurable_and_validated() {
+    let config = crate::config::Config::mock();
+    {
+        let inner = config.mutate_in_place_for_testing();
+        inner.runtime.pve_lxc.edge_ssh_identity_path = "/root/edge-key".to_string();
+        inner.runtime.pve_lxc.edge_known_hosts_path = "/root/known-hosts".to_string();
+        inner.runtime.pve_lxc.edge_ssh_user = "edge-forward".to_string();
+    }
+
+    let resolved = PveLxcExecutor::edge_forwarding_config(&config)
+        .expect("valid edge configuration")
+        .expect("configured edge forwarding");
+    assert_eq!(resolved.1, "edge-forward");
+
+    config
+        .mutate_in_place_for_testing()
+        .runtime
+        .pve_lxc
+        .edge_ssh_user = "root@host".to_string();
+    assert!(PveLxcExecutor::edge_forwarding_config(&config).is_err());
+}
