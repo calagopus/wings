@@ -941,16 +941,57 @@ exit 1
         cli: &PveCli,
         vmid: u32,
     ) -> Result<cli::RuntimeConfigSpec, anyhow::Error> {
-        let environment = server.configuration.read().await.environment(app_config);
+        let (
+            environment,
+            panel_entrypoint,
+            cpuset_cpus,
+            io_weight,
+            memory_unlimited,
+            swap_unlimited,
+        ) = {
+            let configuration = server.configuration.read().await;
+            let resources = PveCli::panel_resources(
+                configuration.build.memory_limit,
+                configuration.build.overhead_memory,
+                configuration.build.swap,
+                configuration.build.cpu_limit,
+                configuration.build.threads.as_deref(),
+            )?;
+            (
+                configuration.environment(app_config),
+                configuration.entrypoint.clone(),
+                configuration
+                    .build
+                    .threads
+                    .as_deref()
+                    .filter(|threads| !threads.trim().is_empty())
+                    .map(PveCli::normalize_cpuset)
+                    .transpose()?,
+                PveCli::cgroup2_io_weight(configuration.build.io_weight)?,
+                resources.memory_unlimited,
+                resources.swap_unlimited,
+            )
+        };
+        let pids_limit = match app_config.load().docker.container_pid_limit {
+            0 => None,
+            limit => Some(limit),
+        };
         let managed_file_mounts = Self::managed_file_mounts(server, app_config).await?;
         let process = server.process_configuration.read().await;
         let halt_signal = Self::halt_signal(&process.stop.r#type, process.stop.value.as_deref());
-        let image_entrypoint = cli.oci_entrypoint(vmid).await?;
         let mut init_arguments = vec!["/calagopus-entrypoint".to_string()];
-        init_arguments.extend(
-            shell_words::split(&image_entrypoint)
-                .context("failed to parse OCI entrypoint for Proxmox LXC")?,
-        );
+        if let Some(entrypoint) = panel_entrypoint {
+            if entrypoint.is_empty() {
+                return Err(anyhow::anyhow!("panel entrypoint override cannot be empty"));
+            }
+            init_arguments.extend(entrypoint);
+        } else {
+            let image_entrypoint = cli.oci_entrypoint(vmid).await?;
+            init_arguments.extend(
+                shell_words::split(&image_entrypoint)
+                    .context("failed to parse OCI entrypoint for Proxmox LXC")?,
+            );
+        }
         let init_command = PveCli::encode_init_command(&init_arguments)?;
 
         Ok(cli::RuntimeConfigSpec {
@@ -959,6 +1000,11 @@ exit 1
             halt_signal,
             init_command: Some(init_command),
             console_logfile: None,
+            cpuset_cpus,
+            pids_limit,
+            io_weight,
+            memory_unlimited,
+            swap_unlimited,
             managed_file_mounts: Some(managed_file_mounts),
         })
     }
@@ -2878,12 +2924,27 @@ exit 1
             script.entrypoint.to_string(),
             script_target.to_string(),
         ])?;
+        let (pids_limit, io_weight) = {
+            let configuration = server.configuration.read().await;
+            (
+                match self.app_config.load().docker.container_pid_limit {
+                    0 => None,
+                    limit => Some(limit),
+                },
+                PveCli::cgroup2_io_weight(configuration.build.io_weight)?,
+            )
+        };
         let runtime_config = cli::RuntimeConfigSpec {
             vmid,
             environment,
             halt_signal: None,
             init_command: Some(init_command),
             console_logfile: Some(log_path.to_string()),
+            cpuset_cpus: None,
+            pids_limit,
+            io_weight,
+            memory_unlimited: resources.memory_unlimited,
+            swap_unlimited: resources.swap_unlimited,
             managed_file_mounts: None,
         };
 
@@ -3304,12 +3365,6 @@ impl ServerExecutor for PveLxcExecutor {
         &self,
         server: &crate::server::Server,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error> {
-        if server.configuration.read().await.entrypoint.is_some() {
-            return Err(anyhow::anyhow!(
-                "Proxmox VE LXC runtime does not support panel entrypoint overrides yet; use the OCI image entrypoint"
-            ));
-        }
-
         let (vmid, _oci_user, created) = self.prepare_server_container(server).await?;
         let runtime_config = match PveProcessHandle::runtime_config(
             server,

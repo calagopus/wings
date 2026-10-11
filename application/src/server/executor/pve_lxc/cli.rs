@@ -117,7 +117,17 @@ PVE::LXC::Config->lock_config($vmid, sub {
                 && $_->[0] ne 'lxc.environment.runtime'
                 && $_->[0] ne 'lxc.signal.halt'
                 && $_->[0] ne 'lxc.init.cmd'
-                && $_->[0] ne 'lxc.console.logfile');
+                && $_->[0] ne 'lxc.console.logfile'
+                && $_->[0] ne 'lxc.cgroup.cpuset.cpus'
+                && $_->[0] ne 'lxc.cgroup2.cpuset.cpus'
+                && $_->[0] ne 'lxc.cgroup.pids.max'
+                && $_->[0] ne 'lxc.cgroup2.pids.max'
+                && $_->[0] ne 'lxc.cgroup.blkio.weight'
+                && $_->[0] ne 'lxc.cgroup2.io.weight'
+                && $_->[0] ne 'lxc.cgroup.memory.limit_in_bytes'
+                && $_->[0] ne 'lxc.cgroup2.memory.max'
+                && $_->[0] ne 'lxc.cgroup.memory.memsw.limit_in_bytes'
+                && $_->[0] ne 'lxc.cgroup2.memory.swap.max');
         if ($keep && defined($managed_mounts) && ref($_) eq 'ARRAY' && @$_ >= 2
                 && $_->[0] eq 'lxc.mount.entry') {
             my $target = mount_target($_->[1]);
@@ -138,6 +148,21 @@ PVE::LXC::Config->lock_config($vmid, sub {
     }
     if (defined($payload->{console_logfile}) && length($payload->{console_logfile})) {
         push @lxc, ['lxc.console.logfile', $payload->{console_logfile}];
+    }
+    if (defined($payload->{cpuset_cpus}) && length($payload->{cpuset_cpus})) {
+        push @lxc, ['lxc.cgroup2.cpuset.cpus', $payload->{cpuset_cpus}];
+    }
+    if (defined($payload->{pids_limit}) && $payload->{pids_limit} > 0) {
+        push @lxc, ['lxc.cgroup2.pids.max', $payload->{pids_limit}];
+    }
+    if (defined($payload->{io_weight}) && $payload->{io_weight} > 0) {
+        push @lxc, ['lxc.cgroup2.io.weight', $payload->{io_weight}];
+    }
+    if ($payload->{memory_unlimited}) {
+        push @lxc, ['lxc.cgroup2.memory.max', 'max'];
+    }
+    if ($payload->{swap_unlimited}) {
+        push @lxc, ['lxc.cgroup2.memory.swap.max', 'max'];
     }
     if (defined($managed_mounts)) {
         push @lxc, map { ['lxc.mount.entry', $_->{entry}] } @$managed_mounts;
@@ -335,6 +360,8 @@ pub struct ContainerOciUser {
 pub struct ContainerResources {
     pub memory_mib: u64,
     pub swap_mib: u64,
+    pub memory_unlimited: bool,
+    pub swap_unlimited: bool,
     pub cpu_limit_percent: Option<u64>,
     pub cores: Option<u64>,
 }
@@ -361,6 +388,16 @@ pub struct RuntimeConfigSpec {
     pub halt_signal: Option<String>,
     pub init_command: Option<String>,
     pub console_logfile: Option<String>,
+    /// Exact host CPUs assigned through the panel's `build.threads` setting.
+    /// `None` removes a previously managed CPU set.
+    pub cpuset_cpus: Option<String>,
+    /// Maximum process count for the container. `None` removes the managed
+    /// cgroup limit.
+    pub pids_limit: Option<u64>,
+    /// cgroup v2 I/O weight in the kernel's 1..=10000 range.
+    pub io_weight: Option<u64>,
+    pub memory_unlimited: bool,
+    pub swap_unlimited: bool,
     /// `None` leaves low-level LXC file mounts untouched. `Some`, including an
     /// empty vector, reconciles all Wings-reserved managed-file targets.
     pub managed_file_mounts: Option<Vec<ManagedFileMountSpec>>,
@@ -473,9 +510,9 @@ impl PveCli {
         cpu_limit: i64,
         threads: Option<&str>,
     ) -> Result<ContainerResources, anyhow::Error> {
-        if memory_limit <= 0 {
+        if memory_limit < 0 {
             return Err(anyhow::anyhow!(
-                "Proxmox LXC currently requires a positive server memory limit; unlimited memory is not mapped yet"
+                "invalid negative memory limit for Proxmox LXC: {memory_limit}"
             ));
         }
         if overhead_memory < 0 {
@@ -483,22 +520,26 @@ impl PveCli {
                 "server overhead memory cannot be negative for the Proxmox LXC runtime"
             ));
         }
-        let memory_mib = memory_limit
-            .checked_add(overhead_memory)
-            .context("server memory plus overhead overflowed")?;
-        if memory_mib < 16 {
-            return Err(anyhow::anyhow!(
-                "Proxmox LXC requires at least 16 MiB of memory, resolved server limit was {memory_mib} MiB"
-            ));
-        }
-        let memory_mib = u64::try_from(memory_mib).context("server memory limit was negative")?;
-
-        let swap_mib = match swap {
-            -1 => {
+        let memory_unlimited = memory_limit == 0;
+        let memory_mib = if memory_unlimited {
+            // PVE requires a regular memory property even when a low-level LXC
+            // cgroup override removes the limit before the first start.
+            16
+        } else {
+            let memory_mib = memory_limit
+                .checked_add(overhead_memory)
+                .context("server memory plus overhead overflowed")?;
+            if memory_mib < 16 {
                 return Err(anyhow::anyhow!(
-                    "unlimited swap (-1) has no direct Proxmox LXC equivalent"
+                    "Proxmox LXC requires at least 16 MiB of memory, resolved server limit was {memory_mib} MiB"
                 ));
             }
+            u64::try_from(memory_mib).context("server memory limit was negative")?
+        };
+
+        let swap_unlimited = memory_unlimited || swap == -1;
+        let swap_mib = match swap {
+            -1 => 0,
             value if value < 0 => {
                 return Err(anyhow::anyhow!(
                     "invalid negative swap limit for Proxmox LXC: {value}"
@@ -517,18 +558,65 @@ impl PveCli {
             value => Some(u64::try_from(value).context("server CPU limit exceeded u64")?),
         };
 
-        if threads.is_some_and(|threads| !threads.trim().is_empty()) {
-            return Err(anyhow::anyhow!(
-                "Proxmox LXC CPU pinning for server build.threads is not implemented yet"
-            ));
-        }
+        let _cpuset_cpus = threads
+            .filter(|threads| !threads.trim().is_empty())
+            .map(Self::normalize_cpuset)
+            .transpose()?;
 
         Ok(ContainerResources {
             memory_mib,
             swap_mib,
+            memory_unlimited,
+            swap_unlimited,
             cpu_limit_percent,
             cores: None,
         })
+    }
+
+    pub(crate) fn normalize_cpuset(value: &str) -> Result<String, anyhow::Error> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("CPU set cannot be empty"));
+        }
+
+        for part in value.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(anyhow::anyhow!("CPU set contains an empty item"));
+            }
+            let (start, end) = match part.split_once('-') {
+                Some((start, end)) => (start, Some(end)),
+                None => (part, None),
+            };
+            let start = start
+                .parse::<u32>()
+                .with_context(|| format!("invalid CPU set item: {part}"))?;
+            if let Some(end) = end {
+                let end = end
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid CPU set item: {part}"))?;
+                if end < start {
+                    return Err(anyhow::anyhow!("invalid descending CPU set range: {part}"));
+                }
+            }
+        }
+
+        Ok(value.to_string())
+    }
+
+    pub(crate) fn cgroup2_io_weight(weight: Option<u16>) -> Result<Option<u64>, anyhow::Error> {
+        let Some(weight) = weight else {
+            return Ok(None);
+        };
+        if !(10..=1000).contains(&weight) {
+            return Err(anyhow::anyhow!(
+                "block I/O weight must be between 10 and 1000, got {weight}"
+            ));
+        }
+
+        // Match opencontainers/cgroups' conversion from the cgroup v1 API
+        // range used by Docker to the cgroup v2 io.weight range.
+        Ok(Some(1 + (u64::from(weight) - 10) * 9999 / 990))
     }
 
     async fn run(program: &std::path::Path, args: &[String]) -> Result<Output, anyhow::Error> {
@@ -631,6 +719,20 @@ impl PveCli {
         }) {
             return Err(anyhow::anyhow!("invalid LXC console logfile path"));
         }
+        if let Some(cpuset) = spec.cpuset_cpus.as_deref() {
+            Self::normalize_cpuset(cpuset)?;
+        }
+        if spec.pids_limit == Some(0) {
+            return Err(anyhow::anyhow!("LXC PID limit must be positive"));
+        }
+        if spec
+            .io_weight
+            .is_some_and(|weight| !(1..=10_000).contains(&weight))
+        {
+            return Err(anyhow::anyhow!(
+                "cgroup v2 I/O weight must be between 1 and 10000"
+            ));
+        }
 
         let (managed_file_mounts, managed_file_targets) =
             if let Some(mounts) = &spec.managed_file_mounts {
@@ -674,6 +776,11 @@ impl PveCli {
             "halt_signal": spec.halt_signal,
             "init_command": spec.init_command,
             "console_logfile": spec.console_logfile,
+            "cpuset_cpus": spec.cpuset_cpus,
+            "pids_limit": spec.pids_limit,
+            "io_weight": spec.io_weight,
+            "memory_unlimited": spec.memory_unlimited,
+            "swap_unlimited": spec.swap_unlimited,
             "managed_file_mounts": managed_file_mounts,
             "managed_file_targets": managed_file_targets,
         }))
@@ -2262,6 +2369,8 @@ mod tests {
             Some(ContainerResources {
                 memory_mib: 2304,
                 swap_mib: 1024,
+                memory_unlimited: false,
+                swap_unlimited: false,
                 cpu_limit_percent: Some(250),
                 cores: None,
             })
@@ -2271,6 +2380,8 @@ mod tests {
             Some(ContainerResources {
                 memory_mib: 2048,
                 swap_mib: 0,
+                memory_unlimited: false,
+                swap_unlimited: false,
                 cpu_limit_percent: None,
                 cores: None,
             })
@@ -2278,10 +2389,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_resource_limits_without_exact_pve_semantics() {
-        assert!(PveCli::panel_resources(0, 0, 0, 0, None).is_err());
-        assert!(PveCli::panel_resources(2048, 0, -1, 0, None).is_err());
-        assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("0-3")).is_err());
+    fn rejects_invalid_resource_limits() {
+        assert!(PveCli::panel_resources(-1, 0, 0, 0, None).is_err());
+        assert!(PveCli::panel_resources(2048, 0, -2, 0, None).is_err());
+        assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("3-1")).is_err());
+    }
+
+    #[test]
+    fn maps_unlimited_memory_and_swap_to_lxc_overrides() {
+        assert_eq!(
+            PveCli::panel_resources(0, 0, 0, 0, None).ok(),
+            Some(ContainerResources {
+                memory_mib: 16,
+                swap_mib: 0,
+                memory_unlimited: true,
+                swap_unlimited: true,
+                cpu_limit_percent: None,
+                cores: None,
+            })
+        );
+        assert_eq!(
+            PveCli::panel_resources(2048, 0, -1, 0, None).ok(),
+            Some(ContainerResources {
+                memory_mib: 2048,
+                swap_mib: 0,
+                memory_unlimited: false,
+                swap_unlimited: true,
+                cpu_limit_percent: None,
+                cores: None,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_panel_cpu_pinning_syntax() {
+        assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("0-3,8")).is_ok());
+        assert!(PveCli::panel_resources(2048, 0, 0, 0, Some("0,,2")).is_err());
+    }
+
+    #[test]
+    fn converts_docker_block_io_weight_to_cgroup_v2() {
+        assert_eq!(PveCli::cgroup2_io_weight(None).ok(), Some(None));
+        assert_eq!(PveCli::cgroup2_io_weight(Some(10)).ok(), Some(Some(1)));
+        assert_eq!(PveCli::cgroup2_io_weight(Some(500)).ok(), Some(Some(4950)));
+        assert_eq!(
+            PveCli::cgroup2_io_weight(Some(1000)).ok(),
+            Some(Some(10_000))
+        );
+        assert!(PveCli::cgroup2_io_weight(Some(9)).is_err());
     }
 
     #[test]
@@ -2292,6 +2447,8 @@ mod tests {
                 &ContainerResources {
                     memory_mib: 4096,
                     swap_mib: 512,
+                    memory_unlimited: false,
+                    swap_unlimited: false,
                     cpu_limit_percent: Some(250),
                     cores: Some(4),
                 },
@@ -2316,6 +2473,8 @@ mod tests {
                 &ContainerResources {
                     memory_mib: 2048,
                     swap_mib: 0,
+                    memory_unlimited: false,
+                    swap_unlimited: false,
                     cpu_limit_percent: None,
                     cores: None,
                 },
@@ -2941,6 +3100,11 @@ lxc.init.uid: 1000
             halt_signal: Some("SIGINT".to_string()),
             init_command: Some("/bin/bash /mnt/install/install.sh".to_string()),
             console_logfile: Some("/var/log/calagopus/install.log".to_string()),
+            cpuset_cpus: Some("0-3,8".to_string()),
+            pids_limit: Some(5120),
+            io_weight: Some(4950),
+            memory_unlimited: true,
+            swap_unlimited: true,
             managed_file_mounts: Some(vec![ManagedFileMountSpec {
                 source_path: "/var/lib/calagopus wings/vmount/example/hosts".to_string(),
                 target_path: "/etc/hosts".to_string(),
@@ -2977,6 +3141,30 @@ lxc.init.uid: 1000
             Some("/var/log/calagopus/install.log")
         );
         assert_eq!(
+            value.get("cpuset_cpus").and_then(serde_json::Value::as_str),
+            Some("0-3,8")
+        );
+        assert_eq!(
+            value.get("pids_limit").and_then(serde_json::Value::as_u64),
+            Some(5120)
+        );
+        assert_eq!(
+            value.get("io_weight").and_then(serde_json::Value::as_u64),
+            Some(4950)
+        );
+        assert_eq!(
+            value
+                .get("memory_unlimited")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .get("swap_unlimited")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
             value
                 .get("managed_file_mounts")
                 .and_then(serde_json::Value::as_array)
@@ -3001,6 +3189,11 @@ lxc.init.uid: 1000
             halt_signal: None,
             init_command: None,
             console_logfile: None,
+            cpuset_cpus: None,
+            pids_limit: None,
+            io_weight: None,
+            memory_unlimited: false,
+            swap_unlimited: false,
             managed_file_mounts: None,
         };
         assert!(PveCli::runtime_config_payload(&invalid).is_err());
