@@ -818,14 +818,14 @@ impl PveProcessHandle {
                 stage_directory.join(Self::managed_file_stage_name(entrypoint_target)?);
             let entrypoint_script = r#"#!/bin/sh
 attempt=0
-while [ "$attempt" -lt 120 ]; do
+while [ "$attempt" -lt 480 ]; do
     if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
         break
     fi
     attempt=$((attempt + 1))
     sleep 0.25
 done
-if [ "$attempt" -ge 120 ]; then
+if [ "$attempt" -ge 480 ]; then
     echo 'timed out waiting for Proxmox DHCP' >&2
     exit 1
 fi
