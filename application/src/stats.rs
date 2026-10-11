@@ -1,6 +1,5 @@
 use serde::Serialize;
 use std::{
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -80,8 +79,12 @@ impl StatsManager {
     }
 }
 
-impl Default for StatsManager {
-    fn default() -> Self {
+impl StatsManager {
+    pub fn new(config: Arc<crate::config::Config>) -> Self {
+        Self::new_with_config(Some(config))
+    }
+
+    fn new_with_config(config: Option<Arc<crate::config::Config>>) -> Self {
         let (stats_tx, stats) =
             tokio::sync::watch::channel((Instant::now(), Arc::new(SystemStats::default())));
         let last_read = Arc::new(parking_lot::Mutex::new(Instant::now()));
@@ -105,6 +108,10 @@ impl Default for StatsManager {
                         return;
                     }
                 };
+                let data_directory = config.as_ref().map_or_else(
+                    || std::path::PathBuf::from("/"),
+                    |config| config.resolve_as_path(|inner| &inner.system.data_directory),
+                );
 
                 let cpu_model = sys
                     .cpus()
@@ -115,7 +122,7 @@ impl Default for StatsManager {
                     sys.refresh_specifics(refresh_kind);
                     networks.refresh(true);
                     for disk in disks.iter_mut() {
-                        if disk.mount_point() == Path::new("/") {
+                        if data_directory.starts_with(disk.mount_point()) {
                             disk.refresh();
                         }
                     }
@@ -156,7 +163,11 @@ impl Default for StatsManager {
                     let total_memory = sys.total_memory();
                     let used_memory = sys.used_memory();
 
-                    let disk = match disks.iter().find(|d| d.mount_point() == Path::new("/")) {
+                    let disk = match disks
+                        .iter()
+                        .filter(|disk| data_directory.starts_with(disk.mount_point()))
+                        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+                    {
                         Some(d) => d,
                         None => match disks.first() {
                             Some(d) => d,
@@ -229,5 +240,11 @@ impl Default for StatsManager {
             last_read,
             sampler,
         }
+    }
+}
+
+impl Default for StatsManager {
+    fn default() -> Self {
+        Self::new_with_config(None)
     }
 }
