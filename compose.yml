@@ -9,7 +9,7 @@ services:
       WINGS_USERNAME: calagopus
     dns:
       - 1.1.1.1
-      - 1.0.0.1
+      - 9.9.9.9
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "/var/lib/docker/containers/:/var/lib/docker/containers/"
