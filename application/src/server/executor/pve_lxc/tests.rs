@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn runtime_entrypoint_does_not_wait_for_dhcp() {
+    let script = PveProcessHandle::runtime_entrypoint_script("/mnt/server/.wings-exit-status");
+
+    assert!(!script.contains("/proc/net/route"));
+    assert!(!script.contains("DHCP"));
+    assert!(script.contains("/mnt/server/.wings-exit-status"));
+}
+
+#[test]
+fn installer_entrypoint_has_a_short_generic_network_gate() {
+    let script = PveLxcExecutor::helper_entrypoint_script();
+
+    assert!(script.contains("while [ \"$attempt\" -lt 120 ]"));
+    assert!(script.contains("/proc/net/route"));
+    assert!(script.contains("timed out waiting for usable network"));
+    assert!(!script.contains("DHCP"));
+}
+
+#[test]
 fn successful_start_followed_by_first_stopped_probe_emits_stopped() {
     let mut seen_running = false;
     let status = PveProcessHandle::observed_status(
@@ -274,6 +293,61 @@ fn helper_tags_are_distinct_from_servers_and_roles() {
     assert_eq!(
         PveLxcExecutor::helper_from_tags("other", PveLxcExecutor::INSTALLER_HELPER_ROLE, &tags,),
         None
+    );
+}
+
+#[test]
+fn startup_cleanup_selects_only_local_installer_helpers() {
+    let server_uuid = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let installer_tags = vec![
+        "calagopus".to_string(),
+        PveLxcExecutor::helper_tag(
+            "calagopus",
+            PveLxcExecutor::INSTALLER_HELPER_ROLE,
+            server_uuid,
+        ),
+    ];
+    let script_tags = vec![
+        "calagopus".to_string(),
+        PveLxcExecutor::helper_tag("calagopus", PveLxcExecutor::SCRIPT_HELPER_ROLE, server_uuid),
+    ];
+    let containers = vec![
+        cli::ClusterContainer {
+            vmid: 200,
+            node: "pve-a".to_string(),
+            status: Some(cli::ContainerStatus::Stopped),
+            tags: installer_tags.clone(),
+        },
+        cli::ClusterContainer {
+            vmid: 201,
+            node: "pve-a".to_string(),
+            status: Some(cli::ContainerStatus::Running),
+            tags: vec![
+                "calagopus".to_string(),
+                PveLxcExecutor::server_tag("calagopus", server_uuid),
+            ],
+        },
+        cli::ClusterContainer {
+            vmid: 202,
+            node: "pve-a".to_string(),
+            status: Some(cli::ContainerStatus::Stopped),
+            tags: script_tags,
+        },
+        cli::ClusterContainer {
+            vmid: 203,
+            node: "pve-b".to_string(),
+            status: Some(cli::ContainerStatus::Stopped),
+            tags: installer_tags,
+        },
+    ];
+
+    let selected = PveLxcExecutor::stale_installer_helpers(&containers, "pve-a", "calagopus");
+    assert_eq!(
+        selected
+            .iter()
+            .map(|container| container.vmid)
+            .collect::<Vec<_>>(),
+        vec![200]
     );
 }
 

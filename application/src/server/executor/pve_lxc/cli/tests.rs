@@ -1,5 +1,180 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_runner_captures_stdout_and_stderr_after_spawn() {
+    let args = vec![
+        "-c".to_string(),
+        "printf stdout-value; printf stderr-value >&2".to_string(),
+    ];
+
+    let output = PveCli::run(std::path::Path::new("/bin/sh"), &args)
+        .await
+        .expect("command should succeed");
+
+    assert_eq!(output.stdout, b"stdout-value");
+    assert_eq!(output.stderr, b"stderr-value");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timeout_cleanup_kills_descendant_in_a_separate_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("descendant.pid");
+    let script = format!(
+        "setsid /bin/sh -c 'echo $$ > {}; exec sleep 30' & wait",
+        pid_file.display()
+    );
+
+    let error = PveCli::run_with_timeout(
+        std::path::Path::new("/bin/sh"),
+        &["-c".to_string(), script],
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("timed out executing"));
+
+    let descendant = tokio::fs::read_to_string(&pid_file)
+        .await
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{descendant}")).exists(),
+        "separate-session descendant {descendant} survived timeout cleanup"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timeout_cleanup_kills_reparented_descendant_that_keeps_pipes_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("reparented-descendant.pid");
+    let script = format!(
+        "setsid /bin/sh -c 'echo $$ > {}; exec sleep 30' &",
+        pid_file.display()
+    );
+
+    let error = PveCli::run_with_timeout(
+        std::path::Path::new("/bin/sh"),
+        &["-c".to_string(), script],
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("timed out executing"));
+
+    let descendant = tokio::fs::read_to_string(&pid_file)
+        .await
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{descendant}")).exists(),
+        "reparented separate-session descendant {descendant} survived timeout cleanup"
+    );
+}
+
+#[test]
+fn scoped_process_identity_rejects_pid_reuse_during_discovery() {
+    assert_eq!(
+        PveCli::stable_process_identity(42, Some(100), Some(101)),
+        None
+    );
+    assert_eq!(
+        PveCli::stable_process_identity(42, Some(100), Some(100)),
+        Some((42, 100))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timeout_cleanup_does_not_signal_a_reused_pid_identity() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let started = PveCli::process_start_time(pid).unwrap();
+
+    PveCli::signal_process_if_same(
+        pid,
+        started.saturating_add(1),
+        rustix::process::Signal::KILL,
+    );
+    assert!(child.try_wait().unwrap().is_none());
+
+    child.kill().await.unwrap();
+    let status = child.wait().await.unwrap();
+    assert_eq!(status.signal(), Some(9));
+}
+
+#[test]
+fn network_probe_timeout_never_exceeds_remaining_budget() {
+    assert_eq!(
+        PveCli::network_probe_timeout(Duration::from_secs(30)),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        PveCli::network_probe_timeout(Duration::from_millis(125)),
+        Some(Duration::from_millis(125))
+    );
+    assert_eq!(PveCli::network_probe_timeout(Duration::ZERO), None);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn successful_start_waits_for_a_usable_default_route() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let pct_path = directory.path().join("pct");
+    let probe_count_path = directory.path().join("route-probes");
+    let script = format!(
+        r#"#!/bin/sh
+case "$1" in
+    start) exit 0 ;;
+    exec)
+        count=0
+        if [ -f "{probe_count}" ]; then count=$(cat "{probe_count}"); fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "{probe_count}"
+        if [ "$count" -ge 3 ]; then exit 0; fi
+        exit 1
+        ;;
+    *) exit 1 ;;
+esac
+"#,
+        probe_count = probe_count_path.display()
+    );
+    tokio::fs::write(&pct_path, script).await.unwrap();
+    tokio::fs::set_permissions(&pct_path, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+
+    let cli = PveCli {
+        pct_path,
+        pvesh_path: "/bin/false".into(),
+        pveversion_path: "/bin/false".into(),
+        pvesm_path: "/bin/false".into(),
+        lxc_attach_path: "/bin/false".into(),
+        lxc_stop_path: "/bin/false".into(),
+        perl_path: "/bin/false".into(),
+    };
+
+    cli.start(201).await.unwrap();
+
+    assert_eq!(
+        tokio::fs::read_to_string(probe_count_path).await.unwrap(),
+        "3\n"
+    );
+}
+
 #[test]
 fn create_arguments_leave_data_mount_for_post_create_configuration() {
     let args = PveCli::create_args(&CreateContainerSpec {

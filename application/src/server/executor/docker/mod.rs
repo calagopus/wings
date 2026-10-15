@@ -1445,6 +1445,39 @@ impl DockerExecutor {
 
         Ok(())
     }
+
+    fn stale_installer_filters(app_name: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            "label".to_string(),
+            vec![
+                format!("Service={app_name}"),
+                "ContainerType=server_installer".to_string(),
+            ],
+        )])
+    }
+
+    async fn cleanup_stale_installer_containers(&self) -> Result<(), anyhow::Error> {
+        let app_name = self.app_config.load().app_name.clone();
+        let containers = self
+            .docker
+            .list_containers_settled(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(Self::stale_installer_filters(&app_name)),
+                ..Default::default()
+            }))
+            .await?;
+
+        for container in containers {
+            let Some(id) = container.id else { continue };
+            tracing::warn!(
+                container = %id,
+                "removing stale Docker installer container left by an interrupted daemon"
+            );
+            self.docker.remove_container_forgiving(&id).await?;
+        }
+
+        Ok(())
+    }
 }
 
 struct LogsReader {
@@ -2881,6 +2914,13 @@ async fn find_running_container(
 impl super::ServerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.app_config.ensure_docker_network(&self.docker).await?;
+        // Installer containers cannot be resumed after Wings restarts because
+        // their controller and output subscription were process-local.
+        self.cleanup_stale_installer_containers()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to reconcile stale Docker installer containers: {error:#}")
+            })?;
         self.firewall.boot().await?;
 
         if std::env::var("OCI_CONTAINER").is_ok() {
@@ -3626,6 +3666,19 @@ impl super::ServerExecutor for DockerExecutor {
 mod tests {
     use super::*;
     use crate::server::configuration::ServerConfiguration;
+
+    #[test]
+    fn stale_installer_cleanup_filters_by_service_and_installer_role() {
+        let filters = DockerExecutor::stale_installer_filters("calagopus");
+        assert_eq!(
+            filters.get("label"),
+            Some(&vec![
+                "Service=calagopus".to_string(),
+                "ContainerType=server_installer".to_string(),
+            ])
+        );
+        assert_eq!(filters.len(), 1);
+    }
 
     #[cfg(unix)]
     #[test]

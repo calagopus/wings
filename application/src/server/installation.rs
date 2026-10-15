@@ -25,6 +25,24 @@ pub const INSTALL_PROGRESS_FILE_NAME: &str = "progress";
 const INSTALL_FILE_READ_LIMIT: u64 = 4096;
 const INSTALL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+async fn complete_cleanup<T, F>(
+    primary: Result<T, anyhow::Error>,
+    durable_cleanup: F,
+) -> Result<T, anyhow::Error>
+where
+    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    let durable = durable_cleanup.await;
+    match (primary, durable) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "installation cleanup failed: {error:#}; durable helper cleanup also failed: {cleanup_error:#}"
+        )),
+    }
+}
+
 pub struct ServerInstaller {
     pub reinstall: bool,
     start_on_completion: bool,
@@ -773,34 +791,35 @@ impl ServerInstaller {
     }
 
     async fn cleanup_container(&self) -> Result<(), anyhow::Error> {
-        let handle = match self.process_handle.lock().await.clone() {
-            Some(h) => h,
-            None => return Ok(()),
-        };
-        let container_script = self.get_installation_script()?;
+        let handle = self.process_handle.lock().await.take();
+        let in_memory_cleanup = async {
+            let Some(handle) = handle else {
+                return Ok(());
+            };
+            let container_script = self.get_installation_script()?;
 
-        if let Err(err) = handle.kill().await {
-            tracing::warn!(
-                server = %self.server.uuid,
-                "failed to kill installation container, ignoring: {}",
-                err
-            );
-        }
+            if let Err(err) = handle.kill().await {
+                tracing::warn!(
+                    server = %self.server.uuid,
+                    "failed to kill installation container, ignoring: {}",
+                    err
+                );
+            }
 
-        let mut env = String::new();
-        for var in &self.environment {
-            env.push_str(&format!("  {var}\n"));
-        }
+            let mut env = String::new();
+            for var in &self.environment {
+                env.push_str(&format!("  {var}\n"));
+            }
 
-        let failure = match self.failure_reason.lock().await.as_ref() {
-            Some(reason) => format!("\n  Failure Reason:       {reason}"),
-            None => String::new(),
-        };
+            let failure = match self.failure_reason.lock().await.as_ref() {
+                Some(reason) => format!("\n  Failure Reason:       {reason}"),
+                None => String::new(),
+            };
 
-        let mut file = ServerInstaller::create_install_logs(&self.server).await?;
-        file.write_all(
-            format!(
-                r"Server Installation Log
+            let mut file = ServerInstaller::create_install_logs(&self.server).await?;
+            file.write_all(
+                format!(
+                    r"Server Installation Log
 
 |
 | Details
@@ -818,34 +837,38 @@ impl ServerInstaller {
 | Script Output
 | ------------------------------
 ",
-                self.server.uuid, container_script.container_image, container_script.entrypoint,
+                    self.server.uuid, container_script.container_image, container_script.entrypoint,
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .await?;
-
-        match handle.logs(None).await {
-            Ok(mut reader) => {
-                tokio::io::copy(&mut reader, &mut file).await?;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    server = %self.server.uuid,
-                    "could not collect installation logs: {}",
-                    err
-                );
-            }
-        }
-
-        file.shutdown().await?;
-
-        self.server
-            .app_state
-            .executor
-            .cleanup_installation_process(&self.server)
             .await?;
 
-        Ok(())
+            match handle.logs(None).await {
+                Ok(mut reader) => {
+                    tokio::io::copy(&mut reader, &mut file).await?;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        server = %self.server.uuid,
+                        "could not collect installation logs: {}",
+                        err
+                    );
+                }
+            }
+
+            file.shutdown().await?;
+            Ok(())
+        }
+        .await;
+
+        complete_cleanup(
+            in_memory_cleanup,
+            self.server
+                .app_state
+                .executor
+                .cleanup_installation_process(&self.server),
+        )
+        .await
     }
 }
 
@@ -858,6 +881,38 @@ impl Drop for ServerInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durable_cleanup_runs_without_an_in_memory_process_handle() {
+        let durable_cleanup_attempted =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted = durable_cleanup_attempted.clone();
+
+        let error =
+            complete_cleanup::<(), _>(Err(anyhow::anyhow!("log collection failed")), async move {
+                attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "log collection failed");
+        assert!(durable_cleanup_attempted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_both_primary_and_durable_failures() {
+        let error =
+            complete_cleanup::<(), _>(Err(anyhow::anyhow!("log collection failed")), async {
+                Err(anyhow::anyhow!("destroy failed"))
+            })
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("log collection failed"));
+        assert!(message.contains("destroy failed"));
+    }
 
     fn progress(content: &str) -> Option<(u64, u64, Option<String>)> {
         tokio_test::block_on(async {

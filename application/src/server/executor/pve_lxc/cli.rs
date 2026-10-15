@@ -10,14 +10,18 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TASK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TASK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CONFIG_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const START_COMMAND_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const START_SETTLE_ATTEMPTS: usize = 20;
 const START_SETTLE_DELAY: Duration = Duration::from_millis(500);
+const START_NETWORK_READINESS_ATTEMPTS: usize = 120;
+const START_NETWORK_READINESS_DELAY: Duration = Duration::from_millis(250);
+const START_NETWORK_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_FILE_TARGETS: [&str; 5] = [
     "/etc/machine-id",
     "/etc/hosts",
@@ -424,13 +428,182 @@ impl PveCli {
         Ok(Some(1 + (u64::from(weight) - 10) * 9999 / 990))
     }
 
+    #[cfg(target_os = "linux")]
+    fn isolate_command_process_group(command: &mut tokio::process::Command) {
+        use std::os::unix::process::CommandExt;
+
+        // Proxmox's `pct` client starts a task subprocess. `kill_on_drop` only
+        // kills the direct client, which used to leave its task child holding
+        // pve-config-<vmid>.lock after a Wings timeout or restart. A dedicated
+        // session makes the client's PID the process-group leader so timeout
+        // cleanup can terminate the complete task tree.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_start_time(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stable_process_identity(
+        pid: u32,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Option<(u32, u64)> {
+        match (before, after) {
+            (Some(before), Some(after)) if before == after => Some((pid, before)),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scoped_process_identity(pid: u32, expected: &[u8]) -> Option<(u32, u64)> {
+        let before = Self::process_start_time(pid);
+        let environment = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+        if !environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected)
+        {
+            return None;
+        }
+        let after = Self::process_start_time(pid);
+        Self::stable_process_identity(pid, before, after)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn command_scope_processes(scope: &str) -> Vec<(u32, u64)> {
+        let expected = format!("CALAGOPUS_PVE_COMMAND_SCOPE={scope}");
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+            .filter_map(|pid| Self::scoped_process_identity(pid, expected.as_bytes()))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal_process_if_same(pid: u32, started: u64, signal: rustix::process::Signal) {
+        use rustix::process::{Pid, kill_process};
+
+        if Self::process_start_time(pid) != Some(started) {
+            return;
+        }
+        if let Some(pid) = Pid::from_raw(pid as i32) {
+            let _ = kill_process(pid, signal);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn terminate_command_scope(scope: &str, root: Option<(u32, u64)>) {
+        use rustix::process::{Pid, Signal, kill_process_group};
+
+        let processes = Self::command_scope_processes(scope);
+        for &(pid, started) in processes.iter().rev() {
+            Self::signal_process_if_same(pid, started, Signal::TERM);
+        }
+        if let Some((pid, started)) = root
+            && Self::process_start_time(pid) == Some(started)
+            && let Some(group) = Pid::from_raw(pid as i32)
+        {
+            let _ = kill_process_group(group, Signal::TERM);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The unique inherited scope survives reparenting and setsid, unlike
+        // PPID/process-group relationships. Re-scan after TERM and validate
+        // each process start time immediately before signaling so PID reuse
+        // cannot target an unrelated host process.
+        for (pid, started) in Self::command_scope_processes(scope) {
+            Self::signal_process_if_same(pid, started, Signal::KILL);
+        }
+        if let Some((pid, started)) = root
+            && Self::process_start_time(pid) == Some(started)
+            && let Some(group) = Pid::from_raw(pid as i32)
+        {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+    }
+
     async fn run(program: &std::path::Path, args: &[String]) -> Result<Output, anyhow::Error> {
+        Self::run_with_timeout(program, args, COMMAND_TIMEOUT).await
+    }
+
+    async fn run_with_timeout(
+        program: &std::path::Path,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<Output, anyhow::Error> {
         let mut command = tokio::process::Command::new(program);
-        command.args(args).kill_on_drop(true);
-        let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
-            .await
-            .with_context(|| format!("timed out executing {}", program.display()))?
+        // `wait_with_output` only captures streams explicitly piped before
+        // `spawn`; unlike `Command::output`, bare `spawn` inherits them.
+        // PVE commands emit JSON on stdout, which must not leak to journald
+        // or be lost before the caller parses it.
+        let scope = uuid::Uuid::new_v4().simple().to_string();
+        command
+            .args(args)
+            .env("CALAGOPUS_PVE_COMMAND_SCOPE", &scope)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        Self::isolate_command_process_group(&mut command);
+
+        let mut child = command
+            .spawn()
             .with_context(|| format!("failed to execute {}", program.display()))?;
+        #[cfg(target_os = "linux")]
+        let root = child
+            .id()
+            .and_then(|pid| Self::process_start_time(pid).map(|started| (pid, started)));
+        let mut stdout_reader = child
+            .stdout
+            .take()
+            .context("spawned Proxmox command did not expose stdout")?;
+        let mut stderr_reader = child
+            .stderr
+            .take()
+            .context("spawned Proxmox command did not expose stderr")?;
+        let operation = async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let (status, _, _) = tokio::try_join!(
+                child.wait(),
+                stdout_reader.read_to_end(&mut stdout),
+                stderr_reader.read_to_end(&mut stderr),
+            )?;
+            Ok::<Output, std::io::Error>(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        let output = match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => {
+                result.with_context(|| format!("failed to execute {}", program.display()))?
+            }
+            Err(_) => {
+                #[cfg(target_os = "linux")]
+                Self::terminate_command_scope(&scope, root).await;
+                let _ = child.wait().await;
+                return Err(anyhow::anyhow!("timed out executing {}", program.display()));
+            }
+        };
 
         if output.status.success() {
             return Ok(output);
@@ -1868,32 +2041,118 @@ impl PveCli {
         ContainerStatus::parse(&String::from_utf8_lossy(&output.stdout))
     }
 
+    fn network_probe_timeout(remaining: Duration) -> Option<Duration> {
+        (!remaining.is_zero()).then(|| remaining.min(Duration::from_secs(10)))
+    }
+
+    async fn has_default_ipv4_route(&self, vmid: u32, timeout: Duration) -> bool {
+        let args = [
+            "exec".to_string(),
+            vmid.to_string(),
+            "--".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route".to_string(),
+        ];
+        Self::run_with_timeout(&self.pct_path, &args, timeout)
+            .await
+            .is_ok()
+    }
+
+    async fn wait_for_default_ipv4_route(&self, vmid: u32) -> bool {
+        let deadline = tokio::time::Instant::now() + START_NETWORK_READINESS_TIMEOUT;
+        for attempt in 0..START_NETWORK_READINESS_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some(probe_timeout) = Self::network_probe_timeout(remaining) else {
+                break;
+            };
+            if self.has_default_ipv4_route(vmid, probe_timeout).await {
+                return true;
+            }
+            if attempt + 1 < START_NETWORK_READINESS_ATTEMPTS {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(START_NETWORK_READINESS_DELAY.min(remaining)).await;
+            }
+        }
+        false
+    }
+
     pub async fn start(&self, vmid: u32) -> Result<(), anyhow::Error> {
         let args = ["start".to_string(), vmid.to_string()];
         let mut last_error = None;
+        let mut retried_command_timeout = false;
+        let mut retried_network_not_ready = false;
 
         for attempt in 0..START_SETTLE_ATTEMPTS {
-            match Self::run(&self.pct_path, &args).await {
-                Ok(_) => return Ok(()),
+            match Self::run_with_timeout(&self.pct_path, &args, START_COMMAND_TIMEOUT).await {
+                Ok(_) => {
+                    if self.wait_for_default_ipv4_route(vmid).await {
+                        return Ok(());
+                    }
+                    self.stop(vmid).await.with_context(|| {
+                        format!(
+                            "failed to stop Proxmox LXC {vmid} after it started without a usable default IPv4 route"
+                        )
+                    })?;
+                    let error = anyhow::anyhow!(
+                        "Proxmox LXC {vmid} started without a usable default IPv4 route"
+                    );
+                    if retried_network_not_ready {
+                        return Err(error.context(
+                            "network readiness failed again after one clean start retry",
+                        ));
+                    }
+                    retried_network_not_ready = true;
+                    last_error = Some(error);
+                    tracing::warn!(
+                        vmid,
+                        "retrying Proxmox LXC start once after network readiness timed out"
+                    );
+                }
                 Err(error) => {
                     let message = error.to_string();
+                    let command_timed_out = message.contains("timed out executing");
                     if !message.contains("monitor socket")
                         && !message.contains("got timeout")
                         && !message.contains("unable to get PID for CT")
+                        && !command_timed_out
                     {
                         return Err(error);
                     }
+                    if command_timed_out && retried_command_timeout {
+                        return Err(error.context(format!(
+                            "Proxmox LXC {vmid} start timed out again after cleaning its task tree"
+                        )));
+                    }
+                    retried_command_timeout |= command_timed_out;
                     tokio::time::sleep(START_SETTLE_DELAY).await;
                     // A failed pct client can still have started the container.
-                    // Reissuing pct start in that case would produce "already running".
+                    // Accept that state only after the guest has a usable IPv4
+                    // default route. A RUNNING container without one is only
+                    // partially ready and must be stopped before a clean retry.
                     if matches!(self.status(vmid).await, Ok(ContainerStatus::Running)) {
-                        return Ok(());
+                        if self.wait_for_default_ipv4_route(vmid).await {
+                            return Ok(());
+                        }
+                        tracing::warn!(
+                            vmid,
+                            "Proxmox LXC is running without a default IPv4 route after a failed start; stopping it before retry"
+                        );
+                        self.stop(vmid).await.with_context(|| {
+                            format!(
+                                "failed to stop Proxmox LXC {vmid} after a start error left it without a default IPv4 route"
+                            )
+                        })?;
                     }
                     last_error = Some(error);
                     if attempt + 1 < START_SETTLE_ATTEMPTS {
                         tracing::warn!(
                             vmid,
                             attempt = attempt + 1,
+                            command_timed_out,
                             "retrying Proxmox LXC start after monitor teardown"
                         );
                     }

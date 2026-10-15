@@ -342,6 +342,33 @@ impl PveLxcExecutor {
     const INSTALLER_HELPER_ROLE: &'static str = "installer";
     const SCRIPT_HELPER_ROLE: &'static str = "script";
 
+    pub(super) fn helper_entrypoint_script() -> &'static str {
+        r#"#!/bin/sh
+attempt=0
+while [ "$attempt" -lt 120 ]; do
+    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
+        "$@"
+        status=$?
+        if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
+            if [ "$status" -eq 0 ]; then
+                : > "$INSTALL_STATUS_FILE"
+            else
+                printf 'installer exited with status %s\n' "$status" > "$INSTALL_STATUS_FILE"
+            fi
+        fi
+        exit "$status"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+done
+echo 'timed out waiting for usable network' >&2
+if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
+    printf '%s\n' 'timed out waiting for usable network' > "$INSTALL_STATUS_FILE"
+fi
+exit 1
+"#
+    }
+
     pub fn new(
         app_config: Arc<crate::config::Config>,
         cli: PveCli,
@@ -746,6 +773,55 @@ impl PveLxcExecutor {
                 ))
             }
         }
+    }
+
+    fn stale_installer_helpers(
+        containers: &[cli::ClusterContainer],
+        node: &str,
+        prefix: &str,
+    ) -> Vec<cli::ClusterContainer> {
+        containers
+            .iter()
+            .filter(|container| container.node == node)
+            .filter(|container| {
+                Self::helper_from_tags(prefix, Self::INSTALLER_HELPER_ROLE, &container.tags)
+                    .is_some()
+            })
+            .cloned()
+            .collect()
+    }
+
+    async fn cleanup_stale_installer_helpers(&self, node: &str) -> Result<(), anyhow::Error> {
+        let prefix = self.app_config.load().runtime.pve_lxc.tag_prefix.clone();
+        let helpers =
+            Self::stale_installer_helpers(&self.cli.list_containers().await?, node, &prefix);
+
+        for helper in helpers {
+            tracing::warn!(
+                vmid = helper.vmid,
+                "removing stale Proxmox installer helper left by an interrupted daemon"
+            );
+            let status = match helper.status {
+                Some(status) => status,
+                None => self.cli.status(helper.vmid).await?,
+            };
+            if status == cli::ContainerStatus::Running {
+                self.cli.stop(helper.vmid).await.with_context(|| {
+                    format!(
+                        "failed to stop stale Proxmox installer helper {}",
+                        helper.vmid
+                    )
+                })?;
+            }
+            self.cli.destroy(helper.vmid).await.with_context(|| {
+                format!(
+                    "failed to destroy stale Proxmox installer helper {}",
+                    helper.vmid
+                )
+            })?;
+        }
+
+        Ok(())
     }
 
     async fn server_container(
@@ -1499,35 +1575,9 @@ impl PveLxcExecutor {
 
         let helper_wrapper_name = "calagopus-helper-entrypoint";
         let helper_wrapper_path = staging_path.join(helper_wrapper_name);
-        tokio::fs::write(
-            &helper_wrapper_path,
-            r#"#!/bin/sh
-attempt=0
-while [ "$attempt" -lt 120 ]; do
-    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
-        "$@"
-        status=$?
-        if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
-            if [ "$status" -eq 0 ]; then
-                : > "$INSTALL_STATUS_FILE"
-            else
-                printf 'installer exited with status %s\n' "$status" > "$INSTALL_STATUS_FILE"
-            fi
-        fi
-        exit "$status"
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.25
-done
-echo 'timed out waiting for Proxmox DHCP' >&2
-if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
-    printf '%s\n' 'timed out waiting for Proxmox DHCP' > "$INSTALL_STATUS_FILE"
-fi
-exit 1
-"#,
-        )
-        .await
-        .context("failed to write Proxmox helper entrypoint wrapper")?;
+        tokio::fs::write(&helper_wrapper_path, Self::helper_entrypoint_script())
+            .await
+            .context("failed to write Proxmox helper entrypoint wrapper")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1540,10 +1590,9 @@ exit 1
         }
 
         self.cli.create_with_bind_mounts(&create, &mounts).await?;
-        // PVE applies a host-managed DHCP lease immediately after CT init starts.
-        // Keep PID 1 alive until that lease installs a default route; otherwise a
-        // fast installer can attempt its first download and exit before `pct`
-        // has a chance to run its DHCP hook.
+        // The helper can begin running before `pct start` returns, so keep the
+        // installer behind a short, generic network-readiness gate. This is a
+        // startup race guard rather than compensation for slow DHCP.
         let init_command = PveCli::encode_init_command(&[
             format!("{staging_target}/{helper_wrapper_name}"),
             script.entrypoint.to_string(),
@@ -1906,6 +1955,14 @@ impl ServerExecutor for PveLxcExecutor {
         self.node
             .set(node.clone())
             .map_err(|_| anyhow::anyhow!("Proxmox VE LXC runtime was booted more than once"))?;
+
+        // Installer helpers cannot be resumed after a daemon restart: their
+        // controller, output subscription, and temporary staging directory are
+        // process-local. Remove only helpers with the durable installer tag;
+        // normal runtime containers and script helpers are never selected.
+        self.cleanup_stale_installer_helpers(&node)
+            .await
+            .context("failed to reconcile stale Proxmox installer helpers")?;
 
         self.firewall
             .boot()

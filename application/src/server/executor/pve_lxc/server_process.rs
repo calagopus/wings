@@ -20,6 +20,71 @@ pub(super) struct PveProcessHandle {
 impl PveProcessHandle {
     const EXIT_STATUS_FILE: &'static str = ".wings-exit-status";
 
+    pub(super) fn runtime_entrypoint_script(exit_status_path: &str) -> String {
+        r#"#!/bin/sh
+read_oom_kills() {
+    value=0
+    if [ -r /sys/fs/cgroup/memory.events ]; then
+        while read -r key count; do
+            if [ "$key" = oom_kill ]; then
+                value=$count
+                break
+            fi
+        done < /sys/fs/cgroup/memory.events
+    fi
+    printf '%s' "$value"
+}
+
+child=0
+child_group=0
+forward_signal() {
+    if [ "$child" -gt 0 ]; then
+        if [ "$child_group" -eq 1 ]; then
+            kill "-$1" "-$child" 2>/dev/null || true
+        else
+            kill "-$1" "$child" 2>/dev/null || true
+        fi
+    fi
+}
+trap 'forward_signal HUP' HUP
+trap 'forward_signal INT' INT
+trap 'forward_signal QUIT' QUIT
+trap 'forward_signal ABRT' ABRT
+trap 'forward_signal TERM' TERM
+
+oom_before=$(read_oom_kills)
+if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" <&0 &
+    child_group=1
+else
+    "$@" <&0 &
+fi
+child=$!
+while :; do
+    wait "$child"
+    status=$?
+    if ! kill -0 "$child" 2>/dev/null; then
+        break
+    fi
+done
+oom_after=$(read_oom_kills)
+oom_killed=0
+if [ "$oom_after" -gt "$oom_before" ]; then
+    oom_killed=1
+fi
+
+marker=__WINGS_EXIT_STATUS_PATH__
+temporary="${marker}.tmp.$$"
+(
+    umask 077
+    printf 'exit_code=%s\noom_killed=%s\n' "$status" "$oom_killed" > "$temporary"
+)
+mv -f "$temporary" "$marker"
+exit "$status"
+"#
+        .replace("__WINGS_EXIT_STATUS_PATH__", exit_status_path)
+    }
+
     pub(super) fn observed_status(
         status: cli::ContainerStatus,
         start_succeeded: bool,
@@ -816,97 +881,20 @@ impl PveProcessHandle {
             let entrypoint_target = "/calagopus-entrypoint";
             let entrypoint_source =
                 stage_directory.join(Self::managed_file_stage_name(entrypoint_target)?);
-            let entrypoint_script = r#"#!/bin/sh
-attempt=0
-while [ "$attempt" -lt 120 ]; do
-    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.25
-done
-if [ "$attempt" -ge 120 ]; then
-    echo 'timed out waiting for Proxmox DHCP' >&2
-    exit 1
-fi
-
-read_oom_kills() {
-    value=0
-    if [ -r /sys/fs/cgroup/memory.events ]; then
-        while read -r key count; do
-            if [ "$key" = oom_kill ]; then
-                value=$count
-                break
-            fi
-        done < /sys/fs/cgroup/memory.events
-    fi
-    printf '%s' "$value"
-}
-
-child=0
-child_group=0
-forward_signal() {
-    if [ "$child" -gt 0 ]; then
-        if [ "$child_group" -eq 1 ]; then
-            kill "-$1" "-$child" 2>/dev/null || true
-        else
-            kill "-$1" "$child" 2>/dev/null || true
-        fi
-    fi
-}
-trap 'forward_signal HUP' HUP
-trap 'forward_signal INT' INT
-trap 'forward_signal QUIT' QUIT
-trap 'forward_signal ABRT' ABRT
-trap 'forward_signal TERM' TERM
-
-oom_before=$(read_oom_kills)
-if command -v setsid >/dev/null 2>&1; then
-    setsid "$@" <&0 &
-    child_group=1
-else
-    "$@" <&0 &
-fi
-child=$!
-while :; do
-    wait "$child"
-    status=$?
-    if ! kill -0 "$child" 2>/dev/null; then
-        break
-    fi
-done
-oom_after=$(read_oom_kills)
-oom_killed=0
-if [ "$oom_after" -gt "$oom_before" ]; then
-    oom_killed=1
-fi
-
-marker=__WINGS_EXIT_STATUS_PATH__
-temporary="${marker}.tmp.$$"
-(
-    umask 077
-    printf 'exit_code=%s\noom_killed=%s\n' "$status" "$oom_killed" > "$temporary"
-)
-mv -f "$temporary" "$marker"
-exit "$status"
-"#
-            .replace(
-                "__WINGS_EXIT_STATUS_PATH__",
-                &format!(
-                    "{}/{}",
-                    PveLxcExecutor::DATA_MOUNT_TARGET,
-                    Self::EXIT_STATUS_FILE
-                ),
-            );
+            let entrypoint_script = Self::runtime_entrypoint_script(&format!(
+                "{}/{}",
+                PveLxcExecutor::DATA_MOUNT_TARGET,
+                Self::EXIT_STATUS_FILE
+            ));
             tokio::fs::write(&entrypoint_source, entrypoint_script)
                 .await
-                .context("failed to stage Proxmox network-ready entrypoint")?;
+                .context("failed to stage Proxmox runtime entrypoint")?;
             tokio::fs::set_permissions(&entrypoint_source, std::fs::Permissions::from_mode(0o755))
                 .await
-                .context("failed to make Proxmox network-ready entrypoint executable")?;
+                .context("failed to make Proxmox runtime entrypoint executable")?;
             let entrypoint_source = tokio::fs::canonicalize(&entrypoint_source)
                 .await
-                .context("failed to resolve staged Proxmox network-ready entrypoint")?;
+                .context("failed to resolve staged Proxmox runtime entrypoint")?;
             let source_path = entrypoint_source
                 .into_os_string()
                 .into_string()
