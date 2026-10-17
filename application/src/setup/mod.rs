@@ -171,7 +171,7 @@ async fn probe(
     let container = std::env::var("OCI_CONTAINER").is_ok();
     let data_directory = state.config.system.data_directory.as_path(&state.config);
 
-    let (cpu_count, memory_bytes, disk_bytes) = tokio::task::spawn_blocking(move || {
+    let (cpu_count, memory_bytes, local_disk_bytes) = tokio::task::spawn_blocking(move || {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         system.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
@@ -187,6 +187,10 @@ async fn probe(
         StatusCode::INTERNAL_SERVER_ERROR,
         "failed to read system information",
     )?;
+
+    // Server data is bind-mounted from this filesystem for every backend, so
+    // its capacity is the only capacity the panel can safely allocate.
+    let disk_bytes = local_disk_bytes;
 
     let ips = if container {
         BTreeSet::new()

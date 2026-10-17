@@ -6205,6 +6205,7 @@ dependencies = [
  "sevenz-rust2",
  "sha1 0.11.0",
  "sha2",
+ "shell-words",
  "sntpc",
  "sntpc-net-tokio",
  "sysinfo",

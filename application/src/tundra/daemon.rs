@@ -1,5 +1,6 @@
 use super::TundraManager;
 use crate::{io::hash_reader::HashReader, routes::State};
+use anyhow::Context;
 use futures::StreamExt;
 use sha2::Digest;
 use std::{
@@ -15,6 +16,7 @@ const BINARY_NAME: &str = "tundra-node";
 const SERVER_PLACEHOLDER: &str = "{server}";
 const EXTRACT_CONTAINER_NAME: &str = "calagopus-wings-tundra-extract";
 const SOURCE_ENTRYPOINT: &str = "/usr/bin/calagopus-tundra";
+const PIDFILE_NAME: &str = "tundra-node.pid";
 
 const CREATE_ATTEMPTS: u32 = 5;
 const CREATE_BACKOFF: Duration = Duration::from_millis(200);
@@ -441,7 +443,9 @@ impl Applied {
 }
 
 pub async fn stop(manager: &TundraManager) -> Result<(), anyhow::Error> {
-    let docker = manager.docker();
+    let Some(docker) = manager.docker() else {
+        return stop_native(manager).await;
+    };
     let inspect = match docker.inspect_container(CONTAINER_NAME, None).await {
         Ok(inspect) => inspect,
         Err(bollard::errors::Error::DockerResponseServerError {
@@ -472,6 +476,124 @@ pub async fn stop(manager: &TundraManager) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn native_pid(manager: &TundraManager) -> Option<u32> {
+    let pid = std::fs::read_to_string(manager.data_dir.join("node").join(PIDFILE_NAME))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let command = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let expected_config = config_path(manager);
+    let command_matches = command
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == expected_config.as_os_str().as_encoded_bytes());
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let expected_binary = binary_path(manager);
+    let executable_bytes = executable.as_os_str().as_encoded_bytes();
+    let expected_bytes = expected_binary.as_os_str().as_encoded_bytes();
+    let executable_matches = executable_bytes == expected_bytes
+        || executable_bytes.strip_suffix(b" (deleted)") == Some(expected_bytes);
+    (command_matches && executable_matches).then_some(pid)
+}
+
+async fn stop_native(manager: &TundraManager) -> Result<(), anyhow::Error> {
+    if !manager.disabled() {
+        return Ok(());
+    }
+    let Some(pid) = native_pid(manager) else {
+        return Ok(());
+    };
+
+    let pid = rustix::process::Pid::from_raw(pid as i32)
+        .context("native tundra daemon PID was invalid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+        .context("failed to stop the native tundra daemon")?;
+    manager.hub.disconnect();
+    Ok(())
+}
+
+async fn restart_native(manager: &TundraManager) -> Result<(), anyhow::Error> {
+    let output = tokio::process::Command::new(binary_path(manager))
+        .arg("restart")
+        .arg("--config")
+        .arg(config_path(manager))
+        .output()
+        .await
+        .context("failed to request a native tundra restart")?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "native tundra restart failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_native(
+    manager: &TundraManager,
+    wanted: &Applied,
+    tunnel_port: u16,
+) -> Result<(), anyhow::Error> {
+    if let Some(pid) = native_pid(manager) {
+        let applied = manager.hub.request_metrics().await;
+        if applied
+            .as_ref()
+            .is_ok_and(|metrics| wanted.matches(metrics))
+        {
+            return Ok(());
+        }
+
+        if manager.serving() && manager.restart_due() {
+            tracing::info!(
+                pid,
+                "requesting the native tundra daemon to apply its current binary and config"
+            );
+            tokio::time::timeout(Duration::from_secs(30), restart_native(manager)).await??;
+        }
+        return Ok(());
+    }
+
+    let mut child = tokio::process::Command::new(binary_path(manager))
+        .arg("--config")
+        .arg(config_path(manager))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("failed to start the native tundra daemon")?;
+    let pid = child
+        .id()
+        .context("native tundra daemon did not expose a process ID")?;
+    let pid_path = manager.data_dir.join("node").join(PIDFILE_NAME);
+    if let Some(parent) = pid_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&pid_path, format!("{pid}\n"))
+        .await
+        .context("failed to write native tundra daemon PID file")?;
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                tracing::info!(?pid, "native tundra daemon stopped");
+            }
+            Ok(status) => {
+                tracing::error!(?pid, %status, "native tundra daemon exited");
+            }
+            Err(error) => {
+                tracing::error!(?pid, "failed to wait for native tundra daemon: {error:#}");
+            }
+        }
+        if tokio::fs::read_to_string(&pid_path)
+            .await
+            .is_ok_and(|contents| contents.trim() == pid.to_string())
+        {
+            tokio::fs::remove_file(pid_path).await.ok();
+        }
+    });
+    tracing::info!(pid, tunnel_port, "started the native tundra daemon");
+    Ok(())
+}
+
 pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow::Error> {
     if !manager.serving() {
         return Ok(());
@@ -493,23 +615,34 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     let source = config.tundra.binary.as_path(&config);
     let source_image = config.tundra.source_image.clone();
     let metrics_port = config.tundra.metrics_port;
-    let hosts_path = config
-        .system
-        .vmount_directory
-        .as_path(&config)
-        .join(SERVER_PLACEHOLDER)
-        .join("hosts");
+    let hosts_path = match state.config.active_runtime_backend() {
+        crate::config::RuntimeBackend::PveLxc => config
+            .runtime
+            .pve_lxc
+            .managed_file_directory
+            .as_path(&config)
+            .join(SERVER_PLACEHOLDER)
+            .join("hosts"),
+        crate::config::RuntimeBackend::Auto | crate::config::RuntimeBackend::Docker => config
+            .system
+            .vmount_directory
+            .as_path(&config)
+            .join(SERVER_PLACEHOLDER)
+            .join("hosts"),
+    };
 
     let image = config.tundra.image.clone();
     let docker = manager.docker();
-    let desired = create_body(state, manager, &image);
     drop(config);
 
     let refresh = !manager.images_refreshed.load(Ordering::Relaxed);
 
     if source.as_os_str().is_empty() {
-        ensure_image(&docker, state, &source_image, "source", refresh).await?;
-        extract_binary(&docker, manager, &source_image).await?;
+        let docker = docker
+            .as_ref()
+            .context("native tundra requires tundra.binary to point to a tundra-node executable")?;
+        ensure_image(docker, state, &source_image, "source", refresh).await?;
+        extract_binary(docker, manager, &source_image).await?;
     } else {
         let dest = binary_path(manager);
         let digest_path = image_digest_path(manager);
@@ -544,6 +677,12 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> Result<(), anyhow
     if !manager.serving() {
         return Ok(());
     }
+
+    let Some(docker) = docker else {
+        return ensure_native(manager, &wanted, own.tunnel_port).await;
+    };
+
+    let desired = create_body(state, manager, &image);
 
     ensure_image(&docker, state, &image, "daemon", refresh).await?;
     manager.images_refreshed.store(true, Ordering::Relaxed);
