@@ -33,9 +33,11 @@ jobs:
           - build: riscv64-linux
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
+            link_flags: -C relocation-model=static
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
+            link_flags: -C relocation-model=static
 
     steps:
       - name: Checkout sources
@@ -59,7 +61,7 @@ jobs:
 
       - name: Build release binary
         run: |
-          RUSTFLAGS="-C target-feature=+crt-static" \
+          RUSTFLAGS="-C target-feature=+crt-static ${{ matrix.link_flags }}" \
           cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary with platform name
