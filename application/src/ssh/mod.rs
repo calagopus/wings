@@ -43,6 +43,8 @@ impl russh::server::Server for Server {
 
             clients: HashMap::new(),
             shell_clients: HashSet::new(),
+
+            removal_task: None,
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use russh::{
-    Channel, ChannelId, MethodSet,
+    Channel, ChannelId, Disconnect, MethodSet,
     server::{Auth, Msg, Session},
 };
 use serde_json::json;
@@ -40,6 +40,8 @@ pub struct SshSession {
 
     pub clients: HashMap<ChannelId, Channel<Msg>>,
     pub shell_clients: HashSet<ChannelId>,
+
+    pub removal_task: Option<tokio::task::AbortHandle>,
 }
 
 impl SshSession {
@@ -234,6 +236,35 @@ impl russh::server::Handler for SshSession {
         Ok(Auth::Accept)
     }
 
+    async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
+        let (Some(user_uuid), Some(server)) = (self.user_uuid, self.server.clone()) else {
+            return Ok(());
+        };
+
+        let handle = session.handle();
+        let task = tokio::spawn(async move {
+            server.user_permissions.wait_for_removal(user_uuid).await;
+
+            tracing::debug!(
+                server = %server.uuid,
+                "closing ssh session due to user permissions removal"
+            );
+
+            handle
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "permission revoked".to_string(),
+                    String::new(),
+                )
+                .await
+                .ok();
+        });
+
+        self.removal_task = Some(task.abort_handle());
+
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
@@ -419,6 +450,10 @@ impl russh::server::Handler for SshSession {
 
 impl Drop for SshSession {
     fn drop(&mut self) {
+        if let Some(task) = self.removal_task.take() {
+            task.abort();
+        }
+
         if let Some(user) = self.user_uuid {
             self.limiter.decrement_sessions(user);
         }
