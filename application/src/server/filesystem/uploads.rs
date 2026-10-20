@@ -128,7 +128,7 @@ impl UploadGuard {
         self.upload.set_progress(uploaded);
     }
 
-    /// Forgets the upload now that its staging file has been renamed onto the final name.
+    /// Forgets the upload now that its staging file has been moved or copied onto the final name.
     pub async fn complete(mut self) {
         self.armed = false;
         self.uploads.write().await.remove(&self.key);

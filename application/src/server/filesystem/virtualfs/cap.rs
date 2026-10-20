@@ -1678,6 +1678,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_opened(&path, &file)?;
 
         if self.is_primary_server_fs {
+            self.server.filesystem.chown_file(&file)?;
             let file = crate::server::filesystem::file::ServerFile::new_file(
                 self.server.clone(),
                 &path,
@@ -1703,6 +1704,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let (path, file) = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
             let file = this.inner.open_with(&path, options)?;
             this.check_opened(&path, &file)?;
+            if this.is_primary_server_fs {
+                this.server.filesystem.chown_file(&file)?;
+            }
 
             Ok((path, file))
         })
