@@ -35,6 +35,13 @@ fn glob_literal(path: &std::path::Path) -> String {
     literal
 }
 
+fn log_restoring(server: &crate::server::Server, path: &std::path::Path) {
+    server.log_daemon(compact_str::format_compact!(
+        "(restoring): {}",
+        path.display()
+    ));
+}
+
 async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyhow::Error> {
     let mut first_byte = [0; 1];
     if reader.read(&mut first_byte).await? == 0 {

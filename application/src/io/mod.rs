@@ -18,6 +18,7 @@ pub mod pipe;
 pub mod range_reader;
 pub mod read_stream;
 pub mod replay_reader;
+pub mod shared_reader;
 pub mod tail;
 
 const KERNEL_COPY_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MiB

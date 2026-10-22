@@ -36,18 +36,6 @@ impl<'a, R: Read> CompressionReader<'a, R> {
             CompressionType::Zstd => CompressionReader::Zstd(zstd::Decoder::new(reader)?),
         })
     }
-
-    pub fn into_inner(self) -> R {
-        match self {
-            CompressionReader::None(reader) => reader,
-            CompressionReader::Gz(decoder) => decoder.into_inner(),
-            CompressionReader::Xz(decoder) => decoder.into_inner(),
-            CompressionReader::Lzip(decoder) => decoder.into_inner(),
-            CompressionReader::Bz2(decoder) => decoder.into_inner(),
-            CompressionReader::Lz4(decoder) => decoder.into_inner(),
-            CompressionReader::Zstd(decoder) => decoder.finish().into_inner(),
-        }
-    }
 }
 
 impl<'a, R: Read> Read for CompressionReader<'a, R> {

@@ -637,6 +637,9 @@ pub trait VirtualReadableFilesystem: Send + Sync {
     fn is_primary_server_fs(&self) -> bool {
         false
     }
+    fn is_ignored(&self, _path: &Path, _file_type: FileType) -> bool {
+        false
+    }
     fn is_fast(&self) -> bool {
         false
     }
@@ -880,6 +883,11 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     async fn async_create_symlink_contents(
         &self,
         contents: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(), anyhow::Error>;
+    fn create_hard_link(
+        &self,
+        original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
     fn create_file(

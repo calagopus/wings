@@ -567,7 +567,7 @@ impl BackupExt for BtrfsBackup {
                                 let path = entry.path;
 
                                 if metadata.is_file() {
-                                    server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
+                                    super::log_restoring(&server, &path);
 
                                     if let Some(parent) = path.parent() {
                                         server.filesystem.async_create_dir_all(parent).await?;

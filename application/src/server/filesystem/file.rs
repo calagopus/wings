@@ -189,8 +189,15 @@ impl ServerFile {
     }
 
     /// Skip Disk Limit Checks
+    #[allow(dead_code)]
     pub fn ignorant(mut self) -> Self {
         self.ignorant = true;
+        self
+    }
+
+    /// Skip Disk Limit Checks if `ignorant` is set
+    pub fn ignorant_if(mut self, ignorant: bool) -> Self {
+        self.ignorant |= ignorant;
         self
     }
 
@@ -443,6 +450,12 @@ impl AsyncServerFile {
     #[allow(dead_code)]
     pub fn ignorant(mut self) -> Self {
         self.ignorant = true;
+        self
+    }
+
+    /// Skip Disk Limit Checks if `ignorant` is set
+    pub fn ignorant_if(mut self, ignorant: bool) -> Self {
+        self.ignorant |= ignorant;
         self
     }
 

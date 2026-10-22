@@ -1980,6 +1980,7 @@ impl ScheduleAction {
                                         files_processed,
                                     ),
                                     Some(bytes_total),
+                                    crate::server::filesystem::archive::ExtractOptions::default(),
                                 )
                                 .await
                         },

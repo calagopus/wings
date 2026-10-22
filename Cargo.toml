@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["application", "pbs-client", "unrar-rs"]
+members = ["application", "pbs-client"]
 default-members = ["application"]
 package.rust-version = "1.99.0"
 

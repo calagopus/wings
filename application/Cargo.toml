@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 tempfile = "3.27.0"
-unrar = { path = "../unrar-rs" }
+unrar = { package = "unrar-ng", git = "https://github.com/0x7d8/unrar.rs.git" }
 pbs-client = { path = "../pbs-client" }
 tundra-common = { git = "https://github.com/calagopus/tundra.git" }
 tracing = { version = "0.1.41", features = ["max_level_debug"] }

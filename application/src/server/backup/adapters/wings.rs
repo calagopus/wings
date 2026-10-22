@@ -1,11 +1,7 @@
 use crate::{
     io::{
         SafeDigestExt,
-        compression::{
-            CompressionType,
-            reader::{AsyncCompressionReader, CompressionReaderMt},
-            writer::CompressionWriter,
-        },
+        compression::{CompressionType, reader::AsyncCompressionReader, writer::CompressionWriter},
         limited_reader::LimitedReader,
         limited_writer::LimitedWriter,
         range_reader::AsyncRangeReader,
@@ -19,26 +15,23 @@ use crate::{
         },
         filesystem::{
             archive::{
-                ArchiveFormat, StreamableArchiveFormat, multi_reader::MultiReader,
-                zip_entry_get_modified_time,
+                Archive, ArchiveFormat, ExtractOptions, StreamableArchiveFormat,
+                multi_reader::MultiReader,
             },
-            cap::FileType,
             virtualfs::{
                 ByteRange, VirtualReadableFilesystem,
                 archive::{seven_zip::VirtualSevenZipArchive, zip::VirtualZipArchive},
             },
         },
     },
-    utils::PortablePermissions,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use sha2::Digest;
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::io::AsyncReadExt;
@@ -692,461 +685,61 @@ impl BackupExt for WingsBackup {
         };
         let format = *format;
 
-        let file = tokio::fs::File::open(&self.path).await?.into_std().await;
+        let file = tokio::fs::File::open(&self.path).await?;
+        let size = file.metadata().await?.len();
+        let file = file.into_std().await;
 
-        match format {
-            ArchiveFormat::Tar
-            | ArchiveFormat::TarGz
-            | ArchiveFormat::TarXz
-            | ArchiveFormat::TarLzip
-            | ArchiveFormat::TarBz2
-            | ArchiveFormat::TarLz4
-            | ArchiveFormat::TarZstd => {
-                let compression_type = format.compression_format();
-                let server = server.clone();
-
-                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    total.store(file.metadata()?.len(), Ordering::SeqCst);
-
-                    let reader = LimitedReader::new_with_bytes_per_second(
-                        file,
-                        server
-                            .app_state
-                            .config
-                            .load()
-                            .system
-                            .backups
-                            .read_limit
-                            .as_bytes(),
-                    );
-                    let reader = progress.counting_reader(reader);
-                    let reader = CompressionReaderMt::new(
-                        reader,
-                        compression_type,
-                        server
-                            .app_state
-                            .config
-                            .load()
-                            .api
-                            .file_decompression_threads,
-                    )?;
-
-                    let mut archive = tar::Archive::new(reader);
-                    let mut directory_entries = Vec::new();
-                    let entries = archive.entries()?;
-
-                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
-                    for entry in entries {
-                        let mut entry = entry?;
-                        let path = server.filesystem.relative_path(&entry.path()?);
-
-                        if path.as_os_str().is_empty() {
-                            continue;
-                        }
-
-                        let destination_path = path.as_path();
-                        let header = entry.header();
-
-                        match header.entry_type() {
-                            tar::EntryType::Directory => {
-                                server.filesystem.create_chowned_dir_all(destination_path)?;
-                                if let Ok(permissions) =
-                                    header.mode().map(PortablePermissions::from_mode_dir)
-                                {
-                                    server
-                                        .filesystem
-                                        .set_permissions(destination_path, permissions)?;
-                                }
-
-                                if let Ok(modified_time) = header.mtime() {
-                                    directory_entries
-                                        .push((destination_path.to_path_buf(), modified_time));
-                                }
-                            }
-                            tar::EntryType::Regular => {
-                                server.log_daemon(compact_str::format_compact!(
-                                    "(restoring): {}",
-                                    path.display()
-                                ));
-
-                                if let Some(parent) = destination_path.parent() {
-                                    server.filesystem.create_chowned_dir_all(parent)?;
-                                }
-
-                                let mut writer = crate::server::filesystem::file::ServerFile::new(
-                                    server.clone(),
-                                    destination_path,
-                                    header.mode().map(PortablePermissions::from_mode_file).ok(),
-                                    header
-                                        .mtime()
-                                        .map(|t| {
-                                            std::time::UNIX_EPOCH
-                                                + std::time::Duration::from_secs(t)
-                                        })
-                                        .ok(),
-                                )?;
-
-                                crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
-                                writer.flush()?;
-                                progress.increment_files();
-                            }
-                            tar::EntryType::Symlink => {
-                                let link =
-                                    entry.link_name().unwrap_or_default().unwrap_or_default();
-
-                                if let Err(err) = server.filesystem.symlink(link, destination_path)
-                                {
-                                    tracing::debug!(
-                                        path = %destination_path.display(),
-                                        "failed to create symlink from archive: {:#?}",
-                                        err
-                                    );
-                                } else {
-                                    progress.increment_files();
-
-                                    if let Ok(modified_time) = header.mtime() {
-                                        server.filesystem.set_times(
-                                            destination_path,
-                                            std::time::UNIX_EPOCH
-                                                + std::time::Duration::from_secs(modified_time),
-                                            None,
-                                        )?;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    for (destination_path, modified_time) in directory_entries {
-                        server
-                            .filesystem
-                            .set_times(
-                                &destination_path,
-                                std::time::UNIX_EPOCH
-                                    + std::time::Duration::from_secs(modified_time),
-                                None,
-                            )
-                            .ok();
-                    }
-
-                    Ok(())
-                })
-                .await??;
+        let config = server.app_state.config.load();
+        let read_limit = config.system.backups.read_limit.as_bytes();
+        let threads = match format {
+            ArchiveFormat::Zip | ArchiveFormat::SevenZip => {
+                Some(config.system.backups.wings.restore_threads)
             }
-            ArchiveFormat::Zip => {
-                let server = server.clone();
+            _ => None,
+        };
+        drop(config);
 
-                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader = MultiReader::new(Arc::new(file))?;
-                    let mut archive = zip::ZipArchive::new(reader)?;
-                    let entry_index = Arc::new(AtomicUsize::new(0));
-
-                    for i in 0..archive.len() {
-                        let entry = archive.by_index(i)?;
-
-                        if entry.enclosed_name().is_none() {
-                            continue;
-                        }
-
-                        total.fetch_add(entry.size(), Ordering::SeqCst);
-                    }
-
-                    let pool = crate::threading::build_pool(
-                        server.app_state.config.load().system.backups.wings.restore_threads,
-                    )?;
-
-                    let error = Arc::new(crate::threading::SharedError::new());
-
-                    pool.in_place_scope(|scope| {
-                        let archive = archive.clone();
-                        let server = server.clone();
-                        let error_clone = Arc::clone(&error);
-
-                        scope.spawn_broadcast(move |_, _| {
-                            let mut archive = archive.clone();
-                            let progress = progress.clone();
-                            let entry_index = Arc::clone(&entry_index);
-                            let error_clone2 = Arc::clone(&error_clone);
-                            let server = server.clone();
-
-                            let mut run = move || -> Result<(), anyhow::Error> {
-                                let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
-
-                                loop {
-                                    if error_clone2.stopped() {
-                                        return Ok(());
-                                    }
-
-                                    let i =
-                                        entry_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    if i >= archive.len() {
-                                        return Ok(());
-                                    }
-
-                                    let mut entry = archive.by_index(i)?;
-                                    let path = match entry.enclosed_name() {
-                                        Some(path) => path,
-                                        None => continue,
-                                    };
-
-                                    if entry.is_dir() {
-                                        server.filesystem.create_chowned_dir_all(&path)?;
-                                        server.filesystem.set_permissions(
-                                            &path,
-                                            PortablePermissions::from_mode_dir(
-                                                entry.unix_mode().unwrap_or(0o755),
-                                            ),
-                                        )?;
-                                    } else if entry.is_file() {
-                                        server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
-
-                                        if let Some(parent) = path.parent() {
-                                            server.filesystem.create_chowned_dir_all(parent)?;
-                                        }
-
-                                        let mut writer = crate::server::filesystem::file::ServerFile::new(
-                                            server.clone(),
-                                            &path,
-                                            entry.unix_mode().map(PortablePermissions::from_mode_file),
-                                            crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
-                                        )?;
-                                        let mut reader = progress.counting_reader(entry);
-
-                                        if let Err(err) = crate::io::copy_shared(&mut read_buffer, &mut reader, &mut writer) {
-                                            if err.kind() == std::io::ErrorKind::InvalidData {
-                                                tracing::warn!(
-                                                    path = %path.display(),
-                                                    "corrupted backup file: {:#?}",
-                                                    err
-                                                );
-                                            } else {
-                                                Err(err)?;
-                                            }
-                                        }
-                                        writer.flush()?;
-                                        progress.increment_files();
-                                    } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
-                                        let link = std::io::read_to_string(&mut entry).unwrap_or_default();
-
-                                        if let Err(err) = server.filesystem.symlink(link, &path) {
-                                            tracing::debug!(
-                                                path = %path.display(),
-                                                "failed to create symlink from backup: {:#?}",
-                                                err
-                                            );
-                                        } else {
-                                            progress.increment_files();
-
-                                            if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
-                                                server.filesystem.set_times(
-                                                    &path,
-                                                    modified_time,
-                                                    None,
-                                                )?;
-                                            }
-                                        }
-                                    }
-                                }
-                            };
-
-                            if let Err(err) = run() {
-                                error_clone.fail(err);
-                            }
-                        });
-                    });
-
-                    for i in 0..archive.len() {
-                        let entry = archive.by_index(i)?;
-
-                        if entry.is_dir() {
-                            let path = match entry.enclosed_name() {
-                                Some(path) => path,
-                                None => continue,
-                            };
-
-                            if server
-                                .filesystem
-                                .is_ignored(&path, FileType::from_is_dir(entry.is_dir()))
-                            {
-                                continue;
-                            }
-
-                            if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
-                                server.filesystem.set_times(
-                                    &path,
-                                    modified_time,
-                                    None,
-                                ).ok();
-                            }
-                        }
-                    }
-
-                    if let Some(err) = error.take() {
-                        Err(err)
-                    } else {
-                        Ok(())
-                    }
-                })
-                .await??;
-            }
-            ArchiveFormat::SevenZip => {
-                let server = server.clone();
-
-                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader = MultiReader::new(Arc::new(file))?;
-                    let password = sevenz_rust2::Password::empty();
-                    let archive = sevenz_rust2::Archive::read(&mut reader.clone(), &password)?;
-
-                    total.store(
-                        archive.files.iter().map(|f| f.size).sum(),
-                        Ordering::Relaxed,
-                    );
-
-                    let pool = crate::threading::build_pool(
-                        server
-                            .app_state
-                            .config
-                            .load()
-                            .system
-                            .backups
-                            .wings
-                            .restore_threads,
-                    )?;
-
-                    let error = Arc::new(crate::threading::SharedError::new());
-
-                    pool.in_place_scope(|scope| {
-                        for block_index in 0..archive.blocks.len() {
-                            let archive = archive.clone();
-                            let progress = progress.clone();
-                            let mut reader = reader.clone();
-                            let server = server.clone();
-                            let error_clone = Arc::clone(&error);
-
-                            scope.spawn(move |_| {
-                                if error_clone.stopped() {
-                                    return;
-                                }
-
-                                let password = sevenz_rust2::Password::empty();
-                                let folder = sevenz_rust2::BlockDecoder::new(
-                                    1,
-                                    block_index,
-                                    &archive,
-                                    &password,
-                                    &mut reader,
-                                );
-
-                                let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
-                                if let Err(err) = folder.for_each_entries(&mut |entry, reader| {
-                                    let path = entry.name();
-                                    if path.starts_with('/') || path.starts_with('\\') {
-                                        return Ok(true);
-                                    }
-
-                                    let destination_path = Path::new(path);
-
-                                    if server.filesystem.is_ignored(
-                                        destination_path,
-                                        FileType::from_is_dir(entry.is_directory()),
-                                    ) {
-                                        return Ok(true);
-                                    }
-
-                                    if entry.is_directory() {
-                                        if let Err(err) = server
-                                            .filesystem
-                                            .create_chowned_dir_all(destination_path)
-                                        {
-                                            return Err(sevenz_rust2::Error::Other(
-                                                err.to_string().into(),
-                                            ));
-                                        }
-                                    } else {
-                                        server.log_daemon(compact_str::format_compact!(
-                                            "(restoring): {path}"
-                                        ));
-
-                                        if let Some(parent) = destination_path.parent()
-                                            && let Err(err) =
-                                                server.filesystem.create_chowned_dir_all(parent)
-                                        {
-                                            return Err(sevenz_rust2::Error::Other(
-                                                err.to_string().into(),
-                                            ));
-                                        }
-
-                                        let mut writer =
-                                            crate::server::filesystem::file::ServerFile::new(
-                                                server.clone(),
-                                                destination_path,
-                                                None,
-                                                if entry.has_last_modified_date {
-                                                    Some(entry.last_modified_date.into())
-                                                } else {
-                                                    None
-                                                },
-                                            )
-                                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                                        let mut reader = progress.counting_reader(reader);
-
-                                        crate::io::copy_shared(
-                                            &mut read_buffer,
-                                            &mut reader,
-                                            &mut writer,
-                                        )?;
-                                        writer.flush()?;
-                                        progress.increment_files();
-                                    }
-
-                                    Ok(true)
-                                }) {
-                                    error_clone.fail(err);
-                                }
-                            });
-                        }
-                    });
-
-                    if let Some(err) = error.take() {
-                        Err(err.into())
-                    } else {
-                        for entry in archive.files {
-                            if entry.is_directory() && entry.has_last_modified_date {
-                                let path = entry.name();
-                                if path.starts_with('/') || path.starts_with('\\') {
-                                    continue;
-                                }
-
-                                let destination_path = Path::new(path);
-
-                                if server.filesystem.is_ignored(
-                                    destination_path,
-                                    FileType::from_is_dir(entry.is_directory()),
-                                ) {
-                                    continue;
-                                }
-
-                                server
-                                    .filesystem
-                                    .set_times(
-                                        destination_path,
-                                        entry.last_modified_date.into(),
-                                        None,
-                                    )
-                                    .ok();
-                            }
-                        }
-
-                        Ok(())
-                    }
-                })
-                .await??;
-            }
+        // an unlimited file keeps lock-free positioned reads instead of seeking
+        // under the shared reader's lock
+        let archive = if read_limit == 0 {
+            Archive::from_file(
+                server.clone(),
+                format.compression_format(),
+                format.archive_type(),
+                file,
+                self.path.clone(),
+                Some(size),
+            )
+        } else {
+            Archive::from_seekable(
+                server.clone(),
+                format.compression_format(),
+                format.archive_type(),
+                LimitedReader::new_with_bytes_per_second(file, read_limit),
+                Some(size),
+            )
         };
 
-        Ok(())
+        let (destination, destination_filesystem) =
+            server.filesystem.resolve_writable_fs(server, "").await;
+
+        archive
+            .extract(
+                destination,
+                destination_filesystem,
+                progress,
+                Some(total),
+                ExtractOptions {
+                    threads,
+                    on_file: Some(Arc::new({
+                        let server = server.clone();
+
+                        move |path| super::log_restoring(&server, path)
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {

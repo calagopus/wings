@@ -840,7 +840,7 @@ impl BackupExt for DdupBakBackup {
 
                     match entry {
                         Entry::File(file) => {
-                            server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
+                            super::log_restoring(server, &path);
 
                             if let Some(parent) = path.parent() {
                                 server.filesystem.create_chowned_dir_all(parent)?;

@@ -65,6 +65,7 @@ impl CapFilesystem {
             server,
             is_primary_server_fs: false,
             is_writable: false,
+            ignore_quota: false,
             is_ignored: None,
         }
     }

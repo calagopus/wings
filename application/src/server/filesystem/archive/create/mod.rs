@@ -1,4 +1,7 @@
-use crate::io::counting_reader::{AsyncCountingReader, CountingReader};
+use crate::io::{
+    counting_reader::{AsyncCountingReader, CountingReader},
+    counting_writer::CountingWriter,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -61,6 +64,14 @@ impl ArchiveProgress {
     }
 
     #[inline]
+    pub fn without_bytes(&self) -> Self {
+        Self {
+            bytes_processed: None,
+            files_processed: self.files_processed.clone(),
+        }
+    }
+
+    #[inline]
     pub fn clone_bytes(&self) -> Option<Arc<AtomicU64>> {
         self.bytes_processed.clone()
     }
@@ -78,6 +89,16 @@ impl ArchiveProgress {
             .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
 
         CountingReader::new_with_bytes_read(reader, counter)
+    }
+
+    #[inline]
+    pub fn counting_writer<W: std::io::Write>(&self, writer: W) -> CountingWriter<W> {
+        let counter = self
+            .bytes_processed
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+
+        CountingWriter::new_with_bytes_written(writer, counter)
     }
 
     #[inline]

@@ -1,11 +1,7 @@
 use crate::{
     io::{
         SafeAsyncWriteExt, SafeDigestExt, SafeSliceMutExt,
-        compression::{
-            CompressionType,
-            reader::{AsyncCompressionReader, CompressionReader},
-            writer::CompressionWriter,
-        },
+        compression::{CompressionType, reader::AsyncCompressionReader, writer::CompressionWriter},
         limited_reader::{AsyncLimitedReader, LimitedReader},
         limited_writer::LimitedWriter,
     },
@@ -16,18 +12,16 @@ use crate::{
             BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
-            archive::{Archive, ArchiveFormat, StreamableArchiveFormat},
+            archive::{Archive, ArchiveFormat, ExtractOptions, StreamableArchiveFormat},
             virtualfs::{ByteRange, VirtualReadableFilesystem},
         },
     },
-    utils::PortablePermissions,
 };
 use compact_str::ToCompactString;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -995,128 +989,62 @@ impl BackupExt for S3Backup {
             }
         };
 
+        let format = ArchiveFormat::from_str(
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| anyhow::anyhow!("failed to determine archive format from download_url"))?;
+
         let response = get_client(&server.app_state.config)
-            .get(url.clone())
+            .get(url)
             .send()
             .await
             .map_err(|err| err.without_url())?;
-        if let Some(content_length) = response.content_length() {
-            total.store(content_length, Ordering::SeqCst);
-        }
+        let size = response.content_length();
 
         let reader = tokio_util::io::StreamReader::new(Box::pin(
             response
                 .bytes_stream()
                 .map_err(|err| std::io::Error::other(err.without_url())),
         ));
+        let reader = LimitedReader::new_with_bytes_per_second(
+            tokio_util::io::SyncIoBridge::new(reader),
+            server
+                .app_state
+                .config
+                .load()
+                .system
+                .backups
+                .read_limit
+                .as_bytes(),
+        );
 
-        let server = server.clone();
+        let (destination, destination_filesystem) =
+            server.filesystem.resolve_writable_fs(server, "").await;
 
-        tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-            let reader = tokio_util::io::SyncIoBridge::new(reader);
-            let reader = LimitedReader::new_with_bytes_per_second(
-                reader,
-                server.app_state.config.load().system.backups.read_limit.as_bytes(),
-            );
-            let reader = progress.counting_reader(reader);
-            let reader = CompressionReader::new(
-                reader,
-                ArchiveFormat::from_str(url.path_segments().and_then(|mut segments| segments.next_back()).unwrap_or_default())
-                    .map_err(|_| anyhow::anyhow!("failed to determine archive format from download_url"))?.compression_format(),
-            )?;
-            let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
+        Archive::from_stream(
+            server.clone(),
+            format.compression_format(),
+            format.archive_type(),
+            reader,
+            size,
+        )
+        .extract(
+            destination,
+            destination_filesystem,
+            progress,
+            Some(total),
+            ExtractOptions {
+                on_file: Some(Arc::new({
+                    let server = server.clone();
 
-            let mut archive = tar::Archive::new(reader);
-            let mut directory_entries = chunked_vec::ChunkedVec::new();
-            let mut last_parent = None;
-            let entries = archive.entries()?;
-
-            let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
-            for entry in entries {
-                let mut entry = entry?;
-                let path = server.filesystem.relative_path(&entry.path()?);
-
-                if path.as_os_str().is_empty() {
-                    continue;
-                }
-
-                let header = entry.header();
-                match header.entry_type() {
-                    tar::EntryType::Directory => {
-                        server.filesystem.create_chowned_dir_all(path.as_path())?;
-                        server
-                            .filesystem
-                            .set_permissions(
-                                path.as_path(),
-                                PortablePermissions::from_mode_dir(header.mode().unwrap_or(0o755)),
-                            )?;
-
-                        if let Ok(modified_time) = header.mtime() && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                            directory_entries.push((path.to_path_buf(), modified_time));
-                        }
-                    }
-                    tar::EntryType::Regular => {
-                        server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
-
-                        if let Some(parent) = path.parent()
-                            && last_parent.as_deref() != Some(parent)
-                        {
-                            server.filesystem.create_chowned_dir_all(parent)?;
-                            last_parent = Some(parent.to_path_buf());
-                        }
-
-                        let mut writer = crate::server::filesystem::file::ServerFile::new(
-                            server.clone(),
-                            &path,
-                            Some(PortablePermissions::from_mode_file(header.mode().unwrap_or(0o644))),
-                            header
-                                .mtime()
-                                .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
-                                .ok(),
-                        )?;
-
-                        crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
-                        writer.flush()?;
-
-                        progress.increment_files();
-                    }
-                    tar::EntryType::Symlink => {
-                        let link = entry.link_name().unwrap_or_default().unwrap_or_default();
-
-                        if let Err(err) = server.filesystem.symlink(link, path.as_path()) {
-                            tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
-                        } else {
-                            progress.increment_files();
-
-                            if let Ok(modified_time) = header.mtime() {
-                                server
-                                    .filesystem
-                                    .set_times(
-                                        path.as_path(),
-                                        std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(modified_time),
-                                        None,
-                                    )?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            for (destination_path, modified_time) in directory_entries {
-                server.filesystem.set_times(
-                    &destination_path,
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_time),
-                    None,
-                )?;
-            }
-
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
+                    move |path| super::log_restoring(&server, path)
+                })),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {

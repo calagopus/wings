@@ -1105,6 +1105,20 @@ impl Filesystem {
         (path, Arc::new(fs))
     }
 
+    /// The primary filesystem without ignore rules or disk quota, for restoring a
+    /// server's files exactly as they were sent.
+    pub fn transfer_writable_fs(
+        &self,
+        server: &crate::server::Server,
+    ) -> Arc<dyn virtualfs::VirtualWritableFilesystem> {
+        let mut fs = self.cap_filesystem.get_virtual(server.clone());
+        fs.is_primary_server_fs = true;
+        fs.is_writable = true;
+        fs.ignore_quota = true;
+
+        Arc::new(fs)
+    }
+
     pub async fn truncate_path(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 

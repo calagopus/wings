@@ -1,17 +1,98 @@
 use super::State;
-use axum::extract::DefaultBodyLimit;
+use crate::{
+    io::{
+        abort::{AbortListener, AbortReader},
+        hash_reader::HashReader,
+        limited_reader::LimitedReader,
+        shared_reader::SharedReader,
+    },
+    server::{
+        filesystem::{
+            archive::{Archive, ExtractOptions, create::ArchiveProgress},
+            virtualfs::VirtualWritableFilesystem,
+        },
+        transfer::TransferArchiveFormat,
+    },
+};
+use axum::extract::{DefaultBodyLimit, multipart::Field};
+use futures::TryStreamExt;
+use sha2::Digest;
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 use utoipa_axum::{
     router::{OpenApiRouter, UtoipaMethodRouterExt},
     routes,
 };
 
 const MAX_CHECKSUM_LEN: usize = 1024;
+const MAX_ROOT_FILES_LEN: usize = 4 * 1024 * 1024;
 
 mod _server_;
 mod capabilities;
 mod files;
 mod query;
 mod ws;
+
+#[allow(clippy::too_many_arguments)]
+fn extract_transfer_archive(
+    runtime: &tokio::runtime::Handle,
+    field: Field<'_>,
+    server: &crate::server::Server,
+    listener: &AbortListener,
+    download_limit: u64,
+    destination: PathBuf,
+    destination_filesystem: Arc<dyn VirtualWritableFilesystem>,
+    progress: ArchiveProgress,
+    options: ExtractOptions,
+) -> Result<sha2::digest::Output<sha2::Sha256>, anyhow::Error> {
+    let format = TransferArchiveFormat::from_str(field.file_name().unwrap_or("archive.tar.gz"))
+        .unwrap_or_default();
+
+    let (reader, writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
+    let reader = tokio_util::io::SyncIoBridge::new_with_handle(reader, runtime.clone());
+    let reader = AbortReader::new(reader, listener.clone());
+    let reader = LimitedReader::new_with_bytes_per_second(reader, download_limit);
+    let reader = SharedReader::new(HashReader::new_with_hasher(reader, sha2::Sha256::new()));
+    let archive = Archive::from_stream(
+        server.clone(),
+        format.compression_format(),
+        format.archive_type(),
+        reader.clone(),
+        None,
+    );
+
+    let consumer = runtime.spawn(async move {
+        archive
+            .extract(destination, destination_filesystem, progress, None, options)
+            .await?;
+
+        let Some(mut reader) = reader.into_inner() else {
+            return Err(anyhow::anyhow!("transfer archive reader is still in use"));
+        };
+
+        tokio::task::spawn_blocking(move || {
+            crate::io::copy_shared(
+                &mut crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE),
+                &mut reader,
+                &mut std::io::sink(),
+            )?;
+
+            Ok(reader.finish())
+        })
+        .await?
+    });
+
+    let mut field = tokio_util::io::SyncIoBridge::new_with_handle(
+        tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
+            std::io::Error::other(format!("failed to read multipart field: {err}"))
+        })),
+        runtime.clone(),
+    );
+    let produced = crate::io::pipe::copy_and_shutdown(&mut field, &mut writer.into_sync());
+    let checksum = runtime.block_on(consumer)??;
+    produced?;
+
+    Ok(checksum)
+}
 
 mod get {
     use crate::{
@@ -51,25 +132,17 @@ mod get {
 
 mod post {
     use crate::{
-        io::{
-            abort::{AbortGuard, AbortReader},
-            compression::{CompressionType, reader::CompressionReader},
-            hash_reader::HashReader,
-            limited_reader::LimitedReader,
-        },
+        io::abort::AbortGuard,
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::{filesystem::archive::Archive, transfer::TransferArchiveFormat},
-        utils::PortablePermissions,
+        server::filesystem::archive::{ExtractOptions, create::ArchiveProgress},
     };
     use axum::{
         extract::Multipart,
         http::{HeaderMap, StatusCode},
     };
-    use futures::TryStreamExt;
     use serde::Serialize;
-    use sha1::Digest;
-    use std::{io::Write, str::FromStr};
+    use std::{io::Write, path::PathBuf, sync::Arc};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
@@ -193,19 +266,11 @@ mod post {
 
                             if field.name() == Some("archive") {
                                 archive_received = true;
-                                let file_name =
-                                    field.file_name().unwrap_or("archive.tar.gz").to_string();
-                                let reader = tokio_util::io::StreamReader::new(
-                                    field.into_stream().map_err(|err| {
-                                        std::io::Error::other(format!(
-                                            "failed to read multipart field: {err}"
-                                        ))
-                                    }),
-                                );
-                                let reader = tokio_util::io::SyncIoBridge::new(reader);
-                                let reader = AbortReader::new(reader, listener.clone());
-                                let reader = LimitedReader::new_with_bytes_per_second(
-                                    reader,
+                                archive_checksum = Some(super::extract_transfer_archive(
+                                    &runtime,
+                                    field,
+                                    &server,
+                                    &listener,
                                     state
                                         .config
                                         .load()
@@ -213,269 +278,20 @@ mod post {
                                         .transfers
                                         .download_limit
                                         .as_bytes(),
-                                );
-                                let reader =
-                                    HashReader::new_with_hasher(reader, sha2::Sha256::new());
-                                let mut reader = CompressionReader::new(
-                                    reader,
-                                    TransferArchiveFormat::from_str(&file_name)
-                                        .map_or(CompressionType::Gz, |f| f.compression_format()),
-                                )?;
+                                    PathBuf::new(),
+                                    server.filesystem.transfer_writable_fs(&server),
+                                    ArchiveProgress::default(),
+                                    ExtractOptions {
+                                        threads: (is_multiplex || multiplex_stream_count > 0)
+                                            .then_some(1),
+                                        map_path: Some(Arc::new({
+                                            let server = server.clone();
 
-                                if TransferArchiveFormat::from_str(&file_name)
-                                    .is_ok_and(|f| f.is_itaf())
-                                {
-                                    let archive = itaf::decoder::ItafDecoder::new(&mut reader)?;
-                                    let mut directory_entries = chunked_vec::ChunkedVec::new();
-                                    let mut last_parent = None;
-                                    let entries = archive.entries();
-
-                                    let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
-                                    for entry in entries {
-                                        let mut entry = entry?;
-                                        let destination_path = entry.enclosed_path();
-                                        if destination_path.as_os_str().is_empty() {
-                                            continue;
-                                        }
-
-                                        match &mut entry {
-                                            itaf::decoder::ArchiveEntry::Directory(dir) => {
-                                                server
-                                                    .filesystem
-                                                    .create_chowned_dir_all(&destination_path)?;
-
-                                                let meta = dir.metadata();
-                                                server.filesystem.set_permissions(
-                                                    &destination_path,
-                                                    PortablePermissions::from_mode_dir(meta.mode),
-                                                )?;
-
-                                                if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                                                    directory_entries.push((destination_path, meta.modified));
-                                                }
-                                            }
-                                            itaf::decoder::ArchiveEntry::File(file_entry) => {
-                                                if let Some(parent) = destination_path.parent()
-                                                    && last_parent.as_deref() != Some(parent)
-                                                {
-                                                    server
-                                                        .filesystem
-                                                        .create_chowned_dir_all(parent)?;
-                                                    last_parent = Some(parent.to_path_buf());
-                                                }
-
-                                                let meta = file_entry.metadata();
-                                                let mut writer =
-                                                    crate::server::filesystem::file::ServerFile::new(
-                                                        server.clone(),
-                                                        &destination_path,
-                                                        Some(PortablePermissions::from_mode_file(meta.mode)),
-                                                        Some(meta.modified),
-                                                    )?
-                                                    .ignorant();
-
-                                                crate::io::copy_shared(
-                                                    &mut read_buffer,
-                                                    file_entry,
-                                                    &mut writer,
-                                                )?;
-                                                writer.flush()?;
-                                            }
-                                            itaf::decoder::ArchiveEntry::Symlink(sym) => {
-                                                let target = sym.target().to_path_buf();
-                                                let meta_modified = sym.metadata().modified;
-
-                                                if let Some(parent) = destination_path.parent()
-                                                    && !parent.as_os_str().is_empty()
-                                                {
-                                                    server
-                                                        .filesystem
-                                                        .create_chowned_dir_all(parent)?;
-                                                }
-
-                                                if let Err(err) = server
-                                                    .filesystem
-                                                    .symlink(target, &destination_path)
-                                                {
-                                                    tracing::debug!(
-                                                        path = %destination_path.display(),
-                                                        "failed to create symlink from itaf archive: {:#?}",
-                                                        err
-                                                    );
-                                                } else {
-                                                    server.filesystem.set_times(
-                                                        &destination_path,
-                                                        meta_modified,
-                                                        None,
-                                                    )?;
-                                                }
-                                            }
-                                            itaf::decoder::ArchiveEntry::Hardlink(link) => {
-                                                let target_path = link.enclosed_target();
-                                                if target_path.as_os_str().is_empty() {
-                                                    tracing::debug!(
-                                                        path = %destination_path.display(),
-                                                        "skipping hardlink with invalid target: {}",
-                                                        target_path.display()
-                                                    );
-                                                    continue;
-                                                }
-
-                                                if let Some(parent) = destination_path.parent()
-                                                    && !parent.as_os_str().is_empty()
-                                                {
-                                                    server
-                                                        .filesystem
-                                                        .create_chowned_dir_all(parent)?;
-                                                }
-
-                                                if let Err(err) = server.filesystem.hard_link(
-                                                    &target_path,
-                                                    &server.filesystem,
-                                                    &destination_path,
-                                                ) {
-                                                    tracing::debug!(
-                                                        path = %destination_path.display(),
-                                                        target = %target_path.display(),
-                                                        "failed to create hardlink from itaf archive: {:#?}",
-                                                        err
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    for (destination_path, modified_time) in directory_entries {
-                                        server.filesystem.set_times(
-                                            &destination_path,
-                                            modified_time,
-                                            None,
-                                        )?;
-                                    }
-
-                                    let mut inner = reader.into_inner();
-                                    crate::io::copy_shared(
-                                        &mut read_buffer,
-                                        &mut inner,
-                                        &mut std::io::sink(),
-                                    )?;
-                                    archive_checksum = Some(inner.finish());
-                                } else {
-                                    let mut archive = tar::Archive::new(reader);
-                                    let mut directory_entries = chunked_vec::ChunkedVec::new();
-                                    let mut last_parent = None;
-                                    let entries = archive.entries()?;
-
-                                    let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
-                                    for entry in entries {
-                                        let mut entry = entry?;
-                                        let path = server.filesystem.relative_path(&entry.path()?);
-
-                                        if path.as_os_str().is_empty() {
-                                            continue;
-                                        }
-
-                                        let destination_path = path.as_path();
-                                        let header = entry.header();
-
-                                        match header.entry_type() {
-                                            tar::EntryType::Directory => {
-                                                server
-                                                    .filesystem
-                                                    .create_chowned_dir_all(destination_path)?;
-                                                if let Ok(permissions) = header
-                                                    .mode()
-                                                    .map(PortablePermissions::from_mode_dir)
-                                                {
-                                                    server.filesystem.set_permissions(
-                                                        destination_path,
-                                                        permissions,
-                                                    )?;
-                                                }
-
-                                                if let Ok(modified_time) = header.mtime() && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                                                    directory_entries.push((
-                                                        destination_path.to_path_buf(),
-                                                        modified_time,
-                                                    ));
-                                                }
-                                            }
-                                            tar::EntryType::Regular => {
-                                                if let Some(parent) = destination_path.parent()
-                                                    && last_parent.as_deref() != Some(parent)
-                                                {
-                                                    server
-                                                        .filesystem
-                                                        .create_chowned_dir_all(parent)?;
-                                                    last_parent = Some(parent.to_path_buf());
-                                                }
-
-                                                let mut writer =
-                                                crate::server::filesystem::file::ServerFile::new(
-                                                    server.clone(),
-                                                    destination_path,
-                                                    header.mode().map(PortablePermissions::from_mode_file).ok(),
-                                                    header
-                                                        .mtime()
-                                                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
-                                                        .ok(),
-                                                )?
-                                                .ignorant();
-
-                                                crate::io::copy_shared(
-                                                    &mut read_buffer,
-                                                    &mut entry,
-                                                    &mut writer,
-                                                )?;
-                                                writer.flush()?;
-                                            }
-                                            tar::EntryType::Symlink => {
-                                                let link = entry
-                                                    .link_name()
-                                                    .unwrap_or_default()
-                                                    .unwrap_or_default();
-
-                                                if let Err(err) = server
-                                                    .filesystem
-                                                    .symlink(link, destination_path)
-                                                {
-                                                    tracing::debug!(
-                                                        path = %destination_path.display(),
-                                                        "failed to create symlink from archive: {:#?}",
-                                                        err
-                                                    );
-                                                } else if let Ok(modified_time) = header.mtime() {
-                                                    server.filesystem.set_times(
-                                                        destination_path,
-                                                        std::time::UNIX_EPOCH
-                                                            + std::time::Duration::from_secs(
-                                                                modified_time,
-                                                            ),
-                                                        None,
-                                                    )?;
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-
-                                    for (destination_path, modified_time) in directory_entries {
-                                        server.filesystem.set_times(
-                                            &destination_path,
-                                            std::time::UNIX_EPOCH
-                                                + std::time::Duration::from_secs(modified_time),
-                                            None,
-                                        )?;
-                                    }
-
-                                    let mut inner = archive.into_inner().into_inner();
-                                    crate::io::copy_shared(
-                                        &mut read_buffer,
-                                        &mut inner,
-                                        &mut std::io::sink(),
-                                    )?;
-                                    archive_checksum = Some(inner.finish());
-                                }
+                                            move |path| server.filesystem.relative_path(path)
+                                        })),
+                                        ..Default::default()
+                                    },
+                                )?);
                             } else if field.name() == Some("checksum") {
                                 let archive_checksum = match archive_checksum.take() {
                                     Some(checksum) => hex::encode(checksum),

@@ -1432,7 +1432,7 @@ impl BackupExt for ResticBackup {
                 progress.increment_bytes(size);
                 progress.increment_files();
 
-                server.log_daemon(compact_str::format_compact!("(restoring): {}", item));
+                super::log_restoring(server, Path::new(item));
             }
         }
 

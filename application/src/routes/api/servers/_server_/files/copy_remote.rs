@@ -577,6 +577,13 @@ mod post {
 
                             let form = reqwest::multipart::Form::new()
                                 .part(
+                                    "root-files",
+                                    reqwest::multipart::Part::bytes(serde_json::to_vec(
+                                        &data.files,
+                                    )?)
+                                    .mime_str("application/json")?,
+                                )
+                                .part(
                                     "archive",
                                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
                                         tokio_util::io::ReaderStream::with_capacity(
@@ -607,7 +614,6 @@ mod post {
                                 .post(&data.url)
                                 .header("Authorization", &data.token)
                                 .header("Total-Bytes", bytes_total.load(Ordering::Relaxed))
-                                .header("Root-Files", serde_json::to_string(&data.files)?)
                                 .multipart(form)
                                 .send();
 

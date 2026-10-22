@@ -132,6 +132,7 @@ mod post {
                                 files_processed,
                             ),
                             Some(total),
+                            crate::server::filesystem::archive::ExtractOptions::default(),
                         )
                         .await
                 },

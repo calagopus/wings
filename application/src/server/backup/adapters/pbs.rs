@@ -862,10 +862,7 @@ impl BackupExt for PbsBackup {
                         }
                     }
                     EntryKind::File { .. } => {
-                        server.log_daemon(compact_str::format_compact!(
-                            "(restoring): {}",
-                            path.display()
-                        ));
+                        super::log_restoring(server, &path);
 
                         if let Some(parent) = path.parent()
                             && last_parent.as_deref() != Some(parent)

@@ -96,6 +96,9 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     fn is_primary_server_fs(&self) -> bool {
         self.inner.is_primary_server_fs
     }
+    fn is_ignored(&self, path: &Path, file_type: FileType) -> bool {
+        self.inner.is_ignored(path, file_type)
+    }
     fn is_fast(&self) -> bool {
         true
     }

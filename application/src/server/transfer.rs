@@ -4,7 +4,7 @@ use crate::{
         compression::{CompressionLevel, CompressionType},
         counting_reader::AsyncCountingReader,
     },
-    server::filesystem::archive::StreamableArchiveFormat,
+    server::filesystem::archive::{ArchiveType, StreamableArchiveFormat},
 };
 use futures::FutureExt;
 use human_bytes::human_bytes;
@@ -100,6 +100,15 @@ impl TransferArchiveFormat {
                 | TransferArchiveFormat::TarLz4
                 | TransferArchiveFormat::TarZstd
         )
+    }
+
+    #[inline]
+    pub const fn archive_type(self) -> ArchiveType {
+        if self.is_itaf() {
+            ArchiveType::Itaf
+        } else {
+            ArchiveType::Tar
+        }
     }
 
     #[inline]
