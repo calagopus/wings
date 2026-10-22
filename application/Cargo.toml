@@ -67,7 +67,7 @@ new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
 chrono-tz = "0.10.4"
 gzp = { version = "2.0.0", default-features = false, features = ["deflate_zlib_ng"] }
-lzma-rust2 = { version = "0.22.0", features = ["optimization"] }
+lzma-rust2 = { version = "0.23.0", features = ["optimization"] }
 bzip2 = "0.6.0"
 zstd = { workspace = true }
 base64 = "0.23.0"
@@ -97,7 +97,7 @@ itaf = "0.3.0"
 arc-swap = "1.9.1"
 rusqlite = { version = "0.40.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
 blake3 = "1.8.5"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 toml_edit = "0.25.12"
 ini-roundtrip = "0.2.1"
 yrs = "0.28.0"
