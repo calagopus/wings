@@ -6,7 +6,7 @@ use compact_str::ToCompactString;
 use futures::TryStreamExt;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 pub struct BackupManager {
@@ -15,6 +15,22 @@ pub struct BackupManager {
     cached_browse_backup_locks: moka::future::Cache<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>,
     cached_backup_adapters: moka::future::Cache<uuid::Uuid, BackupAdapter>,
     database_backup_restores: tokio::sync::broadcast::Sender<DatabaseBackupRestore>,
+    active: AtomicUsize,
+}
+
+struct ActiveBackup<'a>(&'a AtomicUsize);
+
+impl<'a> ActiveBackup<'a> {
+    fn new(active: &'a AtomicUsize) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveBackup<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -75,11 +91,18 @@ impl Default for BackupManager {
                 .build(),
             cached_backup_adapters: moka::future::Cache::new(1024),
             cached_browse_backup_locks: moka::future::Cache::new(10240),
+            active: AtomicUsize::new(0),
         }
     }
 }
 
 impl BackupManager {
+    /// Backups being created or database backups being restored.
+    #[inline]
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
     pub fn subscribe_database_backup_restores(&self) -> DatabaseBackupRestoreWaiter {
         DatabaseBackupRestoreWaiter {
             receiver: self.database_backup_restores.subscribe(),
@@ -113,6 +136,8 @@ impl BackupManager {
         uuid: uuid::Uuid,
         ignore: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         tracing::info!(
             server = %server.uuid,
             backup = %uuid,
@@ -415,6 +440,8 @@ impl BackupManager {
         database_instance: uuid::Uuid,
         extension: &str,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         tracing::info!(
             server = %server.uuid,
             backup = %uuid,
@@ -498,6 +525,8 @@ impl BackupManager {
         download_url: Option<compact_str::CompactString>,
         request_uuid: Option<uuid::Uuid>,
     ) -> Result<(), anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         let completion = request_uuid.map(|uuid| self.start_database_backup_restore(uuid));
         let uuid = backup.uuid();
 

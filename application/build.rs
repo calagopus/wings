@@ -17,6 +17,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FUSEQUOTA_RELEASE");
     println!("cargo:rerun-if-env-changed=FUSEQUOTA_BINARY_PATH");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_PROVIDER");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_API_URL");
 
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string());
@@ -29,6 +32,7 @@ fn main() {
     handle_git_info();
     handle_fusequota(&target_arch, &target_os);
     handle_seccomp();
+    handle_upgrade_source();
 }
 
 #[allow(clippy::panic)]
@@ -205,4 +209,37 @@ fn handle_seccomp() {
         let seccomp_min = serde_json::to_string(&val).expect("Failed to serialize");
         std::fs::write("seccomp.min.json", seccomp_min).expect("Failed to write seccomp.min.json");
     }
+}
+
+#[allow(clippy::panic)]
+fn handle_upgrade_source() {
+    let read = |name: &str, default: &str| {
+        let value = std::env::var(name).unwrap_or_default();
+        if value.is_empty() {
+            default.to_string()
+        } else {
+            value
+        }
+    };
+
+    let provider = read("WINGS_UPGRADE_PROVIDER", "github");
+    let repository = read("WINGS_UPGRADE_REPOSITORY", "calagopus/wings");
+    let api_url = read("WINGS_UPGRADE_API_URL", "https://api.github.com");
+
+    if !matches!(provider.as_str(), "github") {
+        panic!("unsupported WINGS_UPGRADE_PROVIDER {provider:?}, expected one of: github");
+    }
+    if repository.split('/').count() != 2 || repository.split('/').any(str::is_empty) {
+        panic!("WINGS_UPGRADE_REPOSITORY {repository:?} must be in the form owner/repo");
+    }
+    if !api_url.starts_with("https://") && !api_url.starts_with("http://") {
+        panic!("WINGS_UPGRADE_API_URL {api_url:?} must be an http(s) url");
+    }
+
+    println!("cargo:rustc-env=WINGS_UPGRADE_PROVIDER={provider}");
+    println!("cargo:rustc-env=WINGS_UPGRADE_REPOSITORY={repository}");
+    println!(
+        "cargo:rustc-env=WINGS_UPGRADE_API_URL={}",
+        api_url.trim_end_matches('/')
+    );
 }

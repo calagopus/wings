@@ -43,6 +43,7 @@ mod threading;
 mod tls;
 #[cfg(unix)]
 mod tundra;
+mod upgrade;
 mod utils;
 
 use payload::Payload;
@@ -1084,6 +1085,9 @@ fn main() {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         std::process::exit(server::bandwidth::container_main(&args));
     }
+
+    #[cfg(windows)]
+    upgrade::wait_for_previous_process();
 
     let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
