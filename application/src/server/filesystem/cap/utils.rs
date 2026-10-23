@@ -113,6 +113,13 @@ impl AsyncReadDir {
 /// A directory opened once for a listing
 pub struct ListingDir(pub(super) cap_std::fs::Dir);
 
+#[cfg(unix)]
+impl std::os::fd::AsFd for ListingDir {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 impl ListingDir {
     /// Visits every entry except `.` and `..` in enumeration order. An
     /// enumeration error ends the walk and is returned.

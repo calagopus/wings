@@ -78,7 +78,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn open(path: &Path, zstd_level: i32) -> Result<Self, anyhow::Error> {
-        let conn = crate::server::filesystem::sqlite::open(path, OpenFlags::default())
+        let conn = Connection::open_with_flags(path, OpenFlags::default())
             .with_context(|| format!("opening diff db {}", path.display()))?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;

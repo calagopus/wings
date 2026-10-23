@@ -85,15 +85,12 @@ pub async fn handle_message(
             if server.state.get_state() != crate::server::state::ServerState::Offline
                 || state.config.load().api.send_offline_server_logs
             {
-                let socket_jwt = websocket_handler.get_jwt().await?;
-
-                if !socket_jwt
-                    .permissions
+                if !websocket_handler
                     .has_calagopus_permission_or(Permission::ControlReadConsole, true)
+                    .await?
                 {
                     return Ok(());
                 }
-                drop(socket_jwt);
 
                 let mut log_stream = server
                     .logs_lines(Some(state.config.load().system.websocket_log_count))
@@ -116,22 +113,18 @@ pub async fn handle_message(
             };
             let power_action = crate::models::ServerPowerAction::from_str(action)?;
 
-            let socket_jwt = websocket_handler.get_jwt().await?;
-
-            if !socket_jwt
-                .permissions
+            if !websocket_handler
                 .has_permission(power_action.required_permission())
+                .await?
             {
                 tracing::debug!(
                     server = %server.uuid,
-                    "jwt does not have permission to {} server: {:?}",
-                    power_action.to_str(),
-                    socket_jwt.permissions
+                    "jwt does not have permission to {} server",
+                    power_action.to_str()
                 );
 
                 return Ok(());
             }
-            drop(socket_jwt);
 
             match server.checked_power_action(power_action).await {
                 Ok(()) => {
@@ -162,21 +155,17 @@ pub async fn handle_message(
             }
         }
         WebsocketEvent::SendCommand => {
-            let socket_jwt = websocket_handler.get_jwt().await?;
-
-            if !socket_jwt
-                .permissions
+            if !websocket_handler
                 .has_permission(Permission::ControlConsole)
+                .await?
             {
                 tracing::debug!(
                     server = %server.uuid,
-                    "jwt does not have permission to send command to server: {:?}",
-                    socket_jwt.permissions
+                    "jwt does not have permission to send command to server"
                 );
 
                 return Ok(());
             }
-            drop(socket_jwt);
 
             let Some(raw_command) = message.args.first() else {
                 return Ok(());

@@ -314,14 +314,11 @@ impl TargetedWebsocketMessage {
         &self,
         connection_id: &uuid::Uuid,
         user_uuid: &uuid::Uuid,
-        permissions: &Permissions,
+        has_permission: impl Fn(Permission) -> bool,
     ) -> bool {
         (self.user_uuids.is_empty() || self.user_uuids.contains(user_uuid))
             && (self.connection_uuids.is_empty() || self.connection_uuids.contains(connection_id))
-            && self
-                .permissions
-                .iter()
-                .all(|perm| permissions.has_permission(*perm))
+            && self.permissions.iter().all(|perm| has_permission(*perm))
     }
 
     pub fn matches_user(

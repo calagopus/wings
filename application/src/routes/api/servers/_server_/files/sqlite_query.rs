@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
-        routes::{ApiError, api::servers::_server_::GetServer},
+        routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::sqlite,
     };
     use axum::http::StatusCode;
@@ -44,6 +44,7 @@ mod post {
         results: Vec<sqlite::QueryResultSet>,
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn sqlite_error(err: rusqlite::Error) -> ApiResponseResult {
         let status = match &err {
             rusqlite::Error::SqliteFailure(code, _)
@@ -73,6 +74,7 @@ mod post {
         ),
     ), request_body = inline(Payload))]
     pub async fn route(
+        state: GetState,
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
@@ -90,6 +92,7 @@ mod post {
 
         let file_name = Path::new(&data.file)
             .file_name()
+            .and_then(|name| name.to_str())
             .or_api_error(StatusCode::EXPECTATION_FAILED, "invalid file name")?;
 
         let (root, filesystem) = server
@@ -113,99 +116,187 @@ mod post {
             }
         }
 
-        let jail_metadata = match server.filesystem.async_open(&path).await {
-            Ok(file) => match file.metadata().await {
-                Ok(metadata) => metadata,
+        let max_rows = data.rows.clamp(1, sqlite::QUERY_MAX_ROWS) as usize;
+
+        let Ok(_permit) = server.sqlite_query_semaphore.acquire().await else {
+            return ApiResponse::error("sqlite queries are unavailable")
+                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .ok();
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+
+            let cap_filesystem = (*server.filesystem).clone();
+            let directory =
+                match tokio::task::spawn_blocking(move || cap_filesystem.open_listing_dir(&root))
+                    .await?
+                {
+                    Ok(directory) => directory,
+                    Err(_) => {
+                        return ApiResponse::error("file not found")
+                            .with_status(StatusCode::NOT_FOUND)
+                            .ok();
+                    }
+                };
+
+            let user = {
+                let config = state.config.load();
+
+                sqlite::sandbox::SandboxUser {
+                    uid: config.system.user.uid,
+                    gid: config.system.user.gid,
+                }
+            };
+            let outcome = match sqlite::helper::run(sqlite::helper::QueryRequest {
+                directory: directory.as_fd(),
+                file_name,
+                query: &data.query,
+                read_only: data.read_only,
+                max_rows,
+                user,
+            })
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to run the sqlite query helper: {err:#}"
+                    );
+
+                    return ApiResponse::error("failed to run the query helper")
+                        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .ok();
+                }
+            };
+
+            match outcome {
+                sqlite::helper::QueryOutcome::Results(results) => {
+                    ApiResponse::new_serialized(Response { results }).ok()
+                }
+                sqlite::helper::QueryOutcome::Failed(message) => ApiResponse::error(&message)
+                    .with_status(StatusCode::BAD_REQUEST)
+                    .ok(),
+                sqlite::helper::QueryOutcome::TimedOut => {
+                    ApiResponse::error("query exceeded the time limit")
+                        .with_status(StatusCode::REQUEST_TIMEOUT)
+                        .ok()
+                }
+                sqlite::helper::QueryOutcome::Crashed(signal)
+                    if signal == rustix::process::Signal::BUS.as_raw() =>
+                {
+                    ApiResponse::error("the database changed while the query was running")
+                        .with_status(StatusCode::BAD_REQUEST)
+                        .ok()
+                }
+                sqlite::helper::QueryOutcome::Crashed(signal) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "the sqlite query helper died from signal {signal}"
+                    );
+
+                    ApiResponse::error("the query helper crashed")
+                        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .ok()
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &state;
+
+            let jail_metadata = match server.filesystem.async_open(&path).await {
+                Ok(file) => match file.metadata().await {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        return ApiResponse::error("file not found")
+                            .with_status(StatusCode::NOT_FOUND)
+                            .ok();
+                    }
+                },
                 Err(_) => {
                     return ApiResponse::error("file not found")
                         .with_status(StatusCode::NOT_FOUND)
                         .ok();
                 }
-            },
-            Err(_) => {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        let base = tokio::fs::canonicalize(&server.filesystem.base_path).await?;
-        let canonical = match tokio::fs::canonicalize(
-            base.join(server.filesystem.relative_path(&path)),
-        )
-        .await
-        {
-            Ok(canonical) => canonical,
-            Err(_) => {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            let matches = tokio::fs::metadata(&canonical).await.is_ok_and(|metadata| {
-                metadata.dev() == jail_metadata.dev() && metadata.ino() == jail_metadata.ino()
-            });
-            if !canonical.starts_with(&base) || !matches {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = &jail_metadata;
-            if !canonical.starts_with(&base) {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        }
-
-        let flags = if data.read_only {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        } else {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
-
-        let max_rows = data.rows.clamp(1, sqlite::QUERY_MAX_ROWS) as usize;
-
-        let (connection, interrupt) =
-            match tokio::task::spawn_blocking(move || -> Result<_, rusqlite::Error> {
-                let connection = sqlite::open(&canonical, flags)?;
-                connection.busy_timeout(sqlite::QUERY_BUSY_TIMEOUT)?;
-                let interrupt = connection.get_interrupt_handle();
-
-                Ok((connection, interrupt))
-            })
-            .await?
-            {
-                Ok(pair) => pair,
-                Err(err) => return sqlite_error(err),
             };
 
-        let watchdog = tokio::spawn(async move {
-            tokio::time::sleep(sqlite::QUERY_DEADLINE).await;
-            interrupt.interrupt();
-        });
+            let base = tokio::fs::canonicalize(&server.filesystem.base_path).await?;
+            let canonical =
+                match tokio::fs::canonicalize(base.join(server.filesystem.relative_path(&path)))
+                    .await
+                {
+                    Ok(canonical) => canonical,
+                    Err(_) => {
+                        return ApiResponse::error("file not found")
+                            .with_status(StatusCode::NOT_FOUND)
+                            .ok();
+                    }
+                };
 
-        let results = tokio::task::spawn_blocking(move || {
-            sqlite::run_query(connection, &data.query, max_rows, &server.sqlite_memory)
-        })
-        .await?;
-        watchdog.abort();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
 
-        let results = match results {
-            Ok(results) => results,
-            Err(err) => return sqlite_error(err),
-        };
+                let matches = tokio::fs::metadata(&canonical).await.is_ok_and(|metadata| {
+                    metadata.dev() == jail_metadata.dev() && metadata.ino() == jail_metadata.ino()
+                });
+                if !canonical.starts_with(&base) || !matches {
+                    return ApiResponse::error("file not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &jail_metadata;
+                if !canonical.starts_with(&base) {
+                    return ApiResponse::error("file not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            }
 
-        ApiResponse::new_serialized(Response { results }).ok()
+            let flags = if data.read_only {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            } else {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+
+            let (connection, interrupt) =
+                match tokio::task::spawn_blocking(move || -> Result<_, rusqlite::Error> {
+                    let connection = sqlite::open(&canonical, flags)?;
+                    connection.busy_timeout(sqlite::QUERY_BUSY_TIMEOUT)?;
+                    let interrupt = connection.get_interrupt_handle();
+
+                    Ok((connection, interrupt))
+                })
+                .await?
+                {
+                    Ok(pair) => pair,
+                    Err(err) => return sqlite_error(err),
+                };
+
+            let watchdog = tokio::spawn(async move {
+                tokio::time::sleep(sqlite::QUERY_DEADLINE).await;
+                interrupt.interrupt();
+            });
+
+            let results = tokio::task::spawn_blocking(move || {
+                sqlite::run_query(&connection, &data.query, max_rows)
+            })
+            .await?;
+            watchdog.abort();
+
+            match results {
+                Ok(results) => ApiResponse::new_serialized(Response { results }).ok(),
+                Err(err) => sqlite_error(err),
+            }
+        }
     }
 }
 

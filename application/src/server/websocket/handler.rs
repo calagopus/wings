@@ -335,7 +335,9 @@ pub async fn handle_ws(
                                             continue;
                                         }
 
-                                        if message.matches(&websocket_handler.connection_id, &socket_jwt.user_uuid, &socket_jwt.permissions) {
+                                        if message.matches(&websocket_handler.connection_id, &socket_jwt.user_uuid, |permission| {
+                                            socket_jwt.has_live_permission(&server.user_permissions, permission)
+                                        }) {
                                             websocket_handler.send_message(
                                                 message.into_message()
                                             ).await;

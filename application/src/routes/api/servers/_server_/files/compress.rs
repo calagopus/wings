@@ -109,6 +109,8 @@ mod post {
             .is_primary_server_fs()
             .then(|| destination_path.clone());
 
+        let request_ignored = ignored.filter(&server);
+
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
         let files_processed = Arc::new(AtomicU64::new(0));
@@ -137,6 +139,9 @@ mod post {
                         async move {
                             let mut ignored: IsIgnoredFn =
                                 server.filesystem.get_ignored().into();
+                            if let Some(request_ignored) = request_ignored {
+                                ignored = ignored.merge(request_ignored);
+                            }
                             if let Some(excluded_destination) = excluded_destination {
                                 ignored = ignored.excluding(excluded_destination);
                             }

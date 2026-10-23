@@ -1,32 +1,33 @@
 use crate::io::SafeSliceExt;
 use rusqlite::{
     Connection, OpenFlags,
+    config::DbConfig,
     fallible_iterator::FallibleIterator,
     ffi,
     hooks::{AuthAction, AuthContext, Authorization},
 };
-use serde::Serialize;
-use std::{
-    cell::Cell,
-    ffi::{c_int, c_void},
-    marker::PhantomData,
-    path::Path,
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use serde::{Deserialize, Serialize};
+use std::{path::Path, sync::Once, time::Duration};
 use utoipa::ToSchema;
+
+#[cfg(target_os = "linux")]
+pub mod helper;
+#[cfg(target_os = "linux")]
+pub mod sandbox;
+
+#[cfg(target_os = "linux")]
+pub use helper::{HELPER_ARG, helper_main};
 
 pub const QUERY_MAX_LENGTH: usize = 65535;
 pub const QUERY_DEFAULT_ROWS: u32 = 100;
 pub const QUERY_MAX_ROWS: u32 = 1000;
+/// Queries one server may run at the same time, each in its own helper process.
+pub const QUERY_MAX_CONCURRENT: usize = 2;
 const QUERY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const QUERY_MAX_VALUE_BYTES: usize = 256 * 1024;
 const QUERY_SQLITE_LENGTH_LIMIT: i32 = 32 * 1024 * 1024;
 /// Room for a few values of [`QUERY_SQLITE_LENGTH_LIMIT`] plus working memory.
-const QUERY_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+pub const QUERY_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 pub const QUERY_DEADLINE: Duration = Duration::from_secs(15);
 pub const QUERY_BUSY_TIMEOUT: Duration = Duration::from_millis(3000);
 const DENIED_PRAGMAS: &[&str] = &[
@@ -34,16 +35,18 @@ const DENIED_PRAGMAS: &[&str] = &[
     "data_store_directory",
     "hard_heap_limit",
     "soft_heap_limit",
+    "mmap_size",
+    "temp_store",
 ];
 
-#[derive(ToSchema, Serialize, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Clone)]
 pub struct QueryColumn {
     pub name: String,
     pub type_name: String,
     pub binary: bool,
 }
 
-#[derive(ToSchema, Serialize, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryValue {
     Null,
@@ -86,7 +89,7 @@ impl QueryValue {
     }
 }
 
-#[derive(ToSchema, Serialize, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Clone)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<Vec<QueryValue>>,
@@ -94,263 +97,21 @@ pub struct QueryResultSet {
     pub truncated: bool,
 }
 
-/// SQLite memory shared by every query a server runs at the same time.
-pub struct QueryMemory {
-    used: AtomicUsize,
-    limit: usize,
-}
+static DISABLE_MMAP: Once = Once::new();
 
-impl QueryMemory {
-    pub const fn new(limit: usize) -> Self {
-        Self {
-            used: AtomicUsize::new(0),
-            limit,
-        }
-    }
-
-    fn reserve(&self, size: usize) -> bool {
-        self.used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(size).filter(|used| *used <= self.limit)
-            })
-            .is_ok()
-    }
-
-    fn release(&self, size: usize) {
-        self.used.fetch_sub(size, Ordering::AcqRel);
-    }
-
-    fn settle(&self, charged: usize, actual: usize) {
-        if actual > charged {
-            self.used.fetch_add(actual - charged, Ordering::AcqRel);
-        } else {
-            self.release(charged - actual);
-        }
-    }
-}
-
-impl Default for QueryMemory {
-    fn default() -> Self {
-        Self::new(QUERY_MEMORY_LIMIT)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct MemoryBudget {
-    used: usize,
-    memory: *const QueryMemory,
-}
-
-thread_local! {
-    static MEMORY_BUDGET: Cell<Option<MemoryBudget>> = const { Cell::new(None) };
-}
-
-struct MemoryBudgetGuard<'a> {
-    memory: &'a QueryMemory,
-    _thread_bound: PhantomData<*const ()>,
-}
-
-impl<'a> MemoryBudgetGuard<'a> {
-    fn new(memory: &'a QueryMemory) -> Self {
-        debug_assert!(MEMORY_BUDGET.get().is_none());
-        MEMORY_BUDGET.set(Some(MemoryBudget { used: 0, memory }));
-
-        Self {
-            memory,
-            _thread_bound: PhantomData,
-        }
-    }
-}
-
-impl Drop for MemoryBudgetGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(budget) = MEMORY_BUDGET.take() {
-            self.memory.release(budget.used);
-        }
-    }
-}
-
-/// SQLite's own allocator, which the budgeted wrappers forward to. Every pointer
-/// SQLite hands them was returned by these functions, so passing it back is sound.
-struct DefaultAllocator {
-    malloc: unsafe extern "C" fn(c_int) -> *mut c_void,
-    free: unsafe extern "C" fn(*mut c_void),
-    realloc: unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void,
-    size: unsafe extern "C" fn(*mut c_void) -> c_int,
-}
-
-impl DefaultAllocator {
-    unsafe fn allocation_size(&self, pointer: *mut c_void) -> usize {
-        if pointer.is_null() {
-            return 0;
-        }
-
-        // SAFETY: pointer came from this allocator's malloc or realloc, see DefaultAllocator
-        usize::try_from(unsafe { (self.size)(pointer) }).unwrap_or(0)
-    }
-}
-
-static DEFAULT_ALLOCATOR: OnceLock<Option<DefaultAllocator>> = OnceLock::new();
-
-fn default_allocator() -> Option<&'static DefaultAllocator> {
-    DEFAULT_ALLOCATOR.get().and_then(Option::as_ref)
-}
-
-/// Runs `f` against this thread's budget, or returns `None` when no query is running here.
-fn with_budget<R>(f: impl FnOnce(&QueryMemory, &mut usize) -> R) -> Option<R> {
-    MEMORY_BUDGET
-        .try_with(|cell| {
-            let mut budget = cell.get()?;
-            // SAFETY: MEMORY_BUDGET only holds this pointer while the MemoryBudgetGuard that
-            // borrows the QueryMemory is alive, and the guard clears it on drop.
-            let result = f(unsafe { &*budget.memory }, &mut budget.used);
-            cell.set(Some(budget));
-
-            Some(result)
-        })
-        .ok()
-        .flatten()
-}
-
-unsafe extern "C" fn budgeted_malloc(size: c_int) -> *mut c_void {
-    let Some(allocator) = default_allocator() else {
-        return std::ptr::null_mut();
-    };
-
-    with_budget(|memory, used| {
-        let requested = usize::try_from(size).unwrap_or(0);
-        if !memory.reserve(requested) {
-            return std::ptr::null_mut();
-        }
-
-        // SAFETY: forwards SQLite's own allocator the size SQLite asked for; the pointer it
-        // returned is the only one measured
-        let pointer = unsafe { (allocator.malloc)(size) };
-        let allocated = unsafe { allocator.allocation_size(pointer) };
-        memory.settle(requested, allocated);
-        *used = used.saturating_add(allocated);
-
-        pointer
-    })
-    // SAFETY: a plain forward to SQLite's own allocator
-    .unwrap_or_else(|| unsafe { (allocator.malloc)(size) })
-}
-
-unsafe extern "C" fn budgeted_free(pointer: *mut c_void) {
-    let Some(allocator) = default_allocator() else {
-        return;
-    };
-
-    with_budget(|memory, used| {
-        // SAFETY: SQLite only frees pointers its allocator returned, see DefaultAllocator
-        let freed = unsafe { allocator.allocation_size(pointer) }.min(*used);
-        *used -= freed;
-        memory.release(freed);
-    });
-
-    // SAFETY: a plain forward to SQLite's own allocator
-    unsafe { (allocator.free)(pointer) };
-}
-
-unsafe extern "C" fn budgeted_realloc(pointer: *mut c_void, size: c_int) -> *mut c_void {
-    let Some(allocator) = default_allocator() else {
-        return std::ptr::null_mut();
-    };
-
-    with_budget(|memory, used| {
-        // SAFETY: SQLite only reallocates pointers its allocator returned, see DefaultAllocator;
-        // the resized pointer is measured before anything else sees it
-        let old = unsafe { allocator.allocation_size(pointer) }.min(*used);
-        let growth = usize::try_from(size).unwrap_or(0).saturating_sub(old);
-        if !memory.reserve(growth) {
-            return std::ptr::null_mut();
-        }
-
-        let resized = unsafe { (allocator.realloc)(pointer, size) };
-        if resized.is_null() {
-            memory.release(growth);
-            return resized;
-        }
-
-        let allocated = unsafe { allocator.allocation_size(resized) };
-        memory.settle(old + growth, allocated);
-        *used = *used - old + allocated;
-
-        resized
-    })
-    // SAFETY: a plain forward to SQLite's own allocator
-    .unwrap_or_else(|| unsafe { (allocator.realloc)(pointer, size) })
-}
-
-/// Wraps SQLite's allocator so `run_query` can cap what a server's queries allocate on
-/// their own threads. Must run before any connection is opened; every other connection
-/// keeps using the default allocator unchanged.
-fn install_allocator() {
-    DEFAULT_ALLOCATOR.get_or_init(|| {
-        let mut methods = ffi::sqlite3_mem_methods {
-            xMalloc: None,
-            xFree: None,
-            xRealloc: None,
-            xSize: None,
-            xRoundup: None,
-            xInit: None,
-            xShutdown: None,
-            pAppData: std::ptr::null_mut(),
-        };
-
-        // SAFETY: SQLITE_CONFIG_GETMALLOC writes one sqlite3_mem_methods through the pointer,
-        // and is refused with SQLITE_MISUSE once SQLite is initialized.
-        let got = unsafe {
-            ffi::sqlite3_config(
-                ffi::SQLITE_CONFIG_GETMALLOC,
-                &mut methods as *mut ffi::sqlite3_mem_methods,
-            )
-        };
-        if got != ffi::SQLITE_OK {
-            return None;
-        }
-
-        let (Some(malloc), Some(free), Some(realloc), Some(size)) = (
-            methods.xMalloc,
-            methods.xFree,
-            methods.xRealloc,
-            methods.xSize,
-        ) else {
-            return None;
-        };
-
-        let budgeted = ffi::sqlite3_mem_methods {
-            xMalloc: Some(budgeted_malloc),
-            xFree: Some(budgeted_free),
-            xRealloc: Some(budgeted_realloc),
-            ..methods
-        };
-        // SAFETY: SQLITE_CONFIG_MALLOC copies the methods out of the pointer, and is refused
-        // with SQLITE_MISUSE once SQLite is initialized.
-        let set = unsafe {
-            ffi::sqlite3_config(
-                ffi::SQLITE_CONFIG_MALLOC,
-                &budgeted as *const ffi::sqlite3_mem_methods,
-            )
-        };
-        if set != ffi::SQLITE_OK {
-            return None;
-        }
-
-        Some(DefaultAllocator {
-            malloc,
-            free,
-            realloc,
-            size,
-        })
-    });
-}
-
-/// Opens a connection with the budgeted allocator installed, which must happen before
-/// the first connection in the process.
 pub fn open(path: &Path, flags: OpenFlags) -> Result<Connection, rusqlite::Error> {
-    install_allocator();
-    Connection::open_with_flags(path, flags)
+    DISABLE_MMAP.call_once(|| {
+        // SAFETY: SQLITE_CONFIG_MMAP_SIZE takes two i64 arguments, and is refused with
+        // SQLITE_MISUSE once SQLite is initialized, which leaves the default in place.
+        unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_MMAP_SIZE, 0_i64, 0_i64) };
+    });
+
+    let connection = Connection::open_with_flags(path, flags)?;
+    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+
+    Ok(connection)
 }
 
 fn authorize(context: AuthContext<'_>) -> Authorization {
@@ -381,24 +142,11 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
 }
 
 pub fn run_query(
-    connection: Connection,
+    connection: &Connection,
     sql: &str,
     max_rows: usize,
-    memory: &QueryMemory,
 ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
-    if default_allocator().is_none() {
-        return Err(rusqlite::Error::SqliteFailure(
-            ffi::Error::new(ffi::SQLITE_MISUSE),
-            Some("sqlite memory budget is unavailable".to_string()),
-        ));
-    }
-
-    let _budget = MemoryBudgetGuard::new(memory);
-    let results = execute_query(&connection, sql, max_rows).map_err(truncate_error);
-    // the connection's frees must land while the budget guard is still installed
-    drop(connection);
-
-    results
+    execute_query(connection, sql, max_rows).map_err(truncate_error)
 }
 
 fn truncate_error(error: rusqlite::Error) -> rusqlite::Error {
@@ -514,8 +262,6 @@ mod tests {
     use rusqlite::ErrorCode;
     use std::path::PathBuf;
 
-    const TINY_LIMIT: usize = 4 * 1024 * 1024;
-
     fn seeded_db(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         open(&path, OpenFlags::default())
@@ -539,18 +285,7 @@ mod tests {
         sql: &str,
         max_rows: usize,
     ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
-        query_with_limit(connection, sql, max_rows, QUERY_MEMORY_LIMIT)
-    }
-
-    fn query_with_limit(
-        connection: &Connection,
-        sql: &str,
-        max_rows: usize,
-        limit: usize,
-    ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
-        let memory = QueryMemory::new(limit);
-        let _budget = MemoryBudgetGuard::new(&memory);
-        execute_query(connection, sql, max_rows)
+        run_query(connection, sql, max_rows)
     }
 
     fn assert_denied(connection: &Connection, sql: &str) {
@@ -561,16 +296,6 @@ mod tests {
                     ErrorCode::AuthorizationForStatementDenied,
                     "{sql}"
                 );
-            }
-            Err(error) => panic!("{sql}: {error}"),
-            Ok(_) => panic!("{sql}: allowed"),
-        }
-    }
-
-    fn assert_out_of_memory(result: Result<Vec<QueryResultSet>, rusqlite::Error>, sql: &str) {
-        match result {
-            Err(rusqlite::Error::SqliteFailure(error, _)) => {
-                assert_eq!(error.code, ErrorCode::OutOfMemory, "{sql}");
             }
             Err(error) => panic!("{sql}: {error}"),
             Ok(_) => panic!("{sql}: allowed"),
@@ -591,6 +316,75 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    // open
+
+    #[test]
+    fn hardens_every_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path(), "main.db");
+
+        for flags in [
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ] {
+            let connection = open_db(&path, flags);
+            assert!(
+                connection
+                    .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+                    .unwrap()
+            );
+            assert!(
+                !connection
+                    .db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+                    .unwrap()
+            );
+
+            let results = query(&connection, "PRAGMA mmap_size", 100).unwrap();
+            assert_eq!(values(results.last().unwrap()), [[Some("0")]]);
+            let results = query(&connection, "PRAGMA temp_store", 100).unwrap();
+            assert_eq!(values(results.last().unwrap()), [[Some("2")]]);
+        }
+
+        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        assert!(
+            query(
+                &connection,
+                "PRAGMA writable_schema = ON; \
+                 UPDATE sqlite_schema SET sql = 'CREATE TABLE seed(y)' WHERE name = 'seed'",
+                100,
+            )
+            .is_err()
+        );
+        let results = query(&connection, "SELECT sql FROM sqlite_schema", 100).unwrap();
+        assert_eq!(
+            values(results.last().unwrap()),
+            [[Some("CREATE TABLE seed(x)")]]
+        );
+    }
+
+    #[test]
+    fn rejects_mmap_and_temp_store_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path(), "main.db");
+        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+
+        for sql in [
+            "PRAGMA mmap_size = 268435456",
+            "PRAGMA MMAP_SIZE(1048576)",
+            "PRAGMA main.mmap_size = 0",
+            "PRAGMA temp_store = FILE",
+            "PRAGMA temp_store = 1",
+            "PRAGMA Temp_Store(DEFAULT)",
+        ] {
+            assert_denied(&connection, sql);
+        }
+
+        let results = query(&connection, "PRAGMA mmap_size", 100).unwrap();
+        assert_eq!(values(results.last().unwrap()), [[Some("0")]]);
+        let results = query(&connection, "PRAGMA temp_store", 100).unwrap();
+        assert_eq!(values(results.last().unwrap()), [[Some("2")]]);
     }
 
     // run_query
@@ -756,13 +550,12 @@ mod tests {
         let raised = format!("x{}", "é".repeat(500_000));
 
         let result = run_query(
-            open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+            &open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
             "CREATE TABLE t(x); \
              CREATE TRIGGER boom BEFORE INSERT ON t BEGIN \
              SELECT RAISE(ABORT, 'x' || replace(hex(zeroblob(500000)), '00', 'é')); END; \
              INSERT INTO t VALUES (1)",
             100,
-            &QueryMemory::default(),
         );
         match result {
             Err(rusqlite::Error::SqliteFailure(_, Some(message))) => {
@@ -775,10 +568,9 @@ mod tests {
         }
 
         let result = run_query(
-            open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+            &open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
             "SELECT * FROM missing",
             100,
-            &QueryMemory::default(),
         );
         match result {
             Err(rusqlite::Error::SqliteFailure(_, Some(message))) => {
@@ -787,89 +579,6 @@ mod tests {
             Err(error) => panic!("{error}"),
             Ok(_) => panic!("allowed"),
         }
-    }
-
-    // budgeted_malloc
-
-    #[test]
-    fn hostile_queries_fail_with_out_of_memory_and_release_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
-        let wide_row = format!("SELECT {}", ["randomblob(1000000)"; 8].join(", "));
-
-        for sql in [
-            wide_row.as_str(),
-            "ATTACH ':memory:' AS m; CREATE TABLE m.t(x); \
-             WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-             INSERT INTO m.t SELECT randomblob(1000) FROM c",
-            "PRAGMA temp_store = MEMORY; CREATE TEMP TABLE big AS \
-             WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-             SELECT randomblob(1000) AS x FROM c",
-            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-             SELECT length(group_concat(hex(randomblob(1000)))) FROM c",
-        ] {
-            assert_out_of_memory(query_with_limit(&connection, sql, 100, TINY_LIMIT), sql);
-
-            let results = query_with_limit(&connection, "SELECT 1", 100, TINY_LIMIT).unwrap();
-            assert_eq!(values(results.last().unwrap()), [[Some("1")]], "{sql}");
-
-            let unmetered = Connection::open_in_memory().unwrap();
-            unmetered
-                .execute_batch(
-                    "CREATE TABLE t(x); \
-                     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-                     INSERT INTO t SELECT randomblob(1000) FROM c",
-                )
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn budget_does_not_limit_other_threads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = seeded_db(dir.path(), "main.db");
-        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-
-        let hostile = std::thread::spawn(move || {
-            let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
-            let mut gate = Some((holding_tx, release_rx));
-            connection
-                .update_hook(Some(move |_, _: &str, table: &str, _| {
-                    if table == "grow"
-                        && let Some((holding, release)) = gate.take()
-                    {
-                        holding.send(()).unwrap();
-                        let _ = release.recv_timeout(Duration::from_secs(60));
-                    }
-                }))
-                .unwrap();
-
-            query_with_limit(
-                &connection,
-                "ATTACH ':memory:' AS m; CREATE TABLE m.hold(x); CREATE TABLE m.grow(x); \
-                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2000) \
-                 INSERT INTO m.hold SELECT randomblob(1000) FROM c; \
-                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-                 INSERT INTO m.grow SELECT randomblob(1000) FROM c",
-                100,
-                TINY_LIMIT,
-            )
-        });
-
-        holding_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-
-        let mut content = vec![0; 8 * 1024 * 1024];
-        rand::fill(&mut content);
-        let mut storage =
-            crate::server::diff::storage::Storage::open(&dir.path().join("diff.db"), 1).unwrap();
-        let file_id = storage.upsert_file("world/level.dat").unwrap();
-        let revision = storage.insert_snapshot(file_id, None, &content, 0).unwrap();
-        assert!(storage.reconstruct(revision).unwrap() == content);
-
-        release_tx.send(()).unwrap();
-        assert_out_of_memory(hostile.join().unwrap(), "hostile grow");
     }
 
     // authorize
@@ -983,9 +692,9 @@ mod tests {
             "PRAGMA threads",
             "PRAGMA threads = 0",
             "PRAGMA hard_heap_limit",
-            "PRAGMA mmap_size = 4096",
+            "PRAGMA mmap_size",
             "PRAGMA cache_size = 5000",
-            "PRAGMA temp_store = MEMORY",
+            "PRAGMA temp_store",
             "PRAGMA journal_mode = DELETE",
             "ATTACH ':memory:' AS m",
         ] {
@@ -1031,112 +740,5 @@ mod tests {
             let _ = query(&connection, sql, 100);
             assert_eq!(limits(), before, "{sql}");
         }
-    }
-
-    // QueryMemory
-
-    #[test]
-    fn concurrent_queries_share_one_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = seeded_db(dir.path(), "main.db");
-        let shared = QueryMemory::new(TINY_LIMIT);
-        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let big_value = "SELECT length(randomblob(2500000))";
-
-        std::thread::scope(|scope| {
-            let holder = scope.spawn(|| {
-                let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
-                let mut gate = Some((holding_tx, release_rx));
-                connection
-                    .update_hook(Some(move |_, _: &str, table: &str, _| {
-                        if table == "grow"
-                            && let Some((holding, release)) = gate.take()
-                        {
-                            holding.send(()).unwrap();
-                            let _ = release.recv_timeout(Duration::from_secs(60));
-                        }
-                    }))
-                    .unwrap();
-
-                run_query(
-                    connection,
-                    "ATTACH ':memory:' AS m; CREATE TABLE m.hold(x); CREATE TABLE m.grow(x); \
-                     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2500) \
-                     INSERT INTO m.hold SELECT randomblob(1000) FROM c; \
-                     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-                     INSERT INTO m.grow SELECT randomblob(1000) FROM c",
-                    100,
-                    &shared,
-                )
-            });
-
-            holding_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-
-            let contender = run_query(
-                open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
-                big_value,
-                100,
-                &shared,
-            );
-            let separate = run_query(
-                open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
-                big_value,
-                100,
-                &QueryMemory::new(TINY_LIMIT),
-            );
-
-            release_tx.send(()).unwrap();
-            assert_out_of_memory(holder.join().unwrap(), "holder grow");
-            assert_out_of_memory(contender, "contender");
-            assert_eq!(
-                values(separate.unwrap().last().unwrap()),
-                [[Some("2500000")]]
-            );
-        });
-
-        assert_eq!(shared.used.load(Ordering::Acquire), 0);
-        let results = run_query(
-            open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
-            big_value,
-            100,
-            &shared,
-        )
-        .unwrap();
-        assert_eq!(values(results.last().unwrap()), [[Some("2500000")]]);
-    }
-
-    #[test]
-    fn consumed_connection_returns_all_memory_to_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = seeded_db(dir.path(), "main.db");
-        let memory = QueryMemory::new(TINY_LIMIT);
-
-        let results = run_query(
-            open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
-            "PRAGMA cache_size = 100000; ATTACH ':memory:' AS m; CREATE TABLE m.t(x); \
-             WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 1000) \
-             INSERT INTO m.t SELECT randomblob(1000) FROM c; \
-             SELECT count(*) FROM m.t",
-            100,
-            &memory,
-        )
-        .unwrap();
-        assert_eq!(values(results.last().unwrap()), [[Some("1000")]]);
-        assert_eq!(memory.used.load(Ordering::Acquire), 0);
-
-        let sql = "ATTACH ':memory:' AS m; CREATE TABLE m.t(x); \
-                   WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 10000) \
-                   INSERT INTO m.t SELECT randomblob(1000) FROM c";
-        assert_out_of_memory(
-            run_query(
-                open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
-                sql,
-                100,
-                &memory,
-            ),
-            sql,
-        );
-        assert_eq!(memory.used.load(Ordering::Acquire), 0);
     }
 }
