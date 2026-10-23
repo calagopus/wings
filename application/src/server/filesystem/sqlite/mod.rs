@@ -256,6 +256,23 @@ fn execute_query(
     Ok(results)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+fn reexec_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    let supported = *SUPPORTED.get_or_init(|| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--list", "--exact", "server::filesystem::sqlite"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+    if !supported {
+        eprintln!("skipping: the test binary cannot re-exec itself");
+    }
+
+    supported
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

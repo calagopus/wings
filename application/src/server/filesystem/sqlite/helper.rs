@@ -275,7 +275,7 @@ async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::filesystem::sqlite::{QueryResultSet, QueryValue};
+    use crate::server::filesystem::sqlite::{QueryResultSet, QueryValue, reexec_supported};
     use rustix::process::{geteuid, getgid, getuid};
     use std::{
         fs::File,
@@ -295,6 +295,7 @@ mod tests {
     const MODE_ENV: &str = "WINGS_SQLITE_TEST_MODE";
     const PID_ENV: &str = "WINGS_SQLITE_TEST_PID";
     const ENTRY: &str = "server::filesystem::sqlite::helper::tests::helper_entry";
+    const STDOUT_FD: RawFd = 255;
 
     #[test]
     #[ignore = "entry point for the sqlite helper tests"]
@@ -336,31 +337,57 @@ mod tests {
         std::process::exit(code);
     }
 
-    fn entry_shell(stdout: i32) -> (String, Vec<String>) {
-        let mut args = vec![
-            "-c".to_string(),
-            format!("exec \"$0\" \"$@\" {stdout}>&1 >/dev/null"),
-            std::env::current_exe().unwrap().display().to_string(),
-        ];
-        args.extend(
-            [
-                "--ignored",
-                "--exact",
-                ENTRY,
-                "--test-threads=1",
-                "--nocapture",
-            ]
-            .map(String::from),
-        );
+    const ENTRY_ARGS: [&str; 5] = [
+        "--ignored",
+        "--exact",
+        ENTRY,
+        "--test-threads=1",
+        "--nocapture",
+    ];
 
-        ("/bin/sh".to_string(), args)
+    fn park_stdout() -> std::io::Result<()> {
+        // SAFETY: fd 1 is the stdout pipe std installed before running pre_exec hooks, and
+        // the ManuallyDrop wrappers only serve as dup2 targets and are never closed.
+        let (stdout, mut parked, mut target) = unsafe {
+            (
+                BorrowedFd::borrow_raw(1),
+                ManuallyDrop::new(OwnedFd::from_raw_fd(STDOUT_FD)),
+                ManuallyDrop::new(OwnedFd::from_raw_fd(1)),
+            )
+        };
+        rustix::io::dup2(stdout, &mut parked)?;
+        let null = rustix::fs::open(
+            c"/dev/null",
+            rustix::fs::OFlags::WRONLY,
+            rustix::fs::Mode::empty(),
+        )?;
+        rustix::io::dup2(&null, &mut target)?;
+
+        Ok(())
     }
 
-    fn entry_command(directory: BorrowedFd<'_>) -> Command {
-        let stdout = directory.as_raw_fd() + 1;
-        let (program, args) = entry_shell(stdout);
-        let mut command = Command::new(program);
-        command.args(args).env(STDOUT_ENV, stdout.to_string());
+    fn entry_command() -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(ENTRY_ARGS)
+            .env(STDOUT_ENV, STDOUT_FD.to_string());
+        // SAFETY: park_stdout only issues open/dup2/close syscalls and does not allocate.
+        unsafe {
+            command.pre_exec(park_stdout);
+        }
+
+        command
+    }
+
+    fn std_entry_command() -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(ENTRY_ARGS)
+            .env(STDOUT_ENV, STDOUT_FD.to_string());
+        // SAFETY: park_stdout only issues open/dup2/close syscalls and does not allocate.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, park_stdout);
+        }
 
         command
     }
@@ -420,7 +447,7 @@ mod tests {
             mode: Option<&str>,
             deadline: Duration,
         ) -> Result<Exit, anyhow::Error> {
-            let mut command = entry_command(self.directory.as_fd());
+            let mut command = entry_command();
             if let Some(mode) = mode {
                 command.env(MODE_ENV, mode);
                 command.env(PID_ENV, self.path().join("pid"));
@@ -508,6 +535,9 @@ mod tests {
 
     #[test]
     fn probe_reports_the_sandbox_without_results() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
         let response = fixture.finish(Task::Probe);
 
@@ -517,6 +547,9 @@ mod tests {
 
     #[test]
     fn runs_queries_in_the_directory_as_the_server_user() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
 
         let response = fixture.query("main.db", "SELECT x FROM t ORDER BY x", true);
@@ -553,6 +586,9 @@ mod tests {
 
     #[test]
     fn rejects_names_that_leave_the_directory() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
         std::fs::create_dir(fixture.path().join("sub")).unwrap();
         std::fs::copy(
@@ -580,6 +616,9 @@ mod tests {
 
     #[test]
     fn reports_sqlite_errors_as_results() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
 
         let message = failure(fixture.query("main.db", "SELECT * FROM missing", true));
@@ -591,7 +630,7 @@ mod tests {
 
     #[test]
     fn refuses_to_query_as_root() {
-        if !geteuid().is_root() {
+        if !geteuid().is_root() || !reexec_supported() {
             return;
         }
         let fixture = Fixture::new();
@@ -628,6 +667,9 @@ mod tests {
 
     #[test]
     fn maps_crashes_and_deadlines() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
 
         match fixture.spawn_with(fixture.user, Task::Probe, Some("crash"), QUERY_DEADLINE) {
@@ -665,6 +707,9 @@ mod tests {
 
     #[test]
     fn fails_hard_on_a_bad_environment_or_request() {
+        if !reexec_supported() {
+            return;
+        }
         let fixture = Fixture::new();
         let directory = rustix::fs::open(
             fixture.path(),
@@ -692,12 +737,8 @@ mod tests {
             ),
         ];
         for (fd_env, stdin) in cases {
-            let stdout = fd + 1;
-            let (program, args) = entry_shell(stdout);
-            let mut command = std::process::Command::new(program);
+            let mut command = std_entry_command();
             command
-                .args(args)
-                .env(STDOUT_ENV, stdout.to_string())
                 .env("_RJEM_MALLOC_CONF", "background_thread:false")
                 .env_remove("WINGS_SQLITE_DIRECTORY_FD")
                 .stdin(Stdio::piped())
@@ -720,10 +761,7 @@ mod tests {
             assert!(!output.stderr.is_empty(), "{fd_env:?} {stdin:?}");
         }
 
-        let (program, args) = entry_shell(fd + 1);
-        let mut child = std::process::Command::new(program)
-            .args(args)
-            .env(STDOUT_ENV, (fd + 1).to_string())
+        let mut child = std_entry_command()
             .env("_RJEM_MALLOC_CONF", "background_thread:false")
             .env("WINGS_SQLITE_DIRECTORY_FD", fd.to_string())
             .stdin(Stdio::piped())
