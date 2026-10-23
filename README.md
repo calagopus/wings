@@ -183,6 +183,8 @@ system:
     ddup_bak:
       # how many threads to use when creating a ddup-bak backup
       create_threads: 4
+      # how many threads to use when restoring a ddup-bak backup
+      restore_threads: 4
       # the compression format to use for each ddup-bak chunk
       # none, deflate, gzip, brotli, zstd
       compression_format: zstd

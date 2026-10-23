@@ -416,6 +416,9 @@ fn system_backup_s3_retry_limit() -> u64 {
 fn system_backup_ddup_bak_create_threads() -> usize {
     4
 }
+fn system_backup_ddup_bak_restore_threads() -> usize {
+    4
+}
 
 fn system_backup_restic_repository() -> SystemPath {
     #[cfg(unix)]
@@ -1115,6 +1118,8 @@ nestify::nest! {
                 pub ddup_bak: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsDdupBak {
                     #[serde(default = "system_backup_ddup_bak_create_threads")]
                     pub create_threads: usize,
+                    #[serde(default = "system_backup_ddup_bak_restore_threads")]
+                    pub restore_threads: usize,
 
                     #[serde(default)]
                     pub compression_format: #[derive(ToSchema, Clone, Copy, Deserialize, Serialize, Default)] #[serde(rename_all = "snake_case")] pub enum SystemBackupsDdupBakCompressionFormat {

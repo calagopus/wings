@@ -36,6 +36,8 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, sync::RwLock};
 
+const FILES_IN_FLIGHT: usize = 256;
+
 static REPOSITORY: RwLock<Option<Arc<ddup_bak::repository::Repository>>> = RwLock::const_new(None);
 
 pub async fn get_repository(
@@ -786,6 +788,14 @@ impl BackupExt for DdupBakBackup {
         let repository = get_repository(&server.app_state.config).await?;
 
         let archive = self.archive.clone();
+        let threads = server
+            .app_state
+            .config
+            .load()
+            .system
+            .backups
+            .ddup_bak
+            .restore_threads;
 
         let server = server.clone();
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -797,111 +807,130 @@ impl BackupExt for DdupBakBackup {
 
             total.store(total_size, Ordering::SeqCst);
 
-            fn restore_entry(
-                repository: &Arc<ddup_bak::repository::Repository>,
-                entry: &Entry,
-                path: &Path,
-                server: &crate::server::Server,
-                progress: &crate::server::filesystem::archive::create::ArchiveProgress,
-            ) -> Result<(), anyhow::Error> {
-                enum Work<'a> {
-                    Visit {
-                        parent: PathBuf,
-                        entry: &'a Entry,
-                    },
-                    FinishDir {
-                        path: PathBuf,
-                        mtime: std::time::SystemTime,
-                    },
-                }
-
-                let mut stack = vec![Work::Visit {
-                    parent: path.to_path_buf(),
-                    entry,
-                }];
-
-                while let Some(work) = stack.pop() {
-                    let (parent, entry) = match work {
-                        Work::FinishDir { path, mtime } => {
-                            server.filesystem.set_times(&path, mtime, None)?;
-                            continue;
-                        }
-                        Work::Visit { parent, entry } => (parent, entry),
-                    };
-
-                    let path = parent.join(entry.name());
-
-                    if server
-                        .filesystem
-                        .is_ignored(&path, FileType::from_is_dir(entry.is_directory()))
-                    {
-                        continue;
-                    }
-
-                    match entry {
-                        Entry::File(file) => {
-                            super::log_restoring(server, &path);
-
-                            if let Some(parent) = path.parent() {
-                                server.filesystem.create_chowned_dir_all(parent)?;
-                            }
-
-                            let mut writer = crate::server::filesystem::file::ServerFile::new(
-                                server.clone(),
-                                &path,
-                                Some(PortablePermissions::from_mode_file(file.mode.bits())),
-                                Some(file.mtime),
-                            )?;
-                            let reader = repository.entry_reader(Entry::File(file.clone()))?;
-                            let mut reader = progress.counting_reader(reader);
-
-                            crate::io::copy(&mut reader, &mut writer)?;
-                            writer.flush()?;
-
-                            progress.increment_files();
-                        }
-                        Entry::Directory(directory) => {
-                            server.filesystem.create_chowned_dir_all(&path)?;
-                            server.filesystem.set_permissions(
-                                &path,
-                                PortablePermissions::from_mode_dir(directory.mode.bits()),
-                            )?;
-
-                            stack.push(Work::FinishDir {
-                                path: path.clone(),
-                                mtime: directory.mtime,
-                            });
-
-                            for child in directory.entries.iter().rev() {
-                                stack.push(Work::Visit {
-                                    parent: path.clone(),
-                                    entry: child,
-                                });
-                            }
-                        }
-                        Entry::Symlink(symlink) => {
-                            if let Err(err) = server.filesystem.symlink(&symlink.target, &path) {
-                                tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
-                            } else {
-                                progress.increment_files();
-
-                                server.filesystem.set_times(&path, symlink.mtime, None)?;
-                            }
-                        }
-                    }
-                }
-
-                Ok(())
+            enum Step<'a> {
+                Enter(Arc<Path>, &'a Entry),
+                Leave(PathBuf, std::time::SystemTime),
             }
 
-            for entry in archive.entries() {
-                restore_entry(
-                    &repository,
-                    entry,
-                    Path::new("."),
-                    &server,
-                    &progress,
-                )?;
+            let pool = crate::threading::build_pool(threads)?;
+            let in_flight = crate::threading::InFlightLimit::new(FILES_IN_FLIGHT);
+            let error = Arc::new(crate::threading::SharedError::new());
+
+            pool.in_place_scope(|scope| {
+                let walk = || -> Result<(), anyhow::Error> {
+                    let root: Arc<Path> = Arc::from(Path::new("."));
+                    let mut steps: Vec<Step> = archive
+                        .entries()
+                        .iter()
+                        .rev()
+                        .map(|entry| Step::Enter(Arc::clone(&root), entry))
+                        .collect();
+
+                    while let Some(step) = steps.pop() {
+                        let (parent, entry) = match step {
+                            Step::Enter(parent, entry) => (parent, entry),
+                            Step::Leave(path, mtime) => {
+                                server.filesystem.set_times(&path, mtime, None)?;
+                                continue;
+                            }
+                        };
+
+                        if error.stopped() {
+                            break;
+                        }
+
+                        let path = parent.join(entry.name());
+
+                        if server
+                            .filesystem
+                            .is_ignored(&path, FileType::from_is_dir(entry.is_directory()))
+                        {
+                            continue;
+                        }
+
+                        match entry {
+                            Entry::File(file) => {
+                                super::log_restoring(&server, &path);
+
+                                let permit = in_flight.acquire();
+                                let mut writer = crate::server::filesystem::file::ServerFile::new(
+                                    server.clone(),
+                                    &path,
+                                    Some(PortablePermissions::from_mode_file(file.mode.bits())),
+                                    Some(file.mtime),
+                                )?;
+
+                                let repository = &repository;
+                                let progress = progress.clone();
+                                let error = Arc::clone(&error);
+                                scope.spawn(move |_| {
+                                    let _permit = permit;
+                                    if error.stopped() {
+                                        return;
+                                    }
+
+                                    let mut run = || -> Result<(), anyhow::Error> {
+                                        let reader =
+                                            repository.entry_reader(Entry::File(file.clone()))?;
+                                        let mut reader = progress.counting_reader(reader);
+
+                                        crate::io::copy(&mut reader, &mut writer)?;
+                                        writer.flush()?;
+
+                                        progress.increment_files();
+
+                                        Ok(())
+                                    };
+
+                                    if let Err(err) = run() {
+                                        error.fail(err);
+                                    }
+                                });
+                            }
+                            Entry::Directory(directory) => {
+                                server.filesystem.create_chowned_dir_all(&path)?;
+                                server.filesystem.set_permissions(
+                                    &path,
+                                    PortablePermissions::from_mode_dir(directory.mode.bits()),
+                                )?;
+
+                                let parent: Arc<Path> = Arc::from(path.as_path());
+                                steps.push(Step::Leave(path, directory.mtime));
+                                steps.extend(
+                                    directory
+                                        .entries
+                                        .iter()
+                                        .rev()
+                                        .map(|child| Step::Enter(Arc::clone(&parent), child)),
+                                );
+                            }
+                            Entry::Symlink(symlink) => {
+                                if let Err(err) = server.filesystem.symlink(&symlink.target, &path)
+                                {
+                                    tracing::debug!(
+                                        path = %path.display(),
+                                        "failed to create symlink from backup: {:?}",
+                                        err
+                                    );
+                                } else {
+                                    progress.increment_files();
+
+                                    server.filesystem.set_times(&path, symlink.mtime, None)?;
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
+                };
+
+                if let Err(err) = walk() {
+                    error.fail(err);
+                }
+            });
+
+            if let Some(err) = error.take() {
+                return Err(err);
             }
 
             Ok(())
