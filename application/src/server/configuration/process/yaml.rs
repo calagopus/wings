@@ -17,8 +17,16 @@ impl super::ProcessConfigurationFileParser for YamlFileParser {
         let mut json: serde_json::Value = if content.trim().is_empty() {
             serde_json::Value::Object(serde_json::Map::new())
         } else {
-            serde_norway::from_str(content)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+            match serde_saphyr::from_str_with_options(
+                content,
+                crate::utils::yaml_deserialize_options(),
+            ) {
+                Ok(json) => json,
+                Err(err) if crate::utils::is_yaml_limit_error(&err) => {
+                    return Err(anyhow::anyhow!("yaml exceeds parsing limits: {err}"));
+                }
+                Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+            }
         };
 
         for replacement in &config.replace {
@@ -48,7 +56,7 @@ impl super::ProcessConfigurationFileParser for YamlFileParser {
             }
         }
 
-        Ok(serde_norway::to_string(&json)?.into_bytes())
+        Ok(serde_saphyr::to_string(&json)?.into_bytes())
     }
 }
 
@@ -86,7 +94,10 @@ mod tests {
         }
     }
 
-    fn run(content: &str, replace: Vec<ServerConfigurationFileReplacement>) -> serde_json::Value {
+    fn try_run(
+        content: &str,
+        replace: Vec<ServerConfigurationFileReplacement>,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         tokio_test::block_on(async {
             let state = crate::routes::AppState::mock();
             let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
@@ -96,11 +107,13 @@ mod tests {
                 parser: ServerConfigurationFileParser::Yaml,
                 replace,
             };
-            let bytes = YamlFileParser::process_file(content, &config, &server)
-                .await
-                .unwrap();
-            serde_norway::from_str(&String::from_utf8(bytes).unwrap()).unwrap()
+            YamlFileParser::process_file(content, &config, &server).await
         })
+    }
+
+    fn run(content: &str, replace: Vec<ServerConfigurationFileReplacement>) -> serde_json::Value {
+        let bytes = try_run(content, replace).unwrap();
+        serde_saphyr::from_str(&String::from_utf8(bytes).unwrap()).unwrap()
     }
 
     // YamlFileParser
@@ -185,5 +198,48 @@ mod tests {
             vec![gated("url", json!("10.0.0.1"), r"regex:127\.0\.0\.1")],
         );
         assert_eq!(out, json!({"url": "http://10.0.0.1:8080/api"}));
+    }
+
+    #[test]
+    fn alias_expansion_bomb_is_rejected() {
+        let leaf = vec!["1"; 1000].join(", ");
+        let refs = vec!["*leaf"; 500].join(", ");
+        let content = format!("seed: &leaf [{leaf}]\nbomb: [{refs}]\n");
+        assert!(try_run(&content, vec![rep("a", json!(1), None, true)]).is_err());
+    }
+
+    #[test]
+    fn plain_alias_is_rejected_instead_of_clobbered() {
+        assert!(try_run("a: &x 1\nb: *x\n", vec![rep("c", json!(2), None, true)]).is_err());
+    }
+
+    #[test]
+    fn merge_key_is_rejected() {
+        assert!(
+            try_run(
+                "base: &b\n  a: 1\nd:\n  <<: *b\n",
+                vec![rep("e", json!(2), None, true)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unused_anchor_is_preserved() {
+        assert_eq!(
+            run(
+                "seed: &leaf [1, 2]\nother: 3\n",
+                vec![rep("other", json!(4), None, true)]
+            ),
+            json!({"seed": [1, 2], "other": 4})
+        );
+    }
+
+    #[test]
+    fn malformed_yaml_falls_back_to_replacements_only() {
+        assert_eq!(
+            run("key: [unclosed\n", vec![rep("a", json!(1), None, true)]),
+            json!({"a": 1})
+        );
     }
 }

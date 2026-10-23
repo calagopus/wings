@@ -579,6 +579,34 @@ impl CmpExt for Path {
     }
 }
 
+/// serde-saphyr expands every alias into a full copy of its anchor, so a few hundred KB of
+/// aliases can materialize into many GB; YAML parsed from untrusted input never needs them.
+pub fn yaml_deserialize_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        alias_limits: serde_saphyr::alias_limits! {
+            max_alias_expansions_per_anchor: 0,
+        },
+    }
+}
+
+/// Whether the error comes from a budget or alias limit rather than malformed YAML.
+pub fn is_yaml_limit_error(mut err: &serde_saphyr::Error) -> bool {
+    while let serde_saphyr::Error::AliasError { error, .. }
+    | serde_saphyr::Error::WithSnippet { error, .. } = err
+    {
+        err = error;
+    }
+
+    matches!(
+        err,
+        serde_saphyr::Error::Budget { .. }
+            | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
+            | serde_saphyr::Error::AliasReplayCounterOverflow { .. }
+    )
+}
+
 #[cfg(target_os = "linux")]
 pub fn process_memory_usage() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

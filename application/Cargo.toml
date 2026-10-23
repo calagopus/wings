@@ -30,7 +30,7 @@ colored = "3.0.0"
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 nestify = "0.3.3"
 rayon = "1.10.0"
-serde_norway = "0.9.42"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize", "serialize"] }
 serde_default = "0.2.0"
 tokio-util = { version = "0.7.15", features = ["io-util"] }
 uuid = { workspace = true }

@@ -183,7 +183,7 @@ fn render_config(
     metrics_port: u16,
     hosts_path: &Path,
 ) -> Result<String, anyhow::Error> {
-    serde_norway::to_string(&serde_json::json!({
+    serde_saphyr::to_string(&serde_json::json!({
         "remote": {
             "url": format!("unix://{}", manager.socket_path().display()),
             "token": manager.daemon_token(),

@@ -42,7 +42,10 @@ fn parse_value(existing: &Value, raw: &str) -> Value {
         return Value::String(raw.to_string());
     }
 
-    match serde_norway::from_str::<Value>(raw) {
+    match serde_saphyr::from_str_with_options::<Value>(
+        raw,
+        crate::utils::yaml_deserialize_options(),
+    ) {
         Ok(Value::Null) if !raw.trim().is_empty() && !existing.is_null() => {
             Value::String(raw.to_string())
         }

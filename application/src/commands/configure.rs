@@ -112,7 +112,10 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    let response: serde_json::Value = match serde_norway::from_slice(&decoded) {
+                    let response: serde_json::Value = match serde_saphyr::from_slice_with_options(
+                        &decoded,
+                        crate::utils::yaml_deserialize_options(),
+                    ) {
                         Ok(response) => response,
                         Err(_) => {
                             eprintln!("{}", "failed to decode join data payload!".red());

@@ -1623,7 +1623,7 @@ impl Config {
     ) -> Result<(Arc<Self>, ConfigGuard), anyhow::Error> {
         let file = File::open(path).context(format!("failed to open config file {path}"))?;
         let reader = std::io::BufReader::new(file);
-        let mut inner: InnerConfig = serde_norway::from_reader(reader)
+        let mut inner: InnerConfig = serde_saphyr::from_reader(reader)
             .context(format!("failed to parse config file {path}"))?;
 
         #[cfg(unix)]
@@ -1812,8 +1812,8 @@ impl Config {
         let file = opts
             .open(path)
             .context(format!("failed to create config file {path}"))?;
-        let writer = std::io::BufWriter::new(file);
-        serde_norway::to_writer(writer, inner)
+        let mut writer = std::io::BufWriter::new(file);
+        serde_saphyr::to_io_writer(&mut writer, inner)
             .context(format!("failed to write config file {path}"))?;
         Ok(())
     }
@@ -2565,7 +2565,7 @@ mod tests {
     use super::*;
 
     fn from_yaml(yaml: &str) -> InnerConfig {
-        serde_norway::from_str(yaml).expect("failed to parse config")
+        serde_saphyr::from_str(yaml).expect("failed to parse config")
     }
 
     #[test]
@@ -2627,7 +2627,7 @@ mod tests {
         assert!(!Config::migrate_legacy_limits(&mut cfg));
         assert_eq!(cfg.limits.server_concurrent_pulls, 7);
 
-        let yaml = serde_norway::to_string(&cfg).expect("config should round trip");
+        let yaml = serde_saphyr::to_string(&cfg).expect("config should round trip");
         assert!(!yaml.contains("server_remote_download_limit"));
         let reparsed = from_yaml(&yaml);
         assert_eq!(reparsed.limits.server_concurrent_pulls, 7);
