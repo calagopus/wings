@@ -5,7 +5,7 @@ use crate::{
         replay_reader::AsyncReplayReader,
     },
     models::DirectoryEntry,
-    remote::backups::{RawServerBackup, ResticBackupConfiguration},
+    remote::backups::{RawServerBackup, ResticBackupConfiguration, ResticConfigurationSource},
     response::ApiResponse,
     routes::MimeCacheValue,
     server::{
@@ -280,7 +280,44 @@ impl ResticBackup {
             ),
             retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
             environment: config.system.backups.restic.environment.clone(),
+            source: ResticConfigurationSource::Node,
         }
+    }
+
+    fn is_allowed_panel_environment_key(key: &str) -> bool {
+        const PREFIXES: &[&str] = &["AWS_", "B2_", "AZURE_", "GOOGLE_", "OS_", "ST_", "RESTIC_"];
+        const KEYS: &[&str] = &[
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+        ];
+        const DENIED: &[&str] = &[
+            "RESTIC_PASSWORD_COMMAND",
+            "RESTIC_FROM_PASSWORD_COMMAND",
+            "RESTIC_PASSWORD_FILE",
+            "RESTIC_FROM_PASSWORD_FILE",
+            "RESTIC_REPOSITORY",
+            "RESTIC_REPOSITORY_FILE",
+            "RESTIC_FROM_REPOSITORY",
+            "RESTIC_FROM_REPOSITORY_FILE",
+            "RESTIC_CACHE_DIR",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+            "AZURE_CONFIG_DIR",
+            "AZURE_FEDERATED_TOKEN_FILE",
+        ];
+
+        if DENIED.contains(&key) {
+            return false;
+        }
+
+        KEYS.contains(&key) || PREFIXES.iter().any(|prefix| key.starts_with(prefix))
     }
 
     // the repository and password file go through the environment so they never show up in
@@ -290,8 +327,24 @@ impl ResticBackup {
         configuration: &ResticBackupConfiguration,
     ) -> std::process::Command {
         let mut command = std::process::Command::new("restic");
+
+        for (key, value) in &configuration.environment {
+            if key == "PATH" {
+                tracing::warn!("ignoring PATH in restic environment");
+                continue;
+            }
+
+            if configuration.source == ResticConfigurationSource::Panel
+                && !Self::is_allowed_panel_environment_key(key)
+            {
+                tracing::warn!(key, "ignoring disallowed key in panel restic environment");
+                continue;
+            }
+
+            command.env(key, value);
+        }
+
         command
-            .envs(&configuration.environment)
             .env("RESTIC_REPOSITORY", &configuration.repository)
             .arg("--cache-dir")
             .arg(Self::get_restic_cache_dir(config));
@@ -3190,5 +3243,160 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
     async fn close(&self) -> Result<(), anyhow::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn child_env(command: &std::process::Command) -> BTreeMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn configuration(
+        source: ResticConfigurationSource,
+        password_file: Option<&str>,
+        environment: &[(&str, &str)],
+    ) -> ResticBackupConfiguration {
+        ResticBackupConfiguration {
+            repository: "/srv/restic-repo".into(),
+            password_file: password_file.map(Into::into),
+            retry_lock_seconds: 0,
+            environment: environment
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            source,
+        }
+    }
+
+    // ResticBackup::std_command
+    #[test]
+    fn panel_environment_passes_only_backend_and_proxy_keys() {
+        tokio_test::block_on(async {
+            let allowed = [
+                "AWS_ACCESS_KEY_ID",
+                "B2_ACCOUNT_ID",
+                "AZURE_ACCOUNT_NAME",
+                "GOOGLE_PROJECT_ID",
+                "OS_AUTH_URL",
+                "ST_AUTH",
+                "RESTIC_COMPRESSION",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+            ];
+            let denied = [
+                "RESTIC_PASSWORD_COMMAND",
+                "RESTIC_FROM_PASSWORD_COMMAND",
+                "RESTIC_PASSWORD_FILE",
+                "RESTIC_FROM_PASSWORD_FILE",
+                "RESTIC_REPOSITORY",
+                "RESTIC_REPOSITORY_FILE",
+                "RESTIC_FROM_REPOSITORY",
+                "RESTIC_FROM_REPOSITORY_FILE",
+                "RESTIC_CACHE_DIR",
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "AWS_CONFIG_FILE",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+                "AZURE_CONFIG_DIR",
+                "AZURE_FEDERATED_TOKEN_FILE",
+                "PATH",
+                "LD_PRELOAD",
+                "HOME",
+                "RCLONE_CONFIG",
+                "SSH_AUTH_SOCK",
+                "aws_access_key_id",
+                "restic_password_command",
+                "Http_Proxy",
+            ];
+            let mut environment = serde_json::Map::new();
+            for key in allowed {
+                environment.insert(key.into(), format!("ok-{key}").into());
+            }
+            for key in denied {
+                environment.insert(key.into(), "attacker".into());
+            }
+            let configuration: ResticBackupConfiguration =
+                serde_json::from_value(serde_json::json!({
+                    "repository": "/srv/restic-repo",
+                    "password_file": null,
+                    "retry_lock_seconds": 0,
+                    "environment": environment,
+                    "source": "Node",
+                }))
+                .expect("configuration should deserialize");
+            assert_eq!(configuration.source, ResticConfigurationSource::Panel);
+
+            let env = child_env(&ResticBackup::std_command(
+                &crate::config::Config::mock(),
+                &configuration,
+            ));
+
+            for key in allowed {
+                assert_eq!(env.get(key), Some(&Some(format!("ok-{key}"))), "{key}");
+            }
+            for (key, value) in &env {
+                assert_ne!(value.as_deref(), Some("attacker"), "{key}");
+            }
+            assert_eq!(
+                env.get("RESTIC_REPOSITORY"),
+                Some(&Some("/srv/restic-repo".into()))
+            );
+            assert!(!matches!(env.get("RESTIC_PASSWORD_FILE"), Some(Some(_))));
+        });
+    }
+
+    #[test]
+    fn node_environment_passes_everything_but_path() {
+        tokio_test::block_on(async {
+            let configuration = configuration(
+                ResticConfigurationSource::Node,
+                Some("/etc/restic/password"),
+                &[
+                    ("LD_PRELOAD", "node-preload"),
+                    ("RCLONE_CONFIG", "node-rclone"),
+                    ("RESTIC_PASSWORD_COMMAND", "node-command"),
+                    ("RESTIC_REPOSITORY", "node-repository"),
+                    ("PATH", "node-path"),
+                ],
+            );
+
+            let env = child_env(&ResticBackup::std_command(
+                &crate::config::Config::mock(),
+                &configuration,
+            ));
+
+            assert_eq!(env.get("LD_PRELOAD"), Some(&Some("node-preload".into())));
+            assert_eq!(env.get("RCLONE_CONFIG"), Some(&Some("node-rclone".into())));
+            assert_eq!(
+                env.get("RESTIC_PASSWORD_COMMAND"),
+                Some(&Some("node-command".into()))
+            );
+            assert_ne!(env.get("PATH"), Some(&Some("node-path".into())));
+            assert_eq!(
+                env.get("RESTIC_REPOSITORY"),
+                Some(&Some("/srv/restic-repo".into()))
+            );
+            assert_eq!(
+                env.get("RESTIC_PASSWORD_FILE"),
+                Some(&Some("/etc/restic/password".into()))
+            );
+        });
     }
 }

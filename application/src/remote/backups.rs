@@ -24,12 +24,22 @@ pub struct RawServerBackup {
     pub parts: Vec<RawServerBackupPart>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResticConfigurationSource {
+    #[default]
+    Panel,
+    Node,
+}
+
 #[derive(Debug, Clone, ToSchema, Deserialize)]
 pub struct ResticBackupConfiguration {
     pub repository: String,
     pub password_file: Option<String>,
     pub retry_lock_seconds: u64,
     pub environment: BTreeMap<String, String>,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source: ResticConfigurationSource,
 }
 
 #[derive(Debug, Clone, ToSchema, Deserialize)]

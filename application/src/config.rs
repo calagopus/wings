@@ -1533,6 +1533,7 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.passwd.directory",
     "system.backups.restic.repository",
     "system.backups.restic.password_file",
+    "system.backups.restic.environment",
     "system.backups.mounting.path",
     "system.username",
     "system.user",
@@ -2605,6 +2606,29 @@ mod tests {
         let config: InnerConfig = serde_json::from_value(doc).expect("config should deserialize");
         assert!(config.docker.lxcfs.enabled);
         assert_eq!(config.docker.lxcfs.directory.0, "/var/lib/lxcfs");
+    }
+
+    // FORBIDDEN_PATHS
+    #[test]
+    fn restic_environment_cannot_be_changed_by_panel_patches_but_retry_lock_seconds_can() {
+        let config = from_yaml(
+            "system:\n  backups:\n    restic:\n      environment:\n        AWS_REGION: us-east-1\n",
+        );
+        let mut doc = serde_json::to_value(config).expect("config should serialize");
+        let mut patch = serde_json::json!({
+            "system": { "backups": { "restic": {
+                "environment": { "LD_PRELOAD": "/tmp/evil.so" },
+                "retry_lock_seconds": 99
+            } } }
+        });
+        crate::utils::strip_paths(&mut patch, FORBIDDEN_PATHS);
+        json_patch::merge(&mut doc, &patch);
+        let config: InnerConfig = serde_json::from_value(doc).expect("config should deserialize");
+        assert_eq!(
+            config.system.backups.restic.environment,
+            BTreeMap::from([("AWS_REGION".to_string(), "us-east-1".to_string())])
+        );
+        assert_eq!(config.system.backups.restic.retry_lock_seconds, 99);
     }
 
     #[test]
