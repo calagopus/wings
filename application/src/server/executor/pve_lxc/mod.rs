@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod firewall;
+mod forwarding;
 mod helper_process;
 mod server_process;
 
@@ -14,7 +15,7 @@ use crate::io::line_buffer::LineBuffer;
 use anyhow::Context;
 use compact_str::ToCompactString;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Cursor,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
@@ -121,12 +122,6 @@ struct BoundPort {
     family: ProcNetFamily,
     address: Option<IpAddr>,
     port: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EdgePeer {
-    public_ip: Ipv4Addr,
-    tunnel_ip: Ipv4Addr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,40 +273,11 @@ impl PveLxcExecutor {
             None => options.push("ip=dhcp".to_string()),
         }
         options.push("type=veth".to_string());
-        if address.is_none() {
-            options.push("host-managed=1".to_string());
-        }
         Ok(options.join(","))
     }
 
     fn dhcp_network(bridge: &str, vlan_tag: Option<u16>) -> Result<String, anyhow::Error> {
         Self::network_option(bridge, vlan_tag, None)
-    }
-
-    fn network_for_allocation(
-        bridge: &str,
-        vlan_tag: Option<u16>,
-        network_prefix: Option<u8>,
-        gateway: Option<&str>,
-        allocation: Option<&str>,
-    ) -> Result<String, anyhow::Error> {
-        let Some(allocation) = allocation else {
-            return Self::dhcp_network(bridge, vlan_tag);
-        };
-        let allocation = allocation.parse::<Ipv4Addr>().with_context(|| {
-            format!("LXC primary allocation {allocation} is not an IPv4 address")
-        })?;
-        let prefix = network_prefix.context(
-            "Proxmox LXC static allocations require runtime.pve_lxc.network_prefix; configure the isolated LXC subnet before assigning panel allocations",
-        )?;
-        let gateway = gateway
-            .filter(|gateway| !gateway.trim().is_empty())
-            .context(
-                "Proxmox LXC static allocations require runtime.pve_lxc.gateway; configure the isolated LXC subnet before assigning panel allocations",
-            )?
-            .parse::<Ipv4Addr>()
-            .context("Proxmox LXC gateway is not an IPv4 address")?;
-        Self::network_option(bridge, vlan_tag, Some((allocation, prefix, gateway)))
     }
 
     async fn rootfs_storage(
@@ -321,26 +287,84 @@ impl PveLxcExecutor {
         rootfs_size_gib: u64,
     ) -> Result<String, anyhow::Error> {
         if !configured_storage.is_empty() && configured_storage != "auto" {
-            return Ok(configured_storage);
+            return Self::select_rootfs_storage(&configured_storage, 0, &[]);
         }
 
         let required_bytes = rootfs_size_gib
             .checked_mul(1024 * 1024 * 1024)
             .context("Proxmox LXC rootfs size overflowed u64")?;
-        self.cli
-            .available_lxc_storages(node)
-            .await?
-            .into_iter()
-            .find(|storage| storage.available_bytes >= required_bytes)
-            .map(|storage| storage.name)
-            .context(format!(
-                "no active Proxmox LXC storage has {} GiB free for the requested rootfs",
-                rootfs_size_gib
-            ))
+        let storages = self.cli.available_lxc_storages(node).await?;
+        Self::select_rootfs_storage(&configured_storage, required_bytes, &storages).with_context(
+            || {
+                format!(
+                    "no active Proxmox LXC storage has {} GiB free for the requested rootfs",
+                    rootfs_size_gib
+                )
+            },
+        )
+    }
+
+    pub(crate) fn select_rootfs_storage(
+        configured_storage: &str,
+        required_bytes: u64,
+        storages: &[cli::LxcStorage],
+    ) -> Result<String, anyhow::Error> {
+        if !configured_storage.is_empty() && configured_storage != "auto" {
+            return Ok(configured_storage.to_string());
+        }
+
+        storages
+            .iter()
+            .filter(|storage| storage.available_bytes >= required_bytes)
+            .min_by(|left, right| {
+                right
+                    .available_bytes
+                    .cmp(&left.available_bytes)
+                    .then_with(|| left.name.cmp(&right.name))
+            })
+            .map(|storage| storage.name.clone())
+            .context("no active Proxmox LXC storage has enough free capacity")
     }
 
     const INSTALLER_HELPER_ROLE: &'static str = "installer";
     const SCRIPT_HELPER_ROLE: &'static str = "script";
+
+    pub(super) fn helper_entrypoint_script() -> &'static str {
+        r#"#!/bin/sh
+has_usable_ipv4() {
+    awk '
+        $1 == "|--" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { candidate = $2 }
+        $1 == "/32" && $2 == "host" && $3 == "LOCAL" {
+            split(candidate, octet, ".")
+            if (octet[1] != 127 && !(octet[1] == 169 && octet[2] == 254) && candidate != "0.0.0.0") found = 1
+        }
+        END { exit !found }
+    ' /proc/net/fib_trie
+}
+attempt=0
+while [ "$attempt" -lt 120 ]; do
+    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route && has_usable_ipv4; then
+        "$@"
+        status=$?
+        if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
+            if [ "$status" -eq 0 ]; then
+                : > "$INSTALL_STATUS_FILE"
+            else
+                printf 'installer exited with status %s\n' "$status" > "$INSTALL_STATUS_FILE"
+            fi
+        fi
+        exit "$status"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+done
+echo 'timed out waiting for usable network' >&2
+if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
+    printf '%s\n' 'timed out waiting for usable network' > "$INSTALL_STATUS_FILE"
+fi
+exit 1
+"#
+    }
 
     pub fn new(
         app_config: Arc<crate::config::Config>,
@@ -857,256 +881,56 @@ impl PveLxcExecutor {
         )
     }
 
-    fn edge_forward_payload(
+    fn prepare_network_specs(
         configuration: &crate::server::configuration::ServerConfiguration,
-        destination: Ipv4Addr,
-    ) -> Result<Option<(Ipv4Addr, serde_json::Value)>, anyhow::Error> {
-        let Some(allocation) = configuration.allocations.default.as_ref() else {
-            return Ok(None);
-        };
-        let public_ip = allocation
-            .ip
-            .to_string()
-            .parse::<Ipv4Addr>()
-            .with_context(|| {
-                format!(
-                    "Proxmox edge forwarding requires an IPv4 primary allocation, got {}",
-                    allocation.ip
-                )
-            })?;
-        let ports = configuration
-            .allocations
-            .mappings
-            .get(&allocation.ip.to_compact_string())
-            .cloned()
-            .unwrap_or_default();
-        Ok(Some((
-            public_ip,
-            serde_json::json!({
-                "ip": destination.to_string(),
-                // Panel allocations are protocol-neutral. Publish both transports so
-                // TCP games and UDP games preserve the same allocation contract.
-                "tcp": ports,
-                "udp": ports,
-            }),
-        )))
-    }
-
-    fn edge_forwarding_config(
-        app_config: &crate::config::Config,
-    ) -> Result<Option<(String, String, String, String)>, anyhow::Error> {
-        let config = app_config.load();
-        let pve = &config.runtime.pve_lxc;
-        let interface = pve.edge_wireguard_interface.trim().to_string();
-        let user = pve.edge_ssh_user.trim().to_string();
-        let identity_path = pve.edge_ssh_identity_path.trim().to_string();
-        let known_hosts_path = pve.edge_known_hosts_path.trim().to_string();
-        if identity_path.is_empty() && known_hosts_path.is_empty() {
-            return Ok(None);
-        }
-        if interface.is_empty()
-            || user.is_empty()
-            || identity_path.is_empty()
-            || known_hosts_path.is_empty()
-        {
-            return Err(anyhow::anyhow!(
-                "Proxmox edge forwarding requires edge_wireguard_interface, edge_ssh_user, edge_ssh_identity_path, and edge_known_hosts_path"
-            ));
-        }
-        if !user
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            anyhow::bail!("Proxmox edge SSH user contains unsupported characters: {user}");
-        }
-        Ok(Some((interface, user, identity_path, known_hosts_path)))
-    }
-
-    async fn validate_edge_forwarding_config(
-        app_config: &crate::config::Config,
-    ) -> Result<(), anyhow::Error> {
-        let Some((_, _, identity_path, _)) = Self::edge_forwarding_config(app_config)? else {
-            return Ok(());
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-            let metadata = tokio::fs::metadata(&identity_path).await.with_context(|| {
-                format!("failed to inspect Proxmox edge SSH identity {identity_path}")
-            })?;
-            if !metadata.is_file() {
-                anyhow::bail!("Proxmox edge SSH identity is not a regular file: {identity_path}");
-            }
-            if metadata.uid() != 0 || metadata.permissions().mode() & 0o077 != 0 {
-                anyhow::bail!(
-                    "Proxmox edge SSH identity must be owned by root and inaccessible to group and other users: {identity_path}"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn edge_peers(interface: &str) -> Result<Vec<EdgePeer>, anyhow::Error> {
-        let mut command = tokio::process::Command::new("/usr/bin/wg");
-        command.args(["show", interface, "dump"]).kill_on_drop(true);
-        let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
-            .await
-            .context("timed out inspecting WireGuard peers for Proxmox edge forwarding")?
-            .context("failed to inspect WireGuard peers for Proxmox edge forwarding")?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed to inspect WireGuard interface {interface}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        let dump = String::from_utf8(output.stdout)
-            .context("WireGuard peer output was not valid UTF-8")?;
-        let mut peers = Vec::new();
-        for line in dump.lines().skip(1) {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            let Some([_, _, endpoint, allowed_ips, ..]) = fields.get(..) else {
-                continue;
-            };
-            if *endpoint == "(none)" {
-                continue;
-            }
-            let endpoint = endpoint
-                .parse::<std::net::SocketAddr>()
-                .with_context(|| format!("WireGuard peer endpoint was invalid: {endpoint}"))?;
-            let IpAddr::V4(public_ip) = endpoint.ip() else {
-                tracing::warn!(endpoint = %endpoint, "ignoring IPv6 WireGuard edge endpoint because panel allocations require IPv4");
-                continue;
-            };
-            let Some(tunnel_ip) = allowed_ips
-                .split(',')
-                .filter_map(|cidr| cidr.split_once('/'))
-                .find_map(|(ip, prefix)| {
-                    (prefix == "32")
-                        .then(|| ip.parse::<Ipv4Addr>().ok())
-                        .flatten()
+        container_ips: Vec<IpAddr>,
+        vmid: Option<u32>,
+        running: bool,
+        network: &forwarding::NetworkContext,
+    ) -> (
+        crate::server::firewall::FirewallServerSpec,
+        Result<Option<forwarding::ForwardingSpec>, anyhow::Error>,
+    ) {
+        let forwarding = if running && !configuration.allocations.mappings.is_empty() {
+            network
+                .guest_destination(&container_ips)
+                .and_then(|destination| {
+                    forwarding::ForwardingSpec::from_configuration(configuration, destination)
                 })
-            else {
-                continue;
-            };
-            peers.push(EdgePeer {
-                public_ip,
-                tunnel_ip,
-            });
-        }
-        peers.sort_unstable_by_key(|peer| (peer.public_ip, peer.tunnel_ip));
-        peers.dedup();
-        Ok(peers)
-    }
-
-    async fn edge_ssh(
-        host: Ipv4Addr,
-        user: &str,
-        identity_path: &str,
-        known_hosts_path: &str,
-        server: uuid::Uuid,
-        payload: Option<serde_json::Value>,
-    ) -> Result<(), anyhow::Error> {
-        let action = if payload.is_some() { "sync" } else { "clear" };
-        let mut command = tokio::process::Command::new("/usr/bin/ssh");
-        command
-            .args([
-                "-i",
-                identity_path,
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "-o",
-                &format!("UserKnownHostsFile={known_hosts_path}"),
-                &format!("{user}@{host}"),
-                action,
-                &server.to_string(),
-            ])
-            .stdin(if payload.is_some() {
-                std::process::Stdio::piped()
-            } else {
-                std::process::Stdio::null()
-            })
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .context("failed to start Proxmox edge forwarding SSH command")?;
-        if let Some(payload) = payload {
-            let bytes = serde_json::to_vec(&payload)
-                .context("failed to serialize Proxmox edge forwarding payload")?;
-            child
-                .stdin
-                .as_mut()
-                .context("Proxmox edge forwarding SSH stdin was unavailable")?
-                .write_all(&bytes)
-                .await?;
-        }
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
-                .await
-                .context("timed out synchronizing Proxmox edge forwarding")?
-                .context("failed while synchronizing Proxmox edge forwarding")?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "Proxmox edge forwarding {action} for {server} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(())
-    }
-
-    async fn sync_edge_forwarding(
-        app_config: &crate::config::Config,
-        server: uuid::Uuid,
-        public_ip: Option<Ipv4Addr>,
-        payload: Option<serde_json::Value>,
-    ) -> Result<(), anyhow::Error> {
-        let Some((interface, user, identity_path, known_hosts_path)) =
-            Self::edge_forwarding_config(app_config)?
-        else {
-            return Ok(());
+        } else {
+            Ok(None)
         };
-        let peers = Self::edge_peers(&interface).await?;
-        for peer in &peers {
-            Self::edge_ssh(
-                peer.tunnel_ip,
-                &user,
-                &identity_path,
-                &known_hosts_path,
-                server,
-                None,
-            )
-            .await?;
+        (
+            Self::firewall_spec(configuration, container_ips, vmid),
+            forwarding,
+        )
+    }
+
+    fn network_policy_required(
+        configuration: &crate::server::configuration::ServerConfiguration,
+    ) -> bool {
+        !configuration.firewall.is_empty() || !configuration.allocations.mappings.is_empty()
+    }
+
+    async fn sync_allocation_forwarding(
+        server: uuid::Uuid,
+        spec: Option<&forwarding::ForwardingSpec>,
+    ) -> Result<(), anyhow::Error> {
+        forwarding::sync(server, spec).await
+    }
+
+    fn aggregate_reconciliation_errors(errors: Vec<anyhow::Error>) -> Result<(), anyhow::Error> {
+        if errors.is_empty() {
+            return Ok(());
         }
-        if let Some(payload) = payload {
-            let public_ip = public_ip.context(
-                "Proxmox edge forwarding payload did not include a public allocation IP",
-            )?;
-            let peer = peers
-                .iter()
-                .find(|peer| peer.public_ip == public_ip)
-                .with_context(|| {
-                    format!("no WireGuard peer on {interface} has endpoint address {public_ip}")
-                })?;
-            Self::edge_ssh(
-                peer.tunnel_ip,
-                &user,
-                &identity_path,
-                &known_hosts_path,
-                server,
-                Some(payload),
-            )
-            .await?;
-        }
-        Ok(())
+        let details = errors
+            .into_iter()
+            .map(|error| format!("- {error:#}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(anyhow::anyhow!(
+            "Proxmox LXC reconciliation completed with errors:\n{details}"
+        ))
     }
 
     fn firewall_file_access(
@@ -1499,35 +1323,9 @@ impl PveLxcExecutor {
 
         let helper_wrapper_name = "calagopus-helper-entrypoint";
         let helper_wrapper_path = staging_path.join(helper_wrapper_name);
-        tokio::fs::write(
-            &helper_wrapper_path,
-            r#"#!/bin/sh
-attempt=0
-while [ "$attempt" -lt 480 ]; do
-    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
-        "$@"
-        status=$?
-        if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
-            if [ "$status" -eq 0 ]; then
-                : > "$INSTALL_STATUS_FILE"
-            else
-                printf 'installer exited with status %s\n' "$status" > "$INSTALL_STATUS_FILE"
-            fi
-        fi
-        exit "$status"
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.25
-done
-echo 'timed out waiting for Proxmox DHCP' >&2
-if [ -n "${INSTALL_STATUS_FILE:-}" ]; then
-    printf '%s\n' 'timed out waiting for Proxmox DHCP' > "$INSTALL_STATUS_FILE"
-fi
-exit 1
-"#,
-        )
-        .await
-        .context("failed to write Proxmox helper entrypoint wrapper")?;
+        tokio::fs::write(&helper_wrapper_path, Self::helper_entrypoint_script())
+            .await
+            .context("failed to write Proxmox helper entrypoint wrapper")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1540,10 +1338,9 @@ exit 1
         }
 
         self.cli.create_with_bind_mounts(&create, &mounts).await?;
-        // PVE applies a host-managed DHCP lease immediately after CT init starts.
-        // Keep PID 1 alive until that lease installs a default route; otherwise a
-        // fast installer can attempt its first download and exit before `pct`
-        // has a chance to run its DHCP hook.
+        // The helper can begin running before `pct start` returns, so keep the
+        // installer behind a short, generic network-readiness gate. This is a
+        // startup race guard rather than compensation for slow DHCP.
         let init_command = PveCli::encode_init_command(&[
             format!("{staging_target}/{helper_wrapper_name}"),
             script.entrypoint.to_string(),
@@ -1594,7 +1391,7 @@ exit 1
             .cloned()
             .context("Proxmox VE LXC runtime has not been booted")?;
 
-        let (server_uuid, image, resources, primary_allocation) = {
+        let (server_uuid, image, resources) = {
             let configuration = server.configuration.read().await;
             let resources = PveCli::panel_resources(
                 configuration.build.memory_limit,
@@ -1612,11 +1409,6 @@ exit 1
                     .trim_end_matches('~')
                     .to_string(),
                 resources,
-                configuration
-                    .allocations
-                    .default
-                    .as_ref()
-                    .map(|allocation| allocation.ip.to_string()),
             )
         };
         let image = PveCli::normalize_oci_reference(&image)?;
@@ -1628,12 +1420,9 @@ exit 1
             rootfs_storage,
             bridge,
             vlan_tag,
-            network_prefix,
-            gateway,
             rootfs_size_gib,
             tag_prefix,
             unprivileged,
-            edge_forwarding,
             image_cache_max_age,
         ) = {
             let config = self.app_config.load();
@@ -1643,26 +1432,13 @@ exit 1
                 pve.rootfs_storage.clone(),
                 pve.bridge.clone(),
                 pve.vlan_tag,
-                pve.network_prefix,
-                pve.gateway.clone(),
                 pve.rootfs_size_gib,
                 pve.tag_prefix.clone(),
                 pve.unprivileged,
-                Self::edge_forwarding_config(&self.app_config)?.is_some(),
                 Self::image_cache_max_age(&config),
             )
         };
-        let network = if edge_forwarding {
-            Self::dhcp_network(&bridge, vlan_tag)?
-        } else {
-            Self::network_for_allocation(
-                &bridge,
-                vlan_tag,
-                network_prefix,
-                gateway.as_deref(),
-                primary_allocation.as_deref(),
-            )?
-        };
+        let network = Self::dhcp_network(&bridge, vlan_tag)?;
 
         let template = {
             let template_lock = self
@@ -1890,7 +1666,18 @@ impl ServerExecutor for PveLxcExecutor {
                 "Proxmox VE LXC runtime currently requires unprivileged containers because per-mount idmap is required for Wings-owned server data"
             ));
         }
-        Self::validate_edge_forwarding_config(&self.app_config).await?;
+        let forwarding_network = {
+            let config = self.app_config.load();
+            let pve = &config.runtime.pve_lxc;
+            forwarding::NetworkContext::new(
+                &pve.bridge,
+                pve.network_prefix,
+                pve.gateway.as_deref(),
+            )?
+        };
+        forwarding::initialize(&forwarding_network)
+            .await
+            .context("failed to initialize Proxmox allocation forwarding")?;
 
         let raw_version = self.cli.version().await?;
         let version = PveVersion::parse(&raw_version)?;
@@ -1933,42 +1720,76 @@ impl ServerExecutor for PveLxcExecutor {
             .node
             .get()
             .context("Proxmox VE LXC runtime has not been booted")?;
-        let tag_prefix = self.app_config.load().runtime.pve_lxc.tag_prefix.clone();
+        let (tag_prefix, forwarding_network) = {
+            let config = self.app_config.load();
+            let pve = &config.runtime.pve_lxc;
+            (
+                pve.tag_prefix.clone(),
+                forwarding::NetworkContext::new(
+                    &pve.bridge,
+                    pve.network_prefix,
+                    pve.gateway.as_deref(),
+                )?,
+            )
+        };
         let containers = self.cli.list_containers().await?;
+        let mut errors = Vec::new();
+        let mut forwarding_specs = BTreeMap::new();
         let mut specs = Vec::with_capacity(servers.len());
         for server in servers {
+            let server_uuid = server.settings.uuid;
             let container =
-                Self::owned_server_container(&containers, node, &tag_prefix, server.settings.uuid)?;
+                match Self::owned_server_container(&containers, node, &tag_prefix, server_uuid) {
+                    Ok(container) => container,
+                    Err(error) => {
+                        errors.push(error.context(format!(
+                            "failed to prepare Proxmox LXC server {server_uuid} for reconciliation"
+                        )));
+                        continue;
+                    }
+                };
             let running = container
                 .as_ref()
                 .is_some_and(|container| container.status == Some(cli::ContainerStatus::Running));
             let addresses = if let Some(container) = container.as_ref().filter(|_| running) {
-                PveCli::container_addresses(
-                    &self
-                        .cli
-                        .interfaces(&container.node, container.vmid)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to resolve Proxmox LXC addresses while reconciling firewall for {}",
-                                server.settings.uuid
-                            )
-                        })?,
-                )
+                match self.cli.interfaces(&container.node, container.vmid).await {
+                    Ok(interfaces) => PveCli::container_addresses(&interfaces),
+                    Err(error) => {
+                        errors.push(error.context(format!(
+                            "failed to resolve Proxmox LXC addresses while reconciling server {server_uuid}"
+                        )));
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
-            let mut spec = Self::firewall_spec(
+            let (mut spec, forwarding_spec) = Self::prepare_network_specs(
                 &server.settings,
                 addresses,
                 container.as_ref().map(|container| container.vmid),
+                running,
+                &forwarding_network,
             );
+            match forwarding_spec {
+                Ok(Some(spec)) => {
+                    forwarding_specs.insert(server_uuid, spec);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    errors.push(error.context(format!(
+                        "failed to prepare Proxmox allocation forwarding for {server_uuid}"
+                    )));
+                }
+            }
 
             if !server.settings.firewall.is_empty() && spec.container_ips.is_empty() && running {
-                return Err(anyhow::anyhow!(
+                forwarding_specs.remove(&server_uuid);
+                errors.push(anyhow::anyhow!(
                     "running Proxmox LXC server {} has no usable bridged address; refusing to reconcile configured firewall rules without a destination",
                     server.settings.uuid
                 ));
+                continue;
             }
 
             if spec.references_files() {
@@ -1996,7 +1817,16 @@ impl ServerExecutor for PveLxcExecutor {
             specs.push(spec);
         }
 
-        self.firewall.reconcile(&specs).await
+        let (forwarding_specs, conflict_errors) =
+            forwarding::without_binding_conflicts(forwarding_specs);
+        errors.extend(conflict_errors);
+        if let Err(error) = forwarding::sync_all(&forwarding_network, &forwarding_specs).await {
+            errors.push(error.context("failed to reconcile Proxmox allocation forwarding"));
+        }
+        if let Err(error) = self.firewall.reconcile(&specs).await {
+            errors.push(error.context("failed to reconcile Proxmox LXC firewall"));
+        }
+        Self::aggregate_reconciliation_errors(errors)
     }
 
     async fn setup_server_process(
@@ -2144,22 +1974,10 @@ impl ServerExecutor for PveLxcExecutor {
         );
 
         if let Err(error) = handle.sync_firewall(true).await {
-            let configuration = server.configuration.read().await;
-            let requires_network_policy = !configuration.firewall.is_empty()
-                || (configuration.allocations.default.is_some()
-                    && Self::edge_forwarding_config(&self.app_config)?.is_some());
-            drop(configuration);
-            if requires_network_policy {
-                return Err(handle
-                    .stop_after_firewall_failure(
-                        error,
-                        "failed to attach Proxmox LXC network policy",
-                    )
-                    .await);
-            }
             tracing::warn!(
                 server = %server.uuid,
-                "failed to clear Proxmox LXC firewall state for a server without rules: {error:#}"
+                vmid = container.vmid,
+                "failed to reconcile network policy for an adopted running Proxmox LXC; continuing in degraded state without changing guest power: {error:#}"
             );
         }
 
@@ -2176,7 +1994,7 @@ impl ServerExecutor for PveLxcExecutor {
                 "failed to clear Proxmox LXC firewall rules during cleanup: {error:#}"
             );
         }
-        Self::sync_edge_forwarding(&self.app_config, server.uuid, None, None).await?;
+        Self::sync_allocation_forwarding(server.uuid, None).await?;
 
         let Some(container) = self.server_container(server.uuid).await? else {
             PveProcessHandle::cleanup_managed_file_staging(&self.app_config, server.uuid).await?;
@@ -2743,6 +2561,10 @@ impl ServerExecutor for PveLxcExecutor {
                 (ip, ports)
             })
             .collect())
+    }
+
+    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
+        None
     }
 }
 

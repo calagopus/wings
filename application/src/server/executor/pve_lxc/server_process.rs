@@ -12,6 +12,7 @@ pub(super) struct PveProcessHandle {
     stdout_ratelimited_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     started: Arc<AtomicBool>,
+    forwarding_installed: Arc<AtomicBool>,
     status_task: tokio::task::JoinHandle<()>,
     stats_task: tokio::task::JoinHandle<()>,
     console_task: tokio::task::JoinHandle<()>,
@@ -19,10 +20,101 @@ pub(super) struct PveProcessHandle {
 
 impl PveProcessHandle {
     const EXIT_STATUS_FILE: &'static str = ".wings-exit-status";
-    // PVE's host-managed DHCP can lag CT init by several minutes during
-    // replacement starts. Keep the entrypoint alive for four real minutes.
-    pub(super) const DHCP_ROUTE_WAIT_INTERVAL_MILLIS: u32 = 250;
-    pub(super) const DHCP_ROUTE_WAIT_ATTEMPTS: u32 = 1920;
+
+    pub(super) fn runtime_entrypoint_script(exit_status_path: &str) -> String {
+        r#"#!/bin/sh
+read_oom_kills() {
+    value=0
+    if [ -r /sys/fs/cgroup/memory.events ]; then
+        while read -r key count; do
+            if [ "$key" = oom_kill ]; then
+                value=$count
+                break
+            fi
+        done < /sys/fs/cgroup/memory.events
+    fi
+    printf '%s' "$value"
+}
+
+has_usable_ipv4() {
+    awk '
+        $1 == "|--" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { candidate = $2 }
+        $1 == "/32" && $2 == "host" && $3 == "LOCAL" {
+            split(candidate, octet, ".")
+            if (octet[1] != 127 && !(octet[1] == 169 && octet[2] == 254) && candidate != "0.0.0.0") found = 1
+        }
+        END { exit !found }
+    ' /proc/net/fib_trie
+}
+
+marker=__WINGS_EXIT_STATUS_PATH__
+attempt=0
+while [ "$attempt" -lt 120 ]; do
+    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route && has_usable_ipv4; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+done
+if [ "$attempt" -ge 120 ]; then
+    echo 'timed out waiting for usable network' >&2
+    temporary="${marker}.tmp.$$"
+    (
+        umask 077
+        printf 'exit_code=1\noom_killed=0\n' > "$temporary"
+    )
+    mv -f "$temporary" "$marker"
+    exit 1
+fi
+
+child=0
+child_group=0
+forward_signal() {
+    if [ "$child" -gt 0 ]; then
+        if [ "$child_group" -eq 1 ]; then
+            kill "-$1" "-$child" 2>/dev/null || true
+        else
+            kill "-$1" "$child" 2>/dev/null || true
+        fi
+    fi
+}
+trap 'forward_signal HUP' HUP
+trap 'forward_signal INT' INT
+trap 'forward_signal QUIT' QUIT
+trap 'forward_signal ABRT' ABRT
+trap 'forward_signal TERM' TERM
+
+oom_before=$(read_oom_kills)
+if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" <&0 &
+    child_group=1
+else
+    "$@" <&0 &
+fi
+child=$!
+while :; do
+    wait "$child"
+    status=$?
+    if ! kill -0 "$child" 2>/dev/null; then
+        break
+    fi
+done
+oom_after=$(read_oom_kills)
+oom_killed=0
+if [ "$oom_after" -gt "$oom_before" ]; then
+    oom_killed=1
+fi
+
+temporary="${marker}.tmp.$$"
+(
+    umask 077
+    printf 'exit_code=%s\noom_killed=%s\n' "$status" "$oom_killed" > "$temporary"
+)
+mv -f "$temporary" "$marker"
+exit "$status"
+"#
+        .replace("__WINGS_EXIT_STATUS_PATH__", exit_status_path)
+    }
 
     pub(super) fn observed_status(
         status: cli::ContainerStatus,
@@ -31,6 +123,7 @@ impl PveProcessHandle {
         exit_status: Option<(i32, bool)>,
     ) -> Option<super::ProcessStatus> {
         match status {
+            cli::ContainerStatus::Running if !start_succeeded => None,
             cli::ContainerStatus::Running => {
                 *seen_running = true;
                 Some(super::ProcessStatus::Running)
@@ -44,6 +137,46 @@ impl PveProcessHandle {
                 })
             }
         }
+    }
+
+    pub(super) fn should_clear_forwarding(
+        status: cli::ContainerStatus,
+        forwarding_installed: &AtomicBool,
+    ) -> bool {
+        status == cli::ContainerStatus::Stopped && forwarding_installed.load(Ordering::Acquire)
+    }
+
+    pub(super) fn record_forwarding_sync(
+        forwarding_installed: &AtomicBool,
+        desired_nonempty: bool,
+        succeeded: bool,
+    ) {
+        if succeeded {
+            forwarding_installed.store(desired_nonempty, Ordering::Release);
+        }
+    }
+
+    pub(super) fn finish_address_resolution(
+        addresses: Vec<IpAddr>,
+        last_error: Option<anyhow::Error>,
+        vmid: u32,
+    ) -> (Vec<IpAddr>, Option<anyhow::Error>) {
+        if !addresses.is_empty() {
+            return (addresses, None);
+        }
+        let error = last_error.map_or_else(
+            || {
+                anyhow::anyhow!(
+                    "running Proxmox LXC container {vmid} has no usable bridged address"
+                )
+            },
+            |error| {
+                error.context(
+                    "failed to resolve Proxmox LXC address for firewall and allocation forwarding",
+                )
+            },
+        );
+        (addresses, Some(error))
     }
 
     pub(super) fn parse_exit_status(contents: &str) -> Option<(i32, bool)> {
@@ -159,7 +292,9 @@ impl PveProcessHandle {
         >(websocket_log_count * 2);
 
         let started = Arc::new(AtomicBool::new(!suppress_initial_stopped));
+        let forwarding_installed = Arc::new(AtomicBool::new(false));
         let state_started = Arc::clone(&started);
+        let state_forwarding_installed = Arc::clone(&forwarding_installed);
         let state_cli = cli.clone();
         let state_server_uuid = server.uuid;
         let state_exit_status_path = Self::exit_status_path(server);
@@ -172,6 +307,27 @@ impl PveProcessHandle {
                 tick.tick().await;
                 let process_status = match state_cli.status(vmid).await {
                     Ok(status) => {
+                        if Self::should_clear_forwarding(status, &state_forwarding_installed) {
+                            match PveLxcExecutor::sync_allocation_forwarding(
+                                state_server_uuid,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(()) => Self::record_forwarding_sync(
+                                    &state_forwarding_installed,
+                                    false,
+                                    true,
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        server = %state_server_uuid,
+                                        vmid,
+                                        "failed to clear Proxmox allocation forwarding after the LXC stopped: {error:#}"
+                                    );
+                                }
+                            }
+                        }
                         let exit_status = if status == cli::ContainerStatus::Stopped {
                             Self::read_exit_status(&state_exit_status_path).await
                         } else {
@@ -578,6 +734,7 @@ impl PveProcessHandle {
             stdout_ratelimited_rx,
             stdout_rx,
             started,
+            forwarding_installed,
             status_task,
             stats_task,
             console_task,
@@ -820,101 +977,20 @@ impl PveProcessHandle {
             let entrypoint_target = "/calagopus-entrypoint";
             let entrypoint_source =
                 stage_directory.join(Self::managed_file_stage_name(entrypoint_target)?);
-            let entrypoint_script = r#"#!/bin/sh
-attempt=0
-while [ "$attempt" -lt __WINGS_DHCP_WAIT_ATTEMPTS__ ]; do
-    if grep -q '^eth0[[:space:]]*00000000[[:space:]]' /proc/net/route; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.25
-done
-if [ "$attempt" -ge __WINGS_DHCP_WAIT_ATTEMPTS__ ]; then
-    echo 'timed out waiting for Proxmox DHCP' >&2
-    exit 1
-fi
-
-read_oom_kills() {
-    value=0
-    if [ -r /sys/fs/cgroup/memory.events ]; then
-        while read -r key count; do
-            if [ "$key" = oom_kill ]; then
-                value=$count
-                break
-            fi
-        done < /sys/fs/cgroup/memory.events
-    fi
-    printf '%s' "$value"
-}
-
-child=0
-child_group=0
-forward_signal() {
-    if [ "$child" -gt 0 ]; then
-        if [ "$child_group" -eq 1 ]; then
-            kill "-$1" "-$child" 2>/dev/null || true
-        else
-            kill "-$1" "$child" 2>/dev/null || true
-        fi
-    fi
-}
-trap 'forward_signal HUP' HUP
-trap 'forward_signal INT' INT
-trap 'forward_signal QUIT' QUIT
-trap 'forward_signal ABRT' ABRT
-trap 'forward_signal TERM' TERM
-
-oom_before=$(read_oom_kills)
-if command -v setsid >/dev/null 2>&1; then
-    setsid "$@" <&0 &
-    child_group=1
-else
-    "$@" <&0 &
-fi
-child=$!
-while :; do
-    wait "$child"
-    status=$?
-    if ! kill -0 "$child" 2>/dev/null; then
-        break
-    fi
-done
-oom_after=$(read_oom_kills)
-oom_killed=0
-if [ "$oom_after" -gt "$oom_before" ]; then
-    oom_killed=1
-fi
-
-marker=__WINGS_EXIT_STATUS_PATH__
-temporary="${marker}.tmp.$$"
-(
-    umask 077
-    printf 'exit_code=%s\noom_killed=%s\n' "$status" "$oom_killed" > "$temporary"
-)
-mv -f "$temporary" "$marker"
-exit "$status"
-"#
-            .replace(
-                "__WINGS_DHCP_WAIT_ATTEMPTS__",
-                &Self::DHCP_ROUTE_WAIT_ATTEMPTS.to_string(),
-            )
-            .replace(
-                "__WINGS_EXIT_STATUS_PATH__",
-                &format!(
-                    "{}/{}",
-                    PveLxcExecutor::DATA_MOUNT_TARGET,
-                    Self::EXIT_STATUS_FILE
-                ),
-            );
+            let entrypoint_script = Self::runtime_entrypoint_script(&format!(
+                "{}/{}",
+                PveLxcExecutor::DATA_MOUNT_TARGET,
+                Self::EXIT_STATUS_FILE
+            ));
             tokio::fs::write(&entrypoint_source, entrypoint_script)
                 .await
-                .context("failed to stage Proxmox network-ready entrypoint")?;
+                .context("failed to stage Proxmox runtime entrypoint")?;
             tokio::fs::set_permissions(&entrypoint_source, std::fs::Permissions::from_mode(0o755))
                 .await
-                .context("failed to make Proxmox network-ready entrypoint executable")?;
+                .context("failed to make Proxmox runtime entrypoint executable")?;
             let entrypoint_source = tokio::fs::canonicalize(&entrypoint_source)
                 .await
-                .context("failed to resolve staged Proxmox network-ready entrypoint")?;
+                .context("failed to resolve staged Proxmox runtime entrypoint")?;
             let source_path = entrypoint_source
                 .into_os_string()
                 .into_string()
@@ -997,11 +1073,17 @@ exit "$status"
 
     pub(super) async fn sync_firewall(&self, wait_for_address: bool) -> Result<(), anyhow::Error> {
         let server = self.get_server()?;
-        let has_rules = !server.configuration.read().await.firewall.is_empty();
-        let edge_forwarding = PveLxcExecutor::edge_forwarding_config(&self.app_config)?.is_some();
+        let mut errors = Vec::new();
+        let (has_rules, has_mappings) = {
+            let configuration = server.configuration.read().await;
+            (
+                !configuration.firewall.is_empty(),
+                !configuration.allocations.mappings.is_empty(),
+            )
+        };
         let running = self.cli.status(self.vmid).await? == cli::ContainerStatus::Running;
 
-        let container_ips = if running && (has_rules || edge_forwarding) {
+        let container_ips = if running && (has_rules || has_mappings) {
             let mut last_error = None;
             let mut addresses = Vec::new();
             let attempts = if wait_for_address { 40 } else { 1 };
@@ -1023,51 +1105,79 @@ exit "$status"
                 }
             }
 
-            if addresses.is_empty() {
-                if let Some(error) = last_error {
-                    return Err(error.context(
-                        "failed to resolve Proxmox LXC address for firewall and edge forwarding",
-                    ));
-                }
-                return Err(anyhow::anyhow!(
-                    "running Proxmox LXC container {} has no usable bridged address; refusing to leave firewall or edge forwarding unapplied",
-                    self.vmid
-                ));
+            let (addresses, address_error) =
+                Self::finish_address_resolution(addresses, last_error, self.vmid);
+            if let Some(error) = address_error {
+                errors.push(error);
             }
-
             addresses
         } else {
             Vec::new()
         };
 
-        let (mut spec, edge_forward) = {
+        let (mut spec, forwarding_spec) = {
             let configuration = server.configuration.read().await;
-            let destination = container_ips.iter().find_map(|address| match address {
-                IpAddr::V4(address) => Some(*address),
-                IpAddr::V6(_) => None,
-            });
-            let edge_forward = if edge_forwarding && running {
-                Some(PveLxcExecutor::edge_forward_payload(
+            let config = self.app_config.load();
+            let pve = &config.runtime.pve_lxc;
+            match forwarding::NetworkContext::new(
+                &pve.bridge,
+                pve.network_prefix,
+                pve.gateway.as_deref(),
+            ) {
+                Ok(network) => PveLxcExecutor::prepare_network_specs(
                     &configuration,
-                    destination
-                        .context("running Proxmox LXC has no IPv4 address for edge forwarding")?,
-                )?)
-            } else {
-                None
-            };
-            (
-                PveLxcExecutor::firewall_spec(&configuration, container_ips, Some(self.vmid)),
-                edge_forward,
-            )
+                    container_ips,
+                    Some(self.vmid),
+                    running && has_mappings,
+                    &network,
+                ),
+                Err(error) => (
+                    PveLxcExecutor::firewall_spec(&configuration, container_ips, Some(self.vmid)),
+                    Err(error),
+                ),
+            }
         };
         spec.files = Some(PveLxcExecutor::firewall_file_access(&server));
-        self.firewall.sync(&spec).await?;
-        if edge_forwarding {
-            let (public_ip, payload) = edge_forward.flatten().unzip();
-            PveLxcExecutor::sync_edge_forwarding(&self.app_config, server.uuid, public_ip, payload)
-                .await?;
+        if let Err(error) = self.firewall.sync(&spec).await {
+            errors.push(error.context("failed to synchronize Proxmox LXC firewall"));
         }
-        Ok(())
+        match forwarding_spec {
+            Ok(forwarding_spec) => {
+                let desired_nonempty = forwarding_spec.is_some();
+                let result = PveLxcExecutor::sync_allocation_forwarding(
+                    server.uuid,
+                    forwarding_spec.as_ref(),
+                )
+                .await;
+                Self::record_forwarding_sync(
+                    &self.forwarding_installed,
+                    desired_nonempty,
+                    result.is_ok(),
+                );
+                if let Err(error) = result {
+                    errors
+                        .push(error.context("failed to synchronize Proxmox allocation forwarding"));
+                }
+            }
+            Err(preparation_error) => {
+                errors.push(preparation_error.context(
+                    "failed to prepare Proxmox allocation forwarding; previous rules were cleared",
+                ));
+                let clear_result =
+                    PveLxcExecutor::sync_allocation_forwarding(server.uuid, None).await;
+                Self::record_forwarding_sync(
+                    &self.forwarding_installed,
+                    false,
+                    clear_result.is_ok(),
+                );
+                if let Err(clear_error) = clear_result {
+                    errors.push(clear_error.context(
+                        "failed to clear previous Proxmox allocation forwarding after preparation failed",
+                    ));
+                }
+            }
+        }
+        PveLxcExecutor::aggregate_reconciliation_errors(errors)
     }
 
     pub(super) async fn stop_after_firewall_failure(
@@ -1153,17 +1263,12 @@ impl ProcessHandle for PveProcessHandle {
             .await?;
         if let Err(error) = self.sync_firewall(true).await {
             let configuration = server.configuration.read().await;
-            let requires_network_policy = !configuration.firewall.is_empty()
-                || (configuration.allocations.default.is_some()
-                    && PveLxcExecutor::edge_forwarding_config(&self.app_config)?.is_some());
+            let requires_network_policy = PveLxcExecutor::network_policy_required(&configuration);
             drop(configuration);
             if requires_network_policy {
-                return Err(self
-                    .stop_after_firewall_failure(
-                        error,
-                        "failed to synchronize Proxmox LXC network policy after configuration update",
-                    )
-                    .await);
+                return Err(error.context(
+                    "failed to synchronize Proxmox LXC network policy after configuration update",
+                ));
             }
 
             tracing::warn!(
@@ -1189,16 +1294,23 @@ impl ProcessHandle for PveProcessHandle {
                 });
             }
         }
-        self.cli.start(self.vmid).await?;
+        let network = {
+            let config = self.app_config.load();
+            let pve = &config.runtime.pve_lxc;
+            forwarding::NetworkContext::new(
+                &pve.bridge,
+                pve.network_prefix,
+                pve.gateway.as_deref(),
+            )?
+        };
+        self.cli.start(self.vmid, &self.node, &network).await?;
         self.started.store(true, Ordering::Release);
 
         if let Err(error) = self.sync_firewall(true).await {
             let requires_network_policy = match self.get_server() {
                 Ok(server) => {
                     let configuration = server.configuration.read().await;
-                    !configuration.firewall.is_empty()
-                        || (configuration.allocations.default.is_some()
-                            && PveLxcExecutor::edge_forwarding_config(&self.app_config)?.is_some())
+                    PveLxcExecutor::network_policy_required(&configuration)
                 }
                 Err(_) => true,
             };

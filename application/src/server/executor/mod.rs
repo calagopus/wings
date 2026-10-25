@@ -34,10 +34,19 @@ pub async fn create_runtime(config: Arc<crate::config::Config>) -> Result<Runtim
             let own_container = docker::DockerExecutor::own_container(&docker).await;
             let firewall =
                 crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
+            let bandwidth = Arc::new(
+                crate::server::bandwidth::Bandwidth::create(
+                    &config,
+                    &docker,
+                    own_container.as_ref(),
+                )
+                .await,
+            );
             let executor: Arc<dyn ServerExecutor> = Arc::new(docker::DockerExecutor::new(
                 Arc::clone(&docker),
                 config,
                 firewall,
+                bandwidth,
             ));
 
             Ok(Runtime {

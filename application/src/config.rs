@@ -788,14 +788,6 @@ fn pve_lxc_bridge() -> String {
     "vmbr0".to_string()
 }
 
-fn pve_lxc_edge_wireguard_interface() -> String {
-    "wg-calagopus".to_string()
-}
-
-fn pve_lxc_edge_ssh_user() -> String {
-    "root".to_string()
-}
-
 fn pve_lxc_rootfs_size_gib() -> u64 {
     8
 }
@@ -867,25 +859,12 @@ nestify::nest! {
                 /// Optional VLAN tag applied to each LXC veth on `bridge`.
                 #[serde(default)]
                 pub vlan_tag: Option<u16>,
-                /// IPv4 CIDR prefix used by static panel allocations (for example, 24).
+                /// IPv4 CIDR prefix used to identify DHCP addresses in the isolated guest subnet.
                 #[serde(default)]
                 pub network_prefix: Option<u8>,
-                /// IPv4 gateway used by static panel allocations on the LXC network.
+                /// IPv4 gateway used to identify the isolated guest subnet.
                 #[serde(default)]
                 pub gateway: Option<String>,
-                /// WireGuard interface whose peers publish private LXC allocations.
-                /// The panel allocation IP is matched against each peer endpoint.
-                #[serde(default = "pve_lxc_edge_wireguard_interface")]
-                pub edge_wireguard_interface: String,
-                /// SSH account used by the restricted edge forwarding key.
-                #[serde(default = "pve_lxc_edge_ssh_user")]
-                pub edge_ssh_user: String,
-                /// Restricted SSH key used only to synchronize edge port forwards.
-                #[serde(default)]
-                pub edge_ssh_identity_path: String,
-                /// Pinned SSH known-hosts file for the edge host.
-                #[serde(default)]
-                pub edge_known_hosts_path: String,
                 #[serde(default = "pve_lxc_rootfs_size_gib")]
                 pub rootfs_size_gib: u64,
                 /// Maximum retained console bytes for each LXC server. When the

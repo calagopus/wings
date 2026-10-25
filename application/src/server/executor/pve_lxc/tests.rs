@@ -1,14 +1,69 @@
 use super::*;
 
 #[test]
-fn dhcp_route_wait_allows_the_configured_four_minutes() {
-    assert_eq!(PveProcessHandle::DHCP_ROUTE_WAIT_INTERVAL_MILLIS, 250);
-    assert_eq!(PveProcessHandle::DHCP_ROUTE_WAIT_ATTEMPTS, 1920);
+fn auto_rootfs_selection_uses_largest_sufficient_storage_deterministically() {
+    let storages = vec![
+        cli::LxcStorage {
+            name: "pool-b".to_string(),
+            total_bytes: 900,
+            available_bytes: 400,
+        },
+        cli::LxcStorage {
+            name: "pool-a".to_string(),
+            total_bytes: 800,
+            available_bytes: 400,
+        },
+        cli::LxcStorage {
+            name: "pool-c".to_string(),
+            total_bytes: 700,
+            available_bytes: 399,
+        },
+    ];
+
     assert_eq!(
-        u64::from(PveProcessHandle::DHCP_ROUTE_WAIT_INTERVAL_MILLIS)
-            * u64::from(PveProcessHandle::DHCP_ROUTE_WAIT_ATTEMPTS),
-        480_000
+        PveLxcExecutor::select_rootfs_storage("auto", 400, &storages).unwrap(),
+        "pool-a"
     );
+}
+
+#[test]
+fn runtime_entrypoint_has_a_short_generic_network_gate() {
+    let script = PveProcessHandle::runtime_entrypoint_script("/mnt/server/.wings-exit-status");
+
+    assert!(script.contains("while [ \"$attempt\" -lt 120 ]"));
+    assert!(script.contains("/proc/net/route"));
+    assert!(script.contains("/proc/net/fib_trie"));
+    assert!(script.contains("169") && script.contains("254"));
+    assert!(script.contains("timed out waiting for usable network"));
+    assert!(!script.contains("DHCP"));
+    assert!(script.contains("/mnt/server/.wings-exit-status"));
+}
+
+#[test]
+fn pending_start_does_not_publish_transient_running_state() {
+    let mut seen_running = false;
+    assert!(
+        PveProcessHandle::observed_status(
+            cli::ContainerStatus::Running,
+            false,
+            &mut seen_running,
+            None,
+        )
+        .is_none()
+    );
+    assert!(!seen_running);
+}
+
+#[test]
+fn installer_entrypoint_has_a_short_generic_network_gate() {
+    let script = PveLxcExecutor::helper_entrypoint_script();
+
+    assert!(script.contains("while [ \"$attempt\" -lt 120 ]"));
+    assert!(script.contains("/proc/net/route"));
+    assert!(script.contains("/proc/net/fib_trie"));
+    assert!(script.contains("169") && script.contains("254"));
+    assert!(script.contains("timed out waiting for usable network"));
+    assert!(!script.contains("DHCP"));
 }
 
 #[test]
@@ -27,6 +82,160 @@ fn successful_start_followed_by_first_stopped_probe_emits_stopped() {
             oom_killed: true,
         })
     ));
+}
+
+#[test]
+fn stopped_forwarding_clear_retries_until_success() {
+    let installed = AtomicBool::new(false);
+    assert!(!PveProcessHandle::should_clear_forwarding(
+        cli::ContainerStatus::Stopped,
+        &installed,
+    ));
+
+    PveProcessHandle::record_forwarding_sync(&installed, true, false);
+    assert!(!installed.load(Ordering::Acquire));
+    PveProcessHandle::record_forwarding_sync(&installed, true, true);
+    assert!(PveProcessHandle::should_clear_forwarding(
+        cli::ContainerStatus::Stopped,
+        &installed,
+    ));
+    assert!(installed.load(Ordering::Acquire));
+
+    PveProcessHandle::record_forwarding_sync(&installed, false, false);
+    assert!(PveProcessHandle::should_clear_forwarding(
+        cli::ContainerStatus::Stopped,
+        &installed,
+    ));
+    PveProcessHandle::record_forwarding_sync(&installed, false, true);
+    assert!(!PveProcessHandle::should_clear_forwarding(
+        cli::ContainerStatus::Stopped,
+        &installed,
+    ));
+    assert!(!PveProcessHandle::should_clear_forwarding(
+        cli::ContainerStatus::Running,
+        &installed,
+    ));
+
+    let source = include_str!("server_process.rs");
+    let monitor = source
+        .split("let status_task = tokio::spawn")
+        .nth(1)
+        .unwrap()
+        .split("let stats_cli")
+        .next()
+        .unwrap();
+    assert!(source.contains("Arc::clone(&forwarding_installed)"));
+    assert!(monitor.contains("sync_allocation_forwarding"));
+    assert!(!monitor.contains(".stop("));
+    assert!(!monitor.contains(".start("));
+}
+
+#[test]
+fn adopted_sync_failure_path_cannot_stop_the_guest() {
+    let source = include_str!("mod.rs");
+    let attach = source
+        .split("async fn attach_server_process")
+        .nth(1)
+        .unwrap()
+        .split("async fn cleanup_server_process")
+        .next()
+        .unwrap();
+
+    assert!(!attach.contains("stop_after_firewall_failure"));
+    assert!(!attach.contains(".stop("));
+}
+
+#[test]
+fn configuration_sync_policy_failure_cannot_stop_the_guest() {
+    let source = include_str!("server_process.rs");
+    let sync = source
+        .split("async fn sync_configuration")
+        .nth(1)
+        .unwrap()
+        .split("async fn start")
+        .next()
+        .unwrap();
+    assert!(!sync.contains("stop_after_firewall_failure"));
+    assert!(!sync.contains(".stop("));
+}
+
+#[test]
+fn firewall_failure_cannot_skip_allocation_forwarding_sync() {
+    let source = include_str!("server_process.rs");
+    let sync = source
+        .split("pub(super) async fn sync_firewall")
+        .nth(1)
+        .unwrap()
+        .split("pub(super) async fn stop_after_firewall_failure")
+        .next()
+        .unwrap();
+    assert!(sync.contains("if let Err(error) = self.firewall.sync(&spec).await"));
+    assert!(sync.contains("PveLxcExecutor::sync_allocation_forwarding("));
+    assert!(sync.contains("aggregate_reconciliation_errors"));
+}
+
+#[test]
+fn missing_guest_address_is_aggregated_without_short_circuiting_reconciliation() {
+    let (addresses, error) = PveProcessHandle::finish_address_resolution(
+        Vec::new(),
+        Some(anyhow::anyhow!("interface query failed")),
+        1234,
+    );
+    assert!(addresses.is_empty());
+    assert!(format!("{:#}", error.unwrap()).contains("interface query failed"));
+
+    let source = include_str!("server_process.rs");
+    let sync = source
+        .split("pub(super) async fn sync_firewall")
+        .nth(1)
+        .unwrap()
+        .split("pub(super) async fn stop_after_firewall_failure")
+        .next()
+        .unwrap();
+    assert!(sync.contains("finish_address_resolution"));
+    assert!(sync.contains("self.firewall.sync(&spec).await"));
+    assert!(sync.contains("sync_allocation_forwarding"));
+}
+
+#[test]
+fn startup_reconcile_updates_forwarding_for_all_known_servers() {
+    let source = include_str!("mod.rs");
+    let reconcile = source
+        .split("async fn reconcile_firewall")
+        .nth(1)
+        .unwrap()
+        .split("async fn setup_server_process")
+        .next()
+        .unwrap();
+
+    assert!(reconcile.contains("Self::prepare_network_specs("));
+    let address_failure = reconcile
+        .split("failed to resolve Proxmox LXC addresses while reconciling server")
+        .nth(1)
+        .unwrap()
+        .split("} else {")
+        .next()
+        .unwrap();
+    assert!(!address_failure.contains("continue"));
+    assert!(address_failure.contains("Vec::new()"));
+    assert!(reconcile.contains("forwarding_specs.insert(server_uuid, spec)"));
+    assert!(reconcile.contains("forwarding::without_binding_conflicts"));
+    assert!(reconcile.contains("forwarding::sync_all(&forwarding_network, &forwarding_specs)"));
+    assert!(reconcile.contains("aggregate_reconciliation_errors"));
+}
+
+#[test]
+fn nonempty_allocation_mappings_require_network_policy_without_default() {
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(
+        uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31),
+    );
+    configuration.allocations.default = None;
+    configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+
+    assert!(PveLxcExecutor::network_policy_required(&configuration));
 }
 
 #[test]
@@ -76,30 +285,18 @@ async fn runtime_log_never_exceeds_its_retention_limit() {
 }
 
 #[test]
-fn static_allocation_uses_explicit_isolated_vlan_network() {
+fn pve_lxc_always_uses_dhcp_on_the_configured_isolated_network() {
     assert_eq!(
-        PveLxcExecutor::network_for_allocation(
-            "vmbr0",
-            Some(30),
-            Some(24),
-            Some("10.0.30.1"),
-            Some("10.0.30.42"),
-        )
-        .unwrap(),
-        "name=eth0,bridge=vmbr0,firewall=1,tag=30,ip=10.0.30.42/24,gw=10.0.30.1,type=veth"
+        PveLxcExecutor::dhcp_network("vmbr0", Some(30)).unwrap(),
+        "name=eth0,bridge=vmbr0,firewall=1,tag=30,ip=dhcp,type=veth"
     );
 }
 
 #[test]
-fn static_allocation_never_derives_the_management_network() {
-    let error =
-        PveLxcExecutor::network_for_allocation("vmbr0", Some(30), None, None, Some("10.0.30.42"))
-            .unwrap_err();
-    assert!(error.to_string().contains("network_prefix"));
-
+fn dhcp_network_has_no_nonstandard_host_metadata() {
     assert_eq!(
         PveLxcExecutor::dhcp_network("vmbr0", Some(30)).unwrap(),
-        "name=eth0,bridge=vmbr0,firewall=1,tag=30,ip=dhcp,type=veth,host-managed=1"
+        "name=eth0,bridge=vmbr0,firewall=1,tag=30,ip=dhcp,type=veth"
     );
 }
 
@@ -593,25 +790,454 @@ async fn lxc_pid_limit_overrides_the_legacy_docker_setting() {
     assert_eq!(PveLxcExecutor::pids_limit(&config), None);
 }
 
-#[tokio::test]
-async fn edge_ssh_user_is_configurable_and_validated() {
-    let config = crate::config::Config::mock();
-    {
-        let inner = config.mutate_in_place_for_testing();
-        inner.runtime.pve_lxc.edge_ssh_identity_path = "/root/edge-key".to_string();
-        inner.runtime.pve_lxc.edge_known_hosts_path = "/root/known-hosts".to_string();
-        inner.runtime.pve_lxc.edge_ssh_user = "edge-forward".to_string();
+#[test]
+fn native_forwarding_maps_every_ipv4_allocation_for_tcp_and_udp() {
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(
+        uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31),
+    );
+    configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080, 10823]);
+    configuration
+        .allocations
+        .mappings
+        .insert("198.51.100.10".into(), vec![8080]);
+
+    let spec = forwarding::ForwardingSpec::from_configuration(
+        &configuration,
+        "10.203.41.28".parse().unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let script = forwarding::reconcile_script(configuration.uuid, &[], Some(&spec));
+
+    for (ip, port) in [
+        ("192.0.2.60", 8080),
+        ("192.0.2.60", 10823),
+        ("198.51.100.10", 8080),
+    ] {
+        for protocol in ["tcp", "udp"] {
+            assert!(script.contains(&format!(
+                "ip daddr {ip} {protocol} dport {port} dnat to 10.203.41.28:{port}"
+            )));
+            assert!(script.contains(&format!(
+                "ip daddr 10.203.41.28 {protocol} dport {port} ct status dnat accept"
+            )));
+            assert!(script.contains(&format!(
+                "ip daddr 10.203.41.28 {protocol} dport {port} ct status dnat masquerade"
+            )));
+        }
     }
+}
 
-    let resolved = PveLxcExecutor::edge_forwarding_config(&config)
-        .expect("valid edge configuration")
-        .expect("configured edge forwarding");
-    assert_eq!(resolved.1, "edge-forward");
+#[test]
+fn native_forwarding_discovers_only_its_servers_persisted_rules() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let other = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let listing = format!(
+        r#"table ip wings_pve_forward {{
+	chain prerouting {{
+		ip daddr 192.0.2.60 tcp dport 8080 comment "wings-pve:{server}" # handle 7
+		ip daddr 198.51.100.10 tcp dport 8080 comment "wings-pve:{other}" # handle 8
+	}}
+	chain forward {{
+		ip daddr 10.203.41.28 tcp dport 8080 accept comment "wings-pve:{server}" # handle 11
+	}}
+}}
+"#
+    );
 
-    config
-        .mutate_in_place_for_testing()
-        .runtime
-        .pve_lxc
-        .edge_ssh_user = "root@host".to_string();
-    assert!(PveLxcExecutor::edge_forwarding_config(&config).is_err());
+    assert_eq!(
+        forwarding::managed_rules(&listing)
+            .unwrap()
+            .into_iter()
+            .filter(|rule| rule.server == server)
+            .collect::<Vec<_>>(),
+        vec![
+            forwarding::ManagedRule::new_binding(
+                server,
+                "prerouting",
+                7,
+                "192.0.2.60".parse().unwrap(),
+                8080,
+            ),
+            forwarding::ManagedRule::new(server, "forward", 11),
+        ]
+    );
+}
+
+#[test]
+fn native_forwarding_reconcile_removes_only_the_servers_existing_rules() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let rules = vec![
+        forwarding::ManagedRule::new(server, "prerouting", 7),
+        forwarding::ManagedRule::new(server, "forward", 11),
+    ];
+
+    let script = forwarding::reconcile_script(server, &rules, None);
+    assert!(script.contains("delete rule ip wings_pve_forward prerouting handle 7"));
+    assert!(script.contains("delete rule ip wings_pve_forward forward handle 11"));
+    assert!(!script.contains("flush table"));
+    assert!(!script.contains("delete table"));
+}
+
+#[test]
+fn empty_allocation_mappings_clear_without_a_guest_address() {
+    let configuration = crate::server::configuration::ServerConfiguration::mock(
+        uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31),
+    );
+
+    assert_eq!(
+        forwarding::ForwardingSpec::from_configuration(
+            &configuration,
+            "10.203.41.28".parse().unwrap()
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn forwarding_network_context_validates_and_derives_guest_cidr() {
+    let context = forwarding::NetworkContext::new("vmbr42", Some(24), Some("10.203.41.1"))
+        .expect("valid forwarding network context");
+    assert_eq!(context.bridge(), "vmbr42");
+    assert_eq!(context.guest_cidr(), "10.203.41.0/24");
+
+    for (bridge, prefix, gateway) in [
+        ("", Some(24), Some("10.203.41.1")),
+        ("vmbr0;flush", Some(24), Some("10.203.41.1")),
+        ("vmbr0", Some(0), Some("10.203.41.1")),
+        ("vmbr0", Some(33), Some("10.203.41.1")),
+        ("vmbr0", Some(24), Some("not-an-ip")),
+        ("vmbr0", Some(24), None),
+    ] {
+        assert!(forwarding::NetworkContext::new(bridge, prefix, gateway).is_err());
+    }
+}
+
+#[test]
+fn allocation_forwarding_selects_ipv4_from_the_configured_guest_subnet() {
+    let addresses = vec![
+        "172.16.0.20".parse::<IpAddr>().unwrap(),
+        "10.203.41.28".parse::<IpAddr>().unwrap(),
+        "192.168.50.8".parse::<IpAddr>().unwrap(),
+    ];
+    let context = forwarding::NetworkContext::new("vmbr42", Some(24), Some("10.203.41.1")).unwrap();
+
+    assert_eq!(
+        context.guest_destination(&addresses).unwrap(),
+        "10.203.41.28".parse::<Ipv4Addr>().unwrap()
+    );
+}
+
+#[test]
+fn forwarding_network_rejects_loopback_and_link_local_destinations() {
+    let loopback = forwarding::NetworkContext::new("vmbr42", Some(8), Some("127.0.0.1")).unwrap();
+    assert!(
+        loopback
+            .guest_destination(&["127.0.0.2".parse().unwrap()])
+            .is_err()
+    );
+
+    let link_local =
+        forwarding::NetworkContext::new("vmbr42", Some(16), Some("169.254.1.1")).unwrap();
+    assert!(
+        link_local
+            .guest_destination(&["169.254.1.2".parse().unwrap()])
+            .is_err()
+    );
+}
+
+#[test]
+fn native_forwarding_reconcile_all_removes_orphans_and_installs_complete_desired_set() {
+    let desired_server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let orphan = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(desired_server);
+    configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+    let spec = forwarding::ForwardingSpec::from_configuration(
+        &configuration,
+        "10.203.41.28".parse().unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let desired = std::collections::BTreeMap::from([(desired_server, spec)]);
+    let network = forwarding::NetworkContext::new("vmbr42", Some(24), Some("10.203.41.1")).unwrap();
+
+    let script = forwarding::replace_table_script(&network, &desired, true);
+
+    assert!(
+        script.starts_with("delete table ip wings_pve_forward\nadd table ip wings_pve_forward\n")
+    );
+    for chain in [
+        "pve_conntrack_zone",
+        "prerouting",
+        "output",
+        "forward",
+        "postrouting",
+    ] {
+        assert!(script.contains(&format!("add chain ip wings_pve_forward {chain}")));
+        assert!(!script.contains(&format!("flush chain ip wings_pve_forward {chain}")));
+    }
+    assert!(script.contains("iifname \"fwbr*\" ip saddr 10.203.41.0/24 ct zone set 1"));
+    assert!(script.contains("ip saddr 10.203.41.0/24 oifname != \"vmbr42\" masquerade"));
+    assert!(script.contains(&format!("comment \"wings-pve:{desired_server}\"")));
+    assert!(!script.contains(&orphan.to_string()));
+
+    let absent_script = forwarding::replace_table_script(&network, &desired, false);
+    assert!(absent_script.starts_with("add table ip wings_pve_forward\n"));
+    assert!(!absent_script.contains("delete table"));
+}
+
+#[test]
+fn native_forwarding_rejects_duplicate_desired_binding_owners() {
+    let first = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let second = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let mut first_configuration = crate::server::configuration::ServerConfiguration::mock(first);
+    first_configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+    let mut second_configuration = crate::server::configuration::ServerConfiguration::mock(second);
+    second_configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+    let desired = std::collections::BTreeMap::from([
+        (
+            first,
+            forwarding::ForwardingSpec::from_configuration(
+                &first_configuration,
+                "10.203.41.28".parse().unwrap(),
+            )
+            .unwrap()
+            .unwrap(),
+        ),
+        (
+            second,
+            forwarding::ForwardingSpec::from_configuration(
+                &second_configuration,
+                "10.203.41.29".parse().unwrap(),
+            )
+            .unwrap()
+            .unwrap(),
+        ),
+    ]);
+
+    let error = forwarding::validate_binding_owners(&desired).unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("192.0.2.60:8080"));
+    assert!(message.contains(&first.to_string()));
+    assert!(message.contains(&second.to_string()));
+}
+
+#[test]
+fn native_forwarding_runtime_update_rejects_binding_owned_by_another_uuid() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let other = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(server);
+    configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+    let spec = forwarding::ForwardingSpec::from_configuration(
+        &configuration,
+        "10.203.41.28".parse().unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let listing = format!(
+        r#"table ip wings_pve_forward {{
+    chain prerouting {{
+        ip daddr 192.0.2.60 tcp dport 8080 dnat to 10.203.41.29:8080 comment "wings-pve:{other}" # handle 7
+    }}
+}}
+"#
+    );
+    let existing = forwarding::managed_rules(&listing).unwrap();
+
+    let error = forwarding::validate_runtime_binding_owners(server, &spec, &existing).unwrap_err();
+
+    assert!(format!("{error:#}").contains(&other.to_string()));
+}
+
+#[test]
+fn native_forwarding_runtime_conflict_atomically_clears_the_updating_server() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let other = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(server);
+    configuration
+        .allocations
+        .mappings
+        .insert("192.0.2.60".into(), vec![8080]);
+    let spec = forwarding::ForwardingSpec::from_configuration(
+        &configuration,
+        "10.203.41.28".parse().unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let existing = vec![
+        forwarding::ManagedRule::new(server, "output", 4),
+        forwarding::ManagedRule::new_binding(
+            other,
+            "prerouting",
+            7,
+            "192.0.2.60".parse().unwrap(),
+            8080,
+        ),
+    ];
+
+    let (script, conflict) = forwarding::runtime_reconcile_plan(server, Some(&spec), &existing);
+
+    assert!(conflict.is_some());
+    assert!(script.contains("delete rule ip wings_pve_forward output handle 4"));
+    assert!(!script.contains("add rule"));
+    assert!(!script.contains("handle 7"));
+}
+
+#[test]
+fn malformed_forwarding_does_not_discard_the_firewall_spec() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let mut configuration = crate::server::configuration::ServerConfiguration::mock(server);
+    configuration
+        .allocations
+        .mappings
+        .insert("not-an-ip".into(), vec![8080]);
+    let network = forwarding::NetworkContext::new("vmbr42", Some(24), Some("10.203.41.1")).unwrap();
+
+    let (firewall, forwarding) = PveLxcExecutor::prepare_network_specs(
+        &configuration,
+        vec!["10.203.41.28".parse().unwrap()],
+        Some(1234),
+        true,
+        &network,
+    );
+
+    assert_eq!(firewall.server, server);
+    assert_eq!(
+        firewall.target,
+        Some(crate::server::firewall::FirewallTarget::ProxmoxLxc {
+            vmid: 1234,
+            interface: "net0".to_string(),
+        })
+    );
+    assert!(forwarding.unwrap_err().to_string().contains("not-an-ip"));
+}
+
+#[test]
+fn native_forwarding_rejects_unknown_managed_chain_names() {
+    let server = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let listing = format!(
+        r#"table ip wings_pve_forward {{
+    chain prerouting; delete table inet filter {{
+        comment "wings-pve:{server}" # handle 7
+    }}
+}}
+"#
+    );
+
+    let error = forwarding::managed_rules(&listing).unwrap_err();
+
+    assert!(format!("{error:#}").contains("unexpected managed nftables chain"));
+}
+
+#[test]
+fn ipv4_forwarding_parser_requires_enabled_kernel_setting() {
+    assert!(forwarding::parse_ipv4_forwarding("1\n").is_ok());
+
+    for value in ["0\n", "2\n", "enabled\n", ""] {
+        let error = forwarding::parse_ipv4_forwarding(value).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("net.ipv4.ip_forward=1"));
+        assert!(message.contains("/proc/sys/net/ipv4/ip_forward"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn nft_script_timeout_bounds_stdin_write_close_and_wait() {
+    let oversized = vec![b'x'; 1024 * 1024];
+    let started = std::time::Instant::now();
+
+    let error = forwarding::run_script_with(
+        std::path::Path::new("/bin/sh"),
+        &["-c", "sleep 30"],
+        &oversized,
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("timed out applying"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn startup_forwarding_quarantines_every_owner_of_a_duplicate_binding() {
+    let first = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let second = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let healthy = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b33);
+    fn spec(server: uuid::Uuid, allocation: &str, destination: &str) -> forwarding::ForwardingSpec {
+        let mut configuration = crate::server::configuration::ServerConfiguration::mock(server);
+        configuration
+            .allocations
+            .mappings
+            .insert(allocation.into(), vec![8080]);
+        forwarding::ForwardingSpec::from_configuration(&configuration, destination.parse().unwrap())
+            .unwrap()
+            .unwrap()
+    }
+    let desired = std::collections::BTreeMap::from([
+        (first, spec(first, "192.0.2.60", "10.203.41.28")),
+        (second, spec(second, "192.0.2.60", "10.203.41.29")),
+        (healthy, spec(healthy, "198.51.100.10", "10.203.41.30")),
+    ]);
+
+    let (desired, errors) = forwarding::without_binding_conflicts(desired);
+
+    assert_eq!(desired.keys().copied().collect::<Vec<_>>(), vec![healthy]);
+    assert_eq!(errors.len(), 1);
+    let message = format!("{:#}", errors[0]);
+    assert!(message.contains(&first.to_string()));
+    assert!(message.contains(&second.to_string()));
+}
+
+#[test]
+fn startup_reconciliation_error_reports_every_malformed_server() {
+    let first = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b31);
+    let second = uuid::Uuid::from_u128(0x8f9ae020_60b9_4c5f_8ce2_8f0dfb8d7b32);
+    let error = PveLxcExecutor::aggregate_reconciliation_errors(vec![
+        anyhow::anyhow!("server {first}: invalid allocation address"),
+        anyhow::anyhow!("server {second}: missing guest address"),
+    ])
+    .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains(&first.to_string()));
+    assert!(message.contains("invalid allocation address"));
+    assert!(message.contains(&second.to_string()));
+    assert!(message.contains("missing guest address"));
+}
+
+#[test]
+fn startup_reconcile_applies_forwarding_once_after_preparing_all_servers() {
+    let source = include_str!("mod.rs");
+    let reconcile = source
+        .split("async fn reconcile_firewall")
+        .nth(1)
+        .unwrap()
+        .split("async fn setup_server_process")
+        .next()
+        .unwrap();
+    let loop_end = reconcile.find("forwarding::sync_all").unwrap();
+
+    assert_eq!(reconcile.matches("forwarding::sync_all").count(), 1);
+    assert!(!reconcile[..loop_end].contains("sync_allocation_forwarding"));
+    assert!(reconcile.contains("forwarding_specs.remove(&server_uuid)"));
+    assert!(reconcile.contains("aggregate_reconciliation_errors"));
 }

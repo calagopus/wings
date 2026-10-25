@@ -188,7 +188,7 @@ create_ct() {
     --rootfs "${ROOTFS_STORAGE}:${ROOTFS_SIZE_GIB}" \
     --memory "$MEMORY_MIB" \
     --swap "$SWAP_MIB" \
-    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,type=veth,host-managed=1" \
+    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,type=veth" \
     --unprivileged 1 \
     --cmode console \
     --onboot 0 \

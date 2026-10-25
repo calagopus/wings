@@ -16,6 +16,190 @@ async fn command_runner_captures_stdout_and_stderr_after_spawn() {
     assert_eq!(output.stderr, b"stderr-value");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timeout_cleanup_kills_descendant_in_a_separate_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("descendant.pid");
+    let script = format!(
+        "setsid /bin/sh -c 'echo $$ > {}; exec sleep 30' & wait",
+        pid_file.display()
+    );
+
+    let error = PveCli::run_with_timeout(
+        std::path::Path::new("/bin/sh"),
+        &["-c".to_string(), script],
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("timed out executing"));
+
+    let descendant = tokio::fs::read_to_string(&pid_file)
+        .await
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{descendant}")).exists(),
+        "separate-session descendant {descendant} survived timeout cleanup"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn completed_command_does_not_wait_for_reparented_descendant_pipes() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("reparented-descendant.pid");
+    let script = format!(
+        "setsid /bin/sh -c 'echo $$ > {}; exec sleep 30' & printf command-finished",
+        pid_file.display()
+    );
+
+    let output = PveCli::run_with_timeout(
+        std::path::Path::new("/bin/sh"),
+        &["-c".to_string(), script],
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("the completed root command should not wait for inherited pipes");
+    assert_eq!(output.stdout, b"command-finished");
+
+    let descendant = tokio::fs::read_to_string(&pid_file)
+        .await
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    if let Some(pid) = Pid::from_raw(descendant) {
+        let _ = kill_process(pid, Signal::KILL);
+    }
+}
+
+#[test]
+fn scoped_process_identity_rejects_pid_reuse_during_discovery() {
+    assert_eq!(
+        PveCli::stable_process_identity(42, Some(100), Some(101)),
+        None
+    );
+    assert_eq!(
+        PveCli::stable_process_identity(42, Some(100), Some(100)),
+        Some((42, 100))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timeout_cleanup_does_not_signal_a_reused_pid_identity() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let started = PveCli::process_start_time(pid).unwrap();
+
+    PveCli::signal_process_if_same(
+        pid,
+        started.saturating_add(1),
+        rustix::process::Signal::KILL,
+    );
+    assert!(child.try_wait().unwrap().is_none());
+
+    child.kill().await.unwrap();
+    let status = child.wait().await.unwrap();
+    assert_eq!(status.signal(), Some(9));
+}
+
+#[test]
+fn network_probe_timeout_never_exceeds_remaining_budget() {
+    assert_eq!(
+        PveCli::network_probe_timeout(Duration::from_secs(30)),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        PveCli::network_probe_timeout(Duration::from_millis(125)),
+        Some(Duration::from_millis(125))
+    );
+    assert_eq!(PveCli::network_probe_timeout(Duration::ZERO), None);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn successful_start_waits_for_a_default_route_and_guest_subnet_address() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let pct_path = directory.path().join("pct");
+    let pvesh_path = directory.path().join("pvesh");
+    let probe_count_path = directory.path().join("network-probes");
+    let pct_script = format!(
+        r#"#!/bin/sh
+case "$1" in
+    start) exit 0 ;;
+    exec)
+        count=0
+        if [ -f "{probe_count}" ]; then count=$(cat "{probe_count}"); fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "{probe_count}"
+        exit 0
+        ;;
+    *) exit 1 ;;
+esac
+"#,
+        probe_count = probe_count_path.display()
+    );
+    tokio::fs::write(&pct_path, pct_script).await.unwrap();
+    tokio::fs::set_permissions(&pct_path, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+    let pvesh_script = format!(
+        r#"#!/bin/sh
+count=0
+if [ -f "{probe_count}" ]; then count=$(cat "{probe_count}"); fi
+if [ "$count" -ge 3 ]; then
+    printf '%s\n' '[{{"name":"eth0","ip-addresses":[{{"ip-address":"10.203.41.28","ip-address-type":"inet","prefix":24}}]}}]'
+else
+    printf '%s\n' '[{{"name":"eth0","ip-addresses":[{{"ip-address":"169.254.1.2","ip-address-type":"inet","prefix":16}}]}}]'
+fi
+"#,
+        probe_count = probe_count_path.display()
+    );
+    tokio::fs::write(&pvesh_path, pvesh_script).await.unwrap();
+    tokio::fs::set_permissions(&pvesh_path, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+
+    let cli = PveCli {
+        pct_path,
+        pvesh_path,
+        pveversion_path: "/bin/false".into(),
+        pvesm_path: "/bin/false".into(),
+        lxc_attach_path: "/bin/false".into(),
+        lxc_stop_path: "/bin/false".into(),
+        perl_path: "/bin/false".into(),
+    };
+    let network =
+        super::super::forwarding::NetworkContext::new("vmbr42", Some(24), Some("10.203.41.1"))
+            .unwrap();
+
+    cli.start(201, "pve-a", &network).await.unwrap();
+
+    assert_eq!(
+        tokio::fs::read_to_string(probe_count_path).await.unwrap(),
+        "3\n"
+    );
+}
+
+#[test]
+fn start_has_only_one_clean_retry() {
+    assert_eq!(PveCli::start_attempt_limit(), 2);
+}
+
 #[test]
 fn create_arguments_leave_data_mount_for_post_create_configuration() {
     let args = PveCli::create_args(&CreateContainerSpec {
@@ -28,7 +212,7 @@ fn create_arguments_leave_data_mount_for_post_create_configuration() {
         swap_mib: 1024,
         cpu_limit_percent: Some(250),
         cores: Some(2),
-        network: "name=eth0,bridge=vmbr0,ip=dhcp,type=veth,host-managed=1".to_string(),
+        network: "name=eth0,bridge=vmbr0,ip=dhcp,type=veth".to_string(),
         tags: vec!["calagopus".to_string(), "calagopus-server".to_string()],
         unprivileged: true,
     });
@@ -38,12 +222,10 @@ fn create_arguments_leave_data_mount_for_post_create_configuration() {
         args.windows(2)
             .any(|pair| pair == ["--rootfs", "local-lvm:8"])
     );
-    assert!(args.windows(2).any(|pair| {
-        pair == [
-            "--net0",
-            "name=eth0,bridge=vmbr0,ip=dhcp,type=veth,host-managed=1",
-        ]
-    }));
+    assert!(
+        args.windows(2)
+            .any(|pair| { pair == ["--net0", "name=eth0,bridge=vmbr0,ip=dhcp,type=veth",] })
+    );
     assert!(!args.iter().any(|arg| arg == "--mp0"));
     assert!(args.windows(2).any(|pair| pair == ["--cores", "2"]));
     assert!(args.windows(2).any(|pair| pair == ["--cpulimit", "2.5"]));
@@ -503,11 +685,11 @@ fn parses_local_cluster_node() {
 #[test]
 fn orders_available_active_lxc_storages() {
     let output = br#"[
-            {"storage":"local-lvm","active":1,"enabled":1,"content":"images,rootdir","avail":100},
-            {"storage":"zfs","active":1,"enabled":1,"content":"rootdir,images","avail":200},
-            {"storage":"local","active":1,"enabled":1,"content":"iso,vztmpl","avail":300},
-            {"storage":"disabled","active":1,"enabled":0,"content":"rootdir","avail":400},
-            {"storage":"offline","active":0,"enabled":1,"content":"rootdir","avail":500}
+            {"storage":"local-lvm","active":1,"enabled":1,"content":"images,rootdir","total":1000,"avail":100},
+            {"storage":"zfs","active":1,"enabled":1,"content":"rootdir,images","total":2000,"avail":200},
+            {"storage":"local","active":1,"enabled":1,"content":"iso,vztmpl","total":3000,"avail":300},
+            {"storage":"disabled","active":1,"enabled":0,"content":"rootdir","total":4000,"avail":400},
+            {"storage":"offline","active":0,"enabled":1,"content":"rootdir","total":5000,"avail":500}
         ]"#;
 
     assert_eq!(
@@ -515,13 +697,51 @@ fn orders_available_active_lxc_storages() {
         Some(vec![
             LxcStorage {
                 name: "zfs".to_string(),
+                total_bytes: 2000,
                 available_bytes: 200,
             },
             LxcStorage {
                 name: "local-lvm".to_string(),
+                total_bytes: 1000,
                 available_bytes: 100,
             },
         ])
+    );
+}
+
+#[test]
+fn equal_free_capacity_is_ordered_by_storage_name() {
+    let output = br#"[
+            {"storage":"pool-b","active":1,"enabled":1,"content":"rootdir","total":900,"avail":400},
+            {"storage":"pool-a","active":1,"enabled":1,"content":"rootdir","total":800,"avail":400}
+        ]"#;
+
+    let storages = PveCli::parse_available_lxc_storages(output).unwrap();
+    assert_eq!(
+        storages
+            .iter()
+            .map(|storage| storage.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pool-a", "pool-b"]
+    );
+}
+
+#[test]
+fn storage_discovery_accepts_boolean_state_and_skips_rows_without_capacity() {
+    let output = br#"[
+            {"storage":"valid","active":true,"enabled":true,"content":"rootdir","total":2000,"avail":1500},
+            {"storage":"missing-total","active":true,"enabled":true,"content":"rootdir","avail":1400},
+            {"storage":"missing-avail","active":true,"enabled":true,"content":"rootdir","total":1800},
+            {"storage":"inactive","active":false,"enabled":true,"content":"rootdir","total":3000,"avail":2500}
+        ]"#;
+
+    assert_eq!(
+        PveCli::parse_available_lxc_storages(output).unwrap(),
+        vec![LxcStorage {
+            name: "valid".to_string(),
+            total_bytes: 2000,
+            available_bytes: 1500,
+        }]
     );
 }
 

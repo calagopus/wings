@@ -3,6 +3,7 @@ use super::*;
 pub(super) struct PveHelperProcessHandle {
     vmid: u32,
     cli: PveCli,
+    app_config: Arc<crate::config::Config>,
     log_path: PathBuf,
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -101,6 +102,7 @@ impl PveHelperProcessHandle {
         let output_cancelled = Arc::clone(&cancelled);
         let output_server = Arc::downgrade(&**server);
         let output_log_path = log_path.clone();
+        let output_app_config = Arc::clone(&app_config);
         tokio::spawn(async move {
             let mut file = match tokio::fs::OpenOptions::new()
                 .read(true)
@@ -156,7 +158,7 @@ impl PveHelperProcessHandle {
                         let line = Arc::new(compact_str::CompactString::from_utf8_lossy(line));
                         let allow_ratelimit = {
                             ratelimit_counter += 1;
-                            let config = app_config.load();
+                            let config = output_app_config.load();
                             if config.throttles.enabled
                                 && config.throttles.line_reset_interval > 0
                                 && ratelimit_counter >= config.throttles.lines
@@ -311,6 +313,7 @@ impl PveHelperProcessHandle {
         Ok(Self {
             vmid,
             cli,
+            app_config,
             log_path,
             started,
             cancelled,
@@ -368,7 +371,24 @@ impl ProcessHandle for PveHelperProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        self.cli.start(self.vmid).await?;
+        let (configured_node, network) = {
+            let config = self.app_config.load();
+            let pve = &config.runtime.pve_lxc;
+            (
+                pve.node.clone(),
+                forwarding::NetworkContext::new(
+                    &pve.bridge,
+                    pve.network_prefix,
+                    pve.gateway.as_deref(),
+                )?,
+            )
+        };
+        let node = if configured_node.trim().is_empty() {
+            self.cli.local_node().await?
+        } else {
+            configured_node
+        };
+        self.cli.start(self.vmid, &node, &network).await?;
         self.started.store(true, Ordering::Release);
         Ok(())
     }
