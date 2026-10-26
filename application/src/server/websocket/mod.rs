@@ -1,5 +1,6 @@
 use super::permissions::{Permission, Permissions, UserPermissionsMap};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use base64::Engine;
 use compact_str::ToCompactString;
 use futures::{SinkExt, stream::SplitSink};
 use serde::{
@@ -13,8 +14,8 @@ use std::{
     error::Error,
     marker::PhantomData,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 use tokio::sync::{Mutex, RwLock};
@@ -78,6 +79,8 @@ pub enum WebsocketEvent {
 
     #[serde(rename = "configure socket")]
     ConfigureSocket,
+    #[serde(rename = "socket configured")]
+    SocketConfigured,
     #[serde(rename = "set state")]
     SetState,
     #[serde(rename = "send logs")]
@@ -250,6 +253,7 @@ impl WebsocketEvent {
             | Self::TokenExpired
             | Self::Authentication
             | Self::ConfigureSocket
+            | Self::SocketConfigured
             | Self::SetState
             | Self::SendServerLogs
             | Self::SendCommand
@@ -337,6 +341,133 @@ impl TargetedWebsocketMessage {
     }
 }
 
+/// A single websocket message argument.
+///
+/// Structured and binary arguments keep their raw form so `msgpack` transmission can embed them
+/// natively, while every other consumer sees the string they would have received before: compact
+/// JSON for structured arguments, standard base64 for binary ones.
+#[derive(Debug, Clone)]
+pub enum WebsocketArg {
+    Text(compact_str::CompactString),
+    Structured(Arc<StructuredArg>),
+    Binary(Arc<BinaryArg>),
+}
+
+#[derive(Debug)]
+pub struct StructuredArg {
+    value: serde_json::Value,
+    json: OnceLock<compact_str::CompactString>,
+}
+
+#[derive(Debug)]
+pub struct BinaryArg {
+    bytes: Vec<u8>,
+    base64: OnceLock<compact_str::CompactString>,
+}
+
+impl WebsocketArg {
+    pub fn binary(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Binary(Arc::new(BinaryArg {
+            bytes: bytes.into(),
+            base64: OnceLock::new(),
+        }))
+    }
+
+    pub fn structured(value: impl Serialize) -> Result<Self, serde_json::Error> {
+        Ok(Self::Structured(Arc::new(StructuredArg {
+            value: serde_json::to_value(value)?,
+            json: OnceLock::new(),
+        })))
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Structured(arg) => arg.json.get_or_init(|| arg.value.to_compact_string()),
+            Self::Binary(arg) => arg.base64.get_or_init(|| {
+                base64::engine::general_purpose::STANDARD
+                    .encode(&arg.bytes)
+                    .into()
+            }),
+        }
+    }
+}
+
+impl std::ops::Deref for WebsocketArg {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for WebsocketArg {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for WebsocketArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<T: Into<compact_str::CompactString>> From<T> for WebsocketArg {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl Serialize for WebsocketArg {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WebsocketArg {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ArgVisitor;
+
+        impl Visitor<'_> for ArgVisitor {
+            type Value = WebsocketArg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or binary")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(WebsocketArg::Text(value.into()))
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(WebsocketArg::binary(value))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(WebsocketArg::binary(value))
+            }
+        }
+
+        deserializer.deserialize_any(ArgVisitor)
+    }
+}
+
+struct NativeArg<'a>(&'a WebsocketArg);
+
+impl Serialize for NativeArg<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            WebsocketArg::Text(text) => serializer.serialize_str(text),
+            WebsocketArg::Structured(arg) => arg.value.serialize(serializer),
+            WebsocketArg::Binary(arg) => serializer.serialize_bytes(&arg.bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, ToSchema, Deserialize, Serialize)]
 pub struct WebsocketMessage {
     pub event: WebsocketEvent,
@@ -344,7 +475,7 @@ pub struct WebsocketMessage {
     #[serde(deserialize_with = "string_vec_or_empty")]
     #[serde(serialize_with = "arc_vec")]
     #[schema(value_type = Vec<String>)]
-    pub args: Arc<[compact_str::CompactString]>,
+    pub args: Arc<[WebsocketArg]>,
 }
 
 impl WebsocketMessage {
@@ -352,11 +483,27 @@ impl WebsocketMessage {
     pub fn builder(event: WebsocketEvent) -> WebsocketMessageBuilder {
         WebsocketMessageBuilder::new(event)
     }
+
+    /// The same outer shape as [`WebsocketMessage`]'s own `Serialize`, but with structured
+    /// arguments embedded as values instead of JSON strings.
+    fn native(&self) -> NativeWebsocketMessage<'_> {
+        NativeWebsocketMessage {
+            event: self.event,
+            args: &self.args,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NativeWebsocketMessage<'a> {
+    event: WebsocketEvent,
+    #[serde(serialize_with = "native_args")]
+    args: &'a [WebsocketArg],
 }
 
 pub struct WebsocketMessageBuilder {
     event: WebsocketEvent,
-    args: Vec<compact_str::CompactString>,
+    args: Vec<WebsocketArg>,
 }
 
 impl WebsocketMessageBuilder {
@@ -368,22 +515,24 @@ impl WebsocketMessageBuilder {
     }
 
     pub fn structured_arg(mut self, arg: impl Serialize) -> Self {
-        match serde_json::to_string(&arg) {
-            Ok(arg) => self.args.push(arg.into()),
+        match WebsocketArg::structured(arg) {
+            Ok(arg) => self.args.push(arg),
             Err(err) => tracing::warn!("failed to serialize websocket message argument: {:?}", err),
         }
         self
     }
 
-    pub fn arg(mut self, arg: impl Into<compact_str::CompactString>) -> Self {
+    pub fn binary_arg(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.args.push(WebsocketArg::binary(bytes));
+        self
+    }
+
+    pub fn arg(mut self, arg: impl Into<WebsocketArg>) -> Self {
         self.args.push(arg.into());
         self
     }
 
-    pub fn args(
-        mut self,
-        args: impl IntoIterator<Item = impl Into<compact_str::CompactString>>,
-    ) -> Self {
+    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<WebsocketArg>>) -> Self {
         self.args.extend(args.into_iter().map(|arg| arg.into()));
         self
     }
@@ -396,19 +545,17 @@ impl WebsocketMessageBuilder {
     }
 }
 
-fn string_vec_or_empty<'de, D>(
-    deserializer: D,
-) -> Result<Arc<[compact_str::CompactString]>, D::Error>
+fn string_vec_or_empty<'de, D>(deserializer: D) -> Result<Arc<[WebsocketArg]>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct StringVecVisitor(PhantomData<[compact_str::CompactString]>);
+    struct StringVecVisitor(PhantomData<[WebsocketArg]>);
 
     impl<'de> Visitor<'de> for StringVecVisitor {
-        type Value = Arc<[compact_str::CompactString]>;
+        type Value = Arc<[WebsocketArg]>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string array or null")
+            formatter.write_str("a string or binary array or null")
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -416,7 +563,7 @@ where
             A: SeqAccess<'de>,
         {
             let mut vec = Vec::new();
-            while let Some(element) = seq.next_element::<Option<compact_str::CompactString>>()? {
+            while let Some(element) = seq.next_element::<Option<WebsocketArg>>()? {
                 if let Some(value) = element {
                     vec.push(value);
                 }
@@ -435,7 +582,7 @@ where
     deserializer.deserialize_any(StringVecVisitor(PhantomData))
 }
 
-fn arc_vec<S>(vec: &Arc<[compact_str::CompactString]>, serializer: S) -> Result<S::Ok, S::Error>
+fn arc_vec<S>(vec: &Arc<[WebsocketArg]>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -447,6 +594,54 @@ where
     seq.end()
 }
 
+fn native_args<S>(args: &&[WebsocketArg], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(args.len()))?;
+    for item in args.iter() {
+        seq.serialize_element(&NativeArg(item))?;
+    }
+
+    seq.end()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TransmissionMode {
+    /// JSON text frames.
+    Text,
+    /// Msgpack binary frames, structured arguments as JSON strings.
+    Binary,
+    /// Msgpack binary frames, structured and binary arguments embedded as msgpack values.
+    Msgpack,
+}
+
+impl TransmissionMode {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Binary,
+            2 => Self::Msgpack,
+            _ => Self::Text,
+        }
+    }
+
+    /// Decodes an incoming binary argument the way this mode sends them: msgpack bin in
+    /// `msgpack` mode, standard base64 strings otherwise.
+    fn binary_arg(self, arg: &WebsocketArg) -> Option<Cow<'_, [u8]>> {
+        match (self, arg) {
+            (Self::Msgpack, WebsocketArg::Binary(arg)) => Some(Cow::Borrowed(&arg.bytes)),
+            (Self::Text | Self::Binary, WebsocketArg::Text(text)) => {
+                base64::engine::general_purpose::STANDARD
+                    .decode(text)
+                    .ok()
+                    .map(Cow::Owned)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub type SocketJwt = Arc<RwLock<Option<Arc<WebsocketJwtPayload>>>>;
 
 pub struct ServerWebsocketHandler {
@@ -456,7 +651,7 @@ pub struct ServerWebsocketHandler {
     server: crate::server::Server,
     socket_jwt: SocketJwt,
     closed: AtomicBool,
-    binary_mode: AtomicBool,
+    transmission_mode: AtomicU8,
     missed_targeted: AtomicBool,
 }
 
@@ -474,13 +669,17 @@ impl ServerWebsocketHandler {
             server,
             socket_jwt,
             closed: AtomicBool::new(false),
-            binary_mode: AtomicBool::new(false),
+            transmission_mode: AtomicU8::new(TransmissionMode::Text as u8),
             missed_targeted: AtomicBool::new(false),
         }
     }
 
-    fn set_binary_mode(&self, enabled: bool) {
-        self.binary_mode.store(enabled, Ordering::Relaxed);
+    fn set_transmission_mode(&self, mode: TransmissionMode) {
+        self.transmission_mode.store(mode as u8, Ordering::Relaxed);
+    }
+
+    fn binary_arg<'a>(&self, arg: &'a WebsocketArg) -> Option<Cow<'a, [u8]>> {
+        TransmissionMode::from_u8(self.transmission_mode.load(Ordering::Relaxed)).binary_arg(arg)
     }
 
     async fn get_jwt(&self) -> Result<Arc<WebsocketJwtPayload>, anyhow::Error> {
@@ -584,24 +783,30 @@ impl ServerWebsocketHandler {
             return;
         }
 
-        let message = if self.binary_mode.load(Ordering::Relaxed) {
-            let message = match rmp_serde::to_vec(&message) {
-                Ok(message) => message,
+        let mode = TransmissionMode::from_u8(self.transmission_mode.load(Ordering::Relaxed));
+        let message = match mode {
+            TransmissionMode::Text => match serde_json::to_string(&message) {
+                Ok(message) => Message::Text(message.into()),
                 Err(err) => {
                     tracing::error!("failed to serialize websocket message: {:?}", err);
                     return;
                 }
-            };
-            Message::Binary(message.into())
-        } else {
-            let message = match serde_json::to_string(&message) {
-                Ok(message) => message,
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
+            },
+            TransmissionMode::Binary | TransmissionMode::Msgpack => {
+                let encoded = if mode == TransmissionMode::Msgpack {
+                    rmp_serde::to_vec(&message.native())
+                } else {
+                    rmp_serde::to_vec(&message)
+                };
+
+                match encoded {
+                    Ok(message) => Message::Binary(message.into()),
+                    Err(err) => {
+                        tracing::error!("failed to serialize websocket message: {:?}", err);
+                        return;
+                    }
                 }
-            };
-            Message::Text(message.into())
+            }
         };
 
         if let Err(err) = self.sender.lock().await.send(message).await
@@ -784,5 +989,216 @@ mod tests {
                 false
             ));
         });
+    }
+
+    #[derive(Serialize)]
+    struct Nested {
+        label: &'static str,
+        count: u32,
+    }
+
+    #[derive(Serialize)]
+    struct Sample {
+        id: uuid::Uuid,
+        nested: Nested,
+        missing: Option<u8>,
+        big: u64,
+        ratio: f64,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            id: uuid::Uuid::new_v4(),
+            nested: Nested {
+                label: "quote \" and ünïcode",
+                count: 7,
+            },
+            missing: None,
+            big: u64::MAX - 1,
+            ratio: 0.1,
+        }
+    }
+
+    fn mixed_message(value: &Sample) -> WebsocketMessage {
+        WebsocketMessage::builder(WebsocketEvent::SendStats)
+            .arg("text")
+            .structured_arg(value)
+            .build()
+    }
+
+    // WebsocketMessage
+
+    #[test]
+    fn structured_arg_matches_serde_json_string() {
+        let value = sample();
+        let frame: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&mixed_message(&value)).unwrap()).unwrap();
+
+        assert_eq!(
+            frame["args"][1],
+            serde_json::Value::String(serde_json::to_string(&value).unwrap())
+        );
+    }
+
+    #[test]
+    fn binary_frame_matches_text_frame() {
+        let message = mixed_message(&sample());
+        let text: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let binary: serde_json::Value =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&message).unwrap()).unwrap();
+
+        assert_eq!(binary, json!([text["event"], text["args"]]));
+    }
+
+    #[test]
+    fn msgpack_frame_embeds_structured_args_natively() {
+        let value = sample();
+        let message = mixed_message(&value);
+        let decoded: serde_json::Value =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&message.native()).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded,
+            json!([
+                "send stats",
+                ["text", serde_json::to_value(&value).unwrap()]
+            ])
+        );
+
+        let none = WebsocketMessage::builder(WebsocketEvent::SendStats)
+            .structured_arg(None::<u8>)
+            .build();
+        let decoded: serde_json::Value =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&none.native()).unwrap()).unwrap();
+
+        assert_eq!(decoded, json!(["send stats", [null]]));
+    }
+
+    const BINARY: [u8; 5] = [0, 1, 0xfe, 0xff, b'a'];
+
+    fn binary_message() -> WebsocketMessage {
+        WebsocketMessage::builder(WebsocketEvent::SendStats)
+            .arg("text")
+            .binary_arg(BINARY.to_vec())
+            .binary_arg(Vec::new())
+            .build()
+    }
+
+    #[test]
+    fn binary_arg_is_standard_base64_in_text_and_binary_frames() {
+        use base64::Engine;
+
+        let message = binary_message();
+        let text: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+
+        assert_eq!(
+            text["args"],
+            json!([
+                "text",
+                base64::engine::general_purpose::STANDARD.encode(BINARY),
+                ""
+            ])
+        );
+
+        let binary: serde_json::Value =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&message).unwrap()).unwrap();
+
+        assert_eq!(binary, json!([text["event"], text["args"]]));
+    }
+
+    #[test]
+    fn msgpack_frame_embeds_binary_args_as_bin() {
+        use base64::Engine;
+
+        let encoded = rmp_serde::to_vec(&binary_message().native()).unwrap();
+        let mut bin = vec![0xc4, BINARY.len() as u8];
+        bin.extend_from_slice(&BINARY);
+        let base64 = base64::engine::general_purpose::STANDARD.encode(BINARY);
+
+        assert!(encoded.windows(bin.len()).any(|w| w == bin.as_slice()));
+        assert!(encoded.ends_with(&[0xc4, 0]));
+        assert!(
+            !encoded
+                .windows(base64.len())
+                .any(|w| w == base64.as_bytes())
+        );
+    }
+
+    #[test]
+    fn incoming_null_args_are_empty_or_dropped() {
+        let message: WebsocketMessage =
+            serde_json::from_str(r#"{"event":"send command","args":null}"#).unwrap();
+        assert!(message.args.is_empty());
+
+        let message: WebsocketMessage =
+            serde_json::from_str(r#"{"event":"send command","args":["a",null,"b"]}"#).unwrap();
+        let args: Vec<&str> = message.args.iter().map(WebsocketArg::as_str).collect();
+        assert_eq!(args, ["a", "b"]);
+        assert!(
+            message
+                .args
+                .iter()
+                .all(|arg| matches!(arg, WebsocketArg::Text(_)))
+        );
+    }
+
+    #[test]
+    fn incoming_msgpack_bin_args_are_binary() {
+        let event = b"file collab update";
+        let mut frame = vec![0x92, 0xa0 | event.len() as u8];
+        frame.extend_from_slice(event);
+        frame.extend_from_slice(&[0x93, 0xa4]);
+        frame.extend_from_slice(b"path");
+        frame.extend_from_slice(&[0xa1, b'1', 0xc4, BINARY.len() as u8]);
+        frame.extend_from_slice(&BINARY);
+
+        let message: WebsocketMessage = rmp_serde::from_slice(&frame).unwrap();
+
+        assert!(matches!(message.event, WebsocketEvent::FileCollabUpdate));
+        assert_eq!(message.args.len(), 3);
+        assert!(matches!(&message.args[0], WebsocketArg::Text(text) if text == "path"));
+        assert!(matches!(&message.args[1], WebsocketArg::Text(text) if text == "1"));
+        assert!(matches!(&message.args[2], WebsocketArg::Binary(binary) if binary.bytes == BINARY));
+    }
+
+    #[test]
+    fn incoming_non_string_args_are_rejected() {
+        assert!(
+            serde_json::from_str::<WebsocketMessage>(r#"{"event":"send command","args":["a",1]}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WebsocketMessage>(
+                r#"{"event":"send command","args":["a",{"b":1}]}"#
+            )
+            .is_err()
+        );
+    }
+
+    // TransmissionMode
+
+    #[test]
+    fn binary_arg_matches_mode() {
+        use base64::Engine;
+
+        let binary = WebsocketArg::binary(BINARY.to_vec());
+        let base64 = WebsocketArg::from(base64::engine::general_purpose::STANDARD.encode(BINARY));
+
+        assert_eq!(
+            TransmissionMode::Msgpack.binary_arg(&binary).as_deref(),
+            Some(&BINARY[..])
+        );
+        assert!(TransmissionMode::Msgpack.binary_arg(&base64).is_none());
+
+        for mode in [TransmissionMode::Text, TransmissionMode::Binary] {
+            assert_eq!(mode.binary_arg(&base64).as_deref(), Some(&BINARY[..]));
+            assert!(mode.binary_arg(&binary).is_none());
+            assert!(
+                mode.binary_arg(&WebsocketArg::from("not base64!"))
+                    .is_none()
+            );
+        }
     }
 }

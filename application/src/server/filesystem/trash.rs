@@ -1,4 +1,5 @@
 use super::cap::{CapFilesystem, FileType};
+use crate::server::resources::{ResourceUsage, ResourceUsageWatchExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -86,15 +87,30 @@ fn payload_path(uuid: uuid::Uuid, name: &str) -> PathBuf {
     entry_directory(uuid).join(name)
 }
 
-#[derive(Default)]
 pub struct TrashManager {
     entries: RwLock<HashMap<uuid::Uuid, TrashMeta>>,
     retention: AtomicU64,
     usage_threshold: AtomicU64,
     purge_task: std::sync::OnceLock<tokio::task::AbortHandle>,
+    resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
 }
 
 impl TrashManager {
+    pub fn new(resource_usage: tokio::sync::watch::Sender<ResourceUsage>) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            retention: AtomicU64::new(0),
+            usage_threshold: AtomicU64::new(0),
+            purge_task: std::sync::OnceLock::new(),
+            resource_usage,
+        }
+    }
+
+    fn publish_usage(&self, entries: &HashMap<uuid::Uuid, TrashMeta>) {
+        self.resource_usage
+            .publish_trash_usage(entries.values().map(|meta| meta.size).sum());
+    }
+
     /// Retention `0` and thresholds outside `1..=100` disable their purge.
     pub fn update(&self, config: Option<crate::server::configuration::ServerConfigurationTrash>) {
         self.set_retention(config.map(|config| config.retention));
@@ -197,7 +213,9 @@ impl TrashManager {
     }
 
     pub async fn clear(&self) {
-        self.entries.write().await.clear();
+        let mut entries = self.entries.write().await;
+        entries.clear();
+        self.publish_usage(&entries);
     }
 
     /// Rebuilds the index from `.trash/*/meta.json`, dropping entry directories whose
@@ -206,7 +224,7 @@ impl TrashManager {
         let mut read_dir = match filesystem.async_read_dir(TRASH_DIRECTORY).await {
             Ok(read_dir) => read_dir,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.entries.write().await.clear();
+                self.clear().await;
                 return;
             }
             Err(err) => {
@@ -274,6 +292,7 @@ impl TrashManager {
             entries.insert(uuid, meta);
         }
 
+        self.publish_usage(&entries);
         *self.entries.write().await = entries;
     }
 
@@ -380,7 +399,9 @@ impl TrashManager {
             tracing::error!("failed to rename file in diff storage: {:?}", err);
         }
 
-        self.entries.write().await.insert(uuid, meta.clone());
+        let mut entries = self.entries.write().await;
+        entries.insert(uuid, meta.clone());
+        self.publish_usage(&entries);
 
         Ok(meta.entry(uuid))
     }
@@ -438,7 +459,10 @@ impl TrashManager {
             );
         }
 
-        self.entries.write().await.remove(&uuid);
+        let mut entries = self.entries.write().await;
+        entries.remove(&uuid);
+        self.publish_usage(&entries);
+        drop(entries);
 
         if let Err(err) = filesystem.truncate_path(entry_directory(uuid)).await {
             tracing::warn!(
@@ -464,9 +488,12 @@ impl TrashManager {
         server: &crate::server::Server,
         uuid: uuid::Uuid,
     ) -> Result<bool, anyhow::Error> {
-        let Some(meta) = self.entries.write().await.remove(&uuid) else {
+        let mut entries = self.entries.write().await;
+        let Some(meta) = entries.remove(&uuid) else {
             return Ok(false);
         };
+        self.publish_usage(&entries);
+        drop(entries);
 
         if !meta.directory {
             let path = payload_path(uuid, &meta.name);
@@ -477,7 +504,9 @@ impl TrashManager {
         }
 
         if let Err(err) = server.filesystem.truncate_path(entry_directory(uuid)).await {
-            self.entries.write().await.insert(uuid, meta);
+            let mut entries = self.entries.write().await;
+            entries.insert(uuid, meta);
+            self.publish_usage(&entries);
 
             return Err(err);
         }

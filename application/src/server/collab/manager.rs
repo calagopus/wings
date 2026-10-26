@@ -7,9 +7,9 @@ use crate::server::{
         ServerWebsocketHandler, TargetedWebsocketMessage, WebsocketEvent, WebsocketMessage,
     },
 };
-use base64::Engine;
 use compact_str::ToCompactString;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
@@ -27,7 +27,6 @@ use yrs::{
     updates::{decoder::Decode, encoder::Encode},
 };
 
-const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const DIVERGED_REBUILD_TICKS: u32 = 5;
 
@@ -464,7 +463,7 @@ impl CollabSession {
         Some(
             WebsocketMessage::builder(WebsocketEvent::FileCollabAwareness)
                 .arg(self.path.clone())
-                .arg(BASE64.encode(encode_awareness_removal(&clients)))
+                .binary_arg(encode_awareness_removal(&clients))
                 .build(),
         )
     }
@@ -783,14 +782,14 @@ impl CollabManager {
             .send_message(
                 WebsocketMessage::builder(WebsocketEvent::FileCollabSync)
                     .arg(key)
-                    .arg(BASE64.encode(state))
+                    .binary_arg(state)
                     .structured_arg(CollabSyncMeta {
                         dirty,
                         conflict,
                         epoch,
                     })
                     .arg(raw_path)
-                    .arg(BASE64.encode(state_vector))
+                    .binary_arg(state_vector)
                     .build(),
             )
             .await;
@@ -980,7 +979,7 @@ impl CollabManager {
         user_uuid: uuid::Uuid,
         raw_path: &str,
         finished: bool,
-        chunk: &str,
+        chunk: Cow<'_, [u8]>,
         editor: Option<&str>,
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
@@ -995,10 +994,6 @@ impl CollabManager {
             .await?;
 
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
-
-        let chunk = BASE64
-            .decode(chunk)
-            .map_err(|_| CollabError::User("invalid update encoding"))?;
 
         let update = {
             let mut pending = self.pending_updates.lock();
@@ -1022,10 +1017,10 @@ impl CollabManager {
                         return Err(CollabError::User("update is too large"));
                     }
                     if !finished {
-                        pending.insert(pending_key, chunk);
+                        pending.insert(pending_key, chunk.into_owned());
                         return Ok(());
                     }
-                    chunk
+                    chunk.into_owned()
                 }
             }
         };
@@ -1080,7 +1075,7 @@ impl CollabManager {
                 Some(connection_id),
                 WebsocketMessage::builder(WebsocketEvent::FileCollabUpdate)
                     .arg(key)
-                    .arg(BASE64.encode(&update))
+                    .binary_arg(update)
                     .build(),
             )
             .await;
@@ -1094,18 +1089,13 @@ impl CollabManager {
         connection_id: uuid::Uuid,
         user_uuid: uuid::Uuid,
         raw_path: &str,
-        payload: &str,
+        payload: &[u8],
     ) -> Result<(), CollabError> {
         let (key, session) = self
             .subscribed_session(server, connection_id, user_uuid, raw_path, None)
             .await?;
 
-        match BASE64
-            .decode(payload)
-            .ok()
-            .as_deref()
-            .and_then(decode_awareness)
-        {
+        match decode_awareness(payload) {
             Some(entries) => {
                 let max_cursors = self
                     .config
@@ -1128,7 +1118,7 @@ impl CollabManager {
                 Some(connection_id),
                 WebsocketMessage::builder(WebsocketEvent::FileCollabAwareness)
                     .arg(key)
-                    .arg(payload)
+                    .binary_arg(payload)
                     .build(),
             )
             .await;

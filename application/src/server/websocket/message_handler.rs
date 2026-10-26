@@ -1,4 +1,4 @@
-use super::{WebsocketEvent, WebsocketMessage};
+use super::{TransmissionMode, WebsocketEvent, WebsocketMessage};
 use crate::server::{
     PowerActionError,
     activity::{Activity, ActivityEvent},
@@ -31,21 +31,30 @@ pub async fn handle_message(
                         return Ok(());
                     };
 
-                    match mode_str {
-                        "binary" => {
-                            websocket_handler.set_binary_mode(true);
-                        }
-                        "text" => {
-                            websocket_handler.set_binary_mode(false);
-                        }
+                    let mode = match mode_str {
+                        "text" => TransmissionMode::Text,
+                        "binary" => TransmissionMode::Binary,
+                        "msgpack" => TransmissionMode::Msgpack,
                         _ => {
                             tracing::debug!(
                                 server = %server.uuid,
                                 "received unknown transmission mode: {}",
                                 mode_str
                             );
+
+                            return Ok(());
                         }
-                    }
+                    };
+
+                    websocket_handler.set_transmission_mode(mode);
+                    websocket_handler
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::SocketConfigured)
+                                .arg(property_str)
+                                .arg(mode_str)
+                                .build(),
+                        )
+                        .await;
                 }
                 _ => {
                     tracing::debug!(
@@ -268,41 +277,50 @@ pub async fn handle_message(
                         .await
                 }
                 WebsocketEvent::FileCollabUpdate => {
-                    let (Some(finished), Some(chunk)) = (
-                        message.args.get(1).map(|s| s.as_str()),
-                        message.args.get(2).map(|s| s.as_str()),
-                    ) else {
+                    let (Some(finished), Some(chunk)) =
+                        (message.args.get(1).map(|s| s.as_str()), message.args.get(2))
+                    else {
                         return Ok(());
                     };
 
-                    server
-                        .collab
-                        .apply_update(
-                            server,
-                            websocket_handler.connection_id,
-                            user_uuid,
-                            &path,
-                            finished == "1",
-                            chunk,
-                            message.args.get(3).map(|s| s.as_str()),
-                        )
-                        .await
+                    match websocket_handler.binary_arg(chunk) {
+                        Some(chunk) => {
+                            server
+                                .collab
+                                .apply_update(
+                                    server,
+                                    websocket_handler.connection_id,
+                                    user_uuid,
+                                    &path,
+                                    finished == "1",
+                                    chunk,
+                                    message.args.get(3).map(|s| s.as_str()),
+                                )
+                                .await
+                        }
+                        None => Err(CollabError::User("invalid update encoding")),
+                    }
                 }
                 WebsocketEvent::FileCollabAwareness => {
-                    let Some(payload) = message.args.get(1).map(|s| s.as_str()) else {
+                    let Some(payload) = message.args.get(1) else {
                         return Ok(());
                     };
 
-                    server
-                        .collab
-                        .relay_awareness(
-                            server,
-                            websocket_handler.connection_id,
-                            user_uuid,
-                            &path,
-                            payload,
-                        )
-                        .await
+                    match websocket_handler.binary_arg(payload) {
+                        Some(payload) => {
+                            server
+                                .collab
+                                .relay_awareness(
+                                    server,
+                                    websocket_handler.connection_id,
+                                    user_uuid,
+                                    &path,
+                                    &payload,
+                                )
+                                .await
+                        }
+                        None => Err(CollabError::User("invalid awareness encoding")),
+                    }
                 }
                 WebsocketEvent::FileCollabSave => {
                     let force = message.args.get(1).map(|s| s.as_str()) == Some("1");

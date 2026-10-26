@@ -341,6 +341,7 @@ impl Filesystem {
             server_notifier,
             use_server_notifier,
 
+            trash: trash::TrashManager::new(resource_usage.clone()),
             resource_usage,
             disk_limit: AtomicI64::new(disk_limit as i64),
             disk_usage_delta_cached: Arc::new(AtomicI64::new(0)),
@@ -357,7 +358,6 @@ impl Filesystem {
                 .build(),
             operations: operations::OperationManager::new(sender.clone(), Arc::clone(&config)),
             uploads: uploads::UploadManager::new(sender),
-            trash: trash::TrashManager::default(),
         }
     }
 
