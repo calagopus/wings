@@ -223,12 +223,15 @@ fn append_spec(script: &mut String, server: uuid::Uuid, spec: &ForwardingSpec) {
 }
 
 fn append_base_rules(script: &mut String, network: &NetworkContext) {
+    // Proxmox firewall bridges traverse IPv4 netfilter once before routing and
+    // again after routing. Zone every fwbr direction so both halves use the
+    // same bridge-side conntrack entry. Defer masquerading until the routed
+    // pass by excluding the firewall bridge itself.
     script.push_str(&format!(
-        "add rule ip {TABLE} pve_conntrack_zone iifname \"fwbr*\" ip saddr {} ct zone set 1 comment \"wings-pve-base\"\n",
-        network.guest_cidr()
+        "add rule ip {TABLE} pve_conntrack_zone iifname \"fwbr*\" ct zone set 1 comment \"wings-pve-base\"\n"
     ));
     script.push_str(&format!(
-        "add rule ip {TABLE} postrouting ip saddr {} oifname != \"{}\" masquerade comment \"wings-pve-base\"\n",
+        "add rule ip {TABLE} postrouting ip saddr {} oifname != \"{}\" oifname != \"fwbr*\" masquerade comment \"wings-pve-base\"\n",
         network.guest_cidr(),
         network.bridge()
     ));

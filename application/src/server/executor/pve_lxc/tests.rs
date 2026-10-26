@@ -983,8 +983,13 @@ fn native_forwarding_reconcile_all_removes_orphans_and_installs_complete_desired
         assert!(script.contains(&format!("add chain ip wings_pve_forward {chain}")));
         assert!(!script.contains(&format!("flush chain ip wings_pve_forward {chain}")));
     }
-    assert!(script.contains("iifname \"fwbr*\" ip saddr 10.203.41.0/24 ct zone set 1"));
-    assert!(script.contains("ip saddr 10.203.41.0/24 oifname != \"vmbr42\" masquerade"));
+    assert!(script.contains("iifname \"fwbr*\" ct zone set 1"));
+    assert!(!script.contains("iifname \"fwbr*\" ip saddr"));
+    assert!(
+        script.contains(
+            "ip saddr 10.203.41.0/24 oifname != \"vmbr42\" oifname != \"fwbr*\" masquerade"
+        )
+    );
     assert!(script.contains(&format!("comment \"wings-pve:{desired_server}\"")));
     assert!(!script.contains(&orphan.to_string()));
 
