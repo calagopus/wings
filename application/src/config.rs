@@ -324,7 +324,7 @@ fn system_file_history_enabled() -> bool {
     true
 }
 fn system_file_history_zstd_level() -> i32 {
-    19
+    9
 }
 fn system_file_history_anchor_interval() -> u64 {
     4

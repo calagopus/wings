@@ -630,6 +630,24 @@ pub fn process_memory_usage() -> Option<u64> {
     None
 }
 
+pub fn next_aligned_instant(period: std::time::Duration) -> std::time::Instant {
+    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+    let periods = EPOCH.elapsed().as_nanos() / period.as_nanos().max(1) + 1;
+
+    *EPOCH + period.saturating_mul(u32::try_from(periods).unwrap_or(u32::MAX))
+}
+
+pub fn aligned_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::from_std(next_aligned_instant(period)),
+        period,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    interval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

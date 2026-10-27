@@ -1,10 +1,19 @@
-use crate::io::{
-    counting_reader::{AsyncCountingReader, CountingReader},
-    counting_writer::CountingWriter,
+use crate::{
+    io::{
+        counting_reader::{AsyncCountingReader, CountingReader},
+        counting_writer::CountingWriter,
+    },
+    server::filesystem::{
+        cap::{CapFilesystem, FileType},
+        virtualfs::IsIgnoredFn,
+    },
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::io::AsyncRead;
 
@@ -19,6 +28,74 @@ pub use pxar::*;
 pub use seven_zip::*;
 pub use tar::*;
 pub use zip::*;
+
+fn walk_sources(
+    filesystem: &CapFilesystem,
+    base: &Path,
+    sources: impl IntoIterator<Item = impl AsRef<Path>>,
+    is_ignored: &IsIgnoredFn,
+    mut visit: impl FnMut(&Path, &Path, &cap_std::fs::Metadata) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    for source in sources {
+        let relative = source.as_ref();
+        let source = base.join(relative);
+
+        let source_metadata = match filesystem.symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                tracing::debug!(path = %source.display(), "skipping source while creating archive, failed to read metadata: {err:#}");
+                continue;
+            }
+        };
+
+        let file_type: FileType = source_metadata.file_type().into();
+        let verdict = (is_ignored)(file_type, source);
+        let kept = verdict.is_kept();
+        let Some(source) = verdict.reachable(file_type) else {
+            continue;
+        };
+
+        if kept {
+            visit(relative, &source, &source_metadata)?;
+        }
+
+        if !source_metadata.is_dir() {
+            continue;
+        }
+
+        let mut walker = filesystem
+            .walk_dir(&source)?
+            .with_is_ignored(is_ignored.clone());
+
+        while let Some(entry) = walker.next_entry() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::debug!(
+                        "failed to read directory entry while creating archive: {err:#}"
+                    );
+                    break;
+                }
+            };
+
+            let Ok(relative) = entry.path.strip_prefix(base) else {
+                continue;
+            };
+
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::debug!(path = %entry.path.display(), "skipping entry while creating archive, failed to read metadata: {err:#}");
+                    continue;
+                }
+            };
+
+            visit(relative, &entry.path, &metadata)?;
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct ArchiveProgress {

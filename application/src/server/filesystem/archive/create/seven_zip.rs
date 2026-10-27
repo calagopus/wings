@@ -5,7 +5,7 @@ use crate::{
         compression::CompressionLevel,
         fixed_reader::FixedReader,
     },
-    server::filesystem::{archive::Archive, cap::FileType, virtualfs::IsIgnoredFn},
+    server::filesystem::{archive::Archive, virtualfs::IsIgnoredFn},
 };
 use sevenz_rust2::{
     EncoderConfiguration, EncoderMethod, NtTime,
@@ -49,121 +49,48 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
 
         let mut directory_entries = chunked_vec::ChunkedVec::new();
 
-        for source in sources {
-            let relative = source.as_ref();
-            let source = base.join(relative);
+        super::walk_sources(
+            &filesystem,
+            &base,
+            sources,
+            &is_ignored,
+            |relative, path, metadata| {
+                let mtime = metadata
+                    .modified()
+                    .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
+                let ctime = metadata
+                    .created()
+                    .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
 
-            let source_metadata = match filesystem.symlink_metadata(&source) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    tracing::debug!(path = %source.display(), "skipping source while creating 7z archive, failed to read metadata: {err:#}");
-                    continue;
-                }
-            };
-
-            let file_type: FileType = source_metadata.file_type().into();
-            let verdict = (is_ignored)(file_type, source);
-            let kept = verdict.is_kept();
-            let Some(source) = verdict.reachable(file_type) else {
-                continue;
-            };
-
-            let mtime = source_metadata
-                .modified()
-                .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
-            let ctime = source_metadata
-                .created()
-                .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
-
-            if source_metadata.is_dir() {
-                if kept {
+                if metadata.is_dir() {
                     if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
                         directory_entries.push((relative.to_path_buf(), mtime, ctime));
                     }
-                    progress.increment_bytes(source_metadata.len());
-                }
+                    progress.increment_bytes(metadata.len());
+                } else if metadata.is_file() {
+                    let file = filesystem.open(path)?;
+                    let reader = progress.counting_reader(file);
+                    let reader = FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
-                let mut walker = filesystem
-                    .walk_dir(source)?
-                    .with_is_ignored(is_ignored.clone());
-                while let Some(entry) = walker.next_entry() {
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(err) => {
-                            tracing::debug!("failed to read directory entry while creating 7z archive: {err:#}");
-                            break;
-                        }
-                    };
-                    let path = &entry.path;
-
-                    let relative = match path.strip_prefix(&base) {
-                        Ok(path) => path,
-                        Err(_) => continue,
-                    };
-
-                    let metadata = match entry.metadata() {
-                        Ok(metadata) => metadata,
-                        Err(err) => {
-                            tracing::debug!(path = %path.display(), "skipping entry while creating 7z archive, failed to read metadata: {err:#}");
-                            continue;
-                        }
-                    };
-
-                    let mtime = metadata
-                        .modified()
-                        .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
-                    let ctime = metadata
-                        .created()
-                        .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
-
-                    if metadata.is_dir() {
-                        if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                            directory_entries.push((relative.to_path_buf(), mtime, ctime));
-                        }
-                        progress.increment_bytes(metadata.len());
-                    } else if metadata.is_file() {
-                        let file = filesystem.open(path)?;
-                        let reader = progress.counting_reader(file);
-                        let reader =
-                            FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
-
-                        let mut entry =
-                            sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
-                        if let Some(mtime) = mtime {
-                            entry.has_last_modified_date = true;
-                            entry.last_modified_date = mtime;
-                        }
-                        if let Some(ctime) = ctime {
-                            entry.has_creation_date = true;
-                            entry.creation_date = ctime;
-                        }
-                        entry.size = metadata.len();
-
-                        archive.push_archive_entry(entry, Some(reader))?;
-                        progress.increment_files();
+                    let mut entry =
+                        sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
+                    if let Some(mtime) = mtime {
+                        entry.has_last_modified_date = true;
+                        entry.last_modified_date = mtime;
                     }
-                }
-            } else if source_metadata.is_file() {
-                let file = filesystem.open(&source)?;
-                let reader = progress.counting_reader(file);
-                let reader =
-                    FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
+                    if let Some(ctime) = ctime {
+                        entry.has_creation_date = true;
+                        entry.creation_date = ctime;
+                    }
+                    entry.size = metadata.len();
 
-                let mut entry = sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
-                if let Some(mtime) = mtime {
-                    entry.has_last_modified_date = true;
-                    entry.last_modified_date = mtime;
+                    archive.push_archive_entry(entry, Some(reader))?;
+                    progress.increment_files();
                 }
-                if let Some(ctime) = ctime {
-                    entry.has_creation_date = true;
-                    entry.creation_date = ctime;
-                }
-                entry.size = source_metadata.len();
 
-                archive.push_archive_entry(entry, Some(reader))?;
-                progress.increment_files();
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         for (source_path, mtime, ctime) in directory_entries {
             let mut entry =

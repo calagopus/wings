@@ -761,7 +761,7 @@ impl BackupExt for WingsBackup {
             WingsBackupFile::Archive(ArchiveFormat::Zip) => {
                 let reader = Arc::new(tokio::fs::File::open(&self.path).await?.into_std().await);
                 let archive = tokio::task::spawn_blocking(move || {
-                    zip::ZipArchive::new(MultiReader::new(reader)?)
+                    crate::server::filesystem::archive::open_zip(MultiReader::new(reader)?)
                 })
                 .await??;
 

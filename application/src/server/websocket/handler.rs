@@ -379,7 +379,7 @@ pub async fn handle_ws(
                         if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                             loop {
                                 match stdout.recv().await {
-                                    Ok(stdout) => {
+                                    Ok(line) => {
                                         if !websocket_handler.has_calagopus_permission_or(Permission::ControlReadConsole, true).await.is_ok_and(|h| h)
                                         {
                                             websocket_handler
@@ -389,13 +389,18 @@ pub async fn handle_ws(
                                             continue 'outer;
                                         }
 
-                                        websocket_handler.send_message(
+                                        let mut lines = vec![line];
+                                        while let Ok(line) = stdout.try_recv() {
+                                            lines.push(line);
+                                        }
+
+                                        websocket_handler.send_messages(lines.into_iter().map(|line| {
                                             websocket::WebsocketMessage::builder(
                                                 websocket::WebsocketEvent::ServerConsoleOutput,
                                             )
-                                            .arg(stdout.to_compact_string())
-                                            .build(),
-                                        )
+                                            .arg(line.as_str())
+                                            .build()
+                                        }))
                                         .await;
                                     }
                                     Err(RecvError::Closed) => break,

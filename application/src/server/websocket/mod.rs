@@ -778,38 +778,50 @@ impl ServerWebsocketHandler {
         }
     }
 
+    fn encode(
+        mode: TransmissionMode,
+        message: &WebsocketMessage,
+    ) -> Result<Message, anyhow::Error> {
+        Ok(match mode {
+            TransmissionMode::Text => Message::Text(serde_json::to_string(message)?.into()),
+            TransmissionMode::Binary => Message::Binary(rmp_serde::to_vec(message)?.into()),
+            TransmissionMode::Msgpack => {
+                Message::Binary(rmp_serde::to_vec(&message.native())?.into())
+            }
+        })
+    }
+
+    #[inline]
     pub async fn send_message(&self, message: WebsocketMessage) {
+        self.send_messages([message]).await;
+    }
+
+    pub async fn send_messages(&self, messages: impl IntoIterator<Item = WebsocketMessage>) {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
 
         let mode = TransmissionMode::from_u8(self.transmission_mode.load(Ordering::Relaxed));
-        let message = match mode {
-            TransmissionMode::Text => match serde_json::to_string(&message) {
-                Ok(message) => Message::Text(message.into()),
-                Err(err) => {
-                    tracing::error!("failed to serialize websocket message: {:?}", err);
-                    return;
-                }
-            },
-            TransmissionMode::Binary | TransmissionMode::Msgpack => {
-                let encoded = if mode == TransmissionMode::Msgpack {
-                    rmp_serde::to_vec(&message.native())
-                } else {
-                    rmp_serde::to_vec(&message)
-                };
+        let mut sender = self.sender.lock().await;
 
-                match encoded {
-                    Ok(message) => Message::Binary(message.into()),
-                    Err(err) => {
-                        tracing::error!("failed to serialize websocket message: {:?}", err);
-                        return;
+        let mut result = Ok(());
+        for message in messages {
+            match Self::encode(mode, &message) {
+                Ok(message) => {
+                    result = sender.feed(message).await;
+                    if result.is_err() {
+                        break;
                     }
                 }
+                Err(err) => tracing::error!("failed to serialize websocket message: {:?}", err),
             }
-        };
+        }
 
-        if let Err(err) = self.sender.lock().await.send(message).await
+        if result.is_ok() {
+            result = sender.flush().await;
+        }
+
+        if let Err(err) = result
             && err.source().is_none_or(|e| {
                 e.downcast_ref::<std::io::Error>()
                     .is_none_or(|i| i.kind() != std::io::ErrorKind::BrokenPipe)

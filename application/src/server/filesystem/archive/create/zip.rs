@@ -6,16 +6,13 @@ use crate::{
         compression::CompressionLevel,
         fixed_reader::FixedReader,
     },
-    server::filesystem::{
-        cap::{CapFilesystem, FileType},
-        virtualfs::IsIgnoredFn,
-    },
+    server::filesystem::{cap::CapFilesystem, virtualfs::IsIgnoredFn},
     utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
 use positioned_io::ReadAt;
 use std::{
-    collections::BTreeMap,
+    collections::VecDeque,
     io::{Cursor, Seek, Write},
     path::{Path, PathBuf},
 };
@@ -36,6 +33,10 @@ const DIRECT_BYTES: u64 = 64 * 1024 * 1024;
 /// Below this the probe costs more than the compression it saves.
 const PROBE_MIN_BYTES: u64 = 96 * 1024;
 const PROBE_SAMPLE_BYTES: usize = 32 * 1024;
+/// Local plus central header bytes of an entry besides its name, zip64 extras included.
+const ENTRY_HEADER_BYTES: usize = 128;
+/// End of central directory records of a batch archive, zip64 ones included.
+const BATCH_TRAILER_BYTES: usize = 128;
 
 pub async fn create_zip<W: Write + Seek + Send + 'static>(
     filesystem: CapFilesystem,
@@ -50,7 +51,8 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
     let (_guard, listener) = AbortGuard::new();
 
     tokio::task::spawn_blocking(move || {
-        let writer = AbortWriter::new(destination, listener.clone());
+        let writer = std::io::BufWriter::with_capacity(crate::FILE_STREAM_BUFFER_SIZE, destination);
+        let writer = AbortWriter::new(writer, listener.clone());
         let pipeline = Pipeline::new(
             zip::ZipWriter::new(writer),
             filesystem,
@@ -60,7 +62,11 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
         )?;
 
         let archive = pipeline.write(base, sources, is_ignored)?;
-        let mut inner = archive.finish()?.into_inner();
+        let mut inner = archive
+            .finish()?
+            .into_inner()
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
         inner.flush()?;
 
         Ok(inner)
@@ -81,7 +87,8 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
     let (_guard, listener) = AbortGuard::new();
 
     tokio::task::spawn_blocking(move || {
-        let writer = AbortWriter::new(destination, listener.clone());
+        let writer = std::io::BufWriter::with_capacity(crate::FILE_STREAM_BUFFER_SIZE, destination);
+        let writer = AbortWriter::new(writer, listener.clone());
         let pipeline = Pipeline::new(
             zip::ZipWriter::new_stream(writer),
             filesystem,
@@ -91,7 +98,12 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
         )?;
 
         let archive = pipeline.write(base, sources, is_ignored)?;
-        let mut inner = archive.finish()?.into_inner().into_inner();
+        let mut inner = archive
+            .finish()?
+            .into_inner()
+            .into_inner()
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
         inner.flush()?;
 
         Ok(inner)
@@ -297,7 +309,12 @@ impl EntryWriter {
     }
 
     fn compress_batch(&self, batch: Vec<Entry>, bytes: u64) -> Result<BatchArchive, anyhow::Error> {
-        let capacity = bytes as usize + batch.len() * 128;
+        let capacity = bytes as usize
+            + BATCH_TRAILER_BYTES
+            + batch
+                .iter()
+                .map(|entry| ENTRY_HEADER_BYTES + 2 * entry.name.len())
+                .sum::<usize>();
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::with_capacity(capacity)));
         let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
@@ -313,27 +330,17 @@ impl EntryWriter {
     }
 }
 
-struct CompressedBatch {
-    index: usize,
-    bytes: u64,
-    result: Result<BatchArchive, anyhow::Error>,
-}
+type BatchResult = std::sync::mpsc::Receiver<Result<BatchArchive, anyhow::Error>>;
 
 struct Pipeline<Z: Write + Seek> {
     archive: zip::ZipWriter<Z>,
     writer: EntryWriter,
-
     pool: rayon::ThreadPool,
-    sender: std::sync::mpsc::Sender<CompressedBatch>,
-    receiver: std::sync::mpsc::Receiver<CompressedBatch>,
 
     batch: Vec<Entry>,
     batch_bytes: u64,
-    pending: BTreeMap<usize, (u64, BatchArchive)>,
-    submitted: usize,
-    merged: usize,
-
-    in_flight: u64,
+    in_flight: VecDeque<(u64, BatchResult)>,
+    in_flight_bytes: u64,
     window: u64,
 
     read_buffer: Vec<u8>,
@@ -348,7 +355,6 @@ impl<Z: Write + Seek> Pipeline<Z> {
         options: &CreateZipOptions,
     ) -> Result<Self, anyhow::Error> {
         let threads = crate::threading::resolve_threads(options.threads);
-        let (sender, receiver) = std::sync::mpsc::channel();
 
         Ok(Self {
             archive,
@@ -359,14 +365,10 @@ impl<Z: Write + Seek> Pipeline<Z> {
                 level: options.compression_level.to_deflate_level() as i64,
             },
             pool: crate::threading::build_pool(threads)?,
-            sender,
-            receiver,
             batch: Vec::new(),
             batch_bytes: 0,
-            pending: BTreeMap::new(),
-            submitted: 0,
-            merged: 0,
-            in_flight: 0,
+            in_flight: VecDeque::new(),
+            in_flight_bytes: 0,
             window: window_bytes(threads),
             read_buffer: crate::io::mem_buffer(crate::BUFFER_SIZE),
         })
@@ -375,7 +377,7 @@ impl<Z: Write + Seek> Pipeline<Z> {
     fn push(&mut self, entry: Entry) -> Result<(), anyhow::Error> {
         if matches!(entry.kind, EntryKind::File) && entry.len >= DIRECT_BYTES {
             self.submit()?;
-            self.drain(self.submitted)?;
+            self.drain()?;
 
             return self
                 .writer
@@ -405,59 +407,47 @@ impl<Z: Write + Seek> Pipeline<Z> {
 
         let bytes = self.batch_bytes;
 
-        while self.merged < self.submitted
-            && (self.in_flight + bytes > self.window
-                || self.submitted - self.merged >= MAX_IN_FLIGHT_BATCHES)
+        while !self.in_flight.is_empty()
+            && (self.in_flight_bytes + bytes > self.window
+                || self.in_flight.len() >= MAX_IN_FLIGHT_BATCHES)
         {
-            self.receive()?;
+            self.merge_next()?;
         }
 
         let batch = std::mem::take(&mut self.batch);
         self.batch_bytes = 0;
-        let index = self.submitted;
-        self.submitted += 1;
-        self.in_flight += bytes;
 
         let writer = self.writer.clone();
-        let sender = self.sender.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 
         self.pool.spawn(move || {
-            let result = writer.compress_batch(batch, bytes);
-
             // a pipeline that gave up on an earlier error is already gone
-            sender
-                .send(CompressedBatch {
-                    index,
-                    bytes,
-                    result,
-                })
-                .ok();
+            sender.send(writer.compress_batch(batch, bytes)).ok();
         });
 
+        self.in_flight.push_back((bytes, receiver));
+        self.in_flight_bytes += bytes;
+
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<(), anyhow::Error> {
-        let batch = self
-            .receiver
+    fn merge_next(&mut self) -> Result<(), anyhow::Error> {
+        let Some((bytes, receiver)) = self.in_flight.pop_front() else {
+            return Ok(());
+        };
+
+        let batch_archive = receiver
             .recv()
-            .map_err(|_| anyhow::anyhow!("zip worker disconnected"))?;
-
-        self.pending
-            .insert(batch.index, (batch.bytes, batch.result?));
-
-        while let Some((bytes, batch_archive)) = self.pending.remove(&self.merged) {
-            self.in_flight = self.in_flight.saturating_sub(bytes);
-            self.merged += 1;
-            self.archive.merge_archive(batch_archive)?;
-        }
+            .map_err(|_| anyhow::anyhow!("zip worker disconnected"))??;
+        self.in_flight_bytes -= bytes;
+        self.archive.merge_archive(batch_archive)?;
 
         Ok(())
     }
 
-    fn drain(&mut self, until: usize) -> Result<(), anyhow::Error> {
-        while self.merged < until {
-            self.receive()?;
+    fn drain(&mut self) -> Result<(), anyhow::Error> {
+        while !self.in_flight.is_empty() {
+            self.merge_next()?;
         }
 
         Ok(())
@@ -469,91 +459,26 @@ impl<Z: Write + Seek> Pipeline<Z> {
         sources: Vec<impl AsRef<Path>>,
         is_ignored: IsIgnoredFn,
     ) -> Result<zip::ZipWriter<Z>, anyhow::Error> {
-        for source in sources {
-            let relative = source.as_ref();
-            let source = base.join(relative);
+        let filesystem = self.writer.filesystem.clone();
 
-            let source_metadata = match self.writer.filesystem.symlink_metadata(&source) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    tracing::debug!(path = %source.display(), "skipping source while creating zip archive, failed to read metadata: {err:#}");
-                    continue;
-                }
-            };
+        super::walk_sources(
+            &filesystem,
+            &base,
+            sources,
+            &is_ignored,
+            |relative, path, metadata| match Entry::from_metadata(
+                &filesystem,
+                relative,
+                path.to_path_buf(),
+                metadata,
+            ) {
+                Some(entry) => self.push(entry),
+                None => Ok(()),
+            },
+        )?;
 
-            let file_type: FileType = source_metadata.file_type().into();
-            let verdict = (is_ignored)(file_type, source);
-            let kept = verdict.is_kept();
-            let Some(source) = verdict.reachable(file_type) else {
-                continue;
-            };
-
-            if source_metadata.is_dir() {
-                if kept
-                    && let Some(entry) = Entry::from_metadata(
-                        &self.writer.filesystem,
-                        relative,
-                        source.clone(),
-                        &source_metadata,
-                    )
-                {
-                    self.push(entry)?;
-                }
-
-                let mut walker = self
-                    .writer
-                    .filesystem
-                    .walk_dir(source)?
-                    .with_is_ignored(is_ignored.clone());
-
-                while let Some(entry) = walker.next_entry() {
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(err) => {
-                            tracing::debug!(
-                                "failed to read directory entry while creating zip archive: {err:#}"
-                            );
-                            break;
-                        }
-                    };
-
-                    let path = &entry.path;
-
-                    let relative = match path.strip_prefix(&base) {
-                        Ok(path) => path,
-                        Err(_) => continue,
-                    };
-
-                    let metadata = match entry.metadata() {
-                        Ok(metadata) => metadata,
-                        Err(err) => {
-                            tracing::debug!(path = %path.display(), "skipping entry while creating zip archive, failed to read metadata: {err:#}");
-                            continue;
-                        }
-                    };
-
-                    if let Some(entry) = Entry::from_metadata(
-                        &self.writer.filesystem,
-                        relative,
-                        path.clone(),
-                        &metadata,
-                    ) {
-                        self.push(entry)?;
-                    }
-                }
-            } else if let Some(entry) =
-                Entry::from_metadata(&self.writer.filesystem, relative, source, &source_metadata)
-            {
-                self.push(entry)?;
-            }
-        }
-
-        self.finish()
-    }
-
-    fn finish(mut self) -> Result<zip::ZipWriter<Z>, anyhow::Error> {
         self.submit()?;
-        self.drain(self.submitted)?;
+        self.drain()?;
 
         Ok(self.archive)
     }

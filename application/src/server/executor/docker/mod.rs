@@ -1691,11 +1691,7 @@ impl DockerProcessHandle {
             let mut boost_streak = 0u64;
             let mut boost_cooldown_until: Option<std::time::Instant> = None;
 
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(1),
-            );
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
 
             loop {
                 let received = match &mut source {
@@ -1988,11 +1984,7 @@ impl DockerProcessHandle {
             #[cfg(unix)]
             let mut lxcfs_stale_reported = false;
 
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(1),
-            );
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
 
             loop {
                 let died = tokio::select! {

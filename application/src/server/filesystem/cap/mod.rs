@@ -658,6 +658,11 @@ impl CapFilesystem {
         Ok(path)
     }
 
+    pub fn canonicalize_parent(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.try_canonicalize_parent(path.as_ref())
+            .unwrap_or_else(|_| self.relative_path(path.as_ref()))
+    }
+
     /// Canonicalizes every directory component while leaving the final component
     /// untouched. Directories that do not exist yet are kept as given beneath the
     /// deepest one that does.

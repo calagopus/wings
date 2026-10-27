@@ -404,16 +404,21 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
-        if handle.consumed.load(Ordering::Relaxed)
-            >= self.state.config.load().system.sftp.directory_entry_limit
-        {
+        let (entry_limit, send_amount) = {
+            let config = self.state.config.load();
+            (
+                config.system.sftp.directory_entry_limit,
+                config.system.sftp.directory_entry_send_amount,
+            )
+        };
+
+        if handle.consumed.load(Ordering::Relaxed) >= entry_limit {
             return Err(StatusCode::Eof);
         }
 
         let files = tokio::task::spawn_blocking({
             let server = self.server.clone();
             let user_uuid = self.user_uuid;
-            let state = self.state.clone();
             let path = Arc::clone(&handle.path);
             let dir = Arc::clone(&handle.dir);
             let consumed = Arc::clone(&handle.consumed);
@@ -423,8 +428,8 @@ impl russh_sftp::server::Handler for SftpSession {
                 let mut dir = dir.lock();
 
                 loop {
-                    let file = match dir.next_entry() {
-                        Some(Ok((_, file))) => file,
+                    let entry = match dir.next() {
+                        Some(Ok(entry)) => entry,
                         _ => {
                             if files.is_empty() {
                                 return Err(StatusCode::Eof);
@@ -434,8 +439,8 @@ impl russh_sftp::server::Handler for SftpSession {
                         }
                     };
 
-                    let path = path.join(file);
-                    let metadata = match server.filesystem.symlink_metadata(&path) {
+                    let path = path.join(entry.file_name());
+                    let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(_) => continue,
                     };
@@ -458,10 +463,7 @@ impl russh_sftp::server::Handler for SftpSession {
                     files.push(Self::convert_entry(&path, metadata, target_metadata));
                     let prev_consumed = consumed.fetch_add(1, Ordering::Relaxed);
 
-                    if prev_consumed + 1 >= state.config.load().system.sftp.directory_entry_limit
-                        || files.len()
-                            >= state.config.load().system.sftp.directory_entry_send_amount
-                    {
+                    if prev_consumed + 1 >= entry_limit || files.len() >= send_amount {
                         tracing::debug!(
                             "{} entries sent early in sftp readdir ({} total)",
                             files.len(),
@@ -1208,9 +1210,23 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let path = self.server.filesystem.diff_key(Path::new(&filename)).await;
+        let (path, metadata) = tokio::task::spawn_blocking({
+            let server = self.server.clone();
 
-        let pre_size = match self.server.filesystem.async_symlink_metadata(&path).await {
+            move || {
+                let path = server
+                    .filesystem
+                    .canonicalize(&filename)
+                    .unwrap_or_else(|_| server.filesystem.canonicalize_parent(&filename));
+                let metadata = server.filesystem.symlink_metadata(&path);
+
+                (path, metadata)
+            }
+        })
+        .await
+        .map_err(|_| StatusCode::Failure)?;
+
+        let pre_size = match metadata {
             Ok(metadata) => {
                 if !metadata.is_file() {
                     return Err(StatusCode::NoSuchFile);
@@ -1340,18 +1356,18 @@ impl russh_sftp::server::Handler for SftpSession {
                     file.seek(SeekFrom::End(0))?;
                 }
 
+                if pflags.contains(OpenFlags::CREATE)
+                    && let Err(err) = server.filesystem.chown_path(&path)
+                {
+                    tracing::warn!("failed to chown new file: {:?}", err);
+                }
+
                 Ok::<_, std::io::Error>(file)
             }
         })
         .await
         .map_err(|_| StatusCode::Failure)?
         .map_err(|_| StatusCode::Failure)?;
-
-        if pflags.contains(OpenFlags::CREATE)
-            && let Err(err) = self.server.filesystem.async_chown_path(&path).await
-        {
-            tracing::warn!("failed to chown new file: {:?}", err);
-        }
 
         if let Some(event) = activity_event {
             self.server.activity.log_activity(Activity {

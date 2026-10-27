@@ -105,15 +105,18 @@ pub async fn handle_message(
                     .logs_lines(Some(state.config.load().system.websocket_log_count))
                     .await;
 
+                let mut lines = Vec::new();
                 while let Some(Ok(line)) = log_stream.next().await {
-                    websocket_handler
-                        .send_message(
-                            WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
-                                .arg(line.trim())
-                                .build(),
-                        )
-                        .await;
+                    lines.push(line);
                 }
+
+                websocket_handler
+                    .send_messages(lines.into_iter().map(|line| {
+                        WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
+                            .arg(line.trim())
+                            .build()
+                    }))
+                    .await;
             }
         }
         WebsocketEvent::SetState => {

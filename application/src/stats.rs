@@ -1,5 +1,9 @@
 use serde::Serialize;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use sysinfo::{Disks, Networks, System};
 use utoipa::ToSchema;
 
@@ -51,23 +55,39 @@ pub struct SystemStats {
     disk: SystemDiskStats,
 }
 
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+const IDLE_AFTER: Duration = Duration::from_secs(30);
+
 pub struct StatsManager {
-    stats: Arc<arc_swap::ArcSwap<SystemStats>>,
+    stats: tokio::sync::watch::Receiver<(Instant, Arc<SystemStats>)>,
+    last_read: Arc<parking_lot::Mutex<Instant>>,
+    sampler: std::thread::Thread,
 }
 
 impl StatsManager {
-    #[inline]
-    pub fn get_stats(&self) -> Arc<SystemStats> {
-        self.stats.load_full()
+    pub async fn get_stats(&self) -> Arc<SystemStats> {
+        *self.last_read.lock() = Instant::now();
+        self.sampler.unpark();
+
+        let mut stats = self.stats.clone();
+        if stats.borrow_and_update().0.elapsed() > 2 * SAMPLE_INTERVAL {
+            tokio::time::timeout(4 * SAMPLE_INTERVAL, stats.changed())
+                .await
+                .ok();
+        }
+
+        Arc::clone(&stats.borrow().1)
     }
 }
 
 impl Default for StatsManager {
     fn default() -> Self {
-        let stats = Arc::new(arc_swap::ArcSwap::new(Arc::new(SystemStats::default())));
+        let (stats_tx, stats) =
+            tokio::sync::watch::channel((Instant::now(), Arc::new(SystemStats::default())));
+        let last_read = Arc::new(parking_lot::Mutex::new(Instant::now()));
 
-        std::thread::spawn({
-            let stats = Arc::clone(&stats);
+        let sampler = std::thread::spawn({
+            let last_read = Arc::clone(&last_read);
 
             move || {
                 let refresh_kind = sysinfo::RefreshKind::nothing()
@@ -83,9 +103,7 @@ impl Default for StatsManager {
                     .first()
                     .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
 
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
+                let refresh = |sys: &mut System, disks: &mut Disks, networks: &mut Networks| {
                     sys.refresh_specifics(refresh_kind);
                     networks.refresh(true);
                     for disk in disks.list_mut() {
@@ -93,6 +111,19 @@ impl Default for StatsManager {
                             disk.refresh();
                         }
                     }
+                };
+
+                loop {
+                    std::thread::sleep(SAMPLE_INTERVAL);
+
+                    if last_read.lock().elapsed() > IDLE_AFTER {
+                        std::thread::park();
+
+                        refresh(&mut sys, &mut disks, &mut networks);
+                        continue;
+                    }
+
+                    refresh(&mut sys, &mut disks, &mut networks);
 
                     let used_memory_process = match crate::utils::process_memory_usage() {
                         Some(used_memory_process) => used_memory_process,
@@ -155,31 +186,40 @@ impl Default for StatsManager {
                     let cpu_usage = sys.global_cpu_usage();
                     let cpu_threads = sys.cpus().len();
 
-                    stats.store(Arc::new(SystemStats {
-                        cpu: SystemCpuStats {
-                            used: cpu_usage,
-                            threads: cpu_threads,
-                            model: cpu_model.clone(),
-                        },
-                        network,
-                        memory: SystemMemoryStats {
-                            used: used_memory,
-                            used_process: used_memory_process,
-                            total: total_memory,
-                        },
-                        disk: SystemDiskStats {
-                            used: used_disk_space,
-                            total: total_disk_space,
-                            read: total_disk_read,
-                            reading_rate: disk_read_rate,
-                            written: total_disk_write,
-                            writing_rate: disk_write_rate,
-                        },
-                    }));
+                    stats_tx.send_replace((
+                        Instant::now(),
+                        Arc::new(SystemStats {
+                            cpu: SystemCpuStats {
+                                used: cpu_usage,
+                                threads: cpu_threads,
+                                model: cpu_model.clone(),
+                            },
+                            network,
+                            memory: SystemMemoryStats {
+                                used: used_memory,
+                                used_process: used_memory_process,
+                                total: total_memory,
+                            },
+                            disk: SystemDiskStats {
+                                used: used_disk_space,
+                                total: total_disk_space,
+                                read: total_disk_read,
+                                reading_rate: disk_read_rate,
+                                written: total_disk_write,
+                                writing_rate: disk_write_rate,
+                            },
+                        }),
+                    ));
                 }
             }
-        });
+        })
+        .thread()
+        .clone();
 
-        Self { stats }
+        Self {
+            stats,
+            last_read,
+            sampler,
+        }
     }
 }

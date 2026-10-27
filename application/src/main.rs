@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::Next,
     response::IntoResponse,
+    serve::ListenerExt,
 };
 use colored::Colorize;
 use russh::server::Server;
@@ -856,6 +857,17 @@ async fn main_rt() {
                     channel_buffer_size: 1024,
                     event_buffer_size: 1024,
                     keys: vec![key],
+                    nodelay: true,
+                    preferred: russh::Preferred {
+                        cipher: std::borrow::Cow::Borrowed(&[
+                            russh::cipher::AES_256_GCM,
+                            russh::cipher::AES_128_GCM,
+                            russh::cipher::AES_256_CTR,
+                            russh::cipher::AES_192_CTR,
+                            russh::cipher::AES_128_CTR,
+                        ]),
+                        ..russh::Preferred::DEFAULT
+                    },
                     ..Default::default()
                 };
 
@@ -1006,12 +1018,15 @@ async fn main_rt() {
                         }
                         Err(err) => exit_error!("failed to start https server: {:?}", err),
                     },
-                    None => match axum_server::tls_rustls::from_tcp_rustls(listener, rustls_config)
-                    {
+                    None => match axum_server::from_tcp(listener) {
                         Ok(mut server) => {
                             server.http_builder().http2().adaptive_window(true);
 
                             server
+                                .acceptor(
+                                    axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+                                        .acceptor(axum_server::accept::NoDelayAcceptor::new()),
+                                )
                                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                                 .await
                         }
@@ -1022,10 +1037,14 @@ async fn main_rt() {
 
             #[cfg(not(target_os = "linux"))]
             let result = {
-                let mut server = axum_server::bind_rustls(address, rustls_config);
+                let mut server = axum_server::bind(address);
                 server.http_builder().http2().adaptive_window(true);
 
                 server
+                    .acceptor(
+                        axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+                            .acceptor(axum_server::accept::NoDelayAcceptor::new()),
+                    )
                     .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
             };
@@ -1056,7 +1075,9 @@ async fn main_rt() {
             crate::net::apply_socket_congestion_control(&listener, &config);
 
             match axum::serve(
-                listener,
+                listener.tap_io(|tcp| {
+                    tcp.set_nodelay(true).ok();
+                }),
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await

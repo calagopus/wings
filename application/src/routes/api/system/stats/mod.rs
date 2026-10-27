@@ -22,7 +22,7 @@ mod get {
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
         ApiResponse::new_serialized(Response {
-            stats: &state.stats_manager.get_stats(),
+            stats: &*state.stats_manager.get_stats().await,
         })
         .ok()
     }

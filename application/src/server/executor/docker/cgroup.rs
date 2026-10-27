@@ -410,7 +410,7 @@ impl StatsSampler {
 
         let mut entries = Vec::new();
         let mut host_memory = 0;
-        let mut next_tick = std::time::Instant::now() + PERIOD;
+        let mut next_tick = crate::utils::next_aligned_instant(PERIOD);
 
         while !listener.is_aborted() {
             match next_tick.checked_duration_since(std::time::Instant::now()) {
@@ -418,7 +418,7 @@ impl StatsSampler {
                     std::thread::sleep(delay);
                     next_tick += PERIOD;
                 }
-                None => next_tick = std::time::Instant::now() + PERIOD,
+                None => next_tick = crate::utils::next_aligned_instant(PERIOD),
             }
 
             entries.append(&mut incoming.lock());

@@ -163,7 +163,7 @@ impl VirtualZipArchive {
 
         let archive = tokio::task::spawn_blocking(
             move || -> Result<zip::ZipArchive<MultiReader>, anyhow::Error> {
-                let archive = zip::ZipArchive::new(reader)?;
+                let archive = crate::server::filesystem::archive::open_zip(reader)?;
                 Ok(archive)
             },
         )

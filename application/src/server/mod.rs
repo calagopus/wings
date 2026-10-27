@@ -327,6 +327,8 @@ impl Server {
         let mut usage_rx = self.resource_usage.subscribe();
 
         tokio::spawn(async move {
+            let mut throttle = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
+
             while usage_rx.changed().await.is_ok() {
                 let Some(server) = weak.upgrade() else {
                     break;
@@ -347,7 +349,7 @@ impl Server {
                     .ok();
                 drop(server);
 
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                throttle.tick().await;
             }
         });
     }

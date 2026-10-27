@@ -599,6 +599,7 @@ impl Schedule {
                     errors,
                     timestamp,
                 });
+                server.schedules.notify_completed();
 
                 server
                     .schedules

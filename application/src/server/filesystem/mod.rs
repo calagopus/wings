@@ -4,8 +4,8 @@ use crate::{
         filesystem::{
             ignore_list::IgnoreList,
             virtualfs::{
-                AsyncDirectoryStreamWalkFn, IgnoreVerdict, IsIgnoredFn, VirtualReadableFilesystem,
-                VirtualWritableFilesystem,
+                AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, IgnoreVerdict, IsIgnoredFn,
+                VirtualReadableFilesystem, VirtualWritableFilesystem,
             },
         },
         resources::ResourceUsageWatchExt,
@@ -1328,108 +1328,139 @@ impl Filesystem {
             } else {
                 Default::default()
             };
-            let mut walker = filesystem.async_walk_dir_stream(&path, ignored).await?;
+            let threads = server.app_state.config.load().api.file_copy_threads;
+            let quota_copy = filesystem.is_primary_server_fs()
+                && destination_filesystem.is_primary_server_fs()
+                && filesystem.backing_server().uuid == destination_filesystem.backing_server().uuid;
 
-            walker
-                .run_multithreaded(
-                    server.app_state.config.load().api.file_copy_threads,
-                    AsyncDirectoryStreamWalkFn::from({
-                        let server = server.clone();
-                        let filesystem = filesystem.clone();
-                        let source_path = Arc::new(path);
-                        let destination_path = Arc::new(destination_path);
-                        let destination_filesystem = destination_filesystem.clone();
-                        let progress = progress.clone();
+            let copy_entry = {
+                let server = server.clone();
+                let filesystem = filesystem.clone();
+                let source_path = Arc::new(path.clone());
+                let destination_path = Arc::new(destination_path);
+                let destination_filesystem = destination_filesystem.clone();
+                let progress = progress.clone();
 
-                        move |entry: virtualfs::VirtualWalkEntry, stream| {
-                            let path = entry.path;
+                move |entry: virtualfs::VirtualWalkEntry,
+                      stream: Option<virtualfs::AsyncReadableFileStream>| {
+                    let path = entry.path;
 
-                            let server = server.clone();
-                            let filesystem = filesystem.clone();
-                            let source_path = Arc::clone(&source_path);
-                            let destination_path = Arc::clone(&destination_path);
-                            let destination_filesystem = destination_filesystem.clone();
-                            let progress = progress.clone();
+                    let server = server.clone();
+                    let filesystem = filesystem.clone();
+                    let source_path = Arc::clone(&source_path);
+                    let destination_path = Arc::clone(&destination_path);
+                    let destination_filesystem = destination_filesystem.clone();
+                    let progress = progress.clone();
 
-                            async move {
-                                let metadata =
-                                    match filesystem.async_symlink_metadata(&path).await {
-                                        Ok(metadata) => metadata,
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                path = %path.display(),
-                                                "skipping copy entry, failed to stat: {:?}",
-                                                err,
-                                            );
-                                            return Ok(());
-                                        }
-                                    };
+                    async move {
+                        let metadata = match filesystem.async_symlink_metadata(&path).await {
+                            Ok(metadata) => metadata,
+                            Err(err) => {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    "skipping copy entry, failed to stat: {:?}",
+                                    err,
+                                );
+                                return Ok(());
+                            }
+                        };
 
-                                let relative_path = match path.strip_prefix(&*source_path) {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        tracing::debug!(
-                                            path = %path.display(),
-                                            source = %source_path.display(),
-                                            "skipping copy entry, not under source path",
-                                        );
-                                        return Ok(());
-                                    }
-                                };
-                                let destination_path = destination_path.join(relative_path);
+                        let relative_path = match path.strip_prefix(&*source_path) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    source = %source_path.display(),
+                                    "skipping copy entry, not under source path",
+                                );
+                                return Ok(());
+                            }
+                        };
+                        let destination_path = destination_path.join(relative_path);
 
-                                if metadata.file_type.is_file() {
-                                    if let Some(parent) = destination_path.parent() {
-                                        destination_filesystem.async_create_dir_all(&parent).await?;
-                                    }
+                        if metadata.file_type.is_file() {
+                            if let Some(parent) = destination_path.parent() {
+                                destination_filesystem.async_create_dir_all(&parent).await?;
+                            }
 
-                                    if filesystem.is_primary_server_fs()
-                                        && destination_filesystem.is_primary_server_fs()
-                                        && filesystem.backing_server().uuid == destination_filesystem.backing_server().uuid
-                                    {
-                                        server
-                                            .filesystem
-                                            .async_quota_copy(
-                                                &path,
-                                                &destination_path,
-                                                &server,
-                                                Some(metadata.permissions),
-                                                progress.clone_bytes().as_ref(),
-                                            )
-                                            .await?;
-                                    } else {
-                                        let mut reader = progress.async_counting_reader(stream);
+                            if let Some(stream) = stream {
+                                let mut reader = progress.async_counting_reader(stream);
 
-                                        let mut writer = destination_filesystem
-                                            .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
-                                            .await?;
+                                let mut writer = destination_filesystem
+                                    .async_create_file_with_permissions(
+                                        &destination_path,
+                                        Some(metadata.permissions),
+                                    )
+                                    .await?;
 
-                                        tokio::io::copy(&mut reader, &mut writer).await?;
-                                        writer.shutdown().await?;
-                                    }
+                                tokio::io::copy(&mut reader, &mut writer).await?;
+                                writer.shutdown().await?;
+                            } else {
+                                server
+                                    .filesystem
+                                    .async_quota_copy(
+                                        &path,
+                                        &destination_path,
+                                        &server,
+                                        Some(metadata.permissions),
+                                        progress.clone_bytes().as_ref(),
+                                    )
+                                    .await?;
+                            }
 
-                                    progress.increment_files();
-                                } else if metadata.file_type.is_dir() {
-                                    destination_filesystem.async_create_dir_all(&destination_path).await?;
-                                    destination_filesystem
-                                        .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
-                                        .await?;
+                            progress.increment_files();
+                        } else if metadata.file_type.is_dir() {
+                            destination_filesystem
+                                .async_create_dir_all(&destination_path)
+                                .await?;
+                            destination_filesystem
+                                .async_set_permissions(
+                                    &destination_path,
+                                    metadata.file_type,
+                                    metadata.permissions,
+                                )
+                                .await?;
 
-                                    progress.increment_bytes(metadata.size);
-                                } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&path).await {
-                                    if let Err(err) = destination_filesystem.async_create_symlink(&target, &destination_path).await {
-                                        tracing::debug!(path = %destination_path.display(), "failed to create symlink from copy: {:?}", err);
-                                    } else {
-                                        progress.increment_files();
-                                    }
-                                }
-
-                                Ok(())
+                            progress.increment_bytes(metadata.size);
+                        } else if metadata.file_type.is_symlink()
+                            && let Ok(target) = filesystem.async_read_symlink(&path).await
+                        {
+                            if let Err(err) = destination_filesystem
+                                .async_create_symlink(&target, &destination_path)
+                                .await
+                            {
+                                tracing::debug!(path = %destination_path.display(), "failed to create symlink from copy: {:?}", err);
+                            } else {
+                                progress.increment_files();
                             }
                         }
-                    }),
-                )
-                .await?;
+
+                        Ok(())
+                    }
+                }
+            };
+
+            if quota_copy {
+                filesystem
+                    .async_walk_dir(&path, ignored)
+                    .await?
+                    .run_multithreaded(
+                        threads,
+                        AsyncDirectoryWalkFn::from(move |entry| copy_entry(entry, None)),
+                    )
+                    .await?;
+            } else {
+                filesystem
+                    .async_walk_dir_stream(&path, ignored)
+                    .await?
+                    .run_multithreaded(
+                        threads,
+                        AsyncDirectoryStreamWalkFn::from(move |entry, stream| {
+                            copy_entry(entry, Some(stream))
+                        }),
+                    )
+                    .await?;
+            }
         }
 
         Ok(())

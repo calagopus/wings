@@ -113,6 +113,7 @@ mod ktls {
             Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
         fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+            stream.set_nodelay(true).ok();
             let acceptor = tokio_rustls::TlsAcceptor::from(self.config.get_inner());
             let ciphers = Arc::clone(&self.ciphers);
 

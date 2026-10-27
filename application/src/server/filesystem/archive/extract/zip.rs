@@ -1,5 +1,5 @@
 use super::super::{
-    Archive, ExtractOptions, ZIP_SYMLINK_MAX_BYTES, create::ArchiveProgress,
+    Archive, ExtractOptions, ZIP_SYMLINK_MAX_BYTES, create::ArchiveProgress, open_zip,
     zip_entry_get_modified_time, zip_entry_read_symlink_target,
 };
 use crate::{
@@ -97,7 +97,7 @@ pub async fn extract_zip(
     tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
         let reader = super::super::multi_reader::MultiReader::from_seekable(source)?;
         let reader = AbortReader::new(reader, listener);
-        let mut archive = zip::ZipArchive::new(reader)?;
+        let mut archive = open_zip(reader)?;
 
         let mut plan = Vec::with_capacity(archive.len());
         let mut directories = Vec::new();

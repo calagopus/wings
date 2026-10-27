@@ -350,6 +350,14 @@ pub fn zip_entry_read_symlink_target(entry: impl Read) -> Result<String, std::io
     Ok(target)
 }
 
+pub fn open_zip<R: Read + Seek + Clone>(reader: R) -> zip::result::ZipResult<zip::ZipArchive<R>> {
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+
+    zip::ZipArchive::with_config(config, reader.clone()).or_else(|_| zip::ZipArchive::new(reader))
+}
+
 pub trait ReadSeek: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ReadSeek for T {}

@@ -748,12 +748,13 @@ mod tests {
                 command.env("WINGS_SQLITE_DIRECTORY_FD", fd_env);
             }
             let mut child = command.spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(stdin.as_bytes())
-                .unwrap();
+            if let Err(err) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "{fd_env:?} {stdin:?}"
+                );
+            }
             let output = child.wait_with_output().unwrap();
 
             assert_eq!(output.status.code(), Some(1), "{fd_env:?} {stdin:?}");

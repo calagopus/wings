@@ -1,7 +1,7 @@
 use super::{Server, state::ServerState};
 use anyhow::Context;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Write,
     path::Path,
     sync::{
@@ -210,10 +210,14 @@ impl ServerManager {
             let servers = Arc::clone(&self.servers);
 
             async move {
+                let mut last_persisted = None;
+
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-                    if let Err(err) = Self::persist_into(&servers, &root_directory).await {
+                    if let Err(err) =
+                        Self::persist_into(&servers, &root_directory, &mut last_persisted).await
+                    {
                         tracing::error!("failed to persist server states: {:?}", err);
                     }
                 }
@@ -233,21 +237,22 @@ impl ServerManager {
 
         let root_directory = config.resolve_as_path(|cfg| &cfg.system.root_directory);
 
-        Self::persist_into(&self.servers, &root_directory).await
+        Self::persist_into(&self.servers, &root_directory, &mut None).await
     }
 
     async fn persist_into(
         servers: &RwLock<Vec<Server>>,
         root_directory: &Path,
+        last_persisted: &mut Option<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), anyhow::Error> {
         let servers = servers.read().await;
 
-        let states: HashMap<_, _> = servers
+        let states: BTreeMap<_, _> = servers
             .iter()
             .map(|s| (s.uuid, s.state.get_state()))
             .collect();
 
-        let mut installing = HashMap::new();
+        let mut installing = BTreeMap::new();
         for server in servers.iter() {
             if let Some(installer) = server.installer.read().await.as_ref()
                 && let Ok(installation_script) = installer.get_installation_script()
@@ -260,15 +265,26 @@ impl ServerManager {
         }
         drop(servers);
 
-        let states = serde_json::to_vec(&states)?;
-        let installing = serde_json::to_vec(&installing)?;
+        let snapshot = (
+            serde_json::to_vec(&states)?,
+            serde_json::to_vec(&installing)?,
+        );
+        if last_persisted.as_ref() == Some(&snapshot) {
+            return Ok(());
+        }
+
         let root_directory = root_directory.to_path_buf();
 
-        tokio::task::spawn_blocking(move || {
-            write_atomic(&root_directory.join("states.json"), &states)?;
-            write_atomic(&root_directory.join("installing.json"), &installing)
+        let snapshot = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+            write_atomic(&root_directory.join("states.json"), &snapshot.0)?;
+            write_atomic(&root_directory.join("installing.json"), &snapshot.1)?;
+
+            Ok(snapshot)
         })
-        .await?
+        .await??;
+        *last_persisted = Some(snapshot);
+
+        Ok(())
     }
 
     #[inline]

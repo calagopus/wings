@@ -1,9 +1,6 @@
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use std::{
-    io::{Read, Write},
-    path::Path,
-};
+use std::{io::Read, path::Path};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -26,6 +23,8 @@ CREATE TABLE IF NOT EXISTS revisions (
 CREATE INDEX IF NOT EXISTS idx_revisions_file_created ON revisions(file_id, created DESC);
 CREATE INDEX IF NOT EXISTS idx_revisions_file_chain   ON revisions(file_id, chain_id);
 CREATE INDEX IF NOT EXISTS idx_revisions_created      ON revisions(created);
+CREATE INDEX IF NOT EXISTS idx_revisions_chain_heads  ON revisions(id, file_id, chain_id) WHERE base_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_revisions_file_payload ON revisions(file_id, LENGTH(payload));
 "#;
 
 #[derive(Debug, Clone)]
@@ -88,10 +87,6 @@ impl Storage {
         conn.execute_batch(SCHEMA)?;
 
         Ok(Self { conn, zstd_level })
-    }
-
-    pub fn zstd_level(&self) -> i32 {
-        self.zstd_level
     }
 
     pub fn total_payload_bytes(&self) -> Result<u64, anyhow::Error> {
@@ -227,7 +222,74 @@ impl Storage {
         content: &[u8],
         created_ms: i64,
     ) -> Result<i64, anyhow::Error> {
-        let payload = zstd::encode_all(content, self.zstd_level).context("zstd encode snapshot")?;
+        let payload =
+            zstd::bulk::compress(content, self.zstd_level).context("zstd encode snapshot")?;
+
+        self.insert_snapshot_payload(file_id, user, content, payload, created_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_delta(
+        &mut self,
+        file_id: i64,
+        base_id: i64,
+        base_chain_id: i64,
+        base_content: &[u8],
+        user: Option<uuid::Uuid>,
+        content: &[u8],
+        created_ms: i64,
+    ) -> Result<i64, anyhow::Error> {
+        let payload = encode_with_dictionary(content, base_content, self.zstd_level)?;
+
+        self.insert_delta_payload(
+            file_id,
+            base_id,
+            base_chain_id,
+            user,
+            content,
+            payload,
+            created_ms,
+        )
+    }
+
+    /// Stores `content` as a delta against `base`, or as a new snapshot when the
+    /// delta is not at least 10% smaller than one.
+    pub fn insert_successor(
+        &mut self,
+        file_id: i64,
+        base: &RevisionRow,
+        base_content: &[u8],
+        user: Option<uuid::Uuid>,
+        content: &[u8],
+        created_ms: i64,
+    ) -> Result<i64, anyhow::Error> {
+        let delta = encode_with_dictionary(content, base_content, self.zstd_level)?;
+        let snapshot =
+            zstd::bulk::compress(content, self.zstd_level).context("zstd encode snapshot")?;
+
+        if delta.len() * 10 >= snapshot.len() * 9 {
+            self.insert_snapshot_payload(file_id, user, content, snapshot, created_ms)
+        } else {
+            self.insert_delta_payload(
+                file_id,
+                base.id,
+                base.chain_id,
+                user,
+                content,
+                delta,
+                created_ms,
+            )
+        }
+    }
+
+    fn insert_snapshot_payload(
+        &mut self,
+        file_id: i64,
+        user: Option<uuid::Uuid>,
+        content: &[u8],
+        payload: Vec<u8>,
+        created_ms: i64,
+    ) -> Result<i64, anyhow::Error> {
         let hash = blake3::hash(content);
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -254,17 +316,16 @@ impl Storage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_delta(
+    fn insert_delta_payload(
         &mut self,
         file_id: i64,
         base_id: i64,
         base_chain_id: i64,
-        base_content: &[u8],
         user: Option<uuid::Uuid>,
         content: &[u8],
+        payload: Vec<u8>,
         created_ms: i64,
     ) -> Result<i64, anyhow::Error> {
-        let payload = encode_with_dictionary(content, base_content, self.zstd_level)?;
         let hash = blake3::hash(content);
         self.conn.execute(
             "INSERT INTO revisions(file_id, chain_id, created, size, user_id, base_id, payload, content_hash)
@@ -282,14 +343,6 @@ impl Storage {
         )?;
 
         Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn try_encode_delta(
-        &self,
-        base_content: &[u8],
-        new: &[u8],
-    ) -> Result<Vec<u8>, anyhow::Error> {
-        encode_with_dictionary(new, base_content, self.zstd_level)
     }
 
     pub fn reconstruct(&self, id: i64) -> Result<Vec<u8>, anyhow::Error> {
@@ -454,13 +507,13 @@ impl Storage {
             let (pf, pc) = protect.unwrap_or((-1, -1));
             self.conn
                 .query_row(
-                    "SELECT r.file_id, r.chain_id
-                    FROM revisions r
-                    WHERE NOT (r.file_id = ? AND r.chain_id = ?)
-                    AND (SELECT COUNT(DISTINCT chain_id) FROM revisions
-                            WHERE file_id = r.file_id) > 1
-                    GROUP BY r.file_id, r.chain_id
-                    ORDER BY MIN(r.created) ASC, r.chain_id ASC
+                    "SELECT h.file_id, h.chain_id
+                    FROM revisions h
+                    WHERE h.base_id IS NULL AND h.id = h.chain_id
+                    AND NOT (h.file_id = ? AND h.chain_id = ?)
+                    AND EXISTS (SELECT 1 FROM revisions o
+                            WHERE o.file_id = h.file_id AND o.chain_id <> h.chain_id)
+                    ORDER BY h.id
                     LIMIT 1",
                     params![pf, pc],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
@@ -526,12 +579,7 @@ fn encode_with_dictionary(
     dict: &[u8],
     level: i32,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let mut out = Vec::with_capacity(content.len() / 2 + 64);
-    let mut enc = zstd::stream::Encoder::with_dictionary(&mut out, level, dict)?;
-    enc.write_all(content)?;
-    enc.finish()?;
-
-    Ok(out)
+    Ok(zstd::bulk::Compressor::with_dictionary(level, dict)?.compress(content)?)
 }
 
 fn decode_with_dictionary(payload: &[u8], dict: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
