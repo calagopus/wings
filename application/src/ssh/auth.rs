@@ -383,6 +383,7 @@ impl russh::server::Handler for SshSession {
 
         session.channel_success(channel_id)?;
         let exec = super::exec::ExecSession {
+            state: Arc::clone(&self.state),
             server,
 
             user_ip: self.user_ip,

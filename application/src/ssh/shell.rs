@@ -1,8 +1,6 @@
 use crate::{
-    models::ServerPowerAction,
     routes::State,
     server::{
-        PowerActionError,
         activity::{Activity, ActivityEvent},
         permissions::Permission,
         websocket::WebsocketEvent,
@@ -10,7 +8,7 @@ use crate::{
 };
 use russh::{Channel, ChannelWriteHalf, server::Msg};
 use serde_json::json;
-use std::{pin::Pin, str::FromStr, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::broadcast::error::RecvError,
@@ -22,7 +20,7 @@ pub enum ShellMode {
     WinScp,
 }
 
-fn can_read_console(server: &crate::server::Server, user_uuid: uuid::Uuid) -> bool {
+pub(super) fn can_read_console(server: &crate::server::Server, user_uuid: uuid::Uuid) -> bool {
     server.user_permissions.has_user(user_uuid)
         && server.user_permissions.has_calagopus_permission_or(
             user_uuid,
@@ -55,146 +53,22 @@ impl ShellSession {
     ) {
         writer.write_all(b"\r\n").await.unwrap_or_default();
 
-        let prelude = self.state.config.daemon_prelude();
+        let output = super::cli::CliContext {
+            state: &self.state,
+            server: &self.server,
+            user_ip: self.user_ip,
+            user_uuid: self.user_uuid,
+            console_attached: true,
+        }
+        .run(line)
+        .await;
 
-        let mut writeln = async |line: &str| {
+        let prelude = self.state.config.daemon_prelude();
+        for line in output.lines {
             writer
                 .write_all(format!("{prelude} {line}\r\n\x1b[2K").as_bytes())
                 .await
                 .unwrap_or_default();
-        };
-
-        let mut segments = line.split_whitespace();
-        segments.next();
-
-        match segments.next() {
-            Some("help") => {
-                writeln("Available commands:").await;
-                writeln("  help    - Show this help message").await;
-                writeln("  version - Show the current version").await;
-                writeln("  power   - Send a power action to the server").await;
-                writeln("  stats   - Show server statistics").await;
-            }
-            Some("version") => {
-                writeln(&format!("Current version: {}", crate::VERSION)).await;
-            }
-            Some("power") => {
-                let Some(action) = segments
-                    .next()
-                    .and_then(|action| ServerPowerAction::from_str(action).ok())
-                else {
-                    let config = self.state.config.load();
-                    let prefix = &config.system.sftp.shell.cli.name;
-                    writeln(&format!("Usage: {prefix} power <start|restart|stop|kill>")).await;
-                    return;
-                };
-
-                let permission = action.required_permission();
-                if !self.has_permission(permission) {
-                    writeln(&format!(
-                        "You are missing the `{}` permission to do this.",
-                        permission.to_str()
-                    ))
-                    .await;
-                    return;
-                }
-
-                match self.server.checked_power_action(action).await {
-                    Ok(()) => {
-                        self.server.activity.log_activity(Activity {
-                            event: action.activity_event(),
-                            user: Some(self.user_uuid),
-                            ip: Some(self.user_ip),
-                            metadata: None,
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                    Err(PowerActionError::User(message)) => writeln(&message).await,
-                    Err(PowerActionError::Reported(message)) => {
-                        if !can_read_console(&self.server, self.user_uuid) {
-                            writeln(&message).await;
-                        }
-                    }
-                    Err(PowerActionError::Internal(err)) => {
-                        if self.has_permission(Permission::AdminWebsocketErrors) {
-                            writeln(&format!(
-                                "Failed to {} the server: {err:#}",
-                                action.to_str()
-                            ))
-                            .await;
-                        } else {
-                            writeln(&format!(
-                                "An unexpected error occurred while trying to {} the server. Please contact an Administrator.",
-                                action.to_str()
-                            ))
-                            .await;
-                        }
-                    }
-                }
-            }
-            Some("stats") => {
-                let resource_usage = self.server.resource_usage();
-
-                writeln("Server Statistics:").await;
-                writeln(&format!(
-                    "  CPU Usage: {:.2}% / {}",
-                    resource_usage.cpu_absolute,
-                    if self.server.configuration.read().await.build.cpu_limit == 0 {
-                        "Unlimited".to_string()
-                    } else {
-                        format!(
-                            "{}%",
-                            self.server.configuration.read().await.build.cpu_limit
-                        )
-                    }
-                ))
-                .await;
-                writeln(&format!(
-                    "  Memory Usage: {} / {} ({:.2}%)",
-                    human_bytes::human_bytes(resource_usage.memory_bytes as f64),
-                    if self.server.configuration.read().await.build.memory_limit == 0 {
-                        "Unlimited".to_string()
-                    } else {
-                        human_bytes::human_bytes(
-                            (self.server.configuration.read().await.build.memory_limit
-                                * 1024
-                                * 1024) as f64,
-                        )
-                    },
-                    (resource_usage.memory_bytes as f64 / resource_usage.memory_limit_bytes as f64
-                        * 100.0)
-                        .min(100.0)
-                ))
-                .await;
-                writeln(&format!(
-                    "  Disk Usage: {} / {} ({:.2}%)",
-                    human_bytes::human_bytes(resource_usage.disk_bytes as f64),
-                    if self.server.filesystem.disk_limit() == 0 {
-                        "Unlimited".to_string()
-                    } else {
-                        human_bytes::human_bytes(self.server.filesystem.disk_limit() as f64)
-                    },
-                    (resource_usage.disk_bytes as f64 / self.server.filesystem.disk_limit() as f64
-                        * 100.0)
-                        .min(100.0)
-                ))
-                .await;
-                writeln("  Network Usage:").await;
-                writeln(&format!(
-                    "    Received: {}",
-                    human_bytes::human_bytes(resource_usage.network.rx_bytes as f64)
-                ))
-                .await;
-                writeln(&format!(
-                    "    Sent: {}",
-                    human_bytes::human_bytes(resource_usage.network.tx_bytes as f64)
-                ))
-                .await;
-            }
-            _ => {
-                writeln("Unknown command. Type '.wings help' for a list of commands.").await;
-            }
         }
     }
 
@@ -348,9 +222,7 @@ impl ShellSession {
 
                     match self.mode {
                         ShellMode::Normal => {
-                            if line
-                                .starts_with(&self.state.config.load().system.sftp.shell.cli.name)
-                            {
+                            if super::cli::is_cli_command(&self.state, &line) {
                                 self.handle_cli_command(&line, data_writer).await;
                             } else if self.has_permission(Permission::ControlConsole) {
                                 if self.server.state.get_state()

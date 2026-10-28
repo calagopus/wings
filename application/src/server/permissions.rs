@@ -297,6 +297,12 @@ impl UserPermissionsMap {
         .unwrap_or(default)
     }
 
+    pub fn permissions(&self, user_uuid: uuid::Uuid) -> Option<Vec<Permission>> {
+        self.with_user(user_uuid, |permissions, _| {
+            permissions.iter().copied().collect()
+        })
+    }
+
     pub fn has_ignored_files(&self, user_uuid: uuid::Uuid) -> bool {
         self.with_user(user_uuid, |_, ignored| {
             !matches!(ignored, IgnoredFiles::Unrestricted)
