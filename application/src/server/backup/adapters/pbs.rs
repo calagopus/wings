@@ -106,7 +106,10 @@ impl BackupFindExt for PbsBackup {
     async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
         match state.config.client.backup_pbs_configuration(uuid).await {
             Ok(remote) => Ok(remote.group_id().is_some()),
-            Err(_) => Ok(false),
+            Err(err) => {
+                super::log_configuration_error("pbs", uuid, &err);
+                Ok(false)
+            }
         }
     }
 
@@ -116,7 +119,10 @@ impl BackupFindExt for PbsBackup {
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_pbs_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(_) => return Ok(None),
+            Err(err) => {
+                super::log_configuration_error("pbs", uuid, &err);
+                return Ok(None);
+            }
         };
 
         let Some(group_id) = remote.group_id() else {

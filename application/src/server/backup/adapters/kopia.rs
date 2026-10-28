@@ -290,7 +290,10 @@ impl BackupFindExt for KopiaBackup {
     async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
         let remote = match state.config.client.backup_kopia_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(_) => return Ok(false),
+            Err(err) => {
+                super::log_configuration_error("kopia", uuid, &err);
+                return Ok(false);
+            }
         };
 
         let config_file = Self::get_config_file_path(&state.config, &remote);
@@ -315,7 +318,10 @@ impl BackupFindExt for KopiaBackup {
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_kopia_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(_) => return Ok(None),
+            Err(err) => {
+                super::log_configuration_error("kopia", uuid, &err);
+                return Ok(None);
+            }
         };
 
         let config_file = Self::get_config_file_path(&state.config, &remote);

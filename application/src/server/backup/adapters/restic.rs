@@ -518,7 +518,12 @@ impl BackupFindExt for ResticBackup {
             }
         }
 
-        if let Ok(configuration) = state.config.client.backup_restic_configuration(uuid).await {
+        let configuration = state.config.client.backup_restic_configuration(uuid).await;
+        if let Err(err) = &configuration {
+            super::log_configuration_error("restic", uuid, err);
+        }
+
+        if let Ok(configuration) = configuration {
             let output = match ResticBackup::command(&state.config, &configuration)
                 .arg("--json")
                 .arg("--no-lock")
@@ -657,7 +662,12 @@ impl BackupFindExt for ResticBackup {
             }
         }
 
-        if let Ok(configuration) = state.config.client.backup_restic_configuration(uuid).await {
+        let configuration = state.config.client.backup_restic_configuration(uuid).await;
+        if let Err(err) = &configuration {
+            super::log_configuration_error("restic", uuid, err);
+        }
+
+        if let Ok(configuration) = configuration {
             let output = match ResticBackup::command(&state.config, &configuration)
                 .arg("--json")
                 .arg("--no-lock")

@@ -20,6 +20,17 @@ pub use super::BackupAdapter;
 /// every path against every pattern, gets noticeably slow.
 const EXCLUSION_FRONTIER_WARN: usize = 20_000;
 
+fn log_configuration_error(adapter: &str, uuid: uuid::Uuid, err: &anyhow::Error) {
+    if err
+        .downcast_ref::<crate::remote::ApiError>()
+        .is_some_and(|err| err.status == reqwest::StatusCode::EXPECTATION_FAILED)
+    {
+        return;
+    }
+
+    tracing::warn!(backup = %uuid, "failed to get {} backup configuration: {:#}", adapter, err);
+}
+
 /// A path spelled as a literal pattern for an external engine's glob syntax.
 fn glob_literal(path: &std::path::Path) -> String {
     let path = path.to_string_lossy();
