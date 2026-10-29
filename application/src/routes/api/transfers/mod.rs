@@ -284,6 +284,7 @@ mod post {
                                     ExtractOptions {
                                         threads: (is_multiplex || multiplex_stream_count > 0)
                                             .then_some(1),
+                                        preserve_symlink_contents: true,
                                         map_path: Some(Arc::new({
                                             let server = server.clone();
 

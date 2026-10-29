@@ -1376,6 +1376,48 @@ impl CapFilesystem {
         Ok(())
     }
 
+    pub fn symlink_contents(
+        &self,
+        contents: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+    ) -> Result<(), std::io::Error> {
+        let contents = contents.as_ref();
+        let link = self.relative_path(link.as_ref());
+
+        let inner = self.get_inner()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+
+            let Some(name) = link.file_name() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "link path has no final component",
+                ));
+            };
+            let parent = link.parent().unwrap_or(Path::new(""));
+            if parent.as_os_str().is_empty() {
+                rustix::fs::symlinkat(contents, inner.as_fd(), name)?;
+            } else {
+                let parent = inner.open_dir(parent)?;
+                rustix::fs::symlinkat(contents, parent.as_fd(), name)?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let target = Self::resolve_path(&link.parent().unwrap_or(Path::new("")).join(contents));
+
+            let metadata = inner.metadata(&target)?;
+            if metadata.is_dir() {
+                inner.symlink_dir(contents, link)?;
+            } else {
+                inner.symlink_file(contents, link)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn async_symlink_contents(
         &self,
         contents: impl AsRef<Path>,
@@ -1594,6 +1636,32 @@ mod tests {
             CapFilesystem::resolve_path(Path::new("plugins/config.yml")),
             PathBuf::from("plugins/config.yml")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_contents_preserves_literal_targets() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let filesystem = CapFilesystem::new(temp.path()).await?;
+
+            for (name, target) in [
+                ("absolute", "/mnt/game-install"),
+                ("parent", "../drive_c"),
+                ("root", "/"),
+                ("relative", "plugins/config.yml"),
+                ("dangling", "missing/target"),
+            ] {
+                filesystem.symlink_contents(target, name)?;
+                assert_eq!(
+                    std::fs::read_link(temp.path().join(name))?,
+                    Path::new(target)
+                );
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
     }
 
     // relative_path_cow

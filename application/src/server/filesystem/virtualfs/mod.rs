@@ -880,6 +880,11 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
+    fn create_symlink_contents(
+        &self,
+        contents: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(), anyhow::Error>;
     async fn async_create_symlink_contents(
         &self,
         contents: &(dyn AsRef<Path> + Send + Sync),

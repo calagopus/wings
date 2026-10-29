@@ -53,6 +53,7 @@ pub async fn extract_tar(
             &destination_filesystem,
             &write_progress,
             &listener,
+            options.preserve_symlink_contents,
             |writers| {
                 for entry in entries {
                     if writers.stopped() {
@@ -207,6 +208,22 @@ mod tests {
         }
 
         async fn extract(&self) -> Result<PathBuf, anyhow::Error> {
+            self.extract_with_options(ExtractOptions::default()).await
+        }
+
+        async fn extract_with_options(
+            &self,
+            options: ExtractOptions,
+        ) -> Result<PathBuf, anyhow::Error> {
+            self.extract_with_options_and_progress(options, ArchiveProgress::default())
+                .await
+        }
+
+        async fn extract_with_options_and_progress(
+            &self,
+            options: ExtractOptions,
+            progress: ArchiveProgress,
+        ) -> Result<PathBuf, anyhow::Error> {
             let archive = Archive::open(self.server.clone(), PathBuf::from("input.tar")).await?;
             let (destination, filesystem) = self
                 .server
@@ -215,13 +232,7 @@ mod tests {
                 .await;
 
             archive
-                .extract(
-                    destination,
-                    filesystem,
-                    ArchiveProgress::default(),
-                    None,
-                    ExtractOptions::default(),
-                )
+                .extract(destination, filesystem, progress, None, options)
                 .await?;
 
             Ok(self.root.join("out"))
@@ -257,6 +268,88 @@ mod tests {
                 state as u8
             })
             .collect()
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn transfer_extraction_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let fixture = ExtractFixture::new(1).await?;
+            let links = [
+                ("absolute", "/mnt/game-install"),
+                ("relative", "../drive_c"),
+                ("root", "/"),
+            ];
+
+            fixture.build(|builder| {
+                add_file(builder, "sentinel", b"");
+
+                for (name, target) in links {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_mode(0o777);
+                    header.set_mtime(1_700_000_000);
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    builder
+                        .append_link(&mut header, name, target)
+                        .expect("append symlink");
+                }
+            })?;
+
+            let files_processed = Arc::new(AtomicU64::new(0));
+            let out = fixture
+                .extract_with_options_and_progress(
+                    ExtractOptions {
+                        preserve_symlink_contents: true,
+                        ..Default::default()
+                    },
+                    ArchiveProgress::new(Arc::new(AtomicU64::new(0)), files_processed.clone()),
+                )
+                .await?;
+
+            for (name, target) in links {
+                assert_eq!(std::fs::read_link(out.join(name))?, PathBuf::from(target));
+            }
+            assert_eq!(files_processed.load(Ordering::Relaxed), 4);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn transfer_extraction_confines_symlink_entry_paths() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            use std::os::unix::fs::symlink;
+
+            let fixture = ExtractFixture::new(1).await?;
+            let outside = tempfile::tempdir()?;
+            std::fs::create_dir_all(fixture.root.join("out"))?;
+            symlink(outside.path(), fixture.root.join("out/escape"))?;
+
+            fixture.build(|builder| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_mtime(1_700_000_000);
+                header.set_entry_type(tar::EntryType::Symlink);
+                builder
+                    .append_link(&mut header, "escape/link", "/literal-target")
+                    .expect("append symlink");
+            })?;
+
+            let out = fixture
+                .extract_with_options(ExtractOptions {
+                    preserve_symlink_contents: true,
+                    ..Default::default()
+                })
+                .await?;
+
+            assert_eq!(std::fs::read_link(out.join("escape"))?, outside.path());
+            assert!(std::fs::symlink_metadata(outside.path().join("link")).is_err());
+
+            Ok(())
+        })
     }
 
     #[test]

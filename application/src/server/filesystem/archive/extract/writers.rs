@@ -51,6 +51,7 @@ fn shard(path: &Path, shards: usize) -> usize {
 fn apply_job(
     destination_filesystem: &Arc<dyn VirtualWritableFilesystem>,
     progress: &ArchiveProgress,
+    preserve_symlink_contents: bool,
     job: Job,
 ) -> Result<(), anyhow::Error> {
     match job {
@@ -100,14 +101,28 @@ fn apply_job(
             link,
             modified_time,
         } => {
-            if let Err(err) = destination_filesystem.create_symlink(&link, &path) {
+            let result = if preserve_symlink_contents {
+                destination_filesystem.create_symlink_contents(&link, &path)
+            } else {
+                destination_filesystem.create_symlink(&link, &path)
+            };
+            if let Err(err) = result {
                 tracing::debug!(
                     path = %path.display(),
                     "failed to create symlink from archive: {:#?}",
                     err
                 );
-            } else if let Some(modified_time) = modified_time {
-                destination_filesystem.set_times(&path, FileType::Symlink, modified_time, None)?;
+            } else {
+                if let Some(modified_time) = modified_time {
+                    destination_filesystem.set_times(
+                        &path,
+                        FileType::Symlink,
+                        modified_time,
+                        None,
+                    )?;
+                }
+
+                progress.increment_files();
             }
         }
     }
@@ -229,6 +244,7 @@ pub fn with_writers<T>(
     destination_filesystem: &Arc<dyn VirtualWritableFilesystem>,
     progress: &ArchiveProgress,
     listener: &AbortListener,
+    preserve_symlink_contents: bool,
     feed: impl FnOnce(&mut Writers) -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
     let threads = crate::threading::resolve_threads(threads);
@@ -250,7 +266,12 @@ pub fn with_writers<T>(
                         continue;
                     }
 
-                    if let Err(err) = apply_job(destination_filesystem, progress, job) {
+                    if let Err(err) = apply_job(
+                        destination_filesystem,
+                        progress,
+                        preserve_symlink_contents,
+                        job,
+                    ) {
                         error.fail(err);
                     }
                 }

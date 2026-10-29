@@ -448,6 +448,8 @@ pub struct ExtractOptions {
     pub map_path: Option<ExtractPathFn>,
     /// Counts written file bytes instead of archive bytes read.
     pub count_written: bool,
+    /// Writes archive symlink targets exactly as stored instead of resolving them.
+    pub preserve_symlink_contents: bool,
 }
 
 impl ExtractOptions {
