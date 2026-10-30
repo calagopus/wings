@@ -10,14 +10,21 @@ pub struct HelperContainer {
     pub cap_add: &'static [&'static str],
 }
 
+const OWNER_LABEL: &str = "WingsContainer";
+
 impl HelperContainer {
-    fn owns(&self, inspect: &bollard::models::ContainerInspectResponse) -> bool {
-        inspect
+    fn owned_by(&self, inspect: &bollard::models::ContainerInspectResponse, owner: &str) -> bool {
+        let labels = inspect
             .config
             .as_ref()
-            .and_then(|config| config.labels.as_ref())
+            .and_then(|config| config.labels.as_ref());
+
+        labels
             .and_then(|labels| labels.get("ContainerType"))
             .is_some_and(|value| value == self.container_type)
+            && labels
+                .and_then(|labels| labels.get(OWNER_LABEL))
+                .is_some_and(|value| value == owner)
     }
 }
 
@@ -169,63 +176,85 @@ impl StreamingCommand {
     }
 }
 
+struct Tether {
+    container_id: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Tether {
+    fn holds(&self, container_id: Option<&str>) -> bool {
+        !self.task.is_finished() && container_id == Some(self.container_id.as_str())
+    }
+}
+
+impl Drop for Tether {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct DockerHelper {
     docker: Arc<bollard::Docker>,
     spec: &'static HelperContainer,
+    name: String,
+    owner: String,
     image: String,
     service_label: String,
-    ensure_lock: tokio::sync::Mutex<()>,
+    tether: tokio::sync::Mutex<Option<Tether>>,
 }
 
 impl DockerHelper {
     pub fn new(
         docker: Arc<bollard::Docker>,
         spec: &'static HelperContainer,
+        owner: &str,
         image: String,
         service_label: String,
     ) -> Self {
         Self {
             docker,
             spec,
+            name: format!(
+                "{}-{}",
+                spec.name,
+                owner.chars().take(12).collect::<String>()
+            ),
+            owner: owner.to_string(),
             image,
             service_label,
-            ensure_lock: tokio::sync::Mutex::new(()),
+            tether: tokio::sync::Mutex::new(None),
         }
     }
 
     pub async fn ensure(&self) -> Result<(), anyhow::Error> {
-        let _guard = self.ensure_lock.lock().await;
+        let mut tether = self.tether.lock().await;
 
-        match self.docker.inspect_container(self.spec.name, None).await {
+        match self.docker.inspect_container(&self.name, None).await {
             Ok(inspect) => {
-                if !self.spec.owns(&inspect) {
+                if !self.spec.owned_by(&inspect, &self.owner) {
                     return Err(anyhow::anyhow!(
-                        "container name {} is taken by a container that was not created by wings, refusing to replace it",
-                        self.spec.name
+                        "container name {} is taken by a container that was not created by this wings, refusing to replace it",
+                        self.name
                     ));
                 }
 
-                let adoptable = inspect
+                let running = inspect
                     .state
                     .as_ref()
                     .and_then(|state| state.running)
-                    .unwrap_or(false)
-                    && inspect.image.as_deref() == Some(self.image.as_str())
-                    && inspect.host_config.as_ref().is_some_and(|host_config| {
-                        host_config.network_mode.as_deref() == Some(self.spec.network_mode)
-                            && host_config
-                                .pid_mode
-                                .as_deref()
-                                .filter(|mode| !mode.is_empty())
-                                == self.spec.pid_mode
-                    });
-                if adoptable {
+                    .unwrap_or(false);
+                if running
+                    && tether
+                        .as_ref()
+                        .is_some_and(|tether| tether.holds(inspect.id.as_deref()))
+                {
                     return Ok(());
                 }
 
+                *tether = None;
                 force_remove(
                     &self.docker,
-                    &inspect.id.unwrap_or_else(|| self.spec.name.to_string()),
+                    &inspect.id.unwrap_or_else(|| self.name.clone()),
                 )
                 .await?;
             }
@@ -235,34 +264,78 @@ impl DockerHelper {
             Err(err) => return Err(err.into()),
         }
 
-        self.create_helper().await
+        *tether = Some(self.create_helper().await?);
+
+        Ok(())
     }
 
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
-        let _guard = self.ensure_lock.lock().await;
+        let mut tether = self.tether.lock().await;
+        *tether = None;
 
-        force_remove(&self.docker, self.spec.name).await
+        force_remove(&self.docker, &self.name).await
     }
 
     pub async fn remove_stale(
         docker: &bollard::Docker,
         spec: &HelperContainer,
+        owner: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        match docker.inspect_container(spec.name, None).await {
-            Ok(inspect) if spec.owns(&inspect) => force_remove(docker, spec.name).await,
-            Ok(_)
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(err) => Err(err.into()),
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "label".to_string(),
+                    vec![format!("ContainerType={}", spec.container_type)],
+                )])),
+                ..Default::default()
+            }))
+            .await?;
+
+        for container in containers {
+            let Some(id) = container.id else {
+                continue;
+            };
+
+            let stale = match container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(OWNER_LABEL))
+            {
+                None => true,
+                Some(container_owner) if Some(container_owner.as_str()) == owner => true,
+                Some(container_owner) => {
+                    match docker.inspect_container(container_owner, None).await {
+                        Ok(inspect) => !inspect
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.running)
+                            .unwrap_or(false),
+                        Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 404,
+                            ..
+                        }) => true,
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            };
+
+            if stale {
+                force_remove(docker, &id).await?;
+            }
         }
+
+        Ok(())
     }
 
-    async fn create_helper(&self) -> Result<(), anyhow::Error> {
+    async fn create_helper(&self) -> Result<Tether, anyhow::Error> {
         let body = bollard::plugin::ContainerCreateBody {
             image: Some(self.image.clone()),
-            entrypoint: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+            entrypoint: Some(vec!["cat".to_string()]),
             cmd: Some(Vec::new()),
+            attach_stdin: Some(true),
+            open_stdin: Some(true),
+            stdin_once: Some(true),
             stop_signal: Some("SIGKILL".to_string()),
             labels: Some(HashMap::from([
                 ("Service".to_string(), self.service_label.clone()),
@@ -270,6 +343,7 @@ impl DockerHelper {
                     "ContainerType".to_string(),
                     self.spec.container_type.to_string(),
                 ),
+                (OWNER_LABEL.to_string(), self.owner.clone()),
             ])),
             host_config: Some(bollard::plugin::HostConfig {
                 network_mode: Some(self.spec.network_mode.to_string()),
@@ -281,19 +355,23 @@ impl DockerHelper {
             ..Default::default()
         };
 
+        let mut container_id = None;
         for attempt in 1..=5u32 {
             match self
                 .docker
                 .create_container(
                     Some(bollard::query_parameters::CreateContainerOptions {
-                        name: Some(self.spec.name.to_string()),
+                        name: Some(self.name.clone()),
                         ..Default::default()
                     }),
                     body.clone(),
                 )
                 .await
             {
-                Ok(_) => break,
+                Ok(response) => {
+                    container_id = Some(response.id);
+                    break;
+                }
                 Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 409, ..
                 }) if attempt < 5 => {
@@ -303,13 +381,50 @@ impl DockerHelper {
                 Err(err) => return Err(err.into()),
             }
         }
+        let container_id =
+            container_id.ok_or_else(|| anyhow::anyhow!("failed to create {}", self.name))?;
 
-        match self.docker.start_container(self.spec.name, None).await {
+        match self.attach_and_start(&container_id).await {
+            Ok(task) => Ok(Tether { container_id, task }),
+            Err(err) => {
+                force_remove(&self.docker, &container_id).await.ok();
+
+                Err(err)
+            }
+        }
+    }
+
+    async fn attach_and_start(
+        &self,
+        container_id: &str,
+    ) -> Result<tokio::task::JoinHandle<()>, anyhow::Error> {
+        let bollard::container::AttachContainerResults { mut output, input } = self
+            .docker
+            .attach_container(
+                container_id,
+                Some(bollard::query_parameters::AttachContainerOptions {
+                    stdin: true,
+                    stream: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        let task = tokio::spawn(async move {
+            let _input = input;
+            while let Some(Ok(_)) = output.next().await {}
+        });
+
+        match self.docker.start_container(container_id, None).await {
             Ok(())
             | Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 304, ..
-            }) => Ok(()),
-            Err(err) => Err(err.into()),
+            }) => Ok(task),
+            Err(err) => {
+                task.abort();
+
+                Err(err.into())
+            }
         }
     }
 
@@ -353,7 +468,7 @@ impl DockerHelper {
         let exec = self
             .docker
             .create_exec(
-                self.spec.name,
+                &self.name,
                 bollard::exec::CreateExecOptions::<String> {
                     attach_stdin: Some(attach_stdin),
                     attach_stdout: Some(true),
@@ -406,7 +521,7 @@ impl DockerHelper {
         let (write_result, read_result) = tokio::join!(write, collect_exec_output(output));
         let (stdout, stderr) = read_result?;
         if let Err(err) = write_result {
-            tracing::debug!("{} exec stdin write: {err}", self.spec.name);
+            tracing::debug!("{} exec stdin write: {err}", self.name);
         }
 
         let exit_code = wait_exec(&self.docker, &exec_id).await?;

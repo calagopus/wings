@@ -114,6 +114,13 @@ impl Bandwidth {
                 == Some("host")
         });
 
+        if let Err(err) =
+            DockerHelper::remove_stale(docker, &HELPER, own_container.map(|(id, _)| id.as_str()))
+                .await
+        {
+            tracing::warn!("failed to remove stale bandwidth helper containers: {err:#}");
+        }
+
         let backend = match config.load().docker.bandwidth.backend {
             BandwidthBackendKind::Disabled => Backend::Disabled,
             BandwidthBackendKind::Local if !reachable => {
@@ -122,7 +129,14 @@ impl Bandwidth {
                 Backend::Unusable(UNREACHABLE.to_string())
             }
             BandwidthBackendKind::Local => Backend::Local { rootless },
-            BandwidthBackendKind::Auto if reachable => Backend::Local { rootless },
+            BandwidthBackendKind::Auto
+                if reachable
+                    && (rootless
+                        || own_container.is_none()
+                        || linux::ready(false).await.is_ok()) =>
+            {
+                Backend::Local { rootless }
+            }
             BandwidthBackendKind::Auto | BandwidthBackendKind::Container => {
                 match container_helper(config, docker, own_container, rootless).await {
                     Ok((runner, binary)) => {
@@ -140,12 +154,6 @@ impl Bandwidth {
                 }
             }
         };
-
-        if !matches!(backend, Backend::Container { .. })
-            && let Err(err) = DockerHelper::remove_stale(docker, &HELPER).await
-        {
-            tracing::warn!("failed to remove the unused bandwidth helper container: {err:#}");
-        }
 
         Self { backend }
     }
@@ -228,7 +236,7 @@ async fn container_helper(
         !rootless,
         "the container bandwidth backend is not supported with rootless container engines"
     );
-    let Some((_, inspect)) = own_container else {
+    let Some((own_id, inspect)) = own_container else {
         bail!(
             "the container bandwidth backend needs wings to run as a container of the connected container engine"
         );
@@ -246,6 +254,7 @@ async fn container_helper(
     let helper = DockerHelper::new(
         Arc::clone(docker),
         &HELPER,
+        own_id,
         image,
         config.load().app_name.clone(),
     );
