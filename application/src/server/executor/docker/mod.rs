@@ -322,6 +322,10 @@ trait DockerServerConfigurationExt {
     ) -> bollard::plugin::ContainerUpdateBody;
 
     fn installer_resources(&self, config: &crate::config::Config) -> bollard::models::Resources;
+    fn security_opt(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<Vec<String>, serde_json::Error>;
 }
 
 #[async_trait::async_trait]
@@ -580,21 +584,6 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             }
         }
 
-        let mut security_opt = vec!["no-new-privileges".to_string()];
-        if config.load().docker.container_apply_seccomp {
-            security_opt.push(
-                crate::server::configuration::seccomp::Seccomp::default()
-                    .remove_names(
-                        &self.container.seccomp.remove_allowed,
-                        crate::server::configuration::seccomp::Action::Allow,
-                    )
-                    .to_string()?,
-            );
-        }
-        if let Some(profile) = string_to_option(&config.load().docker.container_apparmor_profile) {
-            security_opt.push(format!("apparmor={profile}"));
-        }
-
         let (mut mounts, binds) =
             split_selinux_binds(self.convert_mounts(config, filesystem, host_mounts).await);
 
@@ -671,7 +660,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                             .collect(),
                     ),
                 }),
-                security_opt: Some(security_opt),
+                security_opt: Some(self.security_opt(config)?),
                 ulimits: convert_ulimits(config),
                 sysctls,
                 cap_drop: Some(vec![
@@ -761,6 +750,30 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         }
 
         resources
+    }
+
+    fn security_opt(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<Vec<String>, serde_json::Error> {
+        let config = config.load();
+
+        let mut security_opt = vec!["no-new-privileges".to_string()];
+        if config.docker.container_apply_seccomp {
+            security_opt.push(
+                crate::server::configuration::seccomp::Seccomp::default()
+                    .remove_names(
+                        &self.container.seccomp.remove_allowed,
+                        crate::server::configuration::seccomp::Action::Allow,
+                    )
+                    .to_string()?,
+            );
+        }
+        if let Some(profile) = string_to_option(&config.docker.container_apparmor_profile) {
+            security_opt.push(format!("apparmor={profile}"));
+        }
+
+        Ok(security_opt)
     }
 }
 
@@ -1052,6 +1065,7 @@ impl DockerExecutor {
         resources: bollard::models::Resources,
         staging_dir: &std::path::Path,
         staging_target: &str,
+        security_opt: Vec<String>,
     ) -> bollard::plugin::HostConfig {
         let (mounts, binds) = split_selinux_binds(vec![
             bollard::plugin::Mount {
@@ -1116,6 +1130,7 @@ impl DockerExecutor {
                         .collect(),
                 ),
             }),
+            security_opt: Some(security_opt),
             userns_mode: string_to_option(&config.docker.userns_mode),
             ..Default::default()
         }
@@ -3129,6 +3144,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         let server_config = server.configuration.read().await;
         let resources = server_config.installer_resources(&self.app_config);
+        let security_opt = server_config.security_opt(&self.app_config)?;
 
         let mut env = server_config.environment(&self.app_config);
         for (k, v) in &script.environment {
@@ -3197,6 +3213,7 @@ impl super::ServerExecutor for DockerExecutor {
                 resources,
                 &tmp_dir,
                 "/mnt/install",
+                security_opt,
             )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
@@ -3328,6 +3345,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         let server_config = server.configuration.read().await;
         let resources = server_config.installer_resources(&self.app_config);
+        let security_opt = server_config.security_opt(&self.app_config)?;
 
         let mut env = server_config.environment(&self.app_config);
         for (k, v) in &script.environment {
@@ -3363,6 +3381,7 @@ impl super::ServerExecutor for DockerExecutor {
                 resources,
                 &tmp_dir,
                 "/mnt/script",
+                security_opt,
             )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
