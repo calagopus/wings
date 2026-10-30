@@ -1385,6 +1385,8 @@ nestify::nest! {
 
             #[serde(default)]
             pub userns_mode: String,
+            #[serde(default)]
+            pub mount_options: Vec<String>,
 
             #[serde(default)]
             #[schema(inline)]

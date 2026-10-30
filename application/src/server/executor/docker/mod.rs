@@ -68,23 +68,31 @@ fn selinux_enabled() -> bool {
     *ENABLED.get_or_init(|| Path::new("/sys/fs/selinux/enforce").exists())
 }
 
-fn is_relabelable(source: &str) -> bool {
+fn is_kernel_filesystem(source: &str) -> bool {
     let source = Path::new(source);
 
-    !source.starts_with("/dev") && !source.starts_with("/proc") && !source.starts_with("/sys")
+    source.starts_with("/dev") || source.starts_with("/proc") || source.starts_with("/sys")
 }
 
-fn split_selinux_binds(
+fn split_binds(
     mounts: Vec<bollard::models::Mount>,
+    options: &[String],
 ) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
-    split_binds_for_relabel(mounts, selinux_enabled())
+    split_binds_with(mounts, selinux_enabled(), options)
 }
 
-fn split_binds_for_relabel(
+fn split_binds_with(
     mounts: Vec<bollard::models::Mount>,
     relabel: bool,
+    options: &[String],
 ) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
-    if !relabel {
+    let options = options
+        .iter()
+        .map(|option| option.trim())
+        .filter(|option| !option.is_empty())
+        .collect::<Vec<_>>();
+
+    if !relabel && options.is_empty() {
         return (mounts, None);
     }
 
@@ -93,14 +101,18 @@ fn split_binds_for_relabel(
 
     for mount in mounts {
         match (mount.source.as_deref(), mount.target.as_deref()) {
-            (Some(source), Some(target)) if is_relabelable(source) => {
-                let mode = if mount.read_only.unwrap_or(false) {
+            (Some(source), Some(target)) if !is_kernel_filesystem(source) => {
+                let mut bind_options = vec![if mount.read_only.unwrap_or(false) {
                     "ro"
                 } else {
                     "rw"
-                };
+                }];
+                if relabel {
+                    bind_options.push("z");
+                }
+                bind_options.extend(&options);
 
-                binds.push(format!("{source}:{target}:{mode},z"));
+                binds.push(format!("{source}:{target}:{}", bind_options.join(",")));
             }
             _ => structured.push(mount),
         }
@@ -584,8 +596,10 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             }
         }
 
-        let (mut mounts, binds) =
-            split_selinux_binds(self.convert_mounts(config, filesystem, host_mounts).await);
+        let (mut mounts, binds) = split_binds(
+            self.convert_mounts(config, filesystem, host_mounts).await,
+            &config.load().docker.mount_options,
+        );
 
         #[cfg(unix)]
         if config.load().docker.lxcfs.enabled {
@@ -1067,27 +1081,30 @@ impl DockerExecutor {
         staging_target: &str,
         security_opt: Vec<String>,
     ) -> bollard::plugin::HostConfig {
-        let (mounts, binds) = split_selinux_binds(vec![
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    server_base,
-                )),
-                target: Some("/mnt/server".to_string()),
-                ..Default::default()
-            },
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &staging_dir.to_string_lossy(),
-                )),
-                target: Some(staging_target.to_string()),
-                ..Default::default()
-            },
-        ]);
         let config = self.app_config.load();
+        let (mounts, binds) = split_binds(
+            vec![
+                bollard::plugin::Mount {
+                    typ: Some(bollard::plugin::MountType::BIND),
+                    source: Some(host_mounts::translate_source(
+                        self.host_mounts(),
+                        server_base,
+                    )),
+                    target: Some("/mnt/server".to_string()),
+                    ..Default::default()
+                },
+                bollard::plugin::Mount {
+                    typ: Some(bollard::plugin::MountType::BIND),
+                    source: Some(host_mounts::translate_source(
+                        self.host_mounts(),
+                        &staging_dir.to_string_lossy(),
+                    )),
+                    target: Some(staging_target.to_string()),
+                    ..Default::default()
+                },
+            ],
+            &config.docker.mount_options,
+        );
 
         bollard::plugin::HostConfig {
             memory: resources.memory,
@@ -3764,7 +3781,7 @@ mod tests {
         assert_eq!(installer.cpu_quota, Some(80000));
     }
 
-    // selinux relabelling
+    // split_binds_with
 
     fn bind(source: &str, target: &str, read_only: bool) -> bollard::models::Mount {
         bollard::models::Mount {
@@ -3778,9 +3795,10 @@ mod tests {
 
     #[test]
     fn without_selinux_mounts_stay_structured() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
             false,
+            &[],
         );
 
         assert_eq!(mounts.len(), 1);
@@ -3789,12 +3807,13 @@ mod tests {
 
     #[test]
     fn with_selinux_binds_carry_the_shared_relabel_option() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![
                 bind("/var/lib/wings/volumes/a", "/home/container", false),
                 bind("/run/wings/etc/passwd", "/etc/passwd", true),
             ],
             true,
+            &[],
         );
 
         assert!(mounts.is_empty());
@@ -3809,12 +3828,13 @@ mod tests {
 
     #[test]
     fn kernel_filesystems_are_never_relabelled() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![
                 bind("/dev/hugepages", "/dev/hugepages", false),
                 bind("/var/lib/wings/volumes/a", "/home/container", false),
             ],
             true,
+            &[],
         );
 
         assert_eq!(
@@ -3826,6 +3846,95 @@ mod tests {
             Some(vec![
                 "/var/lib/wings/volumes/a:/home/container:rw,z".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn mount_options_without_selinux_become_binds() {
+        let (mounts, binds) = split_binds_with(
+            vec![
+                bind("/var/lib/wings/volumes/a", "/home/container", false),
+                bind("/run/wings/etc/passwd", "/etc/passwd", true),
+            ],
+            false,
+            &["idmap".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,idmap".to_string(),
+                "/run/wings/etc/passwd:/etc/passwd:ro,idmap".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn relabel_precedes_mount_options_in_configured_order() {
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", true)],
+            true,
+            &["noexec".to_string(), "idmap".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:ro,z,noexec,idmap".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn blank_mount_options_are_ignored() {
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
+            false,
+            &[String::new(), "  ".to_string()],
+        );
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(binds, None);
+
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
+            false,
+            &[" idmap ".to_string(), " ".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,idmap".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn kernel_filesystems_keep_structured_mounts_with_mount_options() {
+        let (mounts, binds) = split_binds_with(
+            vec![
+                bind("/sys/fs/cgroup", "/sys/fs/cgroup", true),
+                bind("/proc/cpuinfo", "/proc/cpuinfo", true),
+                bind("/devices/a", "/home/container", false),
+            ],
+            false,
+            &["idmap".to_string()],
+        );
+
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|mount| mount.source.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("/sys/fs/cgroup"), Some("/proc/cpuinfo")]
+        );
+        assert_eq!(
+            binds,
+            Some(vec!["/devices/a:/home/container:rw,idmap".to_string()])
         );
     }
 }
