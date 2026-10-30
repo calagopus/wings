@@ -74,6 +74,7 @@ pub trait ServerExecutor: Send + Sync {
         &self,
         server: &super::Server,
         script: &super::installation::InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error>;
 
     async fn resolve_internal_target(

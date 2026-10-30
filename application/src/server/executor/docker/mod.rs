@@ -3356,6 +3356,7 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
         script: &super::super::installation::InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
         self.pull_image(&script.container_image, server, true)
             .await?;
@@ -3377,17 +3378,35 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
+        let suffix = rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8);
         let tmp_dir = self.app_config.tmp_data_path(server.uuid);
-        tokio::fs::create_dir_all(&tmp_dir).await?;
-        tokio::fs::write(
-            tmp_dir.join("script.sh"),
-            script.script.replace("\r\n", "\n"),
-        )
-        .await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
+        let script_dir = tmp_dir.join(format!("script-{suffix}"));
+        let staged = async {
+            tokio::fs::create_dir_all(&script_dir).await?;
+            tokio::fs::write(
+                script_dir.join("script.sh"),
+                script.script.replace("\r\n", "\n"),
+            )
+            .await?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755))
+                    .await?;
+                tokio::fs::set_permissions(&script_dir, std::fs::Permissions::from_mode(0o755))
+                    .await?;
+            }
+
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(err) = staged {
+            tokio::fs::remove_dir_all(&script_dir).await.ok();
+            return Err(anyhow::anyhow!(
+                "failed to prepare script staging directory {}: {err}",
+                script_dir.display()
+            ));
         }
 
         server.filesystem.ensure_trash_directory().await;
@@ -3396,7 +3415,7 @@ impl super::ServerExecutor for DockerExecutor {
             host_config: Some(self.installer_host_config(
                 &server.filesystem.base(),
                 resources,
-                &tmp_dir,
+                &script_dir,
                 "/mnt/script",
                 security_opt,
             )),
@@ -3420,55 +3439,101 @@ impl super::ServerExecutor for DockerExecutor {
             ..Default::default()
         };
 
-        let name = format!(
-            "{}_script_runner_{}",
-            server.uuid,
-            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
-        );
-
-        let container = self
+        let container = match self
             .docker
             .create_container(
                 Some(bollard::query_parameters::CreateContainerOptions {
-                    name: Some(name),
+                    name: Some(format!("{}_script_runner_{suffix}", server.uuid)),
                     ..Default::default()
                 }),
                 bollard_config,
             )
-            .await?;
+            .await
+        {
+            Ok(container) => container,
+            Err(err) => {
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
+                return Err(err.into());
+            }
+        };
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
-        let handle = Arc::new(
-            DockerProcessHandle::new(
-                container.id.clone(),
-                Arc::clone(&self.docker),
-                server,
-                Arc::clone(&self.app_config),
-                Arc::clone(&self.firewall),
-                Arc::clone(&self.stats_sampler),
-                status_tx,
-                false,
-                false,
-                None,
-            )
-            .await?,
-        );
+        let handle = match DockerProcessHandle::new(
+            container.id.clone(),
+            Arc::clone(&self.docker),
+            server,
+            Arc::clone(&self.app_config),
+            Arc::clone(&self.firewall),
+            Arc::clone(&self.stats_sampler),
+            status_tx,
+            false,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(handle) => Arc::new(handle),
+            Err(err) => {
+                self.docker
+                    .remove_container_forgiving(&container.id)
+                    .await
+                    .ok();
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
+                return Err(err);
+            }
+        };
 
         tokio::spawn({
             let docker = Arc::clone(&self.docker);
             let server = server.uuid;
 
             async move {
-                if let Some(Err(err)) = docker
-                    .wait_container(
-                        &container.id,
-                        Some(bollard::query_parameters::WaitContainerOptions {
-                            condition: "next-exit".to_string(),
-                        }),
-                    )
-                    .next()
-                    .await
-                {
+                let mut wait = docker.wait_container(
+                    &container.id,
+                    Some(bollard::query_parameters::WaitContainerOptions {
+                        condition: "next-exit".to_string(),
+                    }),
+                );
+                let start_deadline = tokio::time::sleep(std::time::Duration::from_secs(120));
+                tokio::pin!(start_deadline);
+                let mut start_checked = false;
+                let run_deadline = tokio::time::sleep(timeout.unwrap_or_default());
+                tokio::pin!(run_deadline);
+
+                let exit = loop {
+                    tokio::select! {
+                        exit = wait.next() => break exit,
+                        _ = &mut run_deadline, if timeout.is_some() => {
+                            tracing::warn!(
+                                server = %server,
+                                container = %container.id,
+                                "script timed out, killing container"
+                            );
+                            break None;
+                        }
+                        _ = &mut start_deadline, if !start_checked => {
+                            start_checked = true;
+                            let never_started = match docker
+                                .inspect_container_settled(&container.id, None)
+                                .await
+                            {
+                                Ok(inspect) => {
+                                    inspect.state.and_then(|state| state.status)
+                                        == Some(bollard::plugin::ContainerStateStatusEnum::CREATED)
+                                }
+                                Err(DockerResponseServerError {
+                                    status_code: 404, ..
+                                }) => true,
+                                Err(_) => false,
+                            };
+                            if never_started {
+                                break None;
+                            }
+                        }
+                    }
+                };
+
+                if let Some(Err(err)) = exit {
                     tracing::error!(
                         server = %server,
                         container = %container.id,
@@ -3485,6 +3550,8 @@ impl super::ServerExecutor for DockerExecutor {
                         err
                     );
                 }
+
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
             }
         });
 

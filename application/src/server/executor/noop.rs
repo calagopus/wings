@@ -64,6 +64,7 @@ impl ServerExecutor for NoopExecutor {
         &self,
         _server: &crate::server::Server,
         _script: &crate::server::installation::InstallationScript,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error> {
         Self::unsupported()
     }
