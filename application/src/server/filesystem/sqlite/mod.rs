@@ -142,7 +142,7 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
 }
 
 pub fn run_query(
-    connection: &Connection,
+    connection: &mut Connection,
     sql: &str,
     max_rows: usize,
 ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
@@ -164,7 +164,7 @@ fn truncate_error(error: rusqlite::Error) -> rusqlite::Error {
 }
 
 fn execute_query(
-    connection: &Connection,
+    connection: &mut Connection,
     sql: &str,
     max_rows: usize,
 ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
@@ -193,7 +193,6 @@ fn execute_query(
 
         let columns: Vec<QueryColumn> = statement
             .columns()
-            .iter()
             .map(|column| {
                 let type_name = column.decl_type().unwrap_or_default();
 
@@ -298,14 +297,14 @@ mod tests {
     }
 
     fn query(
-        connection: &Connection,
+        connection: &mut Connection,
         sql: &str,
         max_rows: usize,
     ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
         run_query(connection, sql, max_rows)
     }
 
-    fn assert_denied(connection: &Connection, sql: &str) {
+    fn assert_denied(connection: &mut Connection, sql: &str) {
         match query(connection, sql, 100) {
             Err(rusqlite::Error::SqliteFailure(error, _)) => {
                 assert_eq!(
@@ -346,7 +345,7 @@ mod tests {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             OpenFlags::SQLITE_OPEN_READ_WRITE,
         ] {
-            let connection = open_db(&path, flags);
+            let mut connection = open_db(&path, flags);
             assert!(
                 connection
                     .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
@@ -358,23 +357,23 @@ mod tests {
                     .unwrap()
             );
 
-            let results = query(&connection, "PRAGMA mmap_size", 100).unwrap();
+            let results = query(&mut connection, "PRAGMA mmap_size", 100).unwrap();
             assert_eq!(values(results.last().unwrap()), [[Some("0")]]);
-            let results = query(&connection, "PRAGMA temp_store", 100).unwrap();
+            let results = query(&mut connection, "PRAGMA temp_store", 100).unwrap();
             assert_eq!(values(results.last().unwrap()), [[Some("2")]]);
         }
 
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
         assert!(
             query(
-                &connection,
+                &mut connection,
                 "PRAGMA writable_schema = ON; \
                  UPDATE sqlite_schema SET sql = 'CREATE TABLE seed(y)' WHERE name = 'seed'",
                 100,
             )
             .is_err()
         );
-        let results = query(&connection, "SELECT sql FROM sqlite_schema", 100).unwrap();
+        let results = query(&mut connection, "SELECT sql FROM sqlite_schema", 100).unwrap();
         assert_eq!(
             values(results.last().unwrap()),
             [[Some("CREATE TABLE seed(x)")]]
@@ -385,7 +384,7 @@ mod tests {
     fn rejects_mmap_and_temp_store_pragmas() {
         let dir = tempfile::tempdir().unwrap();
         let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         for sql in [
             "PRAGMA mmap_size = 268435456",
@@ -395,12 +394,12 @@ mod tests {
             "PRAGMA temp_store = 1",
             "PRAGMA Temp_Store(DEFAULT)",
         ] {
-            assert_denied(&connection, sql);
+            assert_denied(&mut connection, sql);
         }
 
-        let results = query(&connection, "PRAGMA mmap_size", 100).unwrap();
+        let results = query(&mut connection, "PRAGMA mmap_size", 100).unwrap();
         assert_eq!(values(results.last().unwrap()), [[Some("0")]]);
-        let results = query(&connection, "PRAGMA temp_store", 100).unwrap();
+        let results = query(&mut connection, "PRAGMA temp_store", 100).unwrap();
         assert_eq!(values(results.last().unwrap()), [[Some("2")]]);
     }
 
@@ -410,10 +409,10 @@ mod tests {
     fn allows_normal_read_write_workflow() {
         let dir = tempfile::tempdir().unwrap();
         let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         let results = query(
-            &connection,
+            &mut connection,
             "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT); \
              INSERT INTO t(name) VALUES ('a'), ('b'); \
              SELECT id, name FROM t ORDER BY id",
@@ -438,7 +437,7 @@ mod tests {
         assert!(!select.truncated);
 
         let results = query(
-            &connection,
+            &mut connection,
             "PRAGMA user_version = 3; PRAGMA user_version",
             100,
         )
@@ -446,8 +445,8 @@ mod tests {
         assert_eq!(values(results.last().unwrap()), [[Some("3")]]);
 
         drop(connection);
-        let reader = open_db(&path, OpenFlags::SQLITE_OPEN_READ_ONLY);
-        let results = query(&reader, "SELECT name FROM t ORDER BY id", 100).unwrap();
+        let mut reader = open_db(&path, OpenFlags::SQLITE_OPEN_READ_ONLY);
+        let results = query(&mut reader, "SELECT name FROM t ORDER BY id", 100).unwrap();
         assert_eq!(values(results.last().unwrap()), [[Some("a")], [Some("b")]]);
     }
 
@@ -457,11 +456,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
         let v_of = |id: i64| (id * 7919) % 100_003;
 
         query(
-            &connection,
+            &mut connection,
             "CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT); \
              WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300000) \
              INSERT INTO t SELECT i, i % 100, (i * 7919) % 100003, printf('%06d', i) FROM c",
@@ -476,7 +475,12 @@ mod tests {
             .take(3)
             .map(|(_, id)| vec![Some(id.to_string())])
             .collect();
-        let results = query(&connection, "SELECT id FROM t ORDER BY v DESC, id DESC", 3).unwrap();
+        let results = query(
+            &mut connection,
+            "SELECT id FROM t ORDER BY v DESC, id DESC",
+            3,
+        )
+        .unwrap();
         let select = results.last().unwrap();
         assert!(select.truncated);
         assert_eq!(
@@ -508,7 +512,7 @@ mod tests {
             })
             .collect();
         let results = query(
-            &connection,
+            &mut connection,
             "SELECT g, count(*), sum(v), min(v), max(v) FROM t GROUP BY g ORDER BY g",
             1000,
         )
@@ -526,7 +530,7 @@ mod tests {
 
         let last_per_group: i64 = groups.iter().map(|group| group.4).sum();
         let results = query(
-            &connection,
+            &mut connection,
             "SELECT sum(v - prev) FROM \
              (SELECT v, lag(v, 1, 0) OVER (PARTITION BY g ORDER BY id) AS prev FROM t)",
             100,
@@ -541,7 +545,7 @@ mod tests {
             .map(v_of)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        let results = query(&connection, "SELECT count(DISTINCT v) FROM t", 100).unwrap();
+        let results = query(&mut connection, "SELECT count(DISTINCT v) FROM t", 100).unwrap();
         assert_eq!(
             values(results.last().unwrap()),
             [[Some(distinct.to_string().as_str())]]
@@ -549,7 +553,7 @@ mod tests {
 
         let concat_len = ROWS * 6 + (ROWS - 1);
         let results = query(
-            &connection,
+            &mut connection,
             "SELECT length(group_concat(s, ',')) FROM (SELECT s FROM t ORDER BY s DESC)",
             100,
         )
@@ -567,7 +571,7 @@ mod tests {
         let raised = format!("x{}", "é".repeat(500_000));
 
         let result = run_query(
-            &open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+            &mut open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
             "CREATE TABLE t(x); \
              CREATE TRIGGER boom BEFORE INSERT ON t BEGIN \
              SELECT RAISE(ABORT, 'x' || replace(hex(zeroblob(500000)), '00', 'é')); END; \
@@ -585,7 +589,7 @@ mod tests {
         }
 
         let result = run_query(
-            &open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+            &mut open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
             "SELECT * FROM missing",
             100,
         );
@@ -607,7 +611,7 @@ mod tests {
         let target = dir.path().join("tmp");
         std::fs::create_dir(&target).unwrap();
         let target = target.to_str().unwrap();
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         for sql in [
             format!("PRAGMA temp_store_directory = '{target}'"),
@@ -616,10 +620,10 @@ mod tests {
             format!("PRAGMA Temp_Store_Directory('{target}')"),
             format!("PRAGMA data_store_directory = '{target}'"),
         ] {
-            assert_denied(&connection, &sql);
+            assert_denied(&mut connection, &sql);
         }
 
-        query(&connection, "PRAGMA temp_store_directory", 100).unwrap();
+        query(&mut connection, "PRAGMA temp_store_directory", 100).unwrap();
     }
 
     #[test]
@@ -631,7 +635,7 @@ mod tests {
         let created = dir.path().join("created.db");
         let created_str = created.to_str().unwrap();
         let relative = "wings-sqlite-attach-test.db";
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         for sql in [
             format!("ATTACH '{other}' AS o"),
@@ -644,15 +648,15 @@ mod tests {
             "ATTACH 'file::memory:?cache=shared' AS m".to_string(),
             "ATTACH 'file:x?vfs=memdb' AS m".to_string(),
         ] {
-            assert_denied(&connection, &sql);
+            assert_denied(&mut connection, &sql);
         }
 
         assert!(!created.exists());
         assert!(!Path::new(relative).exists());
 
-        query(&connection, "ATTACH '' AS s; DETACH s", 100).unwrap();
+        query(&mut connection, "ATTACH '' AS s; DETACH s", 100).unwrap();
         let results = query(
-            &connection,
+            &mut connection,
             "ATTACH ':memory:' AS m; CREATE TABLE m.t(x); INSERT INTO m.t VALUES (7); \
              SELECT x FROM m.t; DETACH m",
             100,
@@ -672,17 +676,17 @@ mod tests {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             OpenFlags::SQLITE_OPEN_READ_WRITE,
         ] {
-            let connection = open_db(&path, flags);
-            assert_denied(&connection, &format!("VACUUM INTO '{target_str}'"));
+            let mut connection = open_db(&path, flags);
+            assert_denied(&mut connection, &format!("VACUUM INTO '{target_str}'"));
             assert_denied(
-                &connection,
+                &mut connection,
                 &format!("VACUUM main INTO 'file:{target_str}'"),
             );
             assert!(!target.exists());
         }
 
         query(
-            &open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
+            &mut open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE),
             "VACUUM",
             100,
         )
@@ -693,15 +697,15 @@ mod tests {
     fn ignores_raising_sort_worker_threads() {
         let dir = tempfile::tempdir().unwrap();
         let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         for sql in [
             "PRAGMA threads = 8",
             "PRAGMA THREADS(2)",
             "PRAGMA main.threads = 1",
         ] {
-            query(&connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
-            let results = query(&connection, "PRAGMA threads", 100).unwrap();
+            query(&mut connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let results = query(&mut connection, "PRAGMA threads", 100).unwrap();
             assert_eq!(values(results.last().unwrap()), [[Some("0")]], "{sql}");
         }
 
@@ -715,7 +719,7 @@ mod tests {
             "PRAGMA journal_mode = DELETE",
             "ATTACH ':memory:' AS m",
         ] {
-            query(&connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            query(&mut connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 
@@ -723,7 +727,7 @@ mod tests {
     fn denies_setting_process_wide_heap_limits() {
         let dir = tempfile::tempdir().unwrap();
         let path = seeded_db(dir.path(), "main.db");
-        let connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let mut connection = open_db(&path, OpenFlags::SQLITE_OPEN_READ_WRITE);
 
         // SAFETY: a negative argument only queries the current limit.
         let limits = || unsafe {
@@ -742,19 +746,19 @@ mod tests {
             "PRAGMA Soft_Heap_Limit(0)",
             "PRAGMA soft_heap_limit = 65536",
         ] {
-            assert_denied(&connection, sql);
+            assert_denied(&mut connection, sql);
             assert_eq!(limits(), before, "{sql}");
         }
 
         for sql in ["PRAGMA hard_heap_limit", "PRAGMA soft_heap_limit"] {
-            query(&connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            query(&mut connection, sql, 100).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
 
         for sql in [
             "SELECT * FROM pragma_hard_heap_limit(1)",
             "SELECT * FROM pragma_soft_heap_limit(1)",
         ] {
-            let _ = query(&connection, sql, 100);
+            let _ = query(&mut connection, sql, 100);
             assert_eq!(limits(), before, "{sql}");
         }
     }

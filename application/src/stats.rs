@@ -91,12 +91,20 @@ impl Default for StatsManager {
 
             move || {
                 let refresh_kind = sysinfo::RefreshKind::nothing()
-                    .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_cpu(sysinfo::CpuRefreshKind::nothing().with_usage())
                     .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram());
 
-                let mut sys = System::new_with_specifics(refresh_kind);
-                let mut disks = Disks::new_with_refreshed_list();
-                let mut networks = Networks::new_with_refreshed_list();
+                let (mut sys, mut disks, mut networks) = match (
+                    System::new_with_specifics(refresh_kind),
+                    Disks::new_with_refreshed_list(),
+                    Networks::new_with_refreshed_list(),
+                ) {
+                    (Ok(sys), Ok(disks), Ok(networks)) => (sys, disks, networks),
+                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                        tracing::error!("failed to initialize system stats sampler: {:?}", err);
+                        return;
+                    }
+                };
 
                 let cpu_model = sys
                     .cpus()
@@ -106,7 +114,7 @@ impl Default for StatsManager {
                 let refresh = |sys: &mut System, disks: &mut Disks, networks: &mut Networks| {
                     sys.refresh_specifics(refresh_kind);
                     networks.refresh(true);
-                    for disk in disks.list_mut() {
+                    for disk in disks.iter_mut() {
                         if disk.mount_point() == Path::new("/") {
                             disk.refresh();
                         }

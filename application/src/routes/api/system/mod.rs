@@ -60,7 +60,8 @@ mod get {
         ApiResponse::new_serialized(Response {
             architecture: std::env::consts::ARCH,
             cpu_count: rayon::current_num_threads(),
-            kernel_version: sysinfo::System::kernel_long_version(),
+            kernel_version: sysinfo::System::kernel_long_version()
+                .unwrap_or_else(|_| "unknown".to_string()),
             os: std::env::consts::OS,
             version: &state.version,
             bandwidth: BandwidthStatus {

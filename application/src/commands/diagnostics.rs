@@ -70,7 +70,8 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 write_line(
                     &mut output,
                     "kernel",
-                    &sysinfo::System::kernel_long_version(),
+                    &sysinfo::System::kernel_long_version()
+                        .unwrap_or_else(|_| "unknown".to_string()),
                 )?;
                 write_line(
                     &mut output,

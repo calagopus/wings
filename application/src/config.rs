@@ -2110,12 +2110,12 @@ impl Config {
             return Ok(());
         }
 
-        let users = sysinfo::Users::new_with_refreshed_list();
+        let users = sysinfo::Users::new_with_refreshed_list()?;
 
         if cfg.system.user.rootless.enabled
             && let Ok(current_pid) = sysinfo::get_current_pid()
         {
-            let mut sys = sysinfo::System::new_all();
+            let mut sys = sysinfo::System::new_all()?;
             sys.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[current_pid]),
                 false,
@@ -2147,7 +2147,7 @@ impl Config {
         }
 
         let mut found_user = false;
-        for user in users.list() {
+        for user in users.iter() {
             if user.name() == cfg.system.username {
                 cfg.system.user.uid = **user.id();
                 cfg.system.user.gid = *user.group_id();
@@ -2206,13 +2206,9 @@ impl Config {
             );
         }
 
-        let users = sysinfo::Users::new_with_refreshed_list();
+        let users = sysinfo::Users::new_with_refreshed_list()?;
 
-        let Some(user) = users
-            .list()
-            .iter()
-            .find(|u| u.name() == cfg.system.username)
-        else {
+        let Some(user) = users.iter().find(|u| u.name() == cfg.system.username) else {
             return Err(anyhow::anyhow!(
                 "failed to find user {} after creating it",
                 cfg.system.username

@@ -327,14 +327,28 @@ impl Server {
         let mut usage_rx = self.resource_usage.subscribe();
 
         tokio::spawn(async move {
-            let mut throttle = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
+            let period = std::time::Duration::from_secs(1);
+            let mut throttle = tokio::time::interval_at(
+                tokio::time::Instant::from_std(
+                    crate::utils::next_aligned_instant(period) + period / 2,
+                ),
+                period,
+            );
+            throttle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             while usage_rx.changed().await.is_ok() {
+                let mut deadline = throttle.tick().await;
+                if deadline.elapsed() >= period {
+                    deadline = throttle.tick().await;
+                }
+
                 let Some(server) = weak.upgrade() else {
                     break;
                 };
 
-                let mut usage = *usage_rx.borrow_and_update();
+                let mut usage = usage_rx
+                    .borrow_and_update()
+                    .with_uptime_at(deadline.into_std());
                 usage.state = server.state.get_state();
 
                 server
@@ -347,9 +361,6 @@ impl Server {
                         .build(),
                     )
                     .ok();
-                drop(server);
-
-                throttle.tick().await;
             }
         });
     }
@@ -855,7 +866,10 @@ impl Server {
     }
 
     pub fn resource_usage(&self) -> resources::ResourceUsage {
-        let mut usage = *self.resource_usage.borrow();
+        let mut usage = self
+            .resource_usage
+            .borrow()
+            .with_uptime_at(std::time::Instant::now());
         usage.state = self.state.get_state();
 
         usage

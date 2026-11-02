@@ -19,16 +19,19 @@ fn is_assignable_ip(ip: &IpAddr) -> bool {
 
 pub async fn assignable_host_ips(
     docker_network_name: String,
-) -> Result<BTreeSet<IpAddr>, tokio::task::JoinError> {
-    let networks = tokio::task::spawn_blocking(sysinfo::Networks::new_with_refreshed_list).await?;
+) -> Result<BTreeSet<IpAddr>, anyhow::Error> {
+    let networks =
+        tokio::task::spawn_blocking(sysinfo::Networks::new_with_refreshed_list).await??;
 
     Ok(networks
         .iter()
         .filter(|(name, _)| {
-            *name != &docker_network_name
-                && !name.starts_with("docker")
-                && !name.starts_with("br-")
-                && !name.starts_with("veth")
+            let name = name.as_encoded_bytes();
+
+            name != docker_network_name.as_bytes()
+                && !name.starts_with(b"docker")
+                && !name.starts_with(b"br-")
+                && !name.starts_with(b"veth")
         })
         .flat_map(|(_, data)| data.ip_networks())
         .map(|network| network.addr)

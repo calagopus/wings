@@ -8,7 +8,7 @@ use crate::{
 };
 use russh::{
     Channel, ChannelId, Disconnect, MethodSet, Pty,
-    server::{Auth, Msg, Session},
+    server::{Auth, Msg, Session, VerifiedPublicKey},
 };
 use serde_json::json;
 use std::{
@@ -196,12 +196,12 @@ impl russh::server::Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         username: &str,
-        public_key: &russh::keys::ssh_key::PublicKey,
+        key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.authenticate(
             AuthenticationType::PublicKey,
             username,
-            &public_key.to_openssh()?,
+            &key.public_key.to_openssh()?,
         )
         .await
     }

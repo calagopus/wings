@@ -267,7 +267,7 @@ mod post {
             } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
 
-            let (connection, interrupt) =
+            let (mut connection, interrupt) =
                 match tokio::task::spawn_blocking(move || -> Result<_, rusqlite::Error> {
                     let connection = sqlite::open(&canonical, flags)?;
                     connection.busy_timeout(sqlite::QUERY_BUSY_TIMEOUT)?;
@@ -287,7 +287,7 @@ mod post {
             });
 
             let results = tokio::task::spawn_blocking(move || {
-                sqlite::run_query(&connection, &data.query, max_rows)
+                sqlite::run_query(&mut connection, &data.query, max_rows)
             })
             .await?;
             watchdog.abort();

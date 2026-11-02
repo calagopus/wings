@@ -113,12 +113,12 @@ fn query_database(
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
 
     // a bare name starting with `file:` would be parsed as a URI, the prefix keeps it a path
-    let connection = super::open(&Path::new(".").join(file_name), flags)?;
+    let mut connection = super::open(&Path::new(".").join(file_name), flags)?;
     // SAFETY: sqlite3_hard_heap_limit64 takes one i64 and only sets a process-wide limit.
     unsafe { ffi::sqlite3_hard_heap_limit64(QUERY_MEMORY_LIMIT as i64) };
     connection.busy_timeout(QUERY_BUSY_TIMEOUT)?;
 
-    super::run_query(&connection, query, max_rows)
+    super::run_query(&mut connection, query, max_rows)
 }
 
 pub enum QueryOutcome {

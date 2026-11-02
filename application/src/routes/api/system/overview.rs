@@ -65,7 +65,7 @@ mod get {
         (status = OK, body = inline(Response)),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let mut sys = System::new_all();
+        let mut sys = System::new_all()?;
         sys.refresh_cpu_all();
 
         let used_bytes_process = match crate::utils::process_memory_usage() {
@@ -134,7 +134,7 @@ mod get {
             },
             servers,
             architecture: std::env::consts::ARCH,
-            kernel_version: System::kernel_long_version(),
+            kernel_version: System::kernel_long_version().unwrap_or_else(|_| "unknown".to_string()),
             upgrade,
         })
         .ok()

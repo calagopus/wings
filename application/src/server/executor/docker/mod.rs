@@ -1993,6 +1993,7 @@ impl DockerProcessHandle {
             struct CachedState {
                 status: Option<bollard::plugin::ContainerStateStatusEnum>,
                 started_at: Option<chrono::DateTime<chrono::Utc>>,
+                started_instant: Option<std::time::Instant>,
                 exit_code: i32,
                 oom_killed: bool,
                 cpu_limit: u32,
@@ -2076,13 +2077,29 @@ impl DockerProcessHandle {
                     }
                     let host_config = inspect.host_config.unwrap_or_default();
 
+                    let started_at = state.started_at.as_deref().and_then(|started_at| {
+                        chrono::DateTime::parse_from_rfc3339(started_at)
+                            .ok()
+                            .map(|started_at| started_at.with_timezone(&chrono::Utc))
+                    });
+                    let started_instant = match &cached {
+                        Some(previous) if previous.started_at == started_at => {
+                            previous.started_instant
+                        }
+                        _ => started_at.map(|started_at| {
+                            let now = std::time::Instant::now();
+                            let elapsed = (chrono::Utc::now() - started_at)
+                                .to_std()
+                                .unwrap_or_default();
+
+                            now.checked_sub(elapsed).unwrap_or(now)
+                        }),
+                    };
+
                     cached = Some(CachedState {
                         status: state.status,
-                        started_at: state.started_at.as_deref().and_then(|started_at| {
-                            chrono::DateTime::parse_from_rfc3339(started_at)
-                                .ok()
-                                .map(|started_at| started_at.with_timezone(&chrono::Utc))
-                        }),
+                        started_at,
+                        started_instant,
                         exit_code: state.exit_code.or(wait_exit_code).unwrap_or(-1) as i32,
                         oom_killed: state.oom_killed.unwrap_or(false),
                         cpu_limit: cgroup::CpuCgroup::limit_percent(
@@ -2098,19 +2115,16 @@ impl DockerProcessHandle {
 
                 let process_status = match state.status {
                     Some(bollard::plugin::ContainerStateStatusEnum::RUNNING) => {
-                        if publish_resource_usage && let Some(started_at) = state.started_at {
-                            let uptime = chrono::Utc::now()
-                                .signed_duration_since(started_at)
-                                .num_milliseconds()
-                                .max(0) as u64;
-
+                        if publish_resource_usage
+                            && let Some(started_instant) = state.started_instant
+                        {
                             let limit = match state_boosted_limit.load(Ordering::Relaxed) {
                                 0 => state.cpu_limit,
                                 boosted => boosted,
                             };
 
                             state_usage.send_modify(|usage| {
-                                usage.uptime = uptime;
+                                usage.started_at = Some(started_instant);
                                 usage.cpu_limit_absolute = if limit > 0 {
                                     limit
                                 } else {
@@ -2134,7 +2148,7 @@ impl DockerProcessHandle {
                     }
                     _ => {
                         if publish_resource_usage {
-                            state_usage.send_modify(|usage| usage.uptime = 0);
+                            state_usage.send_if_modified(|usage| usage.started_at.take().is_some());
                         }
                         super::ProcessStatus::Stopped {
                             exit_code: state.exit_code,
