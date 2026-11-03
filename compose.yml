@@ -1,6 +1,6 @@
 services:
   wings:
-    image: ghcr.io/calagopus/wings:latest
+    image: calagopus/wings:latest
     restart: unless-stopped
     environment:
       TZ: "Europe/Berlin"

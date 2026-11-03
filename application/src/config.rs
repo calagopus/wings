@@ -671,7 +671,7 @@ fn tundra_image() -> String {
     "debian:trixie-slim".to_string()
 }
 fn tundra_source_image() -> String {
-    "ghcr.io/calagopus/tundra:latest".to_string()
+    "calagopus/tundra:latest".to_string()
 }
 fn tundra_metrics_port() -> u16 {
     7101
