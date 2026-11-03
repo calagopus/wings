@@ -783,6 +783,20 @@ impl CapFilesystem {
         Ok(content)
     }
 
+    pub fn read_to_vec(
+        &self,
+        path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(self.open(path)?, limit as u64),
+            &mut content,
+        )?;
+
+        Ok(content)
+    }
+
     pub async fn async_open(
         &self,
         path: impl AsRef<Path>,

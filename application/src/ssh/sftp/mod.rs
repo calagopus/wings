@@ -32,6 +32,7 @@ pub struct FileHandle {
 
     file: Arc<Mutex<crate::server::filesystem::file::ServerFile>>,
     append: bool,
+    eof_at: Option<u64>,
 
     diff_track: bool,
     diff_before: Option<Vec<u8>>,
@@ -182,6 +183,11 @@ impl SftpSession {
             || server
                 .user_permissions
                 .is_ignored(server, user_uuid, path, file_type)
+    }
+
+    #[inline]
+    fn may_ignore_server(server: &crate::server::Server, user_uuid: uuid::Uuid) -> bool {
+        server.filesystem.may_ignore() || server.user_permissions.has_ignored_files(user_uuid)
     }
 
     #[inline]
@@ -425,6 +431,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
             move || {
                 let mut files = Vec::new();
+                let may_ignore = Self::may_ignore_server(&server, user_uuid);
                 let mut dir = dir.lock();
 
                 loop {
@@ -445,12 +452,14 @@ impl russh_sftp::server::Handler for SftpSession {
                         Err(_) => continue,
                     };
 
-                    if Self::is_ignored_server(
-                        &server,
-                        user_uuid,
-                        &path,
-                        metadata.file_type().into(),
-                    ) {
+                    if may_ignore
+                        && Self::is_ignored_server(
+                            &server,
+                            user_uuid,
+                            &path,
+                            metadata.file_type().into(),
+                        )
+                    {
                         continue;
                     }
 
@@ -941,13 +950,14 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let handle = match self.handles.get(handle.as_str()) {
+        let handle = match self.handles.get_mut(handle.as_str()) {
             Some(ServerHandle::File(handle)) => handle,
             _ => return Err(StatusCode::NoSuchFile),
         };
+        handle.eof_at = None;
+        let path = handle.path.to_string_lossy().to_string();
 
-        self.setstat(id, handle.path.to_string_lossy().to_string(), attrs)
-            .await
+        self.setstat(id, path, attrs).await
     }
 
     async fn stat(
@@ -1210,107 +1220,86 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let (path, metadata) = tokio::task::spawn_blocking({
+        let is_write = pflags.contains(OpenFlags::WRITE)
+            || pflags.contains(OpenFlags::APPEND)
+            || pflags.contains(OpenFlags::CREATE)
+            || pflags.contains(OpenFlags::TRUNCATE);
+
+        let (read_only, history_enabled, file_size_cap, log_file_reads) = {
+            let config = self.state.config.load();
+            (
+                config.system.sftp.read_only,
+                config.system.file_history.enabled,
+                config.system.file_history.file_size_cap,
+                config.system.sftp.activity.log_file_reads,
+            )
+        };
+
+        let (path, file, diff_track, diff_before) = tokio::task::spawn_blocking({
             let server = self.server.clone();
+            let user_uuid = self.user_uuid;
 
             move || {
                 let path = server
                     .filesystem
                     .canonicalize(&filename)
                     .unwrap_or_else(|_| server.filesystem.canonicalize_parent(&filename));
-                let metadata = server.filesystem.symlink_metadata(&path);
 
-                (path, metadata)
-            }
-        })
-        .await
-        .map_err(|_| StatusCode::Failure)?;
+                let pre_size = match server.filesystem.symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        if !metadata.is_file() {
+                            return Err(StatusCode::NoSuchFile);
+                        }
 
-        let pre_size = match metadata {
-            Ok(metadata) => {
-                if !metadata.is_file() {
+                        Some(metadata.len())
+                    }
+                    Err(_) => {
+                        if !pflags.contains(OpenFlags::CREATE) {
+                            return Err(StatusCode::NoSuchFile);
+                        }
+
+                        None
+                    }
+                };
+
+                let may_ignore = Self::may_ignore_server(&server, user_uuid);
+                if may_ignore && Self::is_ignored_server(&server, user_uuid, &path, FileType::File)
+                {
                     return Err(StatusCode::NoSuchFile);
                 }
 
-                Some(metadata.len())
-            }
-            Err(_) => {
-                if !pflags.contains(OpenFlags::CREATE) {
-                    return Err(StatusCode::NoSuchFile);
+                if is_write && read_only {
+                    return Err(StatusCode::PermissionDenied);
                 }
 
-                None
-            }
-        };
+                let mut diff_track = is_write
+                    && history_enabled
+                    && matches!(pre_size, Some(size) if size > 0 && size <= file_size_cap);
 
-        if self.async_is_ignored(&path, FileType::File).await {
-            return Err(StatusCode::NoSuchFile);
-        }
-
-        let is_write = pflags.contains(OpenFlags::WRITE)
-            || pflags.contains(OpenFlags::APPEND)
-            || pflags.contains(OpenFlags::CREATE)
-            || pflags.contains(OpenFlags::TRUNCATE);
-
-        if is_write && self.state.config.load().system.sftp.read_only {
-            return Err(StatusCode::PermissionDenied);
-        }
-
-        let (history_enabled, file_size_cap) = {
-            let config = self.state.config.load();
-            (
-                config.system.file_history.enabled,
-                config.system.file_history.file_size_cap,
-            )
-        };
-
-        let mut diff_track = is_write
-            && history_enabled
-            && matches!(pre_size, Some(size) if size > 0 && size <= file_size_cap);
-
-        let diff_before = if diff_track {
-            match self
-                .server
-                .filesystem
-                .async_read_to_vec(&path, (file_size_cap + 1) as usize)
-                .await
-            {
-                Ok(before) if before.len() as u64 <= file_size_cap => Some(before),
-                Ok(_) => {
-                    diff_track = false;
+                let diff_before = if diff_track {
+                    match server
+                        .filesystem
+                        .read_to_vec(&path, (file_size_cap + 1) as usize)
+                    {
+                        Ok(before) if before.len() as u64 <= file_size_cap => Some(before),
+                        Ok(_) => {
+                            diff_track = false;
+                            None
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                server = %server.uuid,
+                                path = %path.display(),
+                                "diff: sftp failed to read pre-edit content: {err}"
+                            );
+                            diff_track = false;
+                            None
+                        }
+                    }
+                } else {
                     None
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        server = %self.server.uuid,
-                        path = %path.display(),
-                        "diff: sftp failed to read pre-edit content: {err}"
-                    );
-                    diff_track = false;
-                    None
-                }
-            }
-        } else {
-            None
-        };
+                };
 
-        let mut activity_event = None;
-        if pflags.contains(OpenFlags::TRUNCATE) || pflags.contains(OpenFlags::CREATE) {
-            activity_event = Some(ActivityEvent::SftpCreate);
-        } else if pflags.contains(OpenFlags::WRITE) || pflags.contains(OpenFlags::APPEND) {
-            activity_event = Some(ActivityEvent::SftpWrite);
-        } else if pflags.contains(OpenFlags::READ)
-            && self.state.config.load().system.sftp.activity.log_file_reads
-        {
-            activity_event = Some(ActivityEvent::SftpRead);
-        }
-
-        let file = tokio::task::spawn_blocking({
-            let server = self.server.clone();
-            let user_uuid = self.user_uuid;
-            let path = path.clone();
-
-            move || {
                 let mut open_options = OpenOptions::new();
                 if pflags.contains(OpenFlags::READ) {
                     open_options.read(true);
@@ -1336,24 +1325,27 @@ impl russh_sftp::server::Handler for SftpSession {
                     pflags.contains(OpenFlags::TRUNCATE),
                     |file| {
                         #[cfg(target_os = "linux")]
-                        if Self::is_ignored_server(
-                            &server,
-                            user_uuid,
-                            &server.filesystem.opened_relative_path(file)?,
-                            FileType::File,
-                        ) {
+                        if may_ignore
+                            && Self::is_ignored_server(
+                                &server,
+                                user_uuid,
+                                &server.filesystem.opened_relative_path(file)?,
+                                FileType::File,
+                            )
+                        {
                             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
                         }
                         #[cfg(not(target_os = "linux"))]
-                        let _ = (user_uuid, file);
+                        let _ = file;
 
                         Ok(())
                     },
                 )
-                .map_err(std::io::Error::other)?;
+                .map_err(|_| StatusCode::Failure)?;
 
                 if pflags.contains(OpenFlags::APPEND) {
-                    file.seek(SeekFrom::End(0))?;
+                    file.seek(SeekFrom::End(0))
+                        .map_err(|_| StatusCode::Failure)?;
                 }
 
                 if pflags.contains(OpenFlags::CREATE)
@@ -1362,12 +1354,20 @@ impl russh_sftp::server::Handler for SftpSession {
                     tracing::warn!("failed to chown new file: {:?}", err);
                 }
 
-                Ok::<_, std::io::Error>(file)
+                Ok((path, file, diff_track, diff_before))
             }
         })
         .await
-        .map_err(|_| StatusCode::Failure)?
-        .map_err(|_| StatusCode::Failure)?;
+        .map_err(|_| StatusCode::Failure)??;
+
+        let mut activity_event = None;
+        if pflags.contains(OpenFlags::TRUNCATE) || pflags.contains(OpenFlags::CREATE) {
+            activity_event = Some(ActivityEvent::SftpCreate);
+        } else if pflags.contains(OpenFlags::WRITE) || pflags.contains(OpenFlags::APPEND) {
+            activity_event = Some(ActivityEvent::SftpWrite);
+        } else if pflags.contains(OpenFlags::READ) && log_file_reads {
+            activity_event = Some(ActivityEvent::SftpRead);
+        }
 
         if let Some(event) = activity_event {
             self.server.activity.log_activity(Activity {
@@ -1394,6 +1394,7 @@ impl russh_sftp::server::Handler for SftpSession {
                 path,
                 file: Arc::new(Mutex::new(file)),
                 append: pflags.contains(OpenFlags::APPEND),
+                eof_at: None,
                 diff_track,
                 diff_before,
                 diff_dirty: false,
@@ -1422,16 +1423,27 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
-        let data = tokio::task::spawn_blocking({
+        if handle.eof_at.take() == Some(offset) {
+            return Err(StatusCode::Eof);
+        }
+
+        let (data, at_eof) = tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
 
-            move || -> Result<Vec<u8>, std::io::Error> {
+            move || -> Result<(Vec<u8>, bool), std::io::Error> {
                 let mut data = crate::io::mem_buffer(len.min(256 * 1024) as usize);
-                let bytes_read = file.lock().read_at(offset, &mut data)?;
+                let file = file.lock();
+                let bytes_read = file.read_at(offset, &mut data)?;
+
+                let at_eof = bytes_read > 0
+                    && bytes_read < data.len()
+                    && file
+                        .metadata()
+                        .is_ok_and(|metadata| offset + bytes_read as u64 >= metadata.len());
 
                 data.truncate(bytes_read);
                 data.shrink_to_fit();
-                Ok(data)
+                Ok((data, at_eof))
             }
         })
         .await
@@ -1440,6 +1452,10 @@ impl russh_sftp::server::Handler for SftpSession {
 
         if data.is_empty() {
             return Err(StatusCode::Eof);
+        }
+
+        if at_eof {
+            handle.eof_at = Some(offset + data.len() as u64);
         }
 
         Ok(Data { id, data })
@@ -1491,6 +1507,7 @@ impl russh_sftp::server::Handler for SftpSession {
         .map_err(|_| StatusCode::Failure)?;
 
         handle.diff_dirty = true;
+        handle.eof_at = None;
 
         Ok(Status {
             id,

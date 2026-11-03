@@ -457,6 +457,13 @@ impl Filesystem {
         self.is_backups_virtual(path) || (!file_type.is_dir() && self.is_mount_gateway(path))
     }
 
+    /// Whether [`Self::is_ignored`] can return true for any path at all.
+    pub fn may_ignore(&self) -> bool {
+        self.config.load().system.backups.mounting.enabled
+            || !self.mount_gateways.load().is_empty()
+            || !self.disk_ignored.load().is_empty()
+    }
+
     /// Whether `path` may not be removed, renamed or replaced at all, also when it is
     /// a directory. Resolves the parent chain so a symlink cannot reach around it.
     pub async fn async_is_protected_path(&self, path: &Path) -> bool {

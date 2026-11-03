@@ -211,6 +211,14 @@ impl ServerFile {
         file.sync_all()
     }
 
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(std::io::Error::other("file is not available"));
+        };
+
+        file.metadata()
+    }
+
     fn allocate_accumulated(&mut self) -> std::io::Result<()> {
         if self.accumulated_bytes != 0 {
             if !self.server.filesystem.allocate_in_path_iterator(
