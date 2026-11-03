@@ -124,6 +124,9 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                     server_manager: Arc::new(crate::server::manager::ServerManager::new(
                         &raw_servers,
                     )),
+                    resource_history: Arc::new(
+                        crate::server::resource_history::ResourceHistory::new(&config),
+                    ),
                     backup_manager: Arc::new(
                         crate::server::backup::manager::BackupManager::default(),
                     ),

@@ -355,19 +355,55 @@ mod post {
                                 };
                                 let mut file = runtime.block_on(file.into_std());
 
+                                let mut written = true;
                                 while let Some(chunk) = runtime.block_on(field.chunk())? {
                                     if let Err(err) = file.write_all(&chunk) {
                                         tracing::error!(
                                             "failed to write file history database chunk: {:#?}",
                                             err
                                         );
+                                        written = false;
                                         break;
                                     }
                                 }
+                                drop(file);
 
-                                if let Err(err) = file.flush() {
+                                if !written {
+                                    runtime.block_on(server.diff.destroy());
+                                }
+                            } else if field.name() == Some("resource-history") {
+                                let path = state.resource_history.import_path(server.uuid);
+                                let mut file = match std::fs::File::create(&path) {
+                                    Ok(file) => file,
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "failed to create resource history database: {:#?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                let mut written = true;
+                                while let Some(chunk) = runtime.block_on(field.chunk())? {
+                                    if let Err(err) = file.write_all(&chunk) {
+                                        tracing::error!(
+                                            "failed to write resource history database chunk: {:#?}",
+                                            err
+                                        );
+                                        written = false;
+                                        break;
+                                    }
+                                }
+                                drop(file);
+
+                                if !written {
+                                    std::fs::remove_file(&path).ok();
+                                } else if let Err(err) =
+                                    runtime.block_on(state.resource_history.import(server.uuid))
+                                {
                                     tracing::error!(
-                                        "failed to flush file history database: {:#?}",
+                                        "failed to import resource history database: {:#?}",
                                         err
                                     );
                                 }

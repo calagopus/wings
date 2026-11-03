@@ -27,6 +27,7 @@ pub mod firewall;
 pub mod installation;
 pub mod manager;
 pub mod permissions;
+pub mod resource_history;
 pub mod resources;
 pub mod schedule;
 pub mod script;
@@ -1790,6 +1791,10 @@ impl Server {
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
         self.diff.close().await;
+        self.app_state
+            .resource_history
+            .delete_server(self.uuid)
+            .await;
 
         tokio::spawn({
             let server = self.clone();

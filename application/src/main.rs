@@ -645,6 +645,9 @@ async fn main_rt() {
         executor,
         stats_manager: Arc::new(crate::stats::StatsManager::default()),
         server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
+        resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
+            &config,
+        )),
         backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
@@ -666,6 +669,8 @@ async fn main_rt() {
             state.server_manager.boot(&state, servers).await;
         }
     });
+
+    tokio::spawn(Arc::clone(&state.resource_history).run(Arc::clone(&state.server_manager)));
 
     #[cfg(unix)]
     if state.tundra.is_some() {

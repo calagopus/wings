@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufWriter, IsTerminal},
     path::{Path, PathBuf},
@@ -343,6 +343,33 @@ fn system_file_history_per_server_disk_budget() -> u64 {
 }
 fn system_file_history_maintenance_interval() -> u64 {
     3600
+}
+
+fn system_resource_history_enabled() -> bool {
+    true
+}
+fn system_resource_history_flush_interval() -> u64 {
+    10
+}
+fn system_resource_history_tiers() -> Vec<ResourceHistoryTier> {
+    vec![
+        ResourceHistoryTier {
+            step: 1,
+            retention: 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 10,
+            retention: 7 * 24 * 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 60,
+            retention: 365 * 24 * 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 10 * 60,
+            retention: 0,
+        },
+    ]
 }
 
 fn system_file_collaboration_enabled() -> bool {
@@ -726,6 +753,14 @@ impl From<String> for SystemPath {
     }
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResourceHistoryTier {
+    /// Width of one bucket in seconds.
+    pub step: u64,
+    /// How long buckets are kept in seconds, `0` keeps them forever.
+    pub retention: u64,
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
@@ -1028,6 +1063,17 @@ nestify::nest! {
 
                 #[serde(default = "system_file_history_maintenance_interval")]
                 pub maintenance_interval: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub resource_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemResourceHistory {
+                #[serde(default = "system_resource_history_enabled")]
+                pub enabled: bool,
+                #[serde(default = "system_resource_history_flush_interval")]
+                pub flush_interval: u64,
+                #[serde(default = "system_resource_history_tiers")]
+                pub tiers: Vec<ResourceHistoryTier>,
             },
 
             #[serde(default)]
@@ -1471,6 +1517,40 @@ nestify::nest! {
         pub ignore_panel_config_updates: bool,
         #[serde(default)]
         pub ignore_panel_wings_upgrades: bool,
+    }
+}
+
+impl SystemResourceHistory {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        let max_tiers = crate::server::resource_history::MAX_TIERS;
+        if self.tiers.len() > max_tiers {
+            return Err(anyhow::anyhow!(
+                "system.resource_history.tiers may contain at most {max_tiers} tiers"
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        for tier in &self.tiers {
+            if tier.step == 0 {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers step must be at least 1 second"
+                ));
+            }
+            if tier.retention != 0 && tier.retention < tier.step {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers retention of the {}s tier must be 0 or at least its step",
+                    tier.step
+                ));
+            }
+            if !seen.insert(tier.step) {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers contains the {}s step more than once",
+                    tier.step
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1946,6 +2026,8 @@ impl Config {
                 "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
             ));
         }
+
+        cfg.system.resource_history.validate()?;
 
         if cfg.remote.is_empty() {
             return Err(anyhow::anyhow!(
@@ -2572,6 +2654,18 @@ mod tests {
         serde_saphyr::from_str(yaml).expect("failed to parse config")
     }
 
+    fn history_with(tiers: &[ResourceHistoryTier]) -> Result<(), anyhow::Error> {
+        SystemResourceHistory {
+            tiers: tiers.to_vec(),
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    fn tier(step: u64, retention: u64) -> ResourceHistoryTier {
+        ResourceHistoryTier { step, retention }
+    }
+
     #[test]
     fn allowed_devices_default_to_empty_and_cannot_be_changed_by_panel_patches() {
         assert!(from_yaml("{}").allowed_devices.is_empty());
@@ -2693,5 +2787,35 @@ mod tests {
 
         assert!(Config::migrate_legacy_limits(&mut cfg));
         assert_eq!(cfg.limits.server_concurrent_pulls, 5);
+    }
+
+    // SystemResourceHistory
+    #[test]
+    fn validate_accepts_valid_lists() {
+        assert!(history_with(&[]).is_ok());
+        assert!(history_with(&[tier(10, 10), tier(60, 0), tier(600, 86400)]).is_ok());
+        assert!(
+            history_with(
+                &(1..=crate::server::resource_history::MAX_TIERS as u64)
+                    .map(|s| tier(s, 0))
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_lists() {
+        assert!(
+            history_with(
+                &(1..=crate::server::resource_history::MAX_TIERS as u64 + 1)
+                    .map(|s| tier(s, 0))
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+        assert!(history_with(&[tier(0, 0)]).is_err());
+        assert!(history_with(&[tier(60, 59)]).is_err());
+        assert!(history_with(&[tier(10, 0), tier(60, 0), tier(10, 100)]).is_err());
     }
 }

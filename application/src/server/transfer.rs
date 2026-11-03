@@ -567,6 +567,40 @@ impl OutgoingServerTransfer {
                 }
             }
 
+            match server
+                .app_state
+                .resource_history
+                .export(server.uuid)
+                .await
+            {
+                Ok(Some(history)) => {
+                    bytes_total.fetch_add(history.metadata().await.map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
+
+                    form = form.part(
+                        "resource-history",
+                        reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                AsyncCountingReader::new_with_bytes_read(
+                                    history,
+                                    Arc::clone(&bytes_archived),
+                                ),
+                                crate::TRANSFER_BUFFER_SIZE,
+                            ),
+                        ))
+                        .file_name("resource_history.db")
+                        .mime_str("application/octet-stream")
+                        .expect("failed to set mime type for resource history"),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to export resource history for transfer: {err:#}"
+                    );
+                }
+            }
+
             let proxy = match reqwest::Url::parse(&url) {
                 Ok(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
                     (Some(host), Some(port)) => {

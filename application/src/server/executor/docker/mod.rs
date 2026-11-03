@@ -1219,13 +1219,13 @@ impl DockerExecutor {
         }
     }
 
-    async fn image_exists(&self, image_name: &str) -> bool {
+    async fn image_exists(&self, image: &str) -> bool {
         self.docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: true,
                 filters: Some(HashMap::from([(
                     "reference".to_string(),
-                    vec![image_name.to_string()],
+                    vec![image.to_string()],
                 )])),
                 ..Default::default()
             }))
@@ -1289,7 +1289,7 @@ impl DockerExecutor {
 
         let registry_auth = registry_credentials(&self.app_config.load(), image);
 
-        if cache_config.background_refresh && self.image_exists(image_name).await {
+        if cache_config.background_refresh && self.image_exists(image).await {
             let entry = {
                 let mut cache = pull_cache.lock();
                 Arc::clone(cache.entry(image.into()).or_default())
@@ -1359,7 +1359,7 @@ impl DockerExecutor {
         if let Some(guard) = &last_pull
             && let Some(pulled_at) = **guard
             && pulled_at.elapsed().as_secs() < cache_config.duration
-            && self.image_exists(image_name).await
+            && self.image_exists(image).await
         {
             tracing::debug!(
                 server = %server.uuid,
@@ -1478,7 +1478,7 @@ impl DockerExecutor {
                         server.log_daemon_error(&format!("failed to pull image: {err}"));
                     }
 
-                    if !self.image_exists(image_name).await {
+                    if !self.image_exists(image).await {
                         return Err(err.into());
                     }
 
