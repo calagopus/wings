@@ -650,6 +650,7 @@ mod tests {
     fn rules() -> BTreeMap<uuid::Uuid, Vec<ConcreteRule>> {
         let spec = FirewallServerSpec {
             server: server(),
+            target: None,
             bindings: vec![
                 FirewallBinding {
                     ip: Some("192.168.1.5".parse().unwrap()),
@@ -730,6 +731,7 @@ mod tests {
     fn render_ruleset_declares_sets_and_matches_them_per_family() {
         let spec = FirewallServerSpec {
             server: server(),
+            target: None,
             bindings: vec![FirewallBinding {
                 ip: None,
                 port: 25565,

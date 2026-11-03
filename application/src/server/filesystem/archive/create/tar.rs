@@ -1,4 +1,4 @@
-use super::ArchiveProgress;
+use super::{ArchiveProgress, append_tar_symlink_literal};
 use crate::{
     io::{
         abort::{AbortGuard, AbortWriter},
@@ -62,11 +62,9 @@ fn append_entry<W: Write>(
     } else if let Ok(link_target) = filesystem.read_link_contents(path) {
         header.set_entry_type(tar::EntryType::Symlink);
 
-        if header.set_link_name(link_target).is_ok() {
-            archive.append_data(&mut header, relative, std::io::empty())?;
-            progress.increment_bytes(metadata.len());
-            progress.increment_files();
-        }
+        append_tar_symlink_literal(archive, &mut header, relative, link_target.as_os_str())?;
+        progress.increment_bytes(metadata.len());
+        progress.increment_files();
     }
 
     Ok(())
@@ -210,6 +208,61 @@ mod tests {
     }
 
     // create_tar
+    #[cfg(unix)]
+    #[test]
+    fn transfer_archive_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let long_target = format!("/{}", "long-segment/".repeat(12));
+        let links = [
+            ("root", "/"),
+            ("double-root", "//"),
+            ("fs25-data", "/home/container"),
+            ("parent", "../target"),
+            ("current", "./target"),
+            ("dangling-absolute", "/missing/absolute"),
+            ("dangling-relative", "../missing-relative"),
+            (".wine/dosdevices/z:", "/"),
+            ("long-target", long_target.as_str()),
+        ];
+
+        for (name, target) in &links {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("link parent"))?;
+            symlink(target, path)?;
+        }
+
+        let bytes = tar_tree_filtered(
+            temp.path(),
+            links.iter().map(|(name, _)| *name).collect(),
+            IsIgnoredFn::default(),
+        )?;
+        let mut archived = HashMap::new();
+
+        for entry in tar::Archive::new(Cursor::new(bytes)).entries()? {
+            let entry = entry?;
+            if entry.header().entry_type().is_symlink() {
+                archived.insert(
+                    entry.path()?.into_owned(),
+                    entry
+                        .link_name_bytes()
+                        .expect("symlink target")
+                        .into_owned(),
+                );
+            }
+        }
+
+        for (name, target) in links {
+            assert_eq!(
+                archived.get(Path::new(name)).map(Vec::as_slice),
+                Some(target.as_bytes())
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn reincluded_subtree_is_archived_without_its_excluded_parents() -> Result<(), anyhow::Error> {
         let temp = tempfile::tempdir()?;

@@ -9,6 +9,8 @@ use crate::{
     },
 };
 use std::{
+    ffi::OsStr,
+    io::Write,
     path::Path,
     sync::{
         Arc,
@@ -28,6 +30,44 @@ pub use pxar::*;
 pub use seven_zip::*;
 pub use tar::*;
 pub use zip::*;
+
+pub(crate) fn append_tar_symlink_literal<W: Write>(
+    archive: &mut ::tar::Builder<W>,
+    header: &mut ::tar::Header,
+    path: &Path,
+    target: &OsStr,
+) -> Result<(), std::io::Error> {
+    let target = target.as_encoded_bytes();
+    if target.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symlink target contains a NUL byte",
+        ));
+    }
+
+    if let Err(error) = header.set_link_name_literal(target) {
+        if target.len() <= 100 {
+            return Err(error);
+        }
+
+        let mut long_link = ::tar::Header::new_gnu();
+        long_link.set_path("././@LongLink")?;
+        long_link.set_mode(0o644);
+        long_link.set_uid(0);
+        long_link.set_gid(0);
+        long_link.set_mtime(0);
+        long_link.set_size(target.len() as u64 + 1);
+        long_link.set_entry_type(::tar::EntryType::GNULongLink);
+        long_link.set_cksum();
+
+        let mut contents = Vec::with_capacity(target.len() + 1);
+        contents.extend_from_slice(target);
+        contents.push(0);
+        archive.append(&long_link, std::io::Cursor::new(contents))?;
+    }
+
+    archive.append_data(header, path, std::io::empty())
+}
 
 fn walk_sources(
     filesystem: &CapFilesystem,

@@ -1541,6 +1541,21 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         Ok(())
     }
 
+    fn create_symlink_contents(
+        &self,
+        contents: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(), anyhow::Error> {
+        let link = self.check_write(FileType::Symlink, link.as_ref(), false)?;
+
+        self.inner.symlink_contents(contents.as_ref(), &link)?;
+        if self.is_primary_server_fs {
+            self.server.filesystem.chown_path(&link)?;
+        }
+
+        Ok(())
+    }
+
     async fn async_create_symlink_contents(
         &self,
         contents: &(dyn AsRef<Path> + Send + Sync),
