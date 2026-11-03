@@ -26,6 +26,7 @@ impl PveHelperProcessHandle {
         start_at_end: bool,
         auto_cleanup: bool,
         cleanup_path: Option<PathBuf>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Self, anyhow::Error> {
         if let Some(parent) = log_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -53,6 +54,7 @@ impl PveHelperProcessHandle {
         let status_server = server.uuid;
         tokio::spawn(async move {
             let mut sent_running = false;
+            let mut timeout_deadline = None;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -66,8 +68,26 @@ impl PveHelperProcessHandle {
                     Ok(cli::ContainerStatus::Running) => {
                         if !sent_running {
                             sent_running = true;
-                            if status_tx.send(super::ProcessStatus::Running).await.is_err() {
-                                break;
+                            timeout_deadline =
+                                timeout.map(|duration| tokio::time::Instant::now() + duration);
+                            status_tx.send(super::ProcessStatus::Running).await.ok();
+                        }
+
+                        if timeout_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            timeout_deadline = None;
+                            tracing::warn!(
+                                server = %status_server,
+                                vmid,
+                                "script timed out, stopping Proxmox helper LXC"
+                            );
+                            if let Err(error) = status_cli.stop(vmid).await {
+                                tracing::warn!(
+                                    server = %status_server,
+                                    vmid,
+                                    "failed to stop timed-out Proxmox helper LXC: {error:#}"
+                                );
                             }
                         }
                     }

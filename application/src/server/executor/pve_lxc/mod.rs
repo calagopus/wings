@@ -2162,6 +2162,7 @@ impl ServerExecutor for PveLxcExecutor {
             false,
             false,
             None,
+            None,
         )
         .await
         {
@@ -2218,6 +2219,7 @@ impl ServerExecutor for PveLxcExecutor {
                 true,
                 false,
                 None,
+                None,
             )
             .await?,
         );
@@ -2250,6 +2252,7 @@ impl ServerExecutor for PveLxcExecutor {
         &self,
         server: &crate::server::Server,
         script: &crate::server::installation::InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error> {
         let (resources, mut environment) = {
             let configuration = server.configuration.read().await;
@@ -2339,6 +2342,7 @@ impl ServerExecutor for PveLxcExecutor {
             false,
             true,
             Some(staging_path.clone()),
+            timeout,
         )
         .await
         {

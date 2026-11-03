@@ -67,6 +67,28 @@ fn installer_entrypoint_has_a_short_generic_network_gate() {
 }
 
 #[test]
+fn dropped_script_status_receiver_does_not_disable_timeout_stop() {
+    let source = include_str!("helper_process.rs");
+    let monitor = source
+        .split("let status_server = server.uuid;")
+        .nth(1)
+        .unwrap()
+        .split("let output_cli = cli.clone();")
+        .next()
+        .unwrap();
+    let after_running_notification = monitor
+        .split("status_tx.send(super::ProcessStatus::Running)")
+        .nth(1)
+        .unwrap()
+        .split("if timeout_deadline")
+        .next()
+        .unwrap();
+
+    assert!(!after_running_notification.contains("break"));
+    assert!(monitor.contains("status_cli.stop(vmid).await"));
+}
+
+#[test]
 fn successful_start_followed_by_first_stopped_probe_emits_stopped() {
     let mut seen_running = false;
     let status = PveProcessHandle::observed_status(
