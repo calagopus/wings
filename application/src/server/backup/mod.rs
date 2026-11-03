@@ -56,6 +56,7 @@ impl BackupStream {
 }
 
 pub type DumpReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+pub type DumpSource = futures::future::BoxFuture<'static, Result<DumpReader, anyhow::Error>>;
 
 const DATABASE_DUMP_EXTENSIONS: &[&str] = &["sql", "archive", "rdb", "dump"];
 
@@ -161,12 +162,12 @@ macro_rules! backup_adapters {
                 uuid: uuid::Uuid,
                 extension: &str,
                 compression: CompressionType,
-                reader: DumpReader,
+                source: DumpSource,
             ) -> Result<RawServerBackup, anyhow::Error> {
                 match self {
                     $(Self::$variant => {
                         <$backup as BackupStreamCreateExt>::create_from_stream(
-                            state, uuid, extension, compression, reader,
+                            state, uuid, extension, compression, source,
                         )
                         .await
                     })*
@@ -328,13 +329,15 @@ pub trait BackupCreateExt {
 
 #[async_trait::async_trait]
 pub trait BackupStreamCreateExt {
-    /// `compression` is the compression `reader` is already encoded with.
+    /// `compression` is the compression the dump `source` yields is already encoded with.
+    /// The source opens the dump stream when awaited, so adapters await it only once their
+    /// setup is done: an opened stream left unread can be cut by the panel or a proxy.
     async fn create_from_stream(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
         compression: CompressionType,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error>;
 }
 

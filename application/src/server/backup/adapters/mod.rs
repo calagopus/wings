@@ -1,7 +1,7 @@
 use crate::{
     io::compression::{CompressionType, reader::AsyncCompressionReader},
     remote::backups::RawServerBackup,
-    server::backup::{Backup, DumpReader},
+    server::backup::{Backup, DumpReader, DumpSource},
 };
 use tokio::io::AsyncReadExt;
 
@@ -145,19 +145,29 @@ impl BackupAdapter {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let (extension, compression) = super::parse_dump_extension(extension)?;
-        let reader = prepare_dump_reader(reader).await?;
 
         // Deduplicating adapters compress chunks themselves, and a compressed
         // stream defeats their content-defined chunking.
-        let (reader, compression) = match self {
-            Self::Wings | Self::S3 => (reader, compression),
-            _ => (decompress_dump(reader, compression), CompressionType::None),
+        let decompress = !matches!(self, Self::Wings | Self::S3);
+        let source: DumpSource = Box::pin(async move {
+            let reader = prepare_dump_reader(source.await?).await?;
+
+            Ok(if decompress {
+                decompress_dump(reader, compression)
+            } else {
+                reader
+            })
+        });
+        let compression = if decompress {
+            CompressionType::None
+        } else {
+            compression
         };
 
-        self.create_from_prepared_stream(state, uuid, extension, compression, reader)
+        self.create_from_prepared_stream(state, uuid, extension, compression, source)
             .await
     }
 }
@@ -167,7 +177,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_dump_is_rejected_before_adapter_creation() {
+    fn empty_dump_is_rejected() {
         tokio_test::block_on(async {
             let result = prepare_dump_reader(Box::new(tokio::io::empty())).await;
             assert!(result.is_err_and(|err| err.to_string().contains("0 bytes")));

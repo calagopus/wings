@@ -4,7 +4,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -712,7 +712,7 @@ impl BackupStreamCreateExt for BtrfsBackup {
         _uuid: uuid::Uuid,
         _extension: &str,
         _compression: crate::io::compression::CompressionType,
-        _reader: DumpReader,
+        _source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         Err(anyhow::anyhow!(
             "btrfs backups snapshot the server dataset and cannot store database dumps"

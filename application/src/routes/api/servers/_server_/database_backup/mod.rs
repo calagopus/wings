@@ -65,7 +65,7 @@ mod post {
                 .await
             {
                 tracing::error!(
-                    "failed to create database backup {} (adapter = {:?}) for {}: {}",
+                    "failed to create database backup {} (adapter = {:?}) for {}: {:#}",
                     data.uuid,
                     data.adapter,
                     server.uuid,

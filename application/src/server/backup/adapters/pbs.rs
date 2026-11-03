@@ -13,7 +13,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::{Archive, StreamableArchiveFormat, create::CreatePxarOptions},
@@ -340,7 +340,7 @@ impl BackupStreamCreateExt for PbsBackup {
         uuid: uuid::Uuid,
         extension: &str,
         _compression: crate::io::compression::CompressionType,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_pbs_configuration(uuid).await?;
         let Some(group_id) = remote.group_id() else {
@@ -365,7 +365,7 @@ impl BackupStreamCreateExt for PbsBackup {
             let archive = writer
                 .upload_archive_named(
                     DUMP_ARCHIVE_NAME,
-                    reader,
+                    source.await?,
                     Default::default(),
                     compression_threads,
                 )

@@ -10,7 +10,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -536,7 +536,7 @@ impl BackupStreamCreateExt for KopiaBackup {
         uuid: uuid::Uuid,
         extension: &str,
         _compression: crate::io::compression::CompressionType,
-        mut reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_kopia_configuration(uuid).await?;
 
@@ -550,6 +550,7 @@ impl BackupStreamCreateExt for KopiaBackup {
 
         let result =
             async {
+                let mut reader = source.await?;
                 let mut file = tokio::fs::File::create(&staged_file).await?;
                 tokio::io::copy(&mut reader, &mut file).await?;
                 file.sync_all().await?;

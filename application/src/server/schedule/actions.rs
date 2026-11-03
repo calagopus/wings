@@ -1015,7 +1015,7 @@ impl ScheduleAction {
                             .await
                         {
                             tracing::error!(
-                                "failed to create database backup {} (adapter = {:?}) for {}: {}",
+                                "failed to create database backup {} (adapter = {:?}) for {}: {:#}",
                                 uuid,
                                 adapter,
                                 server.uuid,

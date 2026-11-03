@@ -11,7 +11,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -959,7 +959,7 @@ impl BackupStreamCreateExt for ResticBackup {
         uuid: uuid::Uuid,
         extension: &str,
         _compression: crate::io::compression::CompressionType,
-        mut reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let file_name = format!("{uuid}.{extension}");
 
@@ -1000,6 +1000,7 @@ impl BackupStreamCreateExt for ResticBackup {
 
         let repository_lock = Self::repository_lock(&configuration).await;
         let repository_guard = repository_lock.read().await;
+        let mut reader = source.await?;
         let mut retried = false;
         let (snapshot_id, total_bytes_processed) = loop {
             let mut child = Self::command(&state.config, &configuration)

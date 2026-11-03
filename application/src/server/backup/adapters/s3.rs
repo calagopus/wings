@@ -9,7 +9,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::{Archive, ArchiveFormat, ExtractOptions, StreamableArchiveFormat},
@@ -42,6 +42,25 @@ fn get_client(config: &Arc<crate::config::Config>) -> Arc<reqwest::Client> {
                     .timeout(std::time::Duration::from_secs(
                         config.load().system.backups.s3.part_upload_timeout,
                     ))
+                    .tls_danger_accept_invalid_certs(config.ignore_certificate_errors)
+                    .build()
+                    .expect("failed to build HTTP client"),
+            )
+        })
+        .clone()
+}
+
+static DOWNLOAD_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+
+/// Restores read at the pace of the import, which can stall for minutes, so downloads carry
+/// no total timeout.
+fn get_download_client(config: &Arc<crate::config::Config>) -> Arc<reqwest::Client> {
+    DOWNLOAD_CLIENT
+        .get_or_init(|| {
+            Arc::new(
+                reqwest::ClientBuilder::new()
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
                     .tls_danger_accept_invalid_certs(config.ignore_certificate_errors)
                     .build()
                     .expect("failed to build HTTP client"),
@@ -802,7 +821,7 @@ impl BackupStreamCreateExt for S3Backup {
         uuid: uuid::Uuid,
         _extension: &str,
         source_compression: CompressionType,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let (part_size, initial_urls) = state.config.client.backup_s3_part_urls(uuid, 1).await?;
 
@@ -815,6 +834,7 @@ impl BackupStreamCreateExt for S3Backup {
                 anyhow::anyhow!("no initial urls provided for s3 backup, cannot upload backup")
             })?;
         let compression = Self::compression_from_url(&url);
+        let reader = source.await?;
         let (reader, compression) = if compression == source_compression {
             (reader, CompressionType::None)
         } else {
@@ -905,7 +925,7 @@ impl BackupStreamExt for S3Backup {
             .map(compact_str::CompactString::from)
             .unwrap_or_else(|| self.uuid.to_compact_string());
 
-        let response = get_client(&state.config)
+        let response = get_download_client(&state.config)
             .get(url)
             .send()
             .await?
@@ -996,7 +1016,7 @@ impl BackupExt for S3Backup {
         )
         .map_err(|_| anyhow::anyhow!("failed to determine archive format from download_url"))?;
 
-        let response = get_client(&server.app_state.config)
+        let response = get_download_client(&server.app_state.config)
             .get(url)
             .send()
             .await

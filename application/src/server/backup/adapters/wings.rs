@@ -11,7 +11,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::{
@@ -245,8 +245,9 @@ impl BackupStreamCreateExt for WingsBackup {
         uuid: uuid::Uuid,
         extension: &str,
         source_compression: CompressionType,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let reader = source.await?;
         let config = state.config.load();
         let target_compression = config
             .system

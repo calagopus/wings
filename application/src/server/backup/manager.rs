@@ -477,26 +477,39 @@ impl BackupManager {
         let result = async {
             super::parse_dump_extension(extension)?;
 
-            let response = server
-                .app_state
-                .config
-                .client
-                .database_backup_source(uuid, database_instance)
-                .await?;
-            if let Some(length) = response.content_length() {
-                total.store(length, Ordering::SeqCst);
-            }
+            let source: super::DumpSource = Box::pin({
+                let state = Arc::clone(&server.app_state);
+                let progress = Arc::clone(&progress);
+                let total = Arc::clone(&total);
 
-            let reader = tokio_util::io::StreamReader::new(
-                response.bytes_stream().map_err(std::io::Error::other),
-            );
-            let reader = crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
-                reader,
-                Arc::clone(&progress),
-            );
+                async move {
+                    let response = state
+                        .config
+                        .client
+                        .database_backup_source(uuid, database_instance)
+                        .await?;
+                    if let Some(length) = response.content_length() {
+                        total.store(length, Ordering::SeqCst);
+                    }
+
+                    let reader =
+                        tokio_util::io::StreamReader::new(response.bytes_stream().map_err(|err| {
+                            std::io::Error::other(
+                                anyhow::Error::from(err)
+                                    .context("failed to read database dump from panel"),
+                            )
+                        }));
+
+                    Ok(Box::new(
+                        crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
+                            reader, progress,
+                        ),
+                    ) as super::DumpReader)
+                }
+            });
 
             adapter
-                .create_from_stream(&server.app_state, uuid, extension, Box::new(reader))
+                .create_from_stream(&server.app_state, uuid, extension, source)
                 .await
         }
         .await;

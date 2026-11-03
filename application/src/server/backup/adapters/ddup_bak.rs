@@ -9,7 +9,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -514,7 +514,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         uuid: uuid::Uuid,
         extension: &str,
         _compression: crate::io::compression::CompressionType,
-        mut reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&state.config).await?;
         let path = repository.archive_path(&uuid.to_string())?;
@@ -524,6 +524,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         let staged_file = staging_dir.join(format!("{uuid}.{extension}"));
 
         let result = async {
+            let mut reader = source.await?;
             let mut file = tokio::fs::File::create(&staged_file).await?;
             tokio::io::copy(&mut reader, &mut file).await?;
             file.sync_all().await?;
