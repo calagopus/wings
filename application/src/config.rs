@@ -471,6 +471,10 @@ fn system_backup_restic_retry_lock_seconds() -> u64 {
     60
 }
 
+fn system_backup_kopia_restore_threads() -> usize {
+    8
+}
+
 fn system_backup_btrfs_restore_threads() -> usize {
     4
 }
@@ -1189,6 +1193,14 @@ nestify::nest! {
                     pub retry_lock_seconds: u64,
                     #[serde(default)]
                     pub environment: BTreeMap<String, String>,
+                },
+                #[serde(default)]
+                #[schema(inline)]
+                pub kopia: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsKopia {
+                    #[serde(default)]
+                    pub create_threads: usize,
+                    #[serde(default = "system_backup_kopia_restore_threads")]
+                    pub restore_threads: usize,
                 },
                 #[serde(default)]
                 #[schema(inline)]

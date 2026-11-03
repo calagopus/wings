@@ -461,6 +461,18 @@ impl BackupCreateExt for KopiaBackup {
             .arg("--description")
             .arg(format!("wings backup {uuid}"));
 
+        let create_threads = server
+            .app_state
+            .config
+            .load()
+            .system
+            .backups
+            .kopia
+            .create_threads;
+        if create_threads > 0 {
+            command.arg(format!("--parallel={create_threads}"));
+        }
+
         command
             .arg("--tags")
             .arg(format!("{BACKUP_UUID_TAG}:{uuid}"));
@@ -821,6 +833,17 @@ impl BackupExt for KopiaBackup {
             .arg("--overwrite-files")
             .arg("--overwrite-directories")
             .arg("--overwrite-symlinks")
+            .arg(format!(
+                "--parallel={}",
+                server
+                    .app_state
+                    .config
+                    .load()
+                    .system
+                    .backups
+                    .kopia
+                    .restore_threads
+            ))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
