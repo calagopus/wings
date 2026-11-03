@@ -53,7 +53,6 @@ pub async fn extract_tar(
             &destination_filesystem,
             &write_progress,
             &listener,
-            options.preserve_symlink_contents,
             |writers| {
                 for entry in entries {
                     if writers.stopped() {
@@ -272,17 +271,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
-    fn transfer_extraction_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
+    fn archive_extraction_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
         tokio_test::block_on(async {
             let fixture = ExtractFixture::new(1).await?;
             let links = [
-                ("absolute", "/mnt/game-install"),
-                ("relative", "../drive_c"),
                 ("root", "/"),
+                ("double-root", "//"),
+                ("fs25-data", "/home/container"),
+                ("parent", "../target"),
+                ("current", "./target"),
+                ("dangling-absolute", "/missing/absolute"),
+                ("dangling-relative", "../missing-relative"),
+                (".wine/dosdevices/z:", "/"),
             ];
 
             fixture.build(|builder| {
                 add_file(builder, "sentinel", b"");
+
+                for name in [".wine/", ".wine/dosdevices/"] {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_mode(0o755);
+                    header.set_mtime(1_700_000_000);
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, name, std::io::empty())
+                        .expect("append directory");
+                }
 
                 for (name, target) in links {
                     let mut header = tar::Header::new_gnu();
@@ -290,8 +306,12 @@ mod tests {
                     header.set_mode(0o777);
                     header.set_mtime(1_700_000_000);
                     header.set_entry_type(tar::EntryType::Symlink);
+                    header
+                        .set_link_name_literal(target.as_bytes())
+                        .expect("set literal symlink target");
+                    header.set_cksum();
                     builder
-                        .append_link(&mut header, name, target)
+                        .append_data(&mut header, name, std::io::empty())
                         .expect("append symlink");
                 }
             })?;
@@ -299,18 +319,19 @@ mod tests {
             let files_processed = Arc::new(AtomicU64::new(0));
             let out = fixture
                 .extract_with_options_and_progress(
-                    ExtractOptions {
-                        preserve_symlink_contents: true,
-                        ..Default::default()
-                    },
+                    ExtractOptions::default(),
                     ArchiveProgress::new(Arc::new(AtomicU64::new(0)), files_processed.clone()),
                 )
                 .await?;
 
             for (name, target) in links {
-                assert_eq!(std::fs::read_link(out.join(name))?, PathBuf::from(target));
+                let actual = std::fs::read_link(out.join(name))?;
+                assert_eq!(actual.as_os_str().as_encoded_bytes(), target.as_bytes());
             }
-            assert_eq!(files_processed.load(Ordering::Relaxed), 4);
+            assert_eq!(
+                files_processed.load(Ordering::Relaxed),
+                links.len() as u64 + 1
+            );
 
             Ok(())
         })
@@ -339,10 +360,7 @@ mod tests {
             })?;
 
             let out = fixture
-                .extract_with_options(ExtractOptions {
-                    preserve_symlink_contents: true,
-                    ..Default::default()
-                })
+                .extract_with_options(ExtractOptions::default())
                 .await?;
 
             assert_eq!(std::fs::read_link(out.join("escape"))?, outside.path());

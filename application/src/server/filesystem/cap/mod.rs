@@ -1428,7 +1428,25 @@ impl CapFilesystem {
 
         let inner = self.get_inner()?;
         #[cfg(unix)]
-        tokio::task::spawn_blocking(move || inner.symlink(contents, link)).await??;
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsFd;
+
+            let Some(name) = link.file_name() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "link path has no final component",
+                ));
+            };
+            let parent = link.parent().unwrap_or(Path::new(""));
+            if parent.as_os_str().is_empty() {
+                rustix::fs::symlinkat(&contents, inner.as_fd(), name)?;
+            } else {
+                let parent = inner.open_dir(parent)?;
+                rustix::fs::symlinkat(&contents, parent.as_fd(), name)?;
+            }
+            Ok(())
+        })
+        .await??;
         #[cfg(windows)]
         tokio::task::spawn_blocking(move || {
             let target =

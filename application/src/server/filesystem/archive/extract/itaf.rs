@@ -52,7 +52,6 @@ pub async fn extract_itaf(
             &destination_filesystem,
             &write_progress,
             &listener,
-            options.preserve_symlink_contents,
             |writers| {
                 for entry in decoder.entries() {
                     if writers.stopped() {

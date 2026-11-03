@@ -45,6 +45,7 @@ use pbs_client::{
     writer::{ARCHIVE_NAME, META_BLOB_NAME, PbsBackupWriter},
 };
 use std::{
+    ffi::OsStr,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -57,6 +58,17 @@ use tokio_util::io::SyncIoBridge;
 
 const MAX_TREE_DEPTH: usize = 1024;
 const DUMP_ARCHIVE_NAME: &str = "dump.didx";
+
+async fn restore_symlink_contents(
+    filesystem: &crate::server::filesystem::Filesystem,
+    target: &OsStr,
+    path: &Path,
+) -> Result<(), anyhow::Error> {
+    filesystem
+        .async_symlink_contents(Path::new(target), path)
+        .await?;
+    Ok(())
+}
 
 type GroupLockKey = (
     compact_str::CompactString,
@@ -636,7 +648,12 @@ impl BackupExt for PbsBackup {
                             EntryKind::Symlink(target) => {
                                 header.set_entry_type(tar::EntryType::Symlink);
                                 header.set_size(0);
-                                tar.append_link(&mut header, &path, target.as_os_str())?;
+                                crate::server::filesystem::archive::create::append_tar_symlink_literal(
+                                    &mut tar,
+                                    &mut header,
+                                    &path,
+                                    target.as_os_str(),
+                                )?;
                             }
                         }
                     }
@@ -896,10 +913,12 @@ impl BackupExt for PbsBackup {
                         progress.increment_files();
                     }
                     EntryKind::Symlink(target) => {
-                        if let Err(err) = server
-                            .filesystem
-                            .async_symlink(target.as_os_str(), path.as_path())
-                            .await
+                        if let Err(err) = restore_symlink_contents(
+                            &server.filesystem,
+                            target.as_os_str(),
+                            path.as_path(),
+                        )
+                        .await
                         {
                             tracing::debug!(path = %path.display(), "failed to create symlink from PBS backup: {:?}", err);
                         } else {
@@ -1916,7 +1935,12 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                                 header.set_entry_type(tar::EntryType::Symlink);
                                 header.set_size(0);
                                 if let Some(target) = &entry.symlink {
-                                    tar.append_link(&mut header, &entry.relative, target)?;
+                                    crate::server::filesystem::archive::create::append_tar_symlink_literal(
+                                        &mut tar,
+                                        &mut header,
+                                        &entry.relative,
+                                        target.as_os_str(),
+                                    )?;
                                     progress.increment_files();
                                 }
                             }
@@ -2082,5 +2106,102 @@ impl BackupCleanExt for PbsBackup {
         _uuid: uuid::Uuid,
     ) -> Result<(), anyhow::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_export_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
+        let long_target = format!("/{}", "long-segment/".repeat(12));
+        let links = [
+            ("root", "/"),
+            ("double-root", "//"),
+            ("long-target", long_target.as_str()),
+        ];
+        let mut bytes = Vec::new();
+
+        {
+            let mut archive = tar::Builder::new(&mut bytes);
+            for (name, target) in &links {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                crate::server::filesystem::archive::create::append_tar_symlink_literal(
+                    &mut archive,
+                    &mut header,
+                    Path::new(name),
+                    Path::new(target).as_os_str(),
+                )?;
+            }
+            archive.finish()?;
+        }
+
+        let mut actual = std::collections::HashMap::new();
+        for entry in tar::Archive::new(std::io::Cursor::new(bytes)).entries()? {
+            let entry = entry?;
+            actual.insert(
+                entry.path()?.into_owned(),
+                entry
+                    .link_name_bytes()
+                    .expect("symlink target")
+                    .into_owned(),
+            );
+        }
+
+        for (name, target) in links {
+            assert_eq!(
+                actual.get(Path::new(name)).map(Vec::as_slice),
+                Some(target.as_bytes())
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_export_rejects_nul_in_symlink_target() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+
+        let error = crate::server::filesystem::archive::create::append_tar_symlink_literal(
+            &mut archive,
+            &mut header,
+            Path::new("nul-target"),
+            OsStr::from_bytes(b"target\0suffix"),
+        )
+        .expect_err("NUL-containing symlink target must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_literal_symlink_targets() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            let links = [("root", "/"), ("double-root", "//")];
+
+            for (name, target) in links {
+                restore_symlink_contents(
+                    &server.filesystem,
+                    Path::new(target).as_os_str(),
+                    Path::new(name),
+                )
+                .await?;
+
+                let actual = std::fs::read_link(server.filesystem.base_path.join(name))?;
+                assert_eq!(actual.as_os_str().as_encoded_bytes(), target.as_bytes());
+            }
+
+            Ok(())
+        })
     }
 }

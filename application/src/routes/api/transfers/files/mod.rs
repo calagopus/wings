@@ -193,7 +193,6 @@ mod post {
                                                     move |path| remap_root_path(path, &root_files)
                                                 })),
                                                 count_written: true,
-                                                preserve_symlink_contents: true,
                                                 ..Default::default()
                                             },
                                         )?);

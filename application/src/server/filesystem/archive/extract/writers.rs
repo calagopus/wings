@@ -51,7 +51,6 @@ fn shard(path: &Path, shards: usize) -> usize {
 fn apply_job(
     destination_filesystem: &Arc<dyn VirtualWritableFilesystem>,
     progress: &ArchiveProgress,
-    preserve_symlink_contents: bool,
     job: Job,
 ) -> Result<(), anyhow::Error> {
     match job {
@@ -101,12 +100,7 @@ fn apply_job(
             link,
             modified_time,
         } => {
-            let result = if preserve_symlink_contents {
-                destination_filesystem.create_symlink_contents(&link, &path)
-            } else {
-                destination_filesystem.create_symlink(&link, &path)
-            };
-            if let Err(err) = result {
+            if let Err(err) = destination_filesystem.create_symlink_contents(&link, &path) {
                 tracing::debug!(
                     path = %path.display(),
                     "failed to create symlink from archive: {:#?}",
@@ -244,7 +238,6 @@ pub fn with_writers<T>(
     destination_filesystem: &Arc<dyn VirtualWritableFilesystem>,
     progress: &ArchiveProgress,
     listener: &AbortListener,
-    preserve_symlink_contents: bool,
     feed: impl FnOnce(&mut Writers) -> Result<T, anyhow::Error>,
 ) -> Result<T, anyhow::Error> {
     let threads = crate::threading::resolve_threads(threads);
@@ -266,12 +259,7 @@ pub fn with_writers<T>(
                         continue;
                     }
 
-                    if let Err(err) = apply_job(
-                        destination_filesystem,
-                        progress,
-                        preserve_symlink_contents,
-                        job,
-                    ) {
+                    if let Err(err) = apply_job(destination_filesystem, progress, job) {
                         error.fail(err);
                     }
                 }
