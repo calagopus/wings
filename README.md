@@ -207,6 +207,8 @@ system:
       create_threads: 0
       # how many files kopia restores in parallel (kopia --parallel)
       restore_threads: 8
+      # how often a kopia snapshot or policy change is retried after a transient error
+      retry_limit: 3
 
     # settings for the btrfs backup driver
     btrfs:

@@ -474,6 +474,9 @@ fn system_backup_restic_retry_lock_seconds() -> u64 {
 fn system_backup_kopia_restore_threads() -> usize {
     8
 }
+fn system_backup_kopia_retry_limit() -> u64 {
+    3
+}
 
 fn system_backup_btrfs_restore_threads() -> usize {
     4
@@ -1201,6 +1204,8 @@ nestify::nest! {
                     pub create_threads: usize,
                     #[serde(default = "system_backup_kopia_restore_threads")]
                     pub restore_threads: usize,
+                    #[serde(default = "system_backup_kopia_retry_limit")]
+                    pub retry_limit: u64,
                 },
                 #[serde(default)]
                 #[schema(inline)]
