@@ -41,7 +41,7 @@ impl LineBuffer {
 
         self.buffer
             .get(start..start + len)
-            .map(|slice| slice.trim_ascii())
+            .map(|slice| slice.trim_ascii_end())
     }
 
     pub fn compact(&mut self) {
@@ -53,7 +53,7 @@ impl LineBuffer {
 
     pub fn flush(&self) -> Option<&[u8]> {
         let rest = self.buffer.get(self.line_start..)?;
-        (!rest.is_empty()).then(|| rest.trim_ascii())
+        (!rest.is_empty()).then(|| rest.trim_ascii_end())
     }
 }
 
@@ -123,17 +123,17 @@ mod tests {
     }
 
     #[test]
-    fn trims_surrounding_ascii_whitespace() {
+    fn trims_only_trailing_ascii_whitespace() {
         let mut lb = LineBuffer::new();
         lb.extend(b"  hello  \n");
-        assert_eq!(lb.next_line(), Some(&b"hello"[..]));
+        assert_eq!(lb.next_line(), Some(&b"  hello"[..]));
     }
 
     #[test]
     fn trims_carriage_return_from_crlf() {
         let mut lb = LineBuffer::new();
         lb.extend(b"\thi\r\n");
-        assert_eq!(lb.next_line(), Some(&b"hi"[..]));
+        assert_eq!(lb.next_line(), Some(&b"\thi"[..]));
     }
 
     #[test]
@@ -154,12 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn flush_returns_trimmed_remainder() {
+    fn flush_returns_end_trimmed_remainder() {
         let mut lb = LineBuffer::new();
         lb.extend(b"done\n  leftover  ");
         assert_eq!(lb.next_line(), Some(&b"done"[..]));
-        assert_eq!(lb.flush(), Some(&b"leftover"[..]));
-        assert_eq!(lb.flush(), Some(&b"leftover"[..]));
+        assert_eq!(lb.flush(), Some(&b"  leftover"[..]));
+        assert_eq!(lb.flush(), Some(&b"  leftover"[..]));
     }
 
     #[test]
