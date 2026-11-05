@@ -94,6 +94,7 @@ pub struct InnerServer {
     installing: AtomicBool,
     restoring: AtomicBool,
     transferring: AtomicBool,
+    destroying: AtomicBool,
     last_locked: tokio::sync::watch::Sender<i64>,
 
     pub restarting: AtomicBool,
@@ -302,6 +303,7 @@ impl Server {
             installing: AtomicBool::new(false),
             restoring: AtomicBool::new(false),
             transferring: AtomicBool::new(false),
+            destroying: AtomicBool::new(false),
             last_locked: tokio::sync::watch::Sender::new(0),
 
             restarting: AtomicBool::new(false),
@@ -610,6 +612,10 @@ impl Server {
                                 oom_killed = %oom_killed,
                                 "container stopped, handling crash"
                             );
+
+                            if server.destroying.load(Ordering::SeqCst) {
+                                break;
+                            }
 
                             if server.restarting.load(Ordering::SeqCst) {
                                 server
@@ -1779,14 +1785,13 @@ impl Server {
             "destroying server"
         );
 
+        self.destroying.store(true, Ordering::SeqCst);
         self.set_suspended(true).await;
+        if let Some(installer) = self.installer.read().await.as_ref() {
+            installer.abort();
+        }
         self.kill(true).await.ok();
         self.destroy_container().await;
-        self.configuration
-            .read()
-            .await
-            .remove_vmounts(&self.app_state.config)
-            .await;
 
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
@@ -1796,19 +1801,24 @@ impl Server {
             .delete_server(self.uuid)
             .await;
 
-        tokio::spawn({
-            let server = self.clone();
+        self.diff.destroy().await;
+        let result = self.filesystem.destroy().await;
+        self.filesystem.close();
+        self.configuration
+            .read()
+            .await
+            .remove_vmounts(&self.app_state.config)
+            .await;
 
-            async move {
-                server.diff.destroy().await;
-                server.filesystem.destroy().await;
-                server.filesystem.close();
-
-                if let Some(installer) = server.installer.read().await.as_ref() {
-                    installer.abort();
-                }
-            }
-        });
+        match result {
+            Ok(()) => tracing::info!(server = %self.uuid, "server destroyed"),
+            Err(err) => tracing::error!(
+                server = %self.uuid,
+                path = %self.filesystem.base_path.display(),
+                "failed to delete server base directory: {}",
+                err
+            ),
+        }
     }
 
     pub async fn to_api_response(&self) -> serde_json::Value {

@@ -796,6 +796,8 @@ const TRASH_TMPFS_OPTIONS: &str = "ro,nosuid,nodev,noexec,size=4k";
 
 const TRANSIENT_JSON_ATTEMPTS: u32 = 4;
 const TRANSIENT_JSON_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+const REMOVAL_IN_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const REMOVAL_IN_PROGRESS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[inline]
 fn is_transient_json_error(err: &bollard::errors::Error) -> bool {
@@ -900,6 +902,32 @@ impl DockerRemoveExt for bollard::Docker {
             Err(DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(()),
+            Err(
+                err @ DockerResponseServerError {
+                    status_code: 409, ..
+                },
+            ) => {
+                // with force=true a 409 means another removal is in flight; the container may still report
+                // running while it is being killed, and only turns dead if that removal fails
+                let deadline = tokio::time::Instant::now() + REMOVAL_IN_PROGRESS_TIMEOUT;
+
+                while tokio::time::Instant::now() < deadline {
+                    match self.inspect_container_settled(container_id, None).await {
+                        Err(DockerResponseServerError {
+                            status_code: 404, ..
+                        }) => return Ok(()),
+                        Ok(inspect)
+                            if inspect.state.as_ref().and_then(|state| state.status)
+                                != Some(bollard::plugin::ContainerStateStatusEnum::DEAD) =>
+                        {
+                            tokio::time::sleep(REMOVAL_IN_PROGRESS_POLL).await;
+                        }
+                        _ => return Err(err),
+                    }
+                }
+
+                Err(err)
+            }
             Err(err) => match self.inspect_container_settled(container_id, None).await {
                 Err(DockerResponseServerError {
                     status_code: 404, ..

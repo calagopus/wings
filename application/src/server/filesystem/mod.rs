@@ -1985,7 +1985,7 @@ impl Filesystem {
         }
     }
 
-    pub async fn destroy(&self) {
+    pub async fn destroy(&self) -> Result<(), std::io::Error> {
         self.disk_checker.abort();
         self.trash.abort_purge_task();
         self.app_state
@@ -2001,14 +2001,10 @@ impl Filesystem {
             );
             self.close();
 
-            if let Err(err) = self.get_disk_limiter().destroy().await {
-                tracing::error!(
-                    path = %self.base_path.display(),
-                    "failed to delete server base directory for: {}",
-                    err
-                );
-            }
+            self.get_disk_limiter().destroy().await?;
         }
+
+        Ok(())
     }
 
     pub async fn directory_entry_space(
