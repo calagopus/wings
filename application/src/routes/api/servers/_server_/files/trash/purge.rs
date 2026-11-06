@@ -36,7 +36,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "entry not found")?;
 
         let mut entries = Vec::with_capacity(data.entries.len());
         for uuid in data.entries {

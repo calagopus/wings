@@ -1,6 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+mod _entry_;
 mod purge;
 mod restore;
 
@@ -65,7 +66,7 @@ mod get {
         };
         let page = data.page.unwrap_or(1);
 
-        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "entry not found")?;
 
         let entries = server
             .filesystem
@@ -238,7 +239,7 @@ mod delete {
         ),
     ))]
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
-        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "entry not found")?;
 
         let entries = server
             .filesystem
@@ -257,6 +258,7 @@ mod delete {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/{entry}", _entry_::router(state))
         .nest("/restore", restore::router(state))
         .nest("/purge", purge::router(state))
         .routes(routes!(get::route))

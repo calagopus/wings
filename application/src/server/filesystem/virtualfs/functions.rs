@@ -72,6 +72,17 @@ impl IgnoreVerdict {
             Self::Skip | Self::Descend(_) => self,
         }
     }
+
+    /// Runs `next` on what this verdict let through, demoting its answer for an
+    /// entry this one only descended into.
+    #[inline]
+    pub fn then(self, next: impl FnOnce(PathBuf) -> Self) -> Self {
+        match self {
+            Self::Skip => Self::Skip,
+            Self::Keep(path) => next(path),
+            Self::Descend(path) => next(path).demote(),
+        }
+    }
 }
 
 impl From<Option<PathBuf>> for IgnoreVerdict {
@@ -137,12 +148,9 @@ impl IsIgnoredFn {
 
     pub fn merge(self, other: IsIgnoredFn) -> IsIgnoredFn {
         let (first, second) = (Arc::clone(&self.sync), Arc::clone(&other.sync));
-        let sync: Arc<IsIgnoredFnInner> =
-            Arc::new(move |file_type, path| match first(file_type, path) {
-                IgnoreVerdict::Skip => IgnoreVerdict::Skip,
-                IgnoreVerdict::Keep(path) => second(file_type, path),
-                IgnoreVerdict::Descend(path) => second(file_type, path).demote(),
-            });
+        let sync: Arc<IsIgnoredFnInner> = Arc::new(move |file_type, path| {
+            first(file_type, path).then(|path| second(file_type, path))
+        });
 
         if self.r#async.is_none() && other.r#async.is_none() {
             return Self::from_sync(sync);

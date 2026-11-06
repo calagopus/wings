@@ -214,6 +214,7 @@ pub async fn run(ctx: DiskCheckerContext) {
                                     tmp_disk_usage,
                                 );
                                 let root_space = disk_usage_write.space;
+                                let trash_space = super::trash::physical_usage(&disk_usage_write);
                                 drop(disk_usage_write);
 
                                 disk_usage_cached_logical
@@ -221,6 +222,7 @@ pub async fn run(ctx: DiskCheckerContext) {
                                 disk_usage_cached_physical
                                     .store(root_space.get_physical(), Ordering::Relaxed);
                                 resource_usage.publish_disk_usage(root_space.get_physical());
+                                resource_usage.publish_trash_usage(trash_space);
                             }
 
                             return Ok(());
@@ -283,12 +285,14 @@ pub async fn run(ctx: DiskCheckerContext) {
                         total_size_physical += metadata.size_physical();
                     }
                     pending.flush(&mut tmp_disk_usage);
+                    let trash_space = super::trash::physical_usage(&tmp_disk_usage);
 
                     let old_disk_usage =
                         std::mem::replace(&mut *disk_usage.blocking_write(), tmp_disk_usage);
                     disk_usage_cached_logical.store(total_size, Ordering::Relaxed);
                     disk_usage_cached_physical.store(total_size_physical, Ordering::Relaxed);
                     resource_usage.publish_disk_usage(total_size_physical);
+                    resource_usage.publish_trash_usage(trash_space);
                     drop(old_disk_usage);
 
                     tracing::debug!(

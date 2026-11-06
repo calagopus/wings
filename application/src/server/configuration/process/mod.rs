@@ -539,7 +539,10 @@ impl ProcessConfiguration {
             if let Some(parent) = file_path.parent()
                 && parent.components().next().is_some()
             {
-                server.filesystem.async_create_dir_all(&parent).await?;
+                server
+                    .filesystem
+                    .async_create_chowned_dir_all(&parent)
+                    .await?;
             }
 
             let mut file_content = String::new();

@@ -1278,7 +1278,7 @@ impl ScheduleAction {
                     return Err("file is not a file".into());
                 }
 
-                if let Err(err) = server.filesystem.async_create_dir_all(parent).await {
+                if let Err(err) = server.filesystem.async_create_chowned_dir_all(parent).await {
                     tracing::error!(path = %parent.display(), "failed to create parent directory: {:?}", err);
 
                     return Err("failed to create parent directory".into());

@@ -56,7 +56,7 @@ mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
+        let ignored = crate::routes::token::ignored(&server, &data.ignored, "entry not found")?;
 
         let mut restored = Vec::new();
         let mut conflicts = Vec::new();

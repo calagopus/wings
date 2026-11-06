@@ -181,6 +181,27 @@ impl RequestIgnored {
             .as_ref()
             .map(|matcher| Filesystem::subuser_deny_filter(server, matcher.clone()))
     }
+
+    /// [`IgnoreList::verdict_as`] over the server's deny-list and this request's,
+    /// for filters that judge an entry by a path other than the one it sits at.
+    pub fn verdict_as(
+        &self,
+        server: &crate::server::Server,
+        file_type: cap::FileType,
+        match_path: &Path,
+        path: PathBuf,
+    ) -> IgnoreVerdict {
+        let verdict = server
+            .filesystem
+            .disk_ignored
+            .load()
+            .verdict_as(file_type, match_path, path);
+
+        match &self.0 {
+            Some(matcher) => verdict.then(|path| matcher.verdict_as(file_type, match_path, path)),
+            None => verdict,
+        }
+    }
 }
 
 /// Whether a rename may materialise the destination's parent directories.
@@ -341,7 +362,7 @@ impl Filesystem {
             server_notifier,
             use_server_notifier,
 
-            trash: trash::TrashManager::new(resource_usage.clone()),
+            trash: trash::TrashManager::new(resource_usage.clone(), Arc::clone(&disk_usage)),
             resource_usage,
             disk_limit: AtomicI64::new(disk_limit as i64),
             disk_usage_delta_cached: Arc::new(AtomicI64::new(0)),
@@ -790,6 +811,15 @@ impl Filesystem {
     ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
         let path = self.relative_path(path);
 
+        if let Ok(trash_path) = path.strip_prefix(trash::TRASH_DIRECTORY)
+            && let Some(resolved) = self
+                .trash
+                .resolve_virtual(server, trash_path, ignored)
+                .await
+        {
+            return resolved;
+        }
+
         'backupfs: {
             if !self.config.load().system.backups.mounting.enabled {
                 break 'backupfs;
@@ -1213,7 +1243,7 @@ impl Filesystem {
         if parents == RenameParents::Create
             && let Some(parent) = new_path.parent()
         {
-            self.async_create_dir_all(parent).await?;
+            self.async_create_chowned_dir_all(parent).await?;
         }
 
         let old_metadata = self.async_metadata(&old_path).await?;
@@ -2441,15 +2471,6 @@ impl Filesystem {
 pub struct DirectoryEntryOptions {
     pub directory_size: bool,
     pub r#virtual: bool,
-}
-
-impl DirectoryEntryOptions {
-    pub fn server_fs(is_primary_server_fs: bool) -> Self {
-        Self {
-            directory_size: is_primary_server_fs,
-            r#virtual: !is_primary_server_fs,
-        }
-    }
 }
 
 pub struct PreparedDirectoryEntry {

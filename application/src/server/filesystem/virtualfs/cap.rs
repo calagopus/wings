@@ -106,6 +106,8 @@ pub struct VirtualCapFilesystem {
     pub is_primary_server_fs: bool,
     pub is_writable: bool,
     pub ignore_quota: bool,
+    pub check_links: bool,
+    pub directory_size: bool,
     pub is_ignored: Option<IsIgnoredFn>,
 }
 
@@ -198,12 +200,19 @@ impl VirtualCapFilesystem {
         Ok(path)
     }
 
+    fn entry_options(&self) -> DirectoryEntryOptions {
+        DirectoryEntryOptions {
+            directory_size: self.is_primary_server_fs || self.directory_size,
+            r#virtual: !self.is_primary_server_fs,
+        }
+    }
+
     /// The deny filter symlink targets are checked against; only the primary
-    /// server filesystem resolves them.
+    /// server filesystem and filesystems opting in with `check_links` resolve them.
     fn link_filter(&self) -> Option<&IsIgnoredFn> {
         self.is_ignored
             .as_ref()
-            .filter(|_| self.is_primary_server_fs)
+            .filter(|_| self.is_primary_server_fs || self.check_links)
     }
 
     /// `resolved` when it differs from `path` itself, so only paths that went
@@ -584,7 +593,7 @@ impl VirtualCapFilesystem {
             return Ok(entries.into_iter().map(|(_, entry)| entry).collect());
         }
 
-        let options = DirectoryEntryOptions::server_fs(self.is_primary_server_fs);
+        let options = self.entry_options();
         let mut keyed = Vec::with_capacity(entries.len());
 
         for (directory, prepared) in entries {
@@ -641,7 +650,7 @@ impl VirtualCapFilesystem {
         prepared: Vec<PreparedDirectoryEntry>,
         listener: &AbortListener,
     ) -> Result<Vec<DirectoryEntry>, anyhow::Error> {
-        let options = DirectoryEntryOptions::server_fs(self.is_primary_server_fs);
+        let options = self.entry_options();
         let mut entries = Vec::with_capacity(prepared.len());
 
         for prepared in prepared {
@@ -874,7 +883,7 @@ impl VirtualCapFilesystem {
         let entries = work
             .map_ordered(selected, {
                 let this = self.clone();
-                let options = DirectoryEntryOptions::server_fs(this.is_primary_server_fs);
+                let options = this.entry_options();
 
                 move |prepared| {
                     this.server.filesystem.finish_api_entry_cap_blocking(
@@ -993,12 +1002,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
         self.server
             .filesystem
-            .to_api_entry_cap(
-                &self.inner,
-                path,
-                metadata,
-                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
-            )
+            .to_api_entry_cap(&self.inner, path, metadata, self.entry_options())
             .await
     }
 
@@ -1013,7 +1017,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         Ok(self.server.filesystem.to_api_entry_buffer_blocking(
             path,
             &metadata,
-            DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            self.entry_options(),
             Some(buffer),
             None,
             None,
@@ -1044,7 +1048,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         Some(self.server.filesystem.to_api_file_entry_buffer(
             path.to_path_buf(),
             metadata,
-            DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            self.entry_options(),
             buffer,
         ))
     }
@@ -2392,7 +2396,10 @@ mod tests {
                 fixture.server.filesystem.finish_api_entry_cap(
                     &fixture.cap,
                     prepared,
-                    DirectoryEntryOptions::server_fs(true),
+                    DirectoryEntryOptions {
+                        directory_size: true,
+                        r#virtual: false,
+                    },
                 ),
                 fixture.read_dir("nested", None, 1, NameAsc),
             )?;

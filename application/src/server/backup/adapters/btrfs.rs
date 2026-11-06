@@ -570,13 +570,13 @@ impl BackupExt for BtrfsBackup {
                                     super::log_restoring(&server, &path);
 
                                     if let Some(parent) = path.parent() {
-                                        server.filesystem.async_create_dir_all(parent).await?;
+                                        server.filesystem.async_create_chowned_dir_all(parent).await?;
                                     }
 
                                     filesystem.async_quota_copy(&path, &path, &server, None, progress.clone_bytes().as_ref()).await?;
                                     progress.increment_files();
                                 } else if metadata.is_dir() {
-                                    server.filesystem.async_create_dir_all(&path).await?;
+                                    server.filesystem.async_create_chowned_dir_all(&path).await?;
                                     server
                                         .filesystem
                                         .async_set_permissions(&path, metadata.permissions().into())
