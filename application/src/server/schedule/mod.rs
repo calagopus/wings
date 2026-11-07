@@ -18,6 +18,35 @@ pub enum ScheduleResourceMetric {
     Disk,
 }
 
+impl ScheduleResourceMetric {
+    /// Returns `None` for a percentage against an unlimited memory/disk limit.
+    pub async fn current_value(
+        self,
+        server: &crate::server::Server,
+        usage: &crate::server::resources::ResourceUsage,
+        percentage: bool,
+    ) -> Option<f64> {
+        let current = match self {
+            Self::Cpu => usage.cpu_absolute,
+            Self::Memory => usage.memory_bytes as f64,
+            Self::Disk => usage.disk_bytes as f64,
+        };
+        if !percentage {
+            return Some(current);
+        }
+
+        let limit = match self {
+            Self::Cpu => usage.cpu_limit_absolute as f64,
+            Self::Memory => {
+                server.configuration.read().await.build.memory_limit.max(0) as f64 * 1024.0 * 1024.0
+            }
+            Self::Disk => server.filesystem.disk_limit().max(0) as f64,
+        };
+
+        (limit > 0.0).then(|| current / limit * 100.0)
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ScheduleTrigger {
@@ -48,6 +77,8 @@ pub enum ScheduleTrigger {
         metric: ScheduleResourceMetric,
         comparator: conditions::ScheduleConditionComparator,
         value: f64,
+        #[serde(default)]
+        percentage: bool,
         #[serde(default)]
         for_seconds: u64,
     },
@@ -148,15 +179,17 @@ impl PartialEq for ScheduleTrigger {
                     metric: m1,
                     comparator: c1,
                     value: v1,
+                    percentage: p1,
                     for_seconds: f1,
                 },
                 ScheduleTrigger::ResourceUsage {
                     metric: m2,
                     comparator: c2,
                     value: v2,
+                    percentage: p2,
                     for_seconds: f2,
                 },
-            ) => m1 == m2 && c1 == c2 && v1 == v2 && f1 == f2,
+            ) => m1 == m2 && c1 == c2 && v1 == v2 && p1 == p2 && f1 == f2,
             (
                 ScheduleTrigger::ConsoleLine {
                     contains: c1,
@@ -748,6 +781,7 @@ impl Schedule {
                     metric,
                     comparator,
                     value,
+                    percentage,
                     for_seconds,
                 } => {
                     tasks.push(tokio::task::spawn({
@@ -762,19 +796,20 @@ impl Schedule {
 
                             loop {
                                 let usage = *usage_rx.borrow_and_update();
-
                                 let evaluable = !matches!(
                                     metric,
                                     ScheduleResourceMetric::Cpu | ScheduleResourceMetric::Memory
                                 ) || usage.state
                                     == crate::server::state::ServerState::Running;
-                                let current = match metric {
-                                    ScheduleResourceMetric::Cpu => usage.cpu_absolute,
-                                    ScheduleResourceMetric::Memory => usage.memory_bytes as f64,
-                                    ScheduleResourceMetric::Disk => usage.disk_bytes as f64,
+                                let current = if evaluable {
+                                    metric.current_value(&server, &usage, percentage).await
+                                } else {
+                                    None
                                 };
 
-                                if evaluable && comparator.compare_f64(current, value) {
+                                if current
+                                    .is_some_and(|current| comparator.compare_f64(current, value))
+                                {
                                     let since =
                                         *met_since.get_or_insert_with(tokio::time::Instant::now);
 
