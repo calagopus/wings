@@ -78,16 +78,10 @@ pub async fn extract_tar(
 
                     match header.entry_type() {
                         tar::EntryType::Directory => {
-                            destination_filesystem.create_dir_all(&destination_path)?;
-                            if let Ok(permissions) =
-                                header.mode().map(PortablePermissions::from_mode_dir)
-                            {
-                                destination_filesystem.set_permissions(
-                                    &destination_path,
-                                    FileType::Dir,
-                                    permissions,
-                                )?;
-                            }
+                            destination_filesystem.create_dir_all(
+                                &destination_path,
+                                header.mode().map(PortablePermissions::from_mode_dir).ok(),
+                            )?;
 
                             if let Ok(modified_time) = header.mtime()
                                 && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES

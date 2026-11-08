@@ -174,40 +174,116 @@ impl CapFilesystem {
         (contents, resolved)
     }
 
-    pub async fn async_create_dir(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+    fn create_dir_impl(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        let Some(permissions) = permissions else {
+            return inner.create_dir(path);
+        };
 
-        let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.create_dir(path)).await??;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
 
-        Ok(())
-    }
+            let mut builder = cap_std::fs::DirBuilder::new();
+            builder.mode(permissions.mode() as _);
+            inner.create_dir_with(path, &builder)?;
 
-    pub fn create_dir(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let inner = self.get_inner()?;
+            if !permissions.masked_by_umask() {
+                return Ok(());
+            }
+        }
+        #[cfg(not(unix))]
         inner.create_dir(path)?;
 
-        Ok(())
+        Self::set_permissions_impl(inner, path, permissions)
     }
 
-    pub async fn async_create_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    fn create_dir_all_impl(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        let Some(permissions) = permissions else {
+            return inner.create_dir_all(path);
+        };
+
+        if let Some(parent) = path.parent() {
+            inner.create_dir_all(parent)?;
+        }
+
+        match Self::create_dir_impl(inner, path, Some(permissions)) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && inner.is_dir(path) => {
+                Self::set_permissions_impl(inner, path, permissions)
+            }
+            result => result,
+        }
+    }
+
+    pub async fn async_create_dir(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
         let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.create_dir_all(path)).await??;
+        tokio::task::spawn_blocking(move || Self::create_dir_impl(&inner, &path, permissions))
+            .await??;
 
         Ok(())
     }
 
-    pub fn create_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    pub fn create_dir(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
         let inner = self.get_inner()?;
-        inner.create_dir_all(path)?;
+        Self::create_dir_impl(&inner, &path, permissions)
+    }
+
+    pub async fn async_create_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.async_set_permissions(&path, permissions).await?;
+            }
+
+            return Ok(());
+        }
+
+        let inner = self.get_inner()?;
+        tokio::task::spawn_blocking(move || Self::create_dir_all_impl(&inner, &path, permissions))
+            .await??;
 
         Ok(())
+    }
+
+    pub fn create_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.set_permissions(&path, permissions)?;
+            }
+
+            return Ok(());
+        }
+
+        let inner = self.get_inner()?;
+        Self::create_dir_all_impl(&inner, &path, permissions)
     }
 
     pub async fn async_remove_dir_all(
@@ -1134,18 +1210,10 @@ impl CapFilesystem {
         } else {
             let inner = self.get_inner()?;
 
-            if let Some(permissions) = permissions.into_std_permissions() {
-                tokio::task::spawn_blocking(move || {
-                    inner.set_permissions(path, cap_std::fs::Permissions::from_std(permissions))
-                })
-                .await??;
-            } else {
-                tokio::task::spawn_blocking(move || {
-                    let file = inner.open(&path)?;
-                    file.apply_permissions(permissions)
-                })
-                .await??;
-            }
+            tokio::task::spawn_blocking(move || {
+                Self::set_permissions_impl(&inner, &path, permissions)
+            })
+            .await??;
         }
 
         Ok(())
@@ -1164,16 +1232,23 @@ impl CapFilesystem {
             }
         } else {
             let inner = self.get_inner()?;
-
-            if let Some(permissions) = permissions.into_std_permissions() {
-                inner.set_permissions(path, cap_std::fs::Permissions::from_std(permissions))?;
-            } else {
-                let file = inner.open(&path)?;
-                file.apply_permissions(permissions)?;
-            }
+            Self::set_permissions_impl(&inner, &path, permissions)?;
         }
 
         Ok(())
+    }
+
+    fn set_permissions_impl(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        permissions: PortablePermissions,
+    ) -> Result<(), std::io::Error> {
+        match permissions.into_std_permissions() {
+            Some(permissions) => {
+                inner.set_permissions(path, cap_std::fs::Permissions::from_std(permissions))
+            }
+            None => inner.open(path)?.apply_permissions(permissions),
+        }
     }
 
     pub async fn async_set_symlink_permissions(
@@ -3256,5 +3331,147 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn dir_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    // CapFilesystem::create_dir
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_applies_exact_mode_despite_umask() {
+        let (dir, filesystem) = temp_filesystem();
+
+        for (name, mode) in [("open", 0o777), ("group", 0o775), ("private", 0o700)] {
+            filesystem
+                .create_dir(name, Some(PortablePermissions::from_mode_dir(mode)))
+                .unwrap();
+            assert_eq!(dir_mode(&dir.path().join(name)), mode, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_without_permissions_matches_plain_mkdir() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("reference")).unwrap();
+
+        filesystem.create_dir("created", None).unwrap();
+
+        assert_eq!(
+            dir_mode(&dir.path().join("created")),
+            dir_mode(&dir.path().join("reference"))
+        );
+        assert!(filesystem.create_dir("created", None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_create_dir_applies_exact_mode() {
+        let (dir, filesystem) = temp_filesystem();
+
+        tokio_test::block_on(
+            filesystem.async_create_dir("dir", Some(PortablePermissions::from_mode_dir(0o777))),
+        )
+        .unwrap();
+
+        assert_eq!(dir_mode(&dir.path().join("dir")), 0o777);
+    }
+
+    // CapFilesystem::create_dir_all
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_applies_mode_only_to_leaf() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("reference")).unwrap();
+        let default_mode = dir_mode(&dir.path().join("reference"));
+        let mode = if default_mode == 0o777 { 0o775 } else { 0o777 };
+
+        filesystem
+            .create_dir_all("a/b/c", Some(PortablePermissions::from_mode_dir(mode)))
+            .unwrap();
+
+        assert_eq!(dir_mode(&dir.path().join("a/b/c")), mode);
+        assert_eq!(dir_mode(&dir.path().join("a")), default_mode);
+        assert_eq!(dir_mode(&dir.path().join("a/b")), default_mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_reapplies_mode_to_existing_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("a/b"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        filesystem
+            .create_dir_all("a/b", Some(PortablePermissions::from_mode_dir(0o777)))
+            .unwrap();
+
+        assert_eq!(dir_mode(&dir.path().join("a/b")), 0o777);
+    }
+
+    #[test]
+    fn create_dir_all_errors_when_leaf_is_a_file() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/file"), "x").unwrap();
+
+        assert!(
+            filesystem
+                .create_dir_all("a/file", Some(PortablePermissions::from_mode_dir(0o755)))
+                .is_err()
+        );
+        assert!(filesystem.create_dir_all("a/file", None).is_err());
+        assert!(dir.path().join("a/file").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_applies_mode_to_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for root in ["", "/"] {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            filesystem
+                .create_dir_all(root, Some(PortablePermissions::from_mode_dir(0o775)))
+                .unwrap();
+
+            assert_eq!(dir_mode(dir.path()), 0o775, "{root:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_create_dir_all_applies_mode_to_leaf_and_root() {
+        let (dir, filesystem) = temp_filesystem();
+        let permissions = PortablePermissions::from_mode_dir(0o777);
+
+        tokio_test::block_on(async {
+            filesystem
+                .async_create_dir_all("x/y", Some(permissions))
+                .await
+                .unwrap();
+            filesystem
+                .async_create_dir_all("", Some(permissions))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(dir_mode(&dir.path().join("x/y")), 0o777);
+        assert_eq!(dir_mode(dir.path()), 0o777);
     }
 }

@@ -378,6 +378,23 @@ impl PortablePermissions {
         self.mode
     }
 
+    /// Whether creating something with this mode through a mode-taking syscall (e.g. `mkdirat`)
+    /// may lose bits to the process umask, meaning a follow-up chmod is required.
+    /// The umask is read once from `/proc/self/status`; if unavailable this is always `true`.
+    #[cfg(unix)]
+    pub fn masked_by_umask(self) -> bool {
+        static UMASK: LazyLock<Option<u16>> = LazyLock::new(|| {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let umask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:"))?;
+
+            u16::from_str_radix(umask.trim(), 8).ok()
+        });
+
+        UMASK.is_none_or(|umask| self.mode & umask != 0)
+    }
+
     #[inline]
     pub fn into_std_permissions(self) -> Option<std::fs::Permissions> {
         #[cfg(unix)]

@@ -397,7 +397,7 @@ impl Filesystem {
 
     pub async fn ensure_trash_directory(&self) {
         if let Err(err) = self
-            .async_create_chowned_dir_all(trash::TRASH_DIRECTORY)
+            .async_create_chowned_dir_all(trash::TRASH_DIRECTORY, None)
             .await
         {
             tracing::warn!(
@@ -1243,7 +1243,7 @@ impl Filesystem {
         if parents == RenameParents::Create
             && let Some(parent) = new_path.parent()
         {
-            self.async_create_chowned_dir_all(parent).await?;
+            self.async_create_chowned_dir_all(parent, None).await?;
         }
 
         let old_metadata = self.async_metadata(&old_path).await?;
@@ -1337,7 +1337,9 @@ impl Filesystem {
                 if let Some(parent) = destination_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    destination_filesystem.async_create_dir_all(&parent).await?;
+                    destination_filesystem
+                        .async_create_dir_all(&parent, None)
+                        .await?;
                 }
 
                 let mut writer = destination_filesystem
@@ -1354,10 +1356,7 @@ impl Filesystem {
             progress.increment_files();
         } else {
             destination_filesystem
-                .async_create_dir_all(&destination_path)
-                .await?;
-            destination_filesystem
-                .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
+                .async_create_dir_all(&destination_path, Some(metadata.permissions))
                 .await?;
 
             let ignored = if filesystem.is_primary_server_fs() {
@@ -1417,7 +1416,9 @@ impl Filesystem {
 
                         if metadata.file_type.is_file() {
                             if let Some(parent) = destination_path.parent() {
-                                destination_filesystem.async_create_dir_all(&parent).await?;
+                                destination_filesystem
+                                    .async_create_dir_all(&parent, None)
+                                    .await?;
                             }
 
                             if let Some(stream) = stream {
@@ -1448,14 +1449,7 @@ impl Filesystem {
                             progress.increment_files();
                         } else if metadata.file_type.is_dir() {
                             destination_filesystem
-                                .async_create_dir_all(&destination_path)
-                                .await?;
-                            destination_filesystem
-                                .async_set_permissions(
-                                    &destination_path,
-                                    metadata.file_type,
-                                    metadata.permissions,
-                                )
+                                .async_create_dir_all(&destination_path, Some(metadata.permissions))
                                 .await?;
 
                             progress.increment_bytes(metadata.size);
@@ -1842,29 +1836,46 @@ impl Filesystem {
         }
     }
 
-    pub fn create_chowned_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    pub fn create_chowned_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
         if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.set_permissions(&path, permissions)?;
+            }
+
             return Ok(());
         }
 
-        match self.create_dir(&path) {
-            Ok(_) => {
-                self.chown_path(&path)?;
+        match self.create_dir(&path, permissions) {
+            Ok(_) => return self.chown_path(&path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(permissions) = permissions {
+                    self.set_permissions(&path, permissions)?;
+                }
+
                 return Ok(());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
             Err(_) => {}
         }
 
         let mut progress = PathBuf::new();
-        for component in path.components() {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
             progress.push(component);
+            let permissions = permissions.filter(|_| components.peek().is_none());
 
-            match self.create_dir(&progress) {
+            match self.create_dir(&progress, permissions) {
                 Ok(_) => self.chown_path(&progress)?,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(permissions) = permissions {
+                        self.set_permissions(&progress, permissions)?;
+                    }
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -1872,12 +1883,18 @@ impl Filesystem {
         Ok(())
     }
 
+    /// `permissions` only apply to the leaf directory, and are also applied when it already exists.
     pub async fn async_create_chowned_dir_all(
         &self,
         path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
     ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
         if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.async_set_permissions(&path, permissions).await?;
+            }
+
             return Ok(());
         }
 
@@ -1885,23 +1902,32 @@ impl Filesystem {
         let cap_filesystem = self.cap_filesystem.clone();
 
         tokio::task::spawn_blocking(move || {
-            match cap_filesystem.create_dir(&path) {
-                Ok(_) => {
-                    Self::chown_impl(&config, &cap_filesystem, &path)?;
+            match cap_filesystem.create_dir(&path, permissions) {
+                Ok(_) => return Self::chown_impl(&config, &cap_filesystem, &path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(permissions) = permissions {
+                        cap_filesystem.set_permissions(&path, permissions)?;
+                    }
+
                     return Ok(());
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
                 Err(_) => {}
             }
 
             let mut progress = PathBuf::new();
-            for component in path.components() {
+            let mut components = path.components().peekable();
+            while let Some(component) = components.next() {
                 progress.push(component);
+                let permissions = permissions.filter(|_| components.peek().is_none());
 
-                match cap_filesystem.create_dir(&progress) {
+                match cap_filesystem.create_dir(&progress, permissions) {
                     Ok(_) => Self::chown_impl(&config, &cap_filesystem, &progress)?,
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if let Some(permissions) = permissions {
+                            cap_filesystem.set_permissions(&progress, permissions)?;
+                        }
+                    }
                     Err(err) => return Err(err),
                 }
             }

@@ -597,7 +597,7 @@ impl TrashManager {
         };
 
         filesystem
-            .async_create_chowned_dir_all(&entry_directory)
+            .async_create_chowned_dir_all(&entry_directory, None)
             .await?;
 
         let result = async {

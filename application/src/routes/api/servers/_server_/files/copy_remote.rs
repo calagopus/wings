@@ -364,7 +364,7 @@ mod post {
 
                                                     if metadata.file_type.is_file() {
                                                         if let Some(parent) = destination_path.parent() {
-                                                            destination_filesystem.async_create_dir_all(&parent).await?;
+                                                            destination_filesystem.async_create_dir_all(&parent, None).await?;
                                                         }
 
                                                         if filesystem.is_primary_server_fs()
@@ -396,10 +396,7 @@ mod post {
 
                                                         files_processed.fetch_add(1, Ordering::Relaxed);
                                                     } else if metadata.file_type.is_dir() {
-                                                        destination_filesystem.async_create_dir_all(&destination_path).await?;
-                                                        destination_filesystem
-                                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
-                                                            .await?;
+                                                        destination_filesystem.async_create_dir_all(&destination_path, Some(metadata.permissions)).await?;
 
                                                         bytes_processed.fetch_add(metadata.size, Ordering::Relaxed);
                                                     } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&source_path).await {

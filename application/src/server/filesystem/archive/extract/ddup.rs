@@ -94,11 +94,9 @@ pub async fn extract_ddup(
 
                 match entry {
                     Entry::Directory(dir) => {
-                        destination_filesystem.create_dir_all(&destination_path)?;
-                        destination_filesystem.set_permissions(
+                        destination_filesystem.create_dir_all(
                             &destination_path,
-                            FileType::Dir,
-                            PortablePermissions::from_mode_dir(dir.mode.bits()),
+                            Some(PortablePermissions::from_mode_dir(dir.mode.bits())),
                         )?;
 
                         let parent: Arc<Path> = Arc::from(relative.as_path());

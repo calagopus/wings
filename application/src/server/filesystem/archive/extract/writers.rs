@@ -147,7 +147,7 @@ impl Writers<'_> {
         if let Some(parent) = path.parent()
             && self.last_parent.as_deref() != Some(parent)
         {
-            self.destination_filesystem.create_dir_all(&parent)?;
+            self.destination_filesystem.create_dir_all(&parent, None)?;
             self.last_parent = Some(parent.to_path_buf());
         }
 

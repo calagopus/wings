@@ -485,7 +485,7 @@ impl BackupExt for ZfsBackup {
                                     super::log_restoring(&server, &path);
 
                                     if let Some(parent) = path.parent() {
-                                        server.filesystem.async_create_chowned_dir_all(parent).await?;
+                                        server.filesystem.async_create_chowned_dir_all(parent, None).await?;
                                     }
 
                                     filesystem
@@ -508,10 +508,9 @@ impl BackupExt for ZfsBackup {
                                     }
                                     progress.increment_files();
                                 } else if metadata.is_dir() {
-                                    server.filesystem.async_create_chowned_dir_all(&path).await?;
                                     server
                                         .filesystem
-                                        .async_set_permissions(&path, metadata.permissions().into())
+                                        .async_create_chowned_dir_all(&path, Some(metadata.permissions().into()))
                                         .await?;
                                     if let Ok(modified_time) = metadata.modified() {
                                         server.filesystem.async_set_times(

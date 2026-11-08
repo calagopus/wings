@@ -142,7 +142,7 @@ mod post {
                 .ok();
         }
 
-        filesystem.async_create_dir_all(&root).await?;
+        filesystem.async_create_dir_all(&root, None).await?;
 
         let (_, task) = server
             .filesystem

@@ -1443,13 +1443,19 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
 #[async_trait::async_trait]
 impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
-    fn create_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
+    fn create_dir_all(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), anyhow::Error> {
         let path = self.check_create_dir(path.as_ref())?;
 
         if self.is_primary_server_fs {
-            self.server.filesystem.create_chowned_dir_all(&path)?;
+            self.server
+                .filesystem
+                .create_chowned_dir_all(&path, permissions)?;
         } else {
-            self.inner.create_dir_all(&path)?;
+            self.inner.create_dir_all(&path, permissions)?;
         }
 
         Ok(())
@@ -1457,16 +1463,17 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     async fn async_create_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
     ) -> Result<(), anyhow::Error> {
         let path = self.async_check_create_dir(path.as_ref()).await?;
 
         if self.is_primary_server_fs {
             self.server
                 .filesystem
-                .async_create_chowned_dir_all(&path)
+                .async_create_chowned_dir_all(&path, permissions)
                 .await?;
         } else {
-            self.inner.async_create_dir_all(&path).await?;
+            self.inner.async_create_dir_all(&path, permissions).await?;
         }
 
         Ok(())
@@ -2582,8 +2589,8 @@ mod tests {
             assert!(!csgo_names.iter().any(|name| name == "other.txt"));
 
             assert!(fs.async_metadata(&"top.txt").await.is_err());
-            fs.async_create_dir_all(&"game/csgo").await?;
-            assert!(fs.async_create_dir_all(&"game/newdir").await.is_err());
+            fs.async_create_dir_all(&"game/csgo", None).await?;
+            assert!(fs.async_create_dir_all(&"game/newdir", None).await.is_err());
             assert!(fs.async_create_file(&"game/csgo/new.txt").await.is_err());
 
             Ok(())

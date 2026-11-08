@@ -709,7 +709,10 @@ impl russh_sftp::server::Handler for SftpSession {
         if self
             .server
             .filesystem
-            .async_create_dir(&path)
+            .async_create_dir(
+                &path,
+                attrs.permissions.map(PortablePermissions::from_mode_dir),
+            )
             .await
             .is_err()
         {
@@ -718,16 +721,6 @@ impl russh_sftp::server::Handler for SftpSession {
 
         if let Err(err) = self.server.filesystem.async_chown_path(&path).await {
             tracing::warn!("failed to chown new directory: {:?}", err);
-        }
-        if let Some(permissions) = attrs.permissions
-            && self
-                .server
-                .filesystem
-                .async_set_permissions(&path, PortablePermissions::from_mode_dir(permissions))
-                .await
-                .is_err()
-        {
-            return Err(StatusCode::Failure);
         }
 
         self.server.activity.log_activity(Activity {

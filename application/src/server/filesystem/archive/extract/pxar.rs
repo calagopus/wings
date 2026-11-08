@@ -75,12 +75,9 @@ pub async fn extract_pxar(
 
             match entry.kind() {
                 pbs_client::pxar::EntryKind::Directory => {
-                    let permissions = PortablePermissions::from_mode_dir(stat.mode);
-                    destination_filesystem.create_dir_all(&destination_path)?;
-                    destination_filesystem.set_permissions(
+                    destination_filesystem.create_dir_all(
                         &destination_path,
-                        FileType::Dir,
-                        permissions,
+                        Some(PortablePermissions::from_mode_dir(stat.mode)),
                     )?;
                     if let Some(modified_time) = modified_time
                         && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES
@@ -94,7 +91,7 @@ pub async fn extract_pxar(
                     if let Some(parent) = destination_path.parent()
                         && last_parent.as_deref() != Some(parent)
                     {
-                        destination_filesystem.create_dir_all(&parent)?;
+                        destination_filesystem.create_dir_all(&parent, None)?;
                         last_parent = Some(parent.to_path_buf());
                     }
 

@@ -854,10 +854,15 @@ pub trait VirtualReadableFilesystem: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
-    fn create_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
+    fn create_dir_all(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), anyhow::Error>;
     async fn async_create_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
     ) -> Result<(), anyhow::Error>;
     fn remove_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
     async fn async_remove_dir_all(

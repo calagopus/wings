@@ -889,10 +889,9 @@ impl BackupExt for DdupBakBackup {
                                 });
                             }
                             Entry::Directory(directory) => {
-                                server.filesystem.create_chowned_dir_all(&path)?;
-                                server.filesystem.set_permissions(
+                                server.filesystem.create_chowned_dir_all(
                                     &path,
-                                    PortablePermissions::from_mode_dir(directory.mode.bits()),
+                                    Some(PortablePermissions::from_mode_dir(directory.mode.bits())),
                                 )?;
 
                                 let parent: Arc<Path> = Arc::from(path.as_path());

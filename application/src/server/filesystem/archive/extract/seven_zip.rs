@@ -96,7 +96,7 @@ pub async fn extract_seven_zip(
 
                         if entry.is_directory() {
                             if let Err(err) =
-                                destination_filesystem.create_dir_all(&destination_path)
+                                destination_filesystem.create_dir_all(&destination_path, None)
                             {
                                 return Err(sevenz_rust2::Error::Other(err.to_string().into()));
                             }
@@ -106,7 +106,9 @@ pub async fn extract_seven_zip(
                             if let Some(parent) = destination_path.parent()
                                 && last_parent.as_deref() != Some(parent)
                             {
-                                if let Err(err) = destination_filesystem.create_dir_all(&parent) {
+                                if let Err(err) =
+                                    destination_filesystem.create_dir_all(&parent, None)
+                                {
                                     return Err(sevenz_rust2::Error::Other(err.to_string().into()));
                                 }
                                 last_parent = Some(parent.to_path_buf());
@@ -169,7 +171,7 @@ pub async fn extract_seven_zip(
                         continue;
                     }
 
-                    destination_filesystem.create_dir_all(&destination_path)?;
+                    destination_filesystem.create_dir_all(&destination_path, None)?;
 
                     if entry.has_last_modified_date {
                         destination_filesystem.set_times(

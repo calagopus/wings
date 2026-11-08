@@ -76,11 +76,9 @@ pub async fn extract_itaf(
                         ArchiveEntry::Directory(dir) => {
                             let metadata = dir.metadata();
 
-                            destination_filesystem.create_dir_all(&destination_path)?;
-                            destination_filesystem.set_permissions(
+                            destination_filesystem.create_dir_all(
                                 &destination_path,
-                                FileType::Dir,
-                                PortablePermissions::from_mode_dir(metadata.mode),
+                                Some(PortablePermissions::from_mode_dir(metadata.mode)),
                             )?;
 
                             if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
@@ -135,7 +133,7 @@ pub async fn extract_itaf(
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
-                destination_filesystem.create_dir_all(&parent)?;
+                destination_filesystem.create_dir_all(&parent, None)?;
             }
 
             if let Err(err) = destination_filesystem.create_hard_link(&target, &path) {

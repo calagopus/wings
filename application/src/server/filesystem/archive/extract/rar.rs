@@ -94,7 +94,7 @@ pub async fn extract_rar(
             }
 
             if entry.entry().is_directory() {
-                destination_filesystem.create_dir_all(&destination_path)?;
+                destination_filesystem.create_dir_all(&destination_path, None)?;
 
                 if let Some(modified_time) = dos_time_to_unix(entry.entry().file_time)
                     && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES
@@ -109,7 +109,7 @@ pub async fn extract_rar(
                 if let Some(parent) = destination_path.parent()
                     && last_parent.as_deref() != Some(parent)
                 {
-                    destination_filesystem.create_dir_all(&parent)?;
+                    destination_filesystem.create_dir_all(&parent, None)?;
                     last_parent = Some(parent.to_path_buf());
                 }
 

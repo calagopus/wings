@@ -337,7 +337,7 @@ mod post {
                 ..
             } = &target;
 
-            filesystem.async_create_dir_all(&root).await?;
+            filesystem.async_create_dir_all(&root, None).await?;
 
             let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
             let lock_guard = lock.lock_owned().await;
@@ -635,7 +635,7 @@ mod patch {
         let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
         let lock_guard = lock.lock_owned().await;
 
-        filesystem.async_create_dir_all(&root).await?;
+        filesystem.async_create_dir_all(&root, None).await?;
 
         let disk_offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {

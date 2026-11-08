@@ -1208,7 +1208,7 @@ impl ScheduleAction {
                     return Err("destination not found".into());
                 }
 
-                if let Err(err) = filesystem.async_create_dir_all(&destination).await {
+                if let Err(err) = filesystem.async_create_dir_all(&destination, None).await {
                     tracing::error!(path = %destination.display(), "failed to create directory: {:?}", err);
 
                     return Err("failed to create directory".into());
@@ -1278,7 +1278,11 @@ impl ScheduleAction {
                     return Err("file is not a file".into());
                 }
 
-                if let Err(err) = server.filesystem.async_create_chowned_dir_all(parent).await {
+                if let Err(err) = server
+                    .filesystem
+                    .async_create_chowned_dir_all(parent, None)
+                    .await
+                {
                     tracing::error!(path = %parent.display(), "failed to create parent directory: {:?}", err);
 
                     return Err("failed to create parent directory".into());
@@ -2084,7 +2088,7 @@ impl ScheduleAction {
                     return Err("root not found".into());
                 }
 
-                if let Err(err) = filesystem.async_create_dir_all(&root).await {
+                if let Err(err) = filesystem.async_create_dir_all(&root, None).await {
                     tracing::error!(path = %root.display(), "failed to create directory: {:?}", err);
 
                     return Err("failed to create directory".into());

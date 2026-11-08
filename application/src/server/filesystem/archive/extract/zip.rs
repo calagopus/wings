@@ -152,11 +152,9 @@ pub async fn extract_zip(
         }
 
         for directory in &directories {
-            destination_filesystem.create_dir_all(&directory.path)?;
-            destination_filesystem.set_permissions(
+            destination_filesystem.create_dir_all(
                 &directory.path,
-                FileType::Dir,
-                PortablePermissions::from_mode_dir(directory.mode),
+                Some(PortablePermissions::from_mode_dir(directory.mode)),
             )?;
         }
 
@@ -169,7 +167,7 @@ pub async fn extract_zip(
                 && let Some(parent) = entry.path.parent()
                 && last_parent != Some(parent)
             {
-                destination_filesystem.create_dir_all(&parent)?;
+                destination_filesystem.create_dir_all(&parent, None)?;
                 last_parent = Some(parent);
             }
         }

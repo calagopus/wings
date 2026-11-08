@@ -853,13 +853,9 @@ impl BackupExt for PbsBackup {
                     EntryKind::Directory => {
                         server
                             .filesystem
-                            .async_create_chowned_dir_all(path.as_path())
-                            .await?;
-                        server
-                            .filesystem
-                            .async_set_permissions(
+                            .async_create_chowned_dir_all(
                                 path.as_path(),
-                                PortablePermissions::from_mode_dir(mode),
+                                Some(PortablePermissions::from_mode_dir(mode)),
                             )
                             .await?;
 
@@ -875,7 +871,7 @@ impl BackupExt for PbsBackup {
                         {
                             server
                                 .filesystem
-                                .async_create_chowned_dir_all(parent)
+                                .async_create_chowned_dir_all(parent, None)
                                 .await?;
                             last_parent = Some(parent.to_path_buf());
                         }
