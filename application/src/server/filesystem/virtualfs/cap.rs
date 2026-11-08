@@ -268,6 +268,20 @@ impl VirtualCapFilesystem {
         Ok(())
     }
 
+    /// Opens `path` for reading, refusing it when a symlink led somewhere denied.
+    fn open_checked(&self, path: &Path) -> Result<std::fs::File, anyhow::Error> {
+        if self.link_filter().is_some()
+            && let Some(file) = self.inner.open_exact(path)?
+        {
+            return Ok(file);
+        }
+
+        let file = self.inner.open(path)?;
+        self.check_opened(path, &file)?;
+
+        Ok(file)
+    }
+
     /// The resolved path a write to `path` lands on, when that differs from `path`
     /// itself: its parent directories, and with `follow` the final component too. A
     /// dangling final symlink is refused when followed, since creating through it
@@ -1249,8 +1263,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         range: Option<ByteRange>,
     ) -> Result<FileRead, anyhow::Error> {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
-        let file = self.inner.open(&path)?;
-        self.check_opened(&path, &file)?;
+        let file = self.open_checked(&path)?;
 
         Ok(FileRead::from_file(file, range)?)
     }
@@ -1264,13 +1277,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .await?;
 
         let this = self.clone();
-        let file = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
-            let file = this.inner.open(&path)?;
-            this.check_opened(&path, &file)?;
-
-            Ok(file)
-        })
-        .await??;
+        let file = tokio::task::spawn_blocking(move || this.open_checked(&path)).await??;
 
         Ok(AsyncFileRead::from_file(tokio::fs::File::from_std(file), range).await?)
     }
@@ -1762,7 +1769,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         file_type: FileType,
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
-        let path = self.check_write(file_type, path.as_ref(), !file_type.is_symlink())?;
+        let path = self.check_write(file_type, path.as_ref(), true)?;
 
         self.inner.set_permissions(path, permissions)?;
 
@@ -1775,7 +1782,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self
-            .async_check_write(file_type, path.as_ref(), !file_type.is_symlink())
+            .async_check_write(file_type, path.as_ref(), true)
             .await?;
 
         self.inner.async_set_permissions(path, permissions).await?;
@@ -3002,6 +3009,86 @@ mod tests {
                     .any(|(path, _)| path.file_name().is_some_and(|name| name == "secret.txt"))
             );
             assert!(!bytes.windows(10).any(|window| window == b"SECRET-SUB"));
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::async_set_permissions
+    #[cfg(unix)]
+    #[test]
+    fn chmod_through_a_symlink_checks_the_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+            let root = fixture.server.filesystem.base_path.clone();
+            let mode = |name: &str| -> Result<u32, anyhow::Error> {
+                Ok(std::fs::metadata(root.join(name))?.permissions().mode() & 0o777)
+            };
+            let denied_before = mode("denied.txt")?;
+
+            for link in ["denied-link", "nested/denied-link"] {
+                assert!(
+                    fixture
+                        .fs
+                        .async_set_permissions(
+                            &link,
+                            FileType::Symlink,
+                            PortablePermissions::from_mode_file(0o600),
+                        )
+                        .await
+                        .is_err(),
+                    "{link}"
+                );
+            }
+            assert_eq!(mode("denied.txt")?, denied_before);
+
+            let plain = fixture
+                .fs
+                .clone()
+                .with_is_ignored(IsIgnoredFn::from(IgnoreList::from_lines(["denied.txt"])?));
+            assert!(
+                plain
+                    .async_set_permissions(
+                        &"denied-link",
+                        FileType::Symlink,
+                        PortablePermissions::from_mode_file(0o600),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(mode("denied.txt")?, denied_before);
+
+            fixture
+                .fs
+                .async_set_permissions(
+                    &"file-link",
+                    FileType::Symlink,
+                    PortablePermissions::from_mode_file(0o600),
+                )
+                .await?;
+            assert_eq!(mode("a.txt")?, 0o600);
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::async_read_file
+    #[test]
+    fn reading_through_a_symlink_to_a_denied_file_is_refused() {
+        with_one_blocking_worker(|| async {
+            let fixture = ListingFixture::new(0).await?;
+
+            for link in ["denied-link", "nested/denied-link"] {
+                assert!(
+                    fixture.fs.async_read_file(&link, None).await.is_err(),
+                    "{link}"
+                );
+            }
+            fixture.fs.async_read_file(&"file-link", None).await?;
+            fixture.fs.async_read_file(&"nested/data.bin", None).await?;
 
             Ok(())
         });

@@ -631,7 +631,8 @@ impl CapFilesystem {
         }
 
         let inner = self.get_inner()?;
-        let canonicalized = tokio::task::spawn_blocking(move || inner.canonicalize(path)).await??;
+        let canonicalized =
+            tokio::task::spawn_blocking(move || Self::canonicalize_beneath(&inner, path)).await??;
 
         Ok(canonicalized)
     }
@@ -695,9 +696,48 @@ impl CapFilesystem {
         }
 
         let inner = self.get_inner()?;
-        let canonicalized = inner.canonicalize(path)?;
 
-        Ok(canonicalized)
+        Self::canonicalize_beneath(&inner, path)
+    }
+
+    fn canonicalize_beneath(
+        inner: &cap_std::fs::Dir,
+        path: PathBuf,
+    ) -> Result<PathBuf, std::io::Error> {
+        #[cfg(target_os = "linux")]
+        if Self::open_without_symlinks(inner, &path, rustix::fs::OFlags::PATH)?.is_some() {
+            return Ok(path);
+        }
+
+        inner.canonicalize(path)
+    }
+
+    /// Opens `path` only when none of its components is a symlink, so the file
+    /// opened is exactly the one at `path`. `None` when a symlink is in the way
+    /// or the kernel cannot tell, and the caller has to resolve it the slow way.
+    #[cfg(target_os = "linux")]
+    fn open_without_symlinks(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        flags: rustix::fs::OFlags,
+    ) -> Result<Option<std::fs::File>, std::io::Error> {
+        match rustix::fs::openat2(
+            inner,
+            path,
+            flags | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => Ok(Some(fd.into())),
+            Err(
+                rustix::io::Errno::LOOP
+                | rustix::io::Errno::AGAIN
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::PERM
+                | rustix::io::Errno::XDEV,
+            ) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Path of an opened file relative to the root, as the kernel resolved it when the
@@ -818,6 +858,26 @@ impl CapFilesystem {
         let file = inner.open(path)?;
 
         Ok(file.into_std())
+    }
+
+    /// Like [`Self::open`], but only opens `path` when no symlink lies on the way,
+    /// so the file is known to be the one at `path`.
+    pub fn open_exact(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<std::fs::File>, std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = self.relative_path(path.as_ref());
+
+            Self::open_without_symlinks(&*self.get_inner()?, &path, rustix::fs::OFlags::RDONLY)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+
+            Ok(None)
+        }
     }
 
     pub fn open_with(
@@ -2436,6 +2496,23 @@ mod tests {
         assert_eq!(
             filesystem.canonicalize("link.yml").unwrap(),
             PathBuf::from("config/secret.yml")
+        );
+    }
+
+    #[test]
+    fn canonicalize_resolves_a_symlinked_directory_mid_path() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("real/inner")).unwrap();
+        std::fs::write(dir.path().join("real/inner/file.txt"), b"x").unwrap();
+        filesystem.symlink("real", "alias").unwrap();
+
+        assert_eq!(
+            filesystem.canonicalize("alias/inner/file.txt").unwrap(),
+            PathBuf::from("real/inner/file.txt")
+        );
+        assert_eq!(
+            filesystem.canonicalize("real/inner/file.txt").unwrap(),
+            PathBuf::from("real/inner/file.txt")
         );
     }
 

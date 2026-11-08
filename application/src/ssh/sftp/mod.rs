@@ -33,6 +33,7 @@ pub struct FileHandle {
     file: Arc<Mutex<crate::server::filesystem::file::ServerFile>>,
     append: bool,
     eof_at: Option<u64>,
+    prefetched: Option<Vec<u8>>,
 
     diff_track: bool,
     diff_before: Option<Vec<u8>>,
@@ -73,6 +74,27 @@ pub struct SftpSession {
 
     pub handle_id: u64,
     pub handles: HashMap<compact_str::CompactString, ServerHandle>,
+}
+
+const PREFETCH_LIMIT: u64 = 32 * 1024;
+
+fn read_chunk(
+    file: &crate::server::filesystem::file::ServerFile,
+    offset: u64,
+    len: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut data = crate::io::mem_buffer(len);
+    let bytes_read = file.read_at(offset, &mut data)?;
+
+    let at_eof = bytes_read > 0
+        && bytes_read < data.len()
+        && file
+            .metadata()
+            .is_ok_and(|metadata| offset + bytes_read as u64 >= metadata.len());
+
+    data.truncate(bytes_read);
+    data.shrink_to_fit();
+    Ok((data, at_eof))
 }
 
 impl SftpSession {
@@ -955,6 +977,7 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
         handle.eof_at = None;
+        handle.prefetched = None;
         let path = handle.path.to_string_lossy().to_string();
 
         self.setstat(id, path, attrs).await
@@ -1235,7 +1258,7 @@ impl russh_sftp::server::Handler for SftpSession {
             )
         };
 
-        let (path, file, diff_track, diff_before) = tokio::task::spawn_blocking({
+        let (path, file, diff_track, diff_before, prefetched) = tokio::task::spawn_blocking({
             let server = self.server.clone();
             let user_uuid = self.user_uuid;
 
@@ -1354,7 +1377,16 @@ impl russh_sftp::server::Handler for SftpSession {
                     tracing::warn!("failed to chown new file: {:?}", err);
                 }
 
-                Ok((path, file, diff_track, diff_before))
+                let prefetched = if pflags.contains(OpenFlags::READ) && !is_write {
+                    file.metadata()
+                        .ok()
+                        .filter(|metadata| metadata.is_file() && metadata.len() <= PREFETCH_LIMIT)
+                        .and_then(|metadata| read_chunk(&file, 0, metadata.len() as usize + 1).ok())
+                } else {
+                    None
+                };
+
+                Ok((path, file, diff_track, diff_before, prefetched))
             }
         })
         .await
@@ -1394,7 +1426,10 @@ impl russh_sftp::server::Handler for SftpSession {
                 path,
                 file: Arc::new(Mutex::new(file)),
                 append: pflags.contains(OpenFlags::APPEND),
-                eof_at: None,
+                eof_at: prefetched
+                    .as_ref()
+                    .and_then(|(data, at_eof)| at_eof.then_some(data.len() as u64)),
+                prefetched: prefetched.map(|(data, _)| data),
                 diff_track,
                 diff_before,
                 diff_dirty: false,
@@ -1423,6 +1458,17 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
+        if let Some(data) = handle.prefetched.take()
+            && offset == 0
+            && data.len() <= len as usize
+        {
+            if data.is_empty() {
+                return Err(StatusCode::Eof);
+            }
+
+            return Ok(Data { id, data });
+        }
+
         if handle.eof_at.take() == Some(offset) {
             return Err(StatusCode::Eof);
         }
@@ -1430,21 +1476,7 @@ impl russh_sftp::server::Handler for SftpSession {
         let (data, at_eof) = tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
 
-            move || -> Result<(Vec<u8>, bool), std::io::Error> {
-                let mut data = crate::io::mem_buffer(len.min(256 * 1024) as usize);
-                let file = file.lock();
-                let bytes_read = file.read_at(offset, &mut data)?;
-
-                let at_eof = bytes_read > 0
-                    && bytes_read < data.len()
-                    && file
-                        .metadata()
-                        .is_ok_and(|metadata| offset + bytes_read as u64 >= metadata.len());
-
-                data.truncate(bytes_read);
-                data.shrink_to_fit();
-                Ok((data, at_eof))
-            }
+            move || read_chunk(&file.lock(), offset, len.min(256 * 1024) as usize)
         })
         .await
         .map_err(|_| StatusCode::Failure)?
@@ -1508,6 +1540,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
         handle.diff_dirty = true;
         handle.eof_at = None;
+        handle.prefetched = None;
 
         Ok(Status {
             id,

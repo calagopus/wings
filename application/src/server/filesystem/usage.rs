@@ -360,6 +360,32 @@ impl DiskUsage {
         None
     }
 
+    /// Replaces this node's own files with `own` and its children with `children`, keeping the
+    /// existing subtree of every child given without a freshly walked one.
+    pub fn rebuild(
+        &mut self,
+        own: UsedSpace,
+        children: Vec<(std::ffi::OsString, Option<DiskUsage>)>,
+    ) {
+        let mut children: Vec<_> = children
+            .into_iter()
+            .map(|(name, walked)| (Self::component_key(&name).to_compact_string(), walked))
+            .collect();
+        children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut old = std::mem::take(&mut self.entries).into_iter().peekable();
+        self.space = own;
+
+        for (key, walked) in children {
+            while old.next_if(|(name, _)| *name < key).is_some() {}
+            let kept = old.next_if(|(name, _)| *name == key).map(|(_, node)| node);
+            let child = walked.or(kept).unwrap_or_default();
+
+            self.space = self.space + child.space;
+            self.entries.push((key, child));
+        }
+    }
+
     #[inline]
     pub fn truncate(&mut self) {
         self.space.set_logical(0);

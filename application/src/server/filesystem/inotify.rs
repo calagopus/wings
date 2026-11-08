@@ -35,7 +35,6 @@ const WATCH_FLAGS: WatchFlags = WatchFlags::ATTRIB
 struct WatchedDir {
     uuid: uuid::Uuid,
     path: PathBuf,
-    notifier: InotifyServerNotifier,
 }
 
 struct ServerWatch {
@@ -52,29 +51,21 @@ struct Watches {
 
 impl Watches {
     fn insert_dir(&mut self, wd: i32, uuid: uuid::Uuid, path: PathBuf) {
-        let Some(notifier) = self
-            .servers
-            .get(&uuid)
-            .map(|server| server.notifier.clone())
-        else {
+        let Some(server) = self.servers.get(&uuid) else {
             return;
         };
 
         if let Some(existing) = self.dirs.get(&wd)
             && existing.uuid != uuid
-            && existing.notifier.path.components().count() > notifier.path.components().count()
+            && let Some(existing) = self.servers.get(&existing.uuid)
+            && existing.notifier.path.components().count()
+                > server.notifier.path.components().count()
         {
             return;
         }
 
-        if let Some(existing) = self.dirs.insert(
-            wd,
-            WatchedDir {
-                uuid,
-                path,
-                notifier,
-            },
-        ) && existing.uuid != uuid
+        if let Some(existing) = self.dirs.insert(wd, WatchedDir { uuid, path })
+            && existing.uuid != uuid
             && let Some(server) = self.servers.get_mut(&existing.uuid)
         {
             server.descriptors.remove(&wd);
@@ -95,11 +86,20 @@ impl Watches {
         Some(dir)
     }
 
-    fn descriptors_under(&self, path: &Path) -> Vec<i32> {
-        self.dirs
+    fn descriptors_under(&self, uuid: uuid::Uuid, path: &Path) -> Vec<i32> {
+        let Some(server) = self.servers.get(&uuid) else {
+            return Vec::new();
+        };
+
+        server
+            .descriptors
             .iter()
-            .filter(|(_, dir)| dir.path.starts_with(path))
-            .map(|(wd, _)| *wd)
+            .filter(|wd| {
+                self.dirs
+                    .get(wd)
+                    .is_some_and(|dir| dir.path.starts_with(path))
+            })
+            .copied()
             .collect()
     }
 
@@ -169,7 +169,7 @@ impl InotifyManager {
         let mut reader = inotify::Reader::new(&**fd, &mut buffer);
         let mut touched: HashSet<i32> = HashSet::new();
         let mut new_dirs: Vec<(uuid::Uuid, PathBuf)> = Vec::new();
-        let mut stale_dirs: Vec<PathBuf> = Vec::new();
+        let mut stale_dirs: Vec<(uuid::Uuid, PathBuf)> = Vec::new();
 
         loop {
             {
@@ -205,28 +205,34 @@ impl InotifyManager {
                     );
 
                     for server in table.servers.values() {
-                        server.notifier.add_path(server.notifier.path.clone());
+                        server
+                            .notifier
+                            .signal_firewall_files(&server.notifier.path, None);
+                        server.notifier.add_tree(server.notifier.path.clone());
                     }
                 } else if flags.contains(ReadFlags::IGNORED) {
                     table.remove_dir(wd);
-                } else if let Some(dir) = table.dirs.get(&wd) {
-                    Self::handle_event(
+                } else if let Some(dir) = table.dirs.get(&wd)
+                    && let Some(server) = table.servers.get(&dir.uuid)
+                    && Self::handle_event(
                         dir,
-                        wd,
+                        &server.notifier,
                         flags,
                         name,
-                        &mut touched,
                         &mut new_dirs,
                         &mut stale_dirs,
-                    );
+                    )
+                    && touched.insert(wd)
+                {
+                    server.notifier.add_directory(dir.path.clone());
                 }
             }
 
             if reader.is_buffer_empty() {
                 touched.clear();
 
-                for path in stale_dirs.drain(..) {
-                    Self::unwatch_tree(fd, table, &path);
+                for (uuid, path) in stale_dirs.drain(..) {
+                    Self::unwatch_tree(fd, table, uuid, &path);
                 }
                 for (uuid, path) in new_dirs.drain(..) {
                     let _ = Self::watch_tree(fd, table, uuid, &path);
@@ -237,17 +243,15 @@ impl InotifyManager {
         }
     }
 
+    /// Returns whether the entries of the watched directory itself changed.
     fn handle_event(
         dir: &WatchedDir,
-        wd: i32,
+        notifier: &InotifyServerNotifier,
         flags: ReadFlags,
         name: Option<&OsStr>,
-        touched: &mut HashSet<i32>,
         new_dirs: &mut Vec<(uuid::Uuid, PathBuf)>,
-        stale_dirs: &mut Vec<PathBuf>,
-    ) {
-        let notifier = &dir.notifier;
-
+        stale_dirs: &mut Vec<(uuid::Uuid, PathBuf)>,
+    ) -> bool {
         if flags.contains(ReadFlags::UNMOUNT) {
             tracing::error!(
                 path = %dir.path.display(),
@@ -255,7 +259,7 @@ impl InotifyManager {
             );
             notifier.is_trusted.store(false, Ordering::Relaxed);
 
-            return;
+            return false;
         }
 
         if flags.intersects(ReadFlags::DELETE_SELF | ReadFlags::MOVE_SELF) {
@@ -267,29 +271,28 @@ impl InotifyManager {
                 notifier.is_trusted.store(false, Ordering::Relaxed);
             }
 
-            notifier.add_path(dir.path.clone());
+            notifier.signal_firewall_files(&dir.path, None);
+            notifier.add_tree(dir.path.clone());
 
-            return;
+            return false;
         }
+
+        notifier.signal_firewall_files(&dir.path, name);
 
         if flags.contains(ReadFlags::ISDIR)
             && let Some(name) = name
         {
             if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
-                new_dirs.push((dir.uuid, dir.path.join(name)));
+                let path = dir.path.join(name);
+
+                notifier.add_tree(path.clone());
+                new_dirs.push((dir.uuid, path));
             } else if flags.contains(ReadFlags::MOVED_FROM) {
-                stale_dirs.push(dir.path.join(name));
+                stale_dirs.push((dir.uuid, dir.path.join(name)));
             }
         }
 
-        if notifier.has_firewall_files() {
-            notifier.add_path(match name {
-                Some(name) => dir.path.join(name),
-                None => dir.path.clone(),
-            });
-        } else if touched.insert(wd) {
-            notifier.add_path(dir.path.clone());
-        }
+        true
     }
 
     fn watch_tree(
@@ -337,10 +340,10 @@ impl InotifyManager {
         Ok(())
     }
 
-    fn unwatch_tree(fd: &Arc<OwnedFd>, table: &WatchTable, path: &Path) {
+    fn unwatch_tree(fd: &Arc<OwnedFd>, table: &WatchTable, uuid: uuid::Uuid, path: &Path) {
         let mut table = table.lock();
 
-        for wd in table.descriptors_under(path) {
+        for wd in table.descriptors_under(uuid, path) {
             table.remove_dir(wd);
             let _ = inotify::remove_watch(fd, wd);
         }
@@ -428,10 +431,44 @@ impl InotifyManager {
     }
 }
 
+/// Directories whose own entries changed, and directories whose whole subtree has to be
+/// walked again because it appeared (created or moved in) or the events were lost.
+#[derive(Default)]
+pub struct ModifiedPaths {
+    pub directories: Vec<PathBuf>,
+    pub trees: Vec<PathBuf>,
+}
+
+impl ModifiedPaths {
+    const MAX_PATHS_BEFORE_DEDUP: usize = 512;
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.directories.is_empty() && self.trees.is_empty()
+    }
+
+    fn whole(root: PathBuf) -> Self {
+        Self {
+            directories: Vec::new(),
+            trees: vec![root],
+        }
+    }
+
+    fn deduplicate(&mut self) {
+        self.trees = crate::utils::deduplicate_paths(std::mem::take(&mut self.trees));
+        self.directories.sort();
+        self.directories.dedup();
+
+        let trees = &self.trees;
+        self.directories
+            .retain(|directory| !trees.iter().any(|tree| directory.starts_with(tree)));
+    }
+}
+
 #[derive(Clone)]
 pub struct InotifyServerNotifier {
     path: PathBuf,
-    modified_paths: Arc<Mutex<Vec<PathBuf>>>,
+    modified_paths: Arc<Mutex<ModifiedPaths>>,
     is_trusted: Arc<AtomicBool>,
     dirty_flags: [Arc<AtomicBool>; 2],
     firewall_files: FirewallFiles,
@@ -441,7 +478,7 @@ impl InotifyServerNotifier {
     pub fn new(path: PathBuf, dirty_flags: [Arc<AtomicBool>; 2]) -> Self {
         Self {
             path: path.clone(),
-            modified_paths: Arc::new(Mutex::new(vec![path])),
+            modified_paths: Arc::new(Mutex::new(ModifiedPaths::whole(path))),
             is_trusted: Arc::new(AtomicBool::new(true)),
             dirty_flags,
             firewall_files: Arc::new(Mutex::new(None)),
@@ -456,38 +493,56 @@ impl InotifyServerNotifier {
         };
     }
 
-    #[inline]
-    fn has_firewall_files(&self) -> bool {
-        self.firewall_files.lock().is_some()
+    fn signal_firewall_files(&self, dir: &Path, name: Option<&OsStr>) {
+        if let Some((files, changed)) = &*self.firewall_files.lock() {
+            let path = match name {
+                Some(name) => dir.join(name),
+                None => dir.to_path_buf(),
+            };
+
+            if files.iter().any(|file| file.starts_with(&path)) {
+                changed.notify_one();
+            }
+        }
     }
 
-    fn add_path(&self, path: PathBuf) {
-        const MAX_PATHS_BEFORE_DEDUP: usize = 512;
+    fn add_directory(&self, path: PathBuf) {
+        self.add(path, false);
+    }
 
+    fn add_tree(&self, path: PathBuf) {
+        self.add(path, true);
+    }
+
+    fn add(&self, path: PathBuf, tree: bool) {
         for flag in &self.dirty_flags {
             flag.store(true, Ordering::Relaxed);
         }
 
-        if let Some((files, changed)) = &*self.firewall_files.lock()
-            && files.iter().any(|file| file.starts_with(&path))
-        {
-            changed.notify_one();
-        }
-
         let mut paths = self.modified_paths.lock();
-        if paths.first() == Some(&self.path) {
+        if paths.trees.first() == Some(&self.path) {
+            return;
+        }
+        if tree && path == self.path {
+            *paths = ModifiedPaths::whole(path);
             return;
         }
 
-        paths.push(path);
-
-        if paths.len() >= MAX_PATHS_BEFORE_DEDUP {
-            *paths = crate::utils::deduplicate_paths(std::mem::take(&mut *paths));
+        let list = if tree {
+            &mut paths.trees
+        } else {
+            &mut paths.directories
+        };
+        if !list.contains(&path) {
+            list.push(path);
         }
 
-        if paths.len() >= MAX_PATHS_BEFORE_DEDUP {
-            // still too many paths, just keep the base path
-            *paths = vec![self.path.clone()];
+        if list.len() >= ModifiedPaths::MAX_PATHS_BEFORE_DEDUP {
+            paths.deduplicate();
+        }
+
+        if paths.trees.len() + paths.directories.len() >= ModifiedPaths::MAX_PATHS_BEFORE_DEDUP {
+            *paths = ModifiedPaths::whole(self.path.clone());
         }
     }
 
@@ -497,13 +552,14 @@ impl InotifyServerNotifier {
     }
 
     pub fn clear_modified_paths(&self) {
-        let mut paths = self.modified_paths.lock();
-        paths.clear();
+        *self.modified_paths.lock() = ModifiedPaths::default();
     }
 
-    pub fn take_modified_paths(&self) -> Vec<PathBuf> {
-        let mut paths = self.modified_paths.lock();
-        crate::utils::deduplicate_paths(std::mem::take(&mut *paths))
+    pub fn take_modified_paths(&self) -> ModifiedPaths {
+        let mut paths = std::mem::take(&mut *self.modified_paths.lock());
+        paths.deduplicate();
+
+        paths
     }
 }
 
@@ -587,7 +643,9 @@ mod tests {
             let mut seen = Vec::new();
 
             self.wait_until(|harness| {
-                seen.extend(harness.notifier.take_modified_paths());
+                let modified = harness.notifier.take_modified_paths();
+                seen.extend(modified.directories);
+                seen.extend(modified.trees);
                 seen.iter().any(|modified| modified == path)
             })
         }
@@ -750,7 +808,7 @@ mod tests {
             .watch_firewall_files(vec![watched.clone()], Arc::clone(&changed));
 
         std::fs::write(harness.root.path().join("other.txt"), b"x").expect("write other");
-        assert!(harness.wait_for_modified(&harness.root.path().join("other.txt")));
+        assert!(harness.wait_for_modified(harness.root.path()));
 
         std::fs::write(&watched, b"x").expect("write watched");
         harness.runtime.block_on(async {
