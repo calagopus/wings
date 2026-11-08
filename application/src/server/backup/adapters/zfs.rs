@@ -488,7 +488,24 @@ impl BackupExt for ZfsBackup {
                                         server.filesystem.async_create_chowned_dir_all(parent).await?;
                                     }
 
-                                    filesystem.async_quota_copy(&path, &path, &server, None, progress.clone_bytes().as_ref()).await?;
+                                    filesystem
+                                        .async_quota_copy(
+                                            &path,
+                                            &path,
+                                            &server,
+                                            Some(crate::utils::PortablePermissions::from_mode_file(
+                                                cap_std::fs::PermissionsExt::mode(&metadata.permissions()),
+                                            )),
+                                            progress.clone_bytes().as_ref(),
+                                        )
+                                        .await?;
+                                    if let Ok(modified_time) = metadata.modified() {
+                                        server.filesystem.async_set_times(
+                                            &path,
+                                            modified_time.into_std(),
+                                            None,
+                                        ).await?;
+                                    }
                                     progress.increment_files();
                                 } else if metadata.is_dir() {
                                     server.filesystem.async_create_chowned_dir_all(&path).await?;
