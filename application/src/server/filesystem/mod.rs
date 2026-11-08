@@ -1327,6 +1327,7 @@ impl Filesystem {
                         &destination_path,
                         server,
                         Some(metadata.permissions),
+                        None,
                         progress.clone_bytes().as_ref(),
                     )
                     .await?;
@@ -1441,6 +1442,7 @@ impl Filesystem {
                                         &destination_path,
                                         &server,
                                         Some(metadata.permissions),
+                                        None,
                                         progress.clone_bytes().as_ref(),
                                     )
                                     .await?;
@@ -1691,17 +1693,26 @@ impl Filesystem {
         &self,
         result: Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
+        Self::absorb_chown_refusal_impl(&self.config, &self.chown_refused, self.uuid, result)
+    }
+
+    fn absorb_chown_refusal_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        result: Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
         let Err(err) = result else {
             return Ok(());
         };
 
-        if !self.config.load().system.user.rootless.enabled {
+        if !config.load().system.user.rootless.enabled {
             return Err(err);
         }
 
-        if !self.chown_refused.swap(true, Ordering::Relaxed) {
+        if !chown_refused.swap(true, Ordering::Relaxed) {
             tracing::debug!(
-                server = %self.uuid,
+                server = %uuid,
                 "chown refused under a rootless engine, leaving ownership as written: {}",
                 err
             );
@@ -1716,6 +1727,22 @@ impl Filesystem {
         }
 
         self.absorb_chown_refusal(Self::chown_impl(&self.config, &self.cap_filesystem, path))
+    }
+
+    /// Whether `metadata` already carries the configured owner, so a chown would be a no-op.
+    pub fn is_owned(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let cfg = self.config.load();
+            metadata.uid() == cfg.system.user.uid && metadata.gid() == cfg.system.user.gid
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            true
+        }
     }
 
     pub fn chown_file(&self, file: &std::fs::File) -> Result<(), std::io::Error> {
@@ -1850,37 +1877,14 @@ impl Filesystem {
             return Ok(());
         }
 
-        match self.create_dir(&path, permissions) {
-            Ok(_) => return self.chown_path(&path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Some(permissions) = permissions {
-                    self.set_permissions(&path, permissions)?;
-                }
-
-                return Ok(());
-            }
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
-            Err(_) => {}
-        }
-
-        let mut progress = PathBuf::new();
-        let mut components = path.components().peekable();
-        while let Some(component) = components.next() {
-            progress.push(component);
-            let permissions = permissions.filter(|_| components.peek().is_none());
-
-            match self.create_dir(&progress, permissions) {
-                Ok(_) => self.chown_path(&progress)?,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(permissions) = permissions {
-                        self.set_permissions(&progress, permissions)?;
-                    }
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(())
+        Self::create_chowned_dir_all_impl(
+            &self.config,
+            &self.chown_refused,
+            self.uuid,
+            &self.cap_filesystem,
+            &path,
+            permissions,
+        )
     }
 
     /// `permissions` only apply to the leaf directory, and are also applied when it already exists.
@@ -1899,42 +1903,231 @@ impl Filesystem {
         }
 
         let config = self.config.clone();
+        let chown_refused = Arc::clone(&self.chown_refused);
+        let uuid = self.uuid;
         let cap_filesystem = self.cap_filesystem.clone();
 
         tokio::task::spawn_blocking(move || {
-            match cap_filesystem.create_dir(&path, permissions) {
-                Ok(_) => return Self::chown_impl(&config, &cap_filesystem, &path),
+            Self::create_chowned_dir_all_impl(
+                &config,
+                &chown_refused,
+                uuid,
+                &cap_filesystem,
+                &path,
+                permissions,
+            )
+        })
+        .await?
+    }
+
+    fn create_chowned_dir_all_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        match Self::create_chowned_dir(
+            config,
+            chown_refused,
+            uuid,
+            cap_filesystem,
+            path,
+            permissions,
+        ) {
+            Ok(chowned) => return chowned,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(permissions) = permissions {
+                    cap_filesystem.set_permissions(path, permissions)?;
+                }
+
+                return Ok(());
+            }
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            Err(_) => {}
+        }
+
+        let mut progress = PathBuf::new();
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            progress.push(component);
+            let permissions = permissions.filter(|_| components.peek().is_none());
+
+            match Self::create_chowned_dir(
+                config,
+                chown_refused,
+                uuid,
+                cap_filesystem,
+                &progress,
+                permissions,
+            ) {
+                Ok(chowned) => chowned?,
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Some(permissions) = permissions {
-                        cap_filesystem.set_permissions(&path, permissions)?;
+                        cap_filesystem.set_permissions(&progress, permissions)?;
                     }
-
-                    return Ok(());
                 }
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
-                Err(_) => {}
+                Err(err) => return Err(err),
             }
+        }
 
-            let mut progress = PathBuf::new();
-            let mut components = path.components().peekable();
-            while let Some(component) = components.next() {
-                progress.push(component);
-                let permissions = permissions.filter(|_| components.peek().is_none());
+        Ok(())
+    }
 
-                match cap_filesystem.create_dir(&progress, permissions) {
-                    Ok(_) => Self::chown_impl(&config, &cap_filesystem, &progress)?,
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if let Some(permissions) = permissions {
-                            cap_filesystem.set_permissions(&progress, permissions)?;
-                        }
-                    }
-                    Err(err) => return Err(err),
-                }
+    /// Creates a single directory and chowns it through the same parent directory fd.
+    /// The outer error is the creation's, the inner one the chown's.
+    fn create_chowned_dir(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<Result<(), std::io::Error>, std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            cap_filesystem.create_dir_then(path, permissions, |fd, name| {
+                Self::chown_at(config, chown_refused, uuid, fd, name)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (config, chown_refused, uuid);
+            cap_filesystem.create_dir(path, permissions).map(Ok)
+        }
+    }
+
+    /// Creates a symlink like [`cap::CapFilesystem::symlink`], then chowns it and sets
+    /// its modification time through the same parent directory fd.
+    pub fn create_chowned_symlink(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::create_chowned_symlink_impl(
+                &self.config,
+                &self.chown_refused,
+                self.uuid,
+                &self.cap_filesystem,
+                target.as_ref(),
+                link.as_ref(),
+                false,
+                modified,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.cap_filesystem.symlink(&target, &link)?;
+            self.chown_path(&link)?;
+            if let Some(modified) = modified {
+                self.cap_filesystem.set_times(&link, modified, None)?;
             }
 
             Ok(())
-        })
-        .await?
+        }
+    }
+
+    /// Like [`Self::create_chowned_symlink`], writing `target` verbatim when `verbatim` is set
+    /// (see [`cap::CapFilesystem::async_symlink_contents`]).
+    pub async fn async_create_chowned_symlink(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        verbatim: bool,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let config = self.config.clone();
+            let chown_refused = Arc::clone(&self.chown_refused);
+            let uuid = self.uuid;
+            let cap_filesystem = self.cap_filesystem.clone();
+            let target = target.as_ref().to_path_buf();
+            let link = link.as_ref().to_path_buf();
+
+            tokio::task::spawn_blocking(move || {
+                Self::create_chowned_symlink_impl(
+                    &config,
+                    &chown_refused,
+                    uuid,
+                    &cap_filesystem,
+                    &target,
+                    &link,
+                    verbatim,
+                    None,
+                )
+            })
+            .await?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if verbatim {
+                self.cap_filesystem
+                    .async_symlink_contents(&target, &link)
+                    .await?;
+            } else {
+                self.cap_filesystem.async_symlink(&target, &link).await?;
+            }
+
+            self.async_chown_path(&link).await
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn create_chowned_symlink_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        target: &Path,
+        link: &Path,
+        verbatim: bool,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        cap_filesystem.create_symlink_then(target, link, verbatim, |fd, name| {
+            Self::chown_at(config, chown_refused, uuid, fd, name)?;
+            if let Some(modified) = modified {
+                cap::CapFilesystem::set_times_at(fd, name, modified, None)?;
+            }
+
+            Ok(())
+        })?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chown_at(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        fd: std::os::fd::BorrowedFd<'_>,
+        name: &Path,
+    ) -> Result<(), std::io::Error> {
+        if chown_refused.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let cfg = config.load();
+        let owner_uid = rustix::fs::Uid::from_raw_unchecked(cfg.system.user.uid);
+        let owner_gid = rustix::fs::Gid::from_raw_unchecked(cfg.system.user.gid);
+        drop(cfg);
+
+        Self::absorb_chown_refusal_impl(
+            config,
+            chown_refused,
+            uuid,
+            rustix::fs::chownat(
+                fd,
+                name,
+                Some(owner_uid),
+                Some(owner_gid),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(Into::into),
+        )
     }
 
     pub async fn setup(&self) {
@@ -3053,6 +3246,68 @@ mod tests {
                 started.elapsed(),
                 started.elapsed().as_secs_f64() * 1e6 / files as f64
             );
+
+            Ok(())
+        })
+    }
+
+    // Filesystem::create_chowned_dir_all
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn create_chowned_dir_all_chowns_created_components_and_applies_mode_to_leaf()
+    -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            {
+                let user = &mut server
+                    .app_state
+                    .config
+                    .mutate_in_place_for_testing()
+                    .system
+                    .user;
+                user.uid = 4242;
+                user.gid = 4243;
+            }
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir(root.join("existing"))?;
+            std::fs::create_dir(root.join("reference"))?;
+            let existing_owner = std::fs::metadata(root.join("existing"))?.uid();
+            let meta = |path: &str| std::fs::metadata(root.join(path));
+            let mode = |path: &str| -> Result<u32, std::io::Error> {
+                Ok(meta(path)?.permissions().mode() & 0o777)
+            };
+            let default_mode = mode("reference")?;
+            let leaf_mode = if default_mode == 0o777 { 0o775 } else { 0o777 };
+
+            server.filesystem.create_chowned_dir_all(
+                "existing/b/c",
+                Some(PortablePermissions::from_mode_dir(leaf_mode)),
+            )?;
+            server
+                .filesystem
+                .async_create_chowned_dir_all("x/y", None)
+                .await?;
+
+            for path in ["existing/b", "existing/b/c", "x", "x/y"] {
+                let metadata = meta(path)?;
+                assert_eq!((metadata.uid(), metadata.gid()), (4242, 4243), "{path}");
+            }
+            assert_eq!(meta("existing")?.uid(), existing_owner);
+            assert_eq!(mode("existing/b/c")?, leaf_mode);
+            assert_eq!(mode("existing/b")?, default_mode);
+
+            server
+                .filesystem
+                .async_create_chowned_dir_all(
+                    "existing/b/c",
+                    Some(PortablePermissions::from_mode_dir(0o700)),
+                )
+                .await?;
+            assert_eq!(mode("existing/b/c")?, 0o700);
 
             Ok(())
         })

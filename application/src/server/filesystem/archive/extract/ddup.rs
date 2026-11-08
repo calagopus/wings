@@ -111,28 +111,22 @@ pub async fn extract_ddup(
                     Entry::File(file) => {
                         options.on_file(&destination_path);
 
-                        let permissions = PortablePermissions::from_mode_file(file.mode.bits());
-                        let mtime = file.mtime;
-
-                        let mut writer = destination_filesystem.create_file(&destination_path)?;
+                        let mut writer = destination_filesystem.create_file_with_metadata(
+                            &destination_path,
+                            Some(PortablePermissions::from_mode_file(file.mode.bits())),
+                            Some(file.mtime),
+                        )?;
 
                         let reader = AbortReader::new(file, listener.clone());
                         let mut reader = progress.counting_reader(reader);
 
                         let error = Arc::clone(&error);
-                        let destination_filesystem = Arc::clone(&destination_filesystem);
                         let progress = progress.clone();
                         scope.spawn(move |_| {
-                            let mut run = || -> Result<(), std::io::Error> {
+                            let run = || -> Result<(), std::io::Error> {
                                 crate::io::copy(&mut reader, &mut writer)?;
                                 writer.flush()?;
-
-                                destination_filesystem
-                                    .set_permissions(&destination_path, FileType::File, permissions)
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                                destination_filesystem
-                                    .set_times(&destination_path, FileType::File, mtime, None)
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                                drop(writer);
 
                                 progress.increment_files();
 
@@ -151,21 +145,16 @@ pub async fn extract_ddup(
                         });
                     }
                     Entry::Symlink(link) => {
-                        if let Err(err) =
-                            destination_filesystem.create_symlink(&link.target, &destination_path)
-                        {
+                        if let Err(err) = destination_filesystem.create_symlink_with_metadata(
+                            &link.target,
+                            &destination_path,
+                            Some(link.mtime),
+                        ) {
                             tracing::debug!(
                                 path = %destination_path.display(),
                                 "failed to create symlink from archive: {:#?}",
                                 err
                             );
-                        } else {
-                            destination_filesystem.set_times(
-                                &destination_path,
-                                FileType::Symlink,
-                                link.mtime,
-                                None,
-                            )?;
                         }
                     }
                 }

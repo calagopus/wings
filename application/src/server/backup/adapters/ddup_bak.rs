@@ -905,8 +905,11 @@ impl BackupExt for DdupBakBackup {
                                 );
                             }
                             Entry::Symlink(symlink) => {
-                                if let Err(err) = server.filesystem.symlink(&symlink.target, &path)
-                                {
+                                if let Err(err) = server.filesystem.symlink_with_modified(
+                                    &symlink.target,
+                                    &path,
+                                    Some(symlink.mtime),
+                                ) {
                                     tracing::debug!(
                                         path = %path.display(),
                                         "failed to create symlink from backup: {:?}",
@@ -914,8 +917,6 @@ impl BackupExt for DdupBakBackup {
                                     );
                                 } else {
                                     progress.increment_files();
-
-                                    server.filesystem.set_times(&path, symlink.mtime, None)?;
                                 }
                             }
                         }

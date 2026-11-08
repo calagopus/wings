@@ -37,28 +37,28 @@ fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) ->
 
 /// Opens `path` with `options`, runs `check` on the opened file and only then
 /// truncates it when asked, so nothing is lost before the check passes. Returns
-/// the file and its size before truncation.
+/// the file, its size before truncation and its metadata from before truncation.
 fn open_and_check(
     server: &crate::server::Server,
     path: &Path,
     mut options: cap_std::fs::OpenOptions,
     truncate: bool,
     check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
-) -> Result<(std::fs::File, u64), anyhow::Error> {
+) -> Result<(std::fs::File, u64, Option<std::fs::Metadata>), anyhow::Error> {
     options.truncate(false);
 
     let file = server.filesystem.open_with(path, options)?;
     check(&file)?;
-    let previous_size = file
-        .metadata()
-        .ok()
+    let metadata = file.metadata().ok();
+    let previous_size = metadata
+        .as_ref()
         .filter(|metadata| metadata.is_file())
         .map_or(0, |metadata| metadata.len());
     if truncate && previous_size > 0 {
         file.set_len(0)?;
     }
 
-    Ok((file, previous_size))
+    Ok((file, previous_size, metadata))
 }
 
 fn parent_components(
@@ -90,17 +90,25 @@ fn open_destination(
         cap_std::fs::OpenOptionsExt::mode(&mut options, permissions.mode().into());
     }
 
-    let (file, previous_size) = open_and_check(server, destination, options, true, check)?;
+    let (file, previous_size, metadata) =
+        open_and_check(server, destination, options, true, check)?;
+
+    // chown runs first since it clears setuid/setgid, which the chmod may be asked to set
+    let chowned = !metadata
+        .as_ref()
+        .is_some_and(|metadata| server.filesystem.is_owned(metadata));
+    if chowned {
+        server.filesystem.chown_file(&file)?;
+    }
 
     if let Some(permissions) = permissions
-        && !file
-            .metadata()
-            .is_ok_and(|metadata| has_mode(&metadata, permissions))
+        && ((chowned && permissions.mode() & 0o6000 != 0)
+            || !metadata
+                .as_ref()
+                .is_some_and(|metadata| has_mode(metadata, permissions)))
     {
         file.apply_permissions(permissions)?;
     }
-
-    server.filesystem.chown_file(&file)?;
 
     Ok((file, previous_size))
 }
@@ -142,7 +150,7 @@ impl ServerFile {
         truncate: bool,
         check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
     ) -> Result<Self, anyhow::Error> {
-        let (file, previous_size) = open_and_check(&server, path, options, truncate, check)?;
+        let (file, previous_size, _) = open_and_check(&server, path, options, truncate, check)?;
 
         if truncate {
             Self::wrap(server, path, file, -(previous_size as i64), 0)

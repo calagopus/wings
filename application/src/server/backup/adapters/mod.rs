@@ -53,6 +53,30 @@ fn log_restoring(server: &crate::server::Server, path: &std::path::Path) {
     ));
 }
 
+/// Runs `create` for an entry restored by a walk with inline directories, where
+/// the parent normally exists already. Only when `create` fails with `NotFound`
+/// is the parent created, after which `create` runs once more.
+async fn create_with_parent<T, Fut: Future<Output = Result<T, std::io::Error>>>(
+    server: &crate::server::Server,
+    path: &std::path::Path,
+    mut create: impl FnMut() -> Fut,
+) -> Result<T, std::io::Error> {
+    match create().await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Err(err);
+            };
+
+            server
+                .filesystem
+                .async_create_chowned_dir_all(parent, None)
+                .await?;
+            create().await
+        }
+        result => result,
+    }
+}
+
 async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyhow::Error> {
     let mut first_byte = [0; 1];
     if reader.read(&mut first_byte).await? == 0 {
@@ -274,5 +298,54 @@ mod tests {
             glob_literal(std::path::Path::new("plain/path.txt")),
             "plain/path.txt"
         );
+    }
+
+    // create_with_parent
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn create_with_parent_retries_once_after_creating_parents() {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            let root = server.filesystem.base_path.clone();
+            let path = std::path::Path::new("a/b/file.txt");
+
+            let mut attempts = 0;
+            create_with_parent(&server, path, || {
+                attempts += 1;
+                let target = root.join(path);
+                async move { std::fs::write(target, b"x") }
+            })
+            .await
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(std::fs::read(root.join(path)).unwrap(), b"x");
+
+            let mut attempts = 0;
+            let result = create_with_parent(&server, std::path::Path::new("c/d/file"), || {
+                attempts += 1;
+                async { Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound)) }
+            })
+            .await;
+            assert_eq!(attempts, 2);
+            assert!(result.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound));
+            assert!(root.join("c/d").is_dir());
+        });
+    }
+
+    #[test]
+    fn create_with_parent_returns_other_errors_untouched() {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+
+            let mut attempts = 0;
+            let result = create_with_parent(&server, std::path::Path::new("a/b/file"), || {
+                attempts += 1;
+                async { Err::<(), _>(std::io::Error::other("create failed")) }
+            })
+            .await;
+            assert_eq!(attempts, 1);
+            assert!(result.is_err_and(|err| err.to_string() == "create failed"));
+            assert!(!server.filesystem.base_path.join("a").exists());
+        });
     }
 }

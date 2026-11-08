@@ -155,6 +155,21 @@ fn file_read_headers(size: u64, total_size: u64, reader_range: Option<ByteRange>
     headers
 }
 
+/// Sums the sizes of `paths` on a single blocking task, skipping entries that cannot be read.
+pub async fn total_size(
+    filesystem: Arc<dyn VirtualReadableFilesystem>,
+    paths: Vec<PathBuf>,
+) -> Result<u64, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .filter_map(|path| filesystem.directory_entry_buffer(path, &[]).ok())
+            .map(|entry| entry.size)
+            .sum()
+    })
+    .await
+}
+
 pub enum CheckedDirectoryListing {
     Listing(DirectoryListing),
     NotFound,
@@ -880,6 +895,19 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
+    fn create_symlink_with_metadata(
+        &self,
+        original: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.create_symlink(original, link)?;
+        if let Some(modified) = modified {
+            self.set_times(link, FileType::Symlink, modified, None)?;
+        }
+
+        Ok(())
+    }
     async fn async_create_symlink(
         &self,
         original: &(dyn AsRef<Path> + Send + Sync),

@@ -894,15 +894,14 @@ impl BackupExt for PbsBackup {
                     EntryKind::Symlink(target) => {
                         if let Err(err) = server
                             .filesystem
-                            .async_symlink(target.as_os_str(), path.as_path())
+                            .async_symlink_with_modified(
+                                target.as_os_str(),
+                                path.as_path(),
+                                Some(mtime),
+                            )
                             .await
                         {
                             tracing::debug!(path = %path.display(), "failed to create symlink from PBS backup: {:?}", err);
-                        } else {
-                            server
-                                .filesystem
-                                .async_set_times(path.as_path(), mtime, None)
-                                .await?;
                         }
 
                         progress.increment_files();
@@ -910,12 +909,17 @@ impl BackupExt for PbsBackup {
                 }
             }
 
-            for (destination_path, modified_time) in directory_entries {
-                server
-                    .filesystem
-                    .async_set_times(&destination_path, modified_time, None)
-                    .await?;
-            }
+            let server = server.clone();
+            tokio::task::spawn_blocking(move || {
+                for (destination_path, modified_time) in directory_entries {
+                    server
+                        .filesystem
+                        .set_times(&destination_path, modified_time, None)?;
+                }
+
+                Ok::<(), std::io::Error>(())
+            })
+            .await??;
 
             Ok(())
         };

@@ -457,6 +457,7 @@ pub async fn handle_extended(
                     &sftp_session.server,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|_| StatusCode::NoSuchFile)?;

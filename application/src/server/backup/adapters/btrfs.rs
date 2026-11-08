@@ -7,7 +7,7 @@ use crate::{
             BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
-            archive::StreamableArchiveFormat,
+            archive::{Archive, StreamableArchiveFormat},
             virtualfs::{ByteRange, VirtualReadableFilesystem},
         },
     },
@@ -543,21 +543,26 @@ impl BackupExt for BtrfsBackup {
 
         let server = server.clone();
         let restore_task = async move {
+            let directory_entries = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
             filesystem
                 .async_walk_dir(Path::new(""))
                 .await?
                 .with_is_ignored(ignore.into())
+                .with_inline_dirs()
                 .run_multithreaded(
                     server.app_state.config.load().system.backups.btrfs.restore_threads,
                     Arc::new({
                         let server = server.clone();
                         let filesystem = filesystem.clone();
                         let progress = progress.clone();
+                        let directory_entries = Arc::clone(&directory_entries);
 
                         move |entry: crate::server::filesystem::cap::WalkEntry| {
                             let server = server.clone();
                             let filesystem = filesystem.clone();
                             let progress = progress.clone();
+                            let directory_entries = Arc::clone(&directory_entries);
 
                             async move {
                                 let metadata = match entry.async_metadata().await {
@@ -569,28 +574,23 @@ impl BackupExt for BtrfsBackup {
                                 if metadata.is_file() {
                                     super::log_restoring(&server, &path);
 
-                                    if let Some(parent) = path.parent() {
-                                        server.filesystem.async_create_chowned_dir_all(parent, None).await?;
-                                    }
+                                    let permissions = Some(crate::utils::PortablePermissions::from_mode_file(
+                                        cap_std::fs::PermissionsExt::mode(&metadata.permissions()),
+                                    ));
+                                    let modified_time = metadata.modified().ok().map(|modified_time| modified_time.into_std());
+                                    let bytes = progress.clone_bytes();
 
-                                    filesystem
-                                        .async_quota_copy(
+                                    super::create_with_parent(&server, &path, || {
+                                        filesystem.async_quota_copy(
                                             &path,
                                             &path,
                                             &server,
-                                            Some(crate::utils::PortablePermissions::from_mode_file(
-                                                cap_std::fs::PermissionsExt::mode(&metadata.permissions()),
-                                            )),
-                                            progress.clone_bytes().as_ref(),
+                                            permissions,
+                                            modified_time,
+                                            bytes.as_ref(),
                                         )
-                                        .await?;
-                                    if let Ok(modified_time) = metadata.modified() {
-                                        server.filesystem.async_set_times(
-                                            &path,
-                                            modified_time.into_std(),
-                                            None,
-                                        ).await?;
-                                    }
+                                    })
+                                    .await?;
                                     progress.increment_files();
                                 } else if metadata.is_dir() {
                                     server
@@ -598,25 +598,21 @@ impl BackupExt for BtrfsBackup {
                                         .async_create_chowned_dir_all(&path, Some(metadata.permissions().into()))
                                         .await?;
                                     if let Ok(modified_time) = metadata.modified() {
-                                        server.filesystem.async_set_times(
-                                            &path,
-                                            modified_time.into_std(),
-                                            None,
-                                        ).await?;
+                                        let mut directory_entries = directory_entries.lock();
+                                        if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
+                                            directory_entries.push((path, modified_time.into_std()));
+                                        }
                                     }
                                 } else if metadata.is_symlink() && let Ok(target) = filesystem.async_read_link(&path).await {
-                                    if let Err(err) = server.filesystem.async_symlink(&target, &path).await {
+                                    let modified_time = metadata.modified().ok().map(|modified_time| modified_time.into_std());
+                                    if let Err(err) = super::create_with_parent(&server, &path, || {
+                                        server.filesystem.async_symlink_with_modified(&target, &path, modified_time)
+                                    })
+                                    .await
+                                    {
                                         tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
                                     } else {
                                         progress.increment_files();
-
-                                        if let Ok(modified_time) = metadata.modified() {
-                                            server.filesystem.async_set_times(
-                                                &path,
-                                                modified_time.into_std(),
-                                                None,
-                                            ).await?;
-                                        }
                                     }
                                 }
 
@@ -625,6 +621,16 @@ impl BackupExt for BtrfsBackup {
                         }
                     }),
                 ).await?;
+
+            let directory_entries = std::mem::take(&mut *directory_entries.lock());
+            tokio::task::spawn_blocking(move || {
+                for (path, modified_time) in directory_entries {
+                    server.filesystem.set_times(&path, modified_time, None)?;
+                }
+
+                Ok::<(), std::io::Error>(())
+            })
+            .await??;
 
             Ok::<(), anyhow::Error>(())
         };

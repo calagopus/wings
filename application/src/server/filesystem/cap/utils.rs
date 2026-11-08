@@ -278,6 +278,7 @@ pub struct AsyncWalkDir {
     stack: Vec<(PathBuf, AsyncReadDir, bool)>,
     is_ignored: IsIgnoredFn,
     reversed: bool,
+    inline_dirs: bool,
 }
 
 impl AsyncWalkDir {
@@ -292,11 +293,21 @@ impl AsyncWalkDir {
             stack: vec![(path, read_dir, true)],
             is_ignored: IsIgnoredFn::default(),
             reversed: false,
+            inline_dirs: false,
         })
     }
 
     pub fn with_is_ignored(mut self, is_ignored: IsIgnoredFn) -> Self {
         self.is_ignored = is_ignored;
+        self
+    }
+
+    /// Multithreaded walks run directory callbacks on the walking task before any
+    /// of the directory's descendants are dispatched, so a callback that creates
+    /// the directory has finished before its children's callbacks start. Ignored
+    /// for reversed walks.
+    pub fn with_inline_dirs(mut self) -> Self {
+        self.inline_dirs = true;
         self
     }
 
@@ -388,6 +399,19 @@ impl AsyncWalkDir {
                     break;
                 }
             };
+
+            if self.inline_dirs && !self.reversed && entry.file_type.is_dir() {
+                let Ok(_permit) = semaphore.acquire().await else {
+                    break;
+                };
+
+                if let Err(err) = func(entry).await {
+                    error.fail(err);
+                    break;
+                }
+
+                continue;
+            }
 
             let directory = self.reversed && entry.file_type.is_dir();
             if self.reversed {

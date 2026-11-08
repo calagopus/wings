@@ -236,6 +236,7 @@ impl CapFilesystem {
         Ok(())
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn create_dir(
         &self,
         path: impl AsRef<Path>,
@@ -1071,6 +1072,7 @@ impl CapFilesystem {
         destination_path: impl AsRef<Path>,
         destination_server: &crate::server::Server,
         permissions: Option<PortablePermissions>,
+        modified: Option<std::time::SystemTime>,
         progress: Option<&Arc<AtomicU64>>,
     ) -> Result<u64, std::io::Error> {
         let (guard, listener) = AbortGuard::new();
@@ -1088,6 +1090,7 @@ impl CapFilesystem {
                     &destination_path,
                     &destination_server,
                     permissions,
+                    modified,
                     progress.as_ref(),
                     listener,
                 )
@@ -1100,12 +1103,14 @@ impl CapFilesystem {
         Ok(bytes_copied)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn quota_copy(
         &self,
         path: impl AsRef<Path>,
         destination_path: impl AsRef<Path>,
         destination_server: &crate::server::Server,
         permissions: Option<PortablePermissions>,
+        modified: Option<std::time::SystemTime>,
         progress: Option<&Arc<AtomicU64>>,
         listener: AbortListener,
     ) -> Result<u64, std::io::Error> {
@@ -1191,6 +1196,10 @@ impl CapFilesystem {
                 std::io::ErrorKind::StorageFull,
                 "Failed to allocate space",
             ));
+        }
+
+        if let Some(modified) = modified {
+            writer.set_modified(modified)?;
         }
 
         Ok(bytes_copied)
@@ -1316,39 +1325,7 @@ impl CapFilesystem {
             let path = self.relative_path(path.as_ref());
             let inner = self.get_inner()?;
 
-            let elapsed_modification = modification_time
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "modification time is before UNIX_EPOCH",
-                    )
-                })?;
-            let elapsed_access = access_time
-                .unwrap_or_else(std::time::SystemTime::now)
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "access time is before UNIX_EPOCH",
-                    )
-                })?;
-
-            let times = rustix::fs::Timestamps {
-                last_modification: elapsed_modification.try_into().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "modification time is too large",
-                    )
-                })?,
-                last_access: elapsed_access.try_into().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "access time is too large",
-                    )
-                })?,
-            };
-
+            let times = Self::timestamps(modification_time, access_time)?;
             Self::utimensat_beneath(&inner, &path, &times)?;
 
             Ok(())
@@ -1368,6 +1345,184 @@ impl CapFilesystem {
 
             Ok(())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn timestamps(
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<rustix::fs::Timestamps, std::io::Error> {
+        let elapsed_modification = modification_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "modification time is before UNIX_EPOCH",
+                )
+            })?;
+        let elapsed_access = access_time
+            .unwrap_or_else(std::time::SystemTime::now)
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "access time is before UNIX_EPOCH",
+                )
+            })?;
+
+        Ok(rustix::fs::Timestamps {
+            last_modification: elapsed_modification.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "modification time is too large",
+                )
+            })?,
+            last_access: elapsed_access.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "access time is too large")
+            })?,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_parent<T>(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        op: impl FnOnce(std::os::fd::BorrowedFd<'_>, &Path) -> Result<T, std::io::Error>,
+    ) -> Result<T, std::io::Error> {
+        use std::os::fd::AsFd;
+
+        let Some(name) = path.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path has no final component",
+            ));
+        };
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => Some(inner.open_dir(parent)?),
+            _ => None,
+        };
+
+        op(
+            dir.as_ref().map_or(inner.as_fd(), AsFd::as_fd),
+            Path::new(name),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn create_dir_then<T>(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+        then: impl FnOnce(std::os::fd::BorrowedFd<'_>, &Path) -> T,
+    ) -> Result<T, std::io::Error> {
+        use rustix::fs::{Mode, OFlags};
+
+        let path = self.relative_path(path.as_ref());
+        let inner = self.get_inner()?;
+
+        Self::with_parent(&inner, &path, |fd, name| {
+            let mode = permissions.map_or(0o777, |permissions| permissions.mode().into());
+            rustix::fs::mkdirat(fd, name, Mode::from_raw_mode(mode))?;
+
+            if let Some(permissions) = permissions
+                && permissions.masked_by_umask()
+            {
+                let dir = rustix::fs::openat(
+                    fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                std::fs::File::from(dir).apply_permissions(permissions)?;
+            }
+
+            Ok(then(fd, name))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn symlink_then<T>(
+        &self,
+        target: &Path,
+        link: &Path,
+        then: impl FnOnce(std::os::fd::BorrowedFd<'_>, &Path) -> T,
+    ) -> Result<T, std::io::Error> {
+        let link = self.relative_path(link);
+        let inner = self.get_inner()?;
+
+        Self::with_parent(&inner, &link, |fd, name| {
+            rustix::fs::symlinkat(target, fd, name)?;
+
+            Ok(then(fd, name))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn create_symlink_then<T>(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        verbatim: bool,
+        then: impl FnOnce(std::os::fd::BorrowedFd<'_>, &Path) -> T,
+    ) -> Result<T, std::io::Error> {
+        if verbatim {
+            self.symlink_then(target.as_ref(), link.as_ref(), then)
+        } else {
+            self.symlink_then(&self.relative_path(target.as_ref()), link.as_ref(), then)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_times_at(
+        fd: std::os::fd::BorrowedFd<'_>,
+        name: &Path,
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        let times = Self::timestamps(modification_time, access_time)?;
+        rustix::fs::utimensat(fd, name, &times, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+
+        Ok(())
+    }
+
+    pub fn symlink_with_modified(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            self.create_symlink_then(target, link, false, |fd, name| match modified {
+                Some(modified) => Self::set_times_at(fd, name, modified, None),
+                None => Ok(()),
+            })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.symlink(&target, &link)?;
+            if let Some(modified) = modified {
+                self.set_times(&link, modified, None)?;
+            }
+
+            Ok(())
+        }
+    }
+
+    pub async fn async_symlink_with_modified(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        let target = target.as_ref().to_path_buf();
+        let link = link.as_ref().to_path_buf();
+
+        let self_clone = self.clone();
+        tokio::task::spawn_blocking(move || {
+            self_clone.symlink_with_modified(target, link, modified)
+        })
+        .await?
     }
 
     /// Runs `op` on the last component of `path` relative to its parent
@@ -1502,6 +1657,7 @@ impl CapFilesystem {
         Ok(())
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn symlink(
         &self,
         target: impl AsRef<Path>,
@@ -2375,6 +2531,139 @@ mod tests {
                 std::io::ErrorKind::NotFound
             );
             assert!(completed.load(Ordering::Relaxed));
+        });
+    }
+
+    // AsyncWalkDir::with_inline_dirs
+
+    #[test]
+    fn async_walk_dir_inline_dirs_finish_before_descendants_start() {
+        let runtimes = [
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ];
+
+        for runtime in runtimes {
+            runtime.block_on(async {
+                for threads in [1, 4] {
+                    let (dir, filesystem) = temp_filesystem();
+                    let mut expected = 0;
+                    let mut level = vec![PathBuf::new()];
+                    for _ in 0..3 {
+                        let mut next = Vec::new();
+                        for parent in &level {
+                            for index in 0..3 {
+                                let child = parent.join(format!("d{index}"));
+                                std::fs::create_dir(dir.path().join(&child)).unwrap();
+                                std::fs::write(dir.path().join(&child).join("f"), "x").unwrap();
+                                expected += 2;
+                                next.push(child);
+                            }
+                        }
+                        level = next;
+                    }
+
+                    let finished_dirs =
+                        Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+                    let violations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                    let visited = Arc::new(AtomicUsize::new(0));
+                    let mut walker = filesystem
+                        .async_walk_dir("")
+                        .await
+                        .unwrap()
+                        .with_inline_dirs();
+
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        walker.run_multithreaded(
+                            threads,
+                            Arc::new({
+                                let finished_dirs = Arc::clone(&finished_dirs);
+                                let violations = Arc::clone(&violations);
+                                let visited = Arc::clone(&visited);
+                                move |entry: WalkEntry| {
+                                    let finished_dirs = Arc::clone(&finished_dirs);
+                                    let violations = Arc::clone(&violations);
+                                    let visited = Arc::clone(&visited);
+                                    async move {
+                                        visited.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(parent) = entry.path.parent()
+                                            && !parent.as_os_str().is_empty()
+                                            && !finished_dirs.lock().contains(parent)
+                                        {
+                                            violations.lock().push(entry.path.clone());
+                                        }
+
+                                        tokio::time::sleep(std::time::Duration::from_millis(2))
+                                            .await;
+                                        if entry.file_type().is_dir() {
+                                            finished_dirs.lock().insert(entry.path.clone());
+                                        }
+                                        Ok(())
+                                    }
+                                }
+                            }),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                    assert_eq!(visited.load(Ordering::Relaxed), expected);
+                    assert!(
+                        violations.lock().is_empty(),
+                        "started before parent finished: {:?}",
+                        violations.lock()
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn async_walk_dir_inline_dirs_returns_directory_callback_error() {
+        tokio_test::block_on(async {
+            let (dir, filesystem) = temp_filesystem();
+            std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+            std::fs::write(dir.path().join("a/file"), "x").unwrap();
+            std::fs::write(dir.path().join("a/b/file"), "x").unwrap();
+
+            let descendants = Arc::new(AtomicUsize::new(0));
+            let result = filesystem
+                .async_walk_dir("")
+                .await
+                .unwrap()
+                .with_inline_dirs()
+                .run_multithreaded(
+                    4,
+                    Arc::new({
+                        let descendants = Arc::clone(&descendants);
+                        move |entry: WalkEntry| {
+                            let descendants = Arc::clone(&descendants);
+                            async move {
+                                if entry.path == Path::new("a") {
+                                    tokio::task::yield_now().await;
+                                    return Err(anyhow::anyhow!("directory failed"));
+                                }
+                                if entry.path.starts_with("a") {
+                                    descendants.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(())
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+            assert!(result.is_err_and(|err| err.to_string() == "directory failed"));
+            assert_eq!(descendants.load(Ordering::Relaxed), 0);
         });
     }
 
@@ -3473,5 +3762,145 @@ mod tests {
 
         assert_eq!(dir_mode(&dir.path().join("x/y")), 0o777);
         assert_eq!(dir_mode(dir.path()), 0o777);
+    }
+
+    // CapFilesystem::create_dir_then
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_dir_then_applies_exact_mode_and_passes_parent_and_name() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+
+        for (path, mode) in [("a/open/", 0o777), ("a/group", 0o775)] {
+            let result = filesystem
+                .create_dir_then(
+                    path,
+                    Some(PortablePermissions::from_mode_dir(mode)),
+                    |fd, name| {
+                        let stat =
+                            rustix::fs::statat(fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                                .unwrap();
+                        (name.to_path_buf(), stat.st_mode & 0o7777)
+                    },
+                )
+                .unwrap();
+
+            let leaf = path.trim_start_matches("a/").trim_end_matches('/');
+            assert_eq!(result, (PathBuf::from(leaf), mode), "{path}");
+            assert_eq!(dir_mode(&dir.path().join("a").join(leaf)), mode, "{path}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_dir_then_reports_creation_errors_without_running_then() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("existing")).unwrap();
+        let ran = AtomicBool::new(false);
+
+        for (path, kind) in [
+            ("existing", std::io::ErrorKind::AlreadyExists),
+            ("missing/child", std::io::ErrorKind::NotFound),
+            ("", std::io::ErrorKind::InvalidInput),
+        ] {
+            let error = filesystem
+                .create_dir_then(path, None, |_, _| ran.store(true, Ordering::SeqCst))
+                .unwrap_err();
+            assert_eq!(error.kind(), kind, "{path:?}");
+        }
+
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    // CapFilesystem::create_symlink_then
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_symlink_then_stores_normalized_or_verbatim_target() {
+        let (dir, filesystem) = temp_filesystem();
+        let target = "/config/./../config/secret.yml";
+        filesystem.symlink(target, "reference").unwrap();
+
+        for (link, verbatim) in [("normalized", false), ("verbatim", true)] {
+            let name = filesystem
+                .create_symlink_then(target, link, verbatim, |fd, name| {
+                    assert!(
+                        rustix::fs::statat(fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_ok()
+                    );
+                    name.to_path_buf()
+                })
+                .unwrap();
+            assert_eq!(name, PathBuf::from(link));
+        }
+
+        assert_eq!(
+            std::fs::read_link(dir.path().join("normalized")).unwrap(),
+            std::fs::read_link(dir.path().join("reference")).unwrap()
+        );
+        assert_ne!(
+            std::fs::read_link(dir.path().join("normalized")).unwrap(),
+            PathBuf::from(target)
+        );
+        assert_eq!(
+            std::fs::read_link(dir.path().join("verbatim")).unwrap(),
+            PathBuf::from(target)
+        );
+    }
+
+    // CapFilesystem::set_times_at
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_times_at_changes_the_symlink_not_its_target() {
+        use std::os::fd::AsFd;
+
+        let (dir, _filesystem) = temp_filesystem();
+        std::fs::write(dir.path().join("target"), "x").unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        let target_before = mtime(dir.path().join("target"));
+
+        let root = std::fs::File::open(dir.path()).unwrap();
+        CapFilesystem::set_times_at(root.as_fd(), Path::new("link"), new_mtime(), None).unwrap();
+
+        assert_eq!(mtime(dir.path().join("link")), NEW_MTIME);
+        assert_eq!(mtime(dir.path().join("target")), target_before);
+    }
+
+    // CapFilesystem::symlink_with_modified
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_with_modified_sets_the_link_mtime_only() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::write(dir.path().join("target"), "x").unwrap();
+        let target_before = mtime(dir.path().join("target"));
+
+        filesystem
+            .symlink_with_modified("target", "sync", Some(new_mtime()))
+            .unwrap();
+        tokio_test::block_on(filesystem.async_symlink_with_modified(
+            "target",
+            "async",
+            Some(new_mtime()),
+        ))
+        .unwrap();
+        filesystem
+            .symlink_with_modified("target", "untouched", None)
+            .unwrap();
+
+        for link in ["sync", "async", "untouched"] {
+            assert!(
+                std::fs::symlink_metadata(dir.path().join(link))
+                    .unwrap()
+                    .is_symlink(),
+                "{link}"
+            );
+        }
+        assert_eq!(mtime(dir.path().join("sync")), NEW_MTIME);
+        assert_eq!(mtime(dir.path().join("async")), NEW_MTIME);
+        assert_ne!(mtime(dir.path().join("untouched")), NEW_MTIME);
+        assert_eq!(mtime(dir.path().join("target")), target_before);
     }
 }

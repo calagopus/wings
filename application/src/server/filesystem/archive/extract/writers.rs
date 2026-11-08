@@ -1,7 +1,7 @@
 use super::super::create::ArchiveProgress;
 use crate::{
     io::abort::AbortListener,
-    server::filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem},
+    server::filesystem::virtualfs::VirtualWritableFilesystem,
     threading::{InFlightLimit, InFlightPermit, SharedError},
     utils::PortablePermissions,
 };
@@ -100,14 +100,14 @@ fn apply_job(
             link,
             modified_time,
         } => {
-            if let Err(err) = destination_filesystem.create_symlink(&link, &path) {
+            if let Err(err) =
+                destination_filesystem.create_symlink_with_metadata(&link, &path, modified_time)
+            {
                 tracing::debug!(
                     path = %path.display(),
                     "failed to create symlink from archive: {:#?}",
                     err
                 );
-            } else if let Some(modified_time) = modified_time {
-                destination_filesystem.set_times(&path, FileType::Symlink, modified_time, None)?;
             }
         }
     }

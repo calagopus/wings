@@ -1771,18 +1771,11 @@ impl ScheduleAction {
                                 })
                                 .await??;
 
-                                let mut total_size = 0;
-                                for file in &files {
-                                    let directory_entry = match filesystem
-                                        .async_directory_entry_buffer(&root.join(file), &[])
-                                        .await
-                                    {
-                                        Ok(entry) => entry,
-                                        Err(_) => continue,
-                                    };
-
-                                    total_size += directory_entry.size;
-                                }
+                                let total_size = crate::server::filesystem::virtualfs::total_size(
+                                    filesystem.clone(),
+                                    files.iter().map(|file| root.join(file)).collect(),
+                                )
+                                .await?;
 
                                 bytes_total.store(total_size, std::sync::atomic::Ordering::Relaxed);
 

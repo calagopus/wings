@@ -216,18 +216,14 @@ mod post {
             }
         }
 
-        let mut total_size = 0;
-        for file in &data.files {
-            let directory_entry = match filesystem
-                .async_directory_entry_buffer(&root.join(&file.from), &[])
-                .await
-            {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-
-            total_size += directory_entry.size;
-        }
+        let total_size = crate::server::filesystem::virtualfs::total_size(
+            filesystem.clone(),
+            data.files
+                .iter()
+                .map(|file| root.join(&file.from))
+                .collect(),
+        )
+        .await?;
 
         let bytes_processed = Arc::new(AtomicU64::new(0));
         let bytes_total = Arc::new(AtomicU64::new(total_size));
@@ -377,6 +373,7 @@ mod post {
                                                                     &destination_path,
                                                                     &destination_server,
                                                                     Some(metadata.permissions),
+                                                                    None,
                                                                     Some(&bytes_processed),
                                                                 )
                                                                 .await?;

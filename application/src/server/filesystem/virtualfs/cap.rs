@@ -1529,12 +1529,24 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
+        self.create_symlink_with_metadata(original, link, None)
+    }
+    fn create_symlink_with_metadata(
+        &self,
+        original: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
         let link = self.check_write(FileType::Symlink, link.as_ref(), false)?;
         let original = self.check_ignored(FileType::File, original.as_ref())?;
 
-        self.inner.symlink(original, &link)?;
         if self.is_primary_server_fs {
-            self.server.filesystem.chown_path(&link)?;
+            self.server
+                .filesystem
+                .create_chowned_symlink(original, &link, modified)?;
+        } else {
+            self.inner
+                .symlink_with_modified(original, &link, modified)?;
         }
 
         Ok(())
@@ -1551,9 +1563,13 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             .async_check_ignored(FileType::File, original.as_ref())
             .await?;
 
-        self.inner.async_symlink(original, &link).await?;
         if self.is_primary_server_fs {
-            self.server.filesystem.async_chown_path(&link).await?;
+            self.server
+                .filesystem
+                .async_create_chowned_symlink(original, &link, false)
+                .await?;
+        } else {
+            self.inner.async_symlink(original, &link).await?;
         }
 
         Ok(())
@@ -1568,11 +1584,15 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             .async_check_write(FileType::Symlink, link.as_ref(), false)
             .await?;
 
-        self.inner
-            .async_symlink_contents(contents.as_ref(), &link)
-            .await?;
         if self.is_primary_server_fs {
-            self.server.filesystem.async_chown_path(&link).await?;
+            self.server
+                .filesystem
+                .async_create_chowned_symlink(contents.as_ref(), &link, true)
+                .await?;
+        } else {
+            self.inner
+                .async_symlink_contents(contents.as_ref(), &link)
+                .await?;
         }
 
         Ok(())
@@ -3096,6 +3116,50 @@ mod tests {
             }
             fixture.fs.async_read_file(&"file-link", None).await?;
             fixture.fs.async_read_file(&"nested/data.bin", None).await?;
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::create_symlink_with_metadata
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn create_symlink_with_metadata_sets_link_mtime_and_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+            {
+                let user = &mut fixture
+                    .server
+                    .app_state
+                    .config
+                    .mutate_in_place_for_testing()
+                    .system
+                    .user;
+                user.uid = 4242;
+                user.gid = 4243;
+            }
+            let root = fixture.server.filesystem.base_path.clone();
+            let target_before = std::fs::symlink_metadata(root.join("a.txt"))?;
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+            fixture
+                .fs
+                .create_symlink_with_metadata(&"a.txt", &"new-link", Some(modified))?;
+
+            let link = std::fs::symlink_metadata(root.join("new-link"))?;
+            assert!(link.is_symlink());
+            assert_eq!(link.mtime(), 1_000_000);
+            assert_eq!((link.uid(), link.gid()), (4242, 4243));
+            let target = std::fs::symlink_metadata(root.join("a.txt"))?;
+            assert_eq!(target.mtime(), target_before.mtime());
+            assert_eq!(
+                (target.uid(), target.gid()),
+                (target_before.uid(), target_before.gid())
+            );
 
             Ok(())
         });
