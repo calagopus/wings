@@ -1,4 +1,4 @@
-use crate::server::filesystem::limiter::DiskLimiterExt;
+use crate::server::{filesystem::limiter::DiskLimiterExt, resources::ResourceUsageWatchExt};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -11,7 +11,16 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 
-type DiskUsageMap = HashMap<uuid::Uuid, (PathBuf, PathBuf, u32, i64)>;
+type DiskUsageMap = HashMap<
+    uuid::Uuid,
+    (
+        PathBuf,
+        PathBuf,
+        u32,
+        i64,
+        tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    ),
+>;
 
 static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
     let disk_usage: Arc<RwLock<DiskUsageMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -24,7 +33,7 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
             {
                 let usage_map = disk_usage_clone.read().await;
                 if !usage_map.is_empty() {
-                    for (_, mount, pid, _) in usage_map.values() {
+                    for (_, mount, pid, _, _) in usage_map.values() {
                         mount_groups.entry(mount.clone()).or_default().push(*pid);
                     }
                 }
@@ -58,9 +67,10 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
 
             {
                 let mut usage_map = disk_usage_clone.write().await;
-                for (_, _, pid, usage_ref) in usage_map.values_mut() {
+                for (_, _, pid, usage_ref, resource_usage) in usage_map.values_mut() {
                     if let Some(new_usage) = results.get(pid) {
                         *usage_ref = *new_usage;
+                        resource_usage.publish_disk_usage((*new_usage).max(0) as u64);
                     }
                 }
             }
@@ -235,7 +245,8 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
                 self.filesystem.base_path.clone(),
                 mount_point,
                 project_id,
-                0,
+                -1,
+                self.filesystem.resource_usage.clone(),
             ));
 
         Ok(())
@@ -260,7 +271,8 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
                 self.filesystem.base_path.clone(),
                 mount_point,
                 project_id,
-                0,
+                -1,
+                self.filesystem.resource_usage.clone(),
             ),
         );
         Ok(())

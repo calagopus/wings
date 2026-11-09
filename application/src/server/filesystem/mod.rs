@@ -1559,8 +1559,16 @@ impl Filesystem {
 
         self.disk_usage_delta_cached
             .fetch_add(delta.physical, Ordering::Relaxed);
-        self.resource_usage
-            .publish_disk_usage(self.get_physical_cached_size());
+        if self
+            .config
+            .load()
+            .system
+            .disk_limiter_mode
+            .usage_is_scanned()
+        {
+            self.resource_usage
+                .publish_disk_usage(self.get_physical_cached_size());
+        }
 
         true
     }

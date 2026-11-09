@@ -258,6 +258,7 @@ pub async fn run(ctx: DiskCheckerContext) {
             let disk_usage_cached_logical = disk_usage_cached_logical.clone();
             let disk_usage_cached_physical = disk_usage_cached_physical.clone();
             let resource_usage = resource_usage.clone();
+            let usage_is_scanned = config.load().system.disk_limiter_mode.usage_is_scanned();
 
             async move {
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -308,7 +309,9 @@ pub async fn run(ctx: DiskCheckerContext) {
 
                     disk_usage_cached_logical.store(space.get_logical(), Ordering::Relaxed);
                     disk_usage_cached_physical.store(space.get_physical(), Ordering::Relaxed);
-                    resource_usage.publish_disk_usage(space.get_physical());
+                    if usage_is_scanned {
+                        resource_usage.publish_disk_usage(space.get_physical());
+                    }
                     resource_usage.publish_trash_usage(trash_space);
 
                     tracing::debug!(

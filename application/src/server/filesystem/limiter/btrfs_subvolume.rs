@@ -1,4 +1,4 @@
-use crate::server::filesystem::limiter::DiskLimiterExt;
+use crate::server::{filesystem::limiter::DiskLimiterExt, resources::ResourceUsageWatchExt};
 use std::{
     collections::{HashMap, HashSet},
     os::unix::fs::MetadataExt,
@@ -9,7 +9,16 @@ use tokio::{process::Command, sync::RwLock};
 
 const BTRFS_SUBVOLUME_INODE: u64 = 256;
 
-type DiskUsageMap = HashMap<uuid::Uuid, (PathBuf, PathBuf, u64, i64)>;
+type DiskUsageMap = HashMap<
+    uuid::Uuid,
+    (
+        PathBuf,
+        PathBuf,
+        u64,
+        i64,
+        tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    ),
+>;
 
 static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
     let disk_usage: Arc<RwLock<DiskUsageMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -26,7 +35,7 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                for (_, mount, subvol_id, _) in usage_map.values() {
+                for (_, mount, subvol_id, _, _) in usage_map.values() {
                     mount_groups
                         .entry(mount.clone())
                         .or_default()
@@ -57,9 +66,10 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
 
             {
                 let mut usage_map = disk_usage_clone.write().await;
-                for (_, _, subvol_id, usage_ref) in usage_map.values_mut() {
+                for (_, _, subvol_id, usage_ref, resource_usage) in usage_map.values_mut() {
                     if let Some(new_usage) = results.get(subvol_id) {
                         *usage_ref = *new_usage;
+                        resource_usage.publish_disk_usage((*new_usage).max(0) as u64);
                     }
                 }
             }
@@ -207,7 +217,13 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
 
         DISK_USAGE.write().await.insert(
             self.filesystem.uuid,
-            (self.filesystem.base_path.clone(), mount_point, subvol_id, 0),
+            (
+                self.filesystem.base_path.clone(),
+                mount_point,
+                subvol_id,
+                -1,
+                self.filesystem.resource_usage.clone(),
+            ),
         );
 
         Ok(())
@@ -229,7 +245,13 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
             .write()
             .await
             .entry(self.filesystem.uuid)
-            .or_insert((self.filesystem.base_path.clone(), mount_point, subvol_id, 0));
+            .or_insert((
+                self.filesystem.base_path.clone(),
+                mount_point,
+                subvol_id,
+                -1,
+                self.filesystem.resource_usage.clone(),
+            ));
 
         Ok(())
     }

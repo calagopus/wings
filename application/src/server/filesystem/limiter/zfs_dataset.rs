@@ -1,4 +1,4 @@
-use crate::server::filesystem::limiter::DiskLimiterExt;
+use crate::server::{filesystem::limiter::DiskLimiterExt, resources::ResourceUsageWatchExt};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -6,7 +6,15 @@ use std::{
 };
 use tokio::{process::Command, sync::RwLock};
 
-type DiskUsageMap = HashMap<uuid::Uuid, (PathBuf, String, i64)>;
+type DiskUsageMap = HashMap<
+    uuid::Uuid,
+    (
+        PathBuf,
+        String,
+        i64,
+        tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    ),
+>;
 
 static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
     let disk_usage: Arc<RwLock<DiskUsageMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -50,9 +58,10 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
 
                     let mut usage_map = disk_usage_clone.write().await;
 
-                    for (_, dataset_name, usage_ref) in usage_map.values_mut() {
+                    for (_, dataset_name, usage_ref, resource_usage) in usage_map.values_mut() {
                         if let Some(found_usage) = system_usage.get(dataset_name.as_str()) {
                             *usage_ref = *found_usage;
+                            resource_usage.publish_disk_usage((*found_usage).max(0) as u64);
                         }
                     }
                 }
@@ -192,7 +201,12 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
             .write()
             .await
             .entry(self.filesystem.uuid)
-            .or_insert((self.filesystem.base_path.clone(), dataset_name, 0));
+            .or_insert((
+                self.filesystem.base_path.clone(),
+                dataset_name,
+                -1,
+                self.filesystem.resource_usage.clone(),
+            ));
 
         Ok(())
     }
@@ -208,7 +222,12 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
 
         DISK_USAGE.write().await.insert(
             self.filesystem.uuid,
-            (self.filesystem.base_path.clone(), dataset_name, 0),
+            (
+                self.filesystem.base_path.clone(),
+                dataset_name,
+                -1,
+                self.filesystem.resource_usage.clone(),
+            ),
         );
 
         Ok(())
