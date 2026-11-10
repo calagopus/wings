@@ -2556,9 +2556,9 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itaf"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "778d8b0fa8a3ef6b8b74c196616939261c6f7ffd92505b6c1b0b2135842a937a"
+checksum = "b1bdbb020169a58b8da8113618b43ba8d91313819498729b151179565fbb0878"
 dependencies = [
  "crc",
 ]

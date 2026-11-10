@@ -1398,7 +1398,7 @@ impl BackupExt for ResticBackup {
                                 let link =
                                     entry.link_name().unwrap_or_default().unwrap_or_default();
                                 let target = link.to_string_lossy();
-                                if itaf::spec::validate_name(name).is_ok() {
+                                if !target.is_empty() && itaf::spec::validate_name(name).is_ok() {
                                     itaf_enc.add_symlink(name, &target, false, &meta)?;
                                 }
                             }
@@ -2638,7 +2638,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 let link =
                                     entry.link_name().unwrap_or_default().unwrap_or_default();
                                 let target = link.to_string_lossy();
-                                if itaf::spec::validate_name(name).is_ok() {
+                                if !target.is_empty() && itaf::spec::validate_name(name).is_ok() {
                                     itaf_enc.add_symlink(name, &target, false, &meta)?;
                                     progress.increment_files();
                                 }
@@ -3153,7 +3153,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                                 .unwrap_or_default()
                                                 .unwrap_or_default();
                                             let target = link.to_string_lossy();
-                                            if itaf::spec::validate_name(inner_name).is_ok() {
+                                            if !target.is_empty()
+                                                && itaf::spec::validate_name(inner_name).is_ok()
+                                            {
                                                 itaf_enc.add_symlink(
                                                     inner_name, &target, false, &meta,
                                                 )?;

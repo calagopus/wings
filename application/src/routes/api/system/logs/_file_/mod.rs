@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod ws;
 
 fn log_file_path(state: &State, file: &str) -> Option<std::path::PathBuf> {
-    if !crate::utils::is_single_component_file_name(file) {
+    if !crate::utils::is_log_file_name(file) {
         return None;
     }
 

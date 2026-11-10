@@ -36,6 +36,7 @@ pub async fn extract_itaf(
         let (read_progress, write_progress) = options.progress(&progress);
         let reader = super::decompressed_reader(source, compression, threads, &read_progress)?;
         let reader = AbortReader::new(reader, listener.clone());
+        let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
 
         if let Some(total) = total
             && let Some(size) = size

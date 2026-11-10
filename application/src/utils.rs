@@ -90,6 +90,13 @@ pub fn is_single_component_file_name(name: &str) -> bool {
     }
 }
 
+pub fn is_log_file_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|c| matches!(c, '\\' | '%' | '?' | '#') || c.is_control())
+        && is_single_component_file_name(name)
+}
+
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
     static RE_STAR: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)filename\*=utf-8''([^;]+)").expect("Failed to compile regex")
@@ -707,6 +714,28 @@ mod tests {
         assert!(!is_single_component_file_name("."));
         assert!(!is_single_component_file_name(".."));
         assert!(!is_single_component_file_name("./x"));
+    }
+
+    // is_log_file_name
+
+    #[test]
+    fn log_file_name_accepts_rotated_and_compressed_logs() {
+        assert!(is_log_file_name("wings.log"));
+        assert!(is_log_file_name("wings.2026-11-10.log"));
+        assert!(is_log_file_name("wings.log.gz"));
+    }
+
+    #[test]
+    fn log_file_name_rejects_url_significant_characters() {
+        assert!(!is_log_file_name("..\\config"));
+        assert!(!is_log_file_name("a\\b"));
+        assert!(!is_log_file_name("%2e%2e"));
+        assert!(!is_log_file_name("a?b"));
+        assert!(!is_log_file_name("a#b"));
+        assert!(!is_log_file_name("a\0b"));
+        assert!(!is_log_file_name("a\nb"));
+        assert!(!is_log_file_name("../config"));
+        assert!(!is_log_file_name(".."));
     }
 
     // draw_progress_bar

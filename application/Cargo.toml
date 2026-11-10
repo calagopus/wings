@@ -93,7 +93,7 @@ sntpc-net-tokio = "1.0.1"
 sntpc = { version = "0.11.0", features = ["std"] }
 hex = { workspace = true }
 json-patch = "5.0.0"
-itaf = "0.3.0"
+itaf = "0.4.0"
 arc-swap = "1.9.1"
 rusqlite = { version = "0.41.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
 blake3 = "1.8.5"
