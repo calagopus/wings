@@ -157,20 +157,20 @@ impl History {
                     disk = Some(d);
                 }
                 let row = raw.rows.get(&i).copied().unwrap_or_default();
-                let running = row.n > 0;
+                let running = row.n > 0.0;
 
                 HistoryPoint {
                     start: Self::timestamp(point_start),
                     states,
-                    sampled_seconds: Some(row.n.max(0) as u64),
-                    cpu_average: running.then(|| row.cpu_sum as f64 / row.n as f64 / 100.0),
-                    cpu_max: running.then(|| row.cpu_max as f64 / 100.0),
+                    sampled_seconds: Some(row.n.max(0.0).round() as u64),
+                    cpu_average: running.then(|| row.cpu_sum / row.n / 100.0),
+                    cpu_max: running.then(|| row.cpu_max / 100.0),
                     memory_average_bytes: running
-                        .then(|| (row.mem_sum / row.n).max(0) as u64 * 1024),
-                    memory_max_bytes: running.then(|| row.mem_max.max(0) as u64 * 1024),
+                        .then(|| (row.mem_sum / row.n).max(0.0) as u64 * 1024),
+                    memory_max_bytes: running.then(|| row.mem_max.max(0.0) as u64 * 1024),
                     disk_bytes: disk.map(|d| d.max(0) as u64 * 1024),
-                    network_rx_bytes: Some(row.rx.max(0) as u64),
-                    network_tx_bytes: Some(row.tx.max(0) as u64),
+                    network_rx_bytes: Some(row.rx.max(0.0).round() as u64),
+                    network_tx_bytes: Some(row.tx.max(0.0).round() as u64),
                 }
             })
             .collect();
@@ -584,19 +584,19 @@ mod tests {
                 (
                     1,
                     PointRow {
-                        n: 2,
-                        cpu_sum: 300,
-                        cpu_max: 200,
-                        mem_sum: 2048,
-                        mem_max: 1536,
-                        rx: 5,
-                        tx: 6,
+                        n: 2.0,
+                        cpu_sum: 300.0,
+                        cpu_max: 200.0,
+                        mem_sum: 2048.0,
+                        mem_max: 1536.0,
+                        rx: 5.0,
+                        tx: 6.0,
                     },
                 ),
                 (
                     3,
                     PointRow {
-                        rx: 7,
+                        rx: 7.0,
                         ..Default::default()
                     },
                 ),

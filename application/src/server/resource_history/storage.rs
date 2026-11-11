@@ -83,15 +83,16 @@ pub struct StoredTier {
     pub retired: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Bucket totals attributed to one point, buckets straddling points are split by overlap.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct PointRow {
-    pub n: i64,
-    pub cpu_sum: i64,
-    pub cpu_max: i64,
-    pub mem_sum: i64,
-    pub mem_max: i64,
-    pub rx: i64,
-    pub tx: i64,
+    pub n: f64,
+    pub cpu_sum: f64,
+    pub cpu_max: f64,
+    pub mem_sum: f64,
+    pub mem_max: f64,
+    pub rx: f64,
+    pub tx: f64,
 }
 
 #[derive(Default)]
@@ -178,16 +179,20 @@ impl Storage {
     }
 
     /// Picks the coarsest tier whose step fits into one slice of `width` seconds and whose data
-    /// reaches back to `start`. Without such a tier the fitting one reaching back the furthest is
-    /// used, and when no tier is fine enough the finest one.
+    /// reaches back to `start`. Without such a tier the fitting one with data before `end` reaching
+    /// back the furthest is used. When no fitting tier has data in `[start, end)`, the finest tier
+    /// reaching `start` regardless of its step (or the one reaching back the furthest), and when no
+    /// tier has data in it at all the finest one.
     pub fn choose_tier(
         candidates: &[(u64, Option<i64>)],
         start: i64,
+        end: i64,
         width: i64,
     ) -> Option<(u64, Option<i64>)> {
         let fitting = candidates
             .iter()
             .filter(|(step, _)| *step as i64 <= width.max(1));
+        let inside = |(_, from): &&(u64, Option<i64>)| from.is_some_and(|from| from < end);
 
         fitting
             .clone()
@@ -195,8 +200,13 @@ impl Storage {
             .max_by_key(|(step, _)| *step)
             .or_else(|| {
                 fitting
-                    .filter(|(_, from)| from.is_some())
+                    .filter(inside)
                     .min_by_key(|(step, from)| (*from, std::cmp::Reverse(*step)))
+            })
+            .or_else(|| {
+                candidates.iter().filter(inside).min_by_key(|(step, from)| {
+                    (from.map_or(i64::MAX, |from| from.max(start)), *step)
+                })
             })
             .or_else(|| candidates.iter().min_by_key(|(step, _)| *step))
             .copied()
@@ -579,7 +589,6 @@ impl Storage {
         for tier in self.tiers()? {
             let coverage = self.coverage(id, tier.step)?;
 
-            // a retired tier stopped recording, it can only serve ranges that end before that
             if tier.retired && coverage.is_none_or(|(_, until)| until < end) {
                 continue;
             }
@@ -587,7 +596,7 @@ impl Storage {
             candidates.push((tier.step, coverage.map(|(from, _)| from)));
         }
         let width = (end - start) / points as i64;
-        let Some((step, covered_from)) = Self::choose_tier(&candidates, start, width) else {
+        let Some((step, covered_from)) = Self::choose_tier(&candidates, start, end, width) else {
             return Ok(None);
         };
 
@@ -598,25 +607,54 @@ impl Storage {
         let index = format!("MIN(?5 - 1, MAX(0, (b * {step_i} - ?3) * ?5 / (?4 - ?3)))");
         let p = params![id, b0, start, end, points as i64, b1];
 
-        let mut rows = HashMap::new();
+        let now = chrono::Utc::now().timestamp();
+        let span = (end - start) as i128;
+        let index_of =
+            |t: i64| (((t - start) as i128 * points as i128 / span) as usize).min(points - 1);
+        let mut rows = HashMap::<usize, PointRow>::new();
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {index} AS i, SUM(n), SUM(cpu_sum), MAX(cpu_max), SUM(mem_sum), MAX(mem_max), SUM(rx), SUM(tx)
-            FROM {table} WHERE server = ?1 AND b >= ?2 AND b < ?6 GROUP BY i"
+            "SELECT b, n, cpu_sum, cpu_max, mem_sum, mem_max, rx, tx
+            FROM {table} WHERE server = ?1 AND b >= ?2 AND b < ?3"
         ))?;
-        let mut q = stmt.query(p)?;
+        let mut q = stmt.query(params![id, b0, b1])?;
         while let Some(r) = q.next()? {
-            rows.insert(
-                r.get::<_, i64>(0)?.max(0) as usize,
-                PointRow {
-                    n: r.get(1)?,
-                    cpu_sum: r.get(2)?,
-                    cpu_max: r.get(3)?,
-                    mem_sum: r.get(4)?,
-                    mem_max: r.get(5)?,
-                    rx: r.get(6)?,
-                    tx: r.get(7)?,
-                },
+            let bucket_start = r.get::<_, i64>(0)? * step_i;
+            let bucket_end = (bucket_start + step_i).min(now.max(bucket_start + 1));
+            let (since, until) = (bucket_start.max(start), bucket_end.min(end));
+            if since >= until {
+                continue;
+            }
+
+            let field = |i: usize| r.get::<_, i64>(i).map(|v| v as f64);
+            let (n, cpu_sum, cpu_max, mem_sum, mem_max, rx, tx) = (
+                field(1)?,
+                field(2)?,
+                field(3)?,
+                field(4)?,
+                field(5)?,
+                field(6)?,
+                field(7)?,
             );
+
+            let first = index_of(since).saturating_sub(1);
+            let last = (index_of(until - 1) + 1).min(points - 1);
+            for i in first..=last {
+                let (point_start, point_end) = super::History::point_bounds(start, end, points, i);
+                let overlap = until.min(point_end) - since.max(point_start);
+                if overlap <= 0 {
+                    continue;
+                }
+
+                let share = overlap as f64 / (bucket_end - bucket_start) as f64;
+                let row = rows.entry(i).or_default();
+                row.n += n * share;
+                row.cpu_sum += cpu_sum * share;
+                row.cpu_max = row.cpu_max.max(cpu_max);
+                row.mem_sum += mem_sum * share;
+                row.mem_max = row.mem_max.max(mem_max);
+                row.rx += rx * share;
+                row.tx += tx * share;
+            }
         }
 
         // with exactly one max() aggregate sqlite takes the bare disk column from that row
@@ -871,14 +909,14 @@ mod tests {
     }
 
     fn sum(bs: std::ops::RangeInclusive<i64>) -> PointRow {
-        let n = bs.clone().count() as i64;
-        let total: i64 = bs.clone().sum();
+        let n = bs.clone().count() as f64;
+        let total = bs.clone().sum::<i64>() as f64;
         PointRow {
             n,
             cpu_sum: total,
-            cpu_max: *bs.end(),
+            cpu_max: *bs.end() as f64,
             mem_sum: total,
-            mem_max: *bs.end(),
+            mem_max: *bs.end() as f64,
             rx: total,
             tx: n,
         }
@@ -936,13 +974,13 @@ mod tests {
         assert_eq!(
             raw.rows.get(&0),
             Some(&PointRow {
-                n: 3,
-                cpu_sum: 130,
-                cpu_max: 60,
-                mem_sum: 18,
-                mem_max: 8,
-                rx: 4,
-                tx: 6,
+                n: 3.0,
+                cpu_sum: 130.0,
+                cpu_max: 60.0,
+                mem_sum: 18.0,
+                mem_max: 8.0,
+                rx: 4.0,
+                tx: 6.0,
             })
         );
         assert_eq!(raw.disks.get(&0), Some(&7));
@@ -964,10 +1002,77 @@ mod tests {
         assert_eq!(raw.step, 10);
         assert_eq!(raw.covered_from, Some(-10));
         assert_eq!(raw.rows.len(), 2);
-        assert_eq!(raw.rows.get(&0), Some(&sum(0..=2)));
-        assert_eq!(raw.rows.get(&1), Some(&sum(3..=4)));
+        // halves of buckets 0 and 2 go to point 0, halves of 2 and 4 to point 1
+        assert_eq!(
+            raw.rows.get(&0),
+            Some(&PointRow {
+                n: 2.0,
+                cpu_sum: 2.0,
+                cpu_max: 2.0,
+                mem_sum: 2.0,
+                mem_max: 2.0,
+                rx: 2.0,
+                tx: 2.0,
+            })
+        );
+        assert_eq!(
+            raw.rows.get(&1),
+            Some(&PointRow {
+                n: 2.0,
+                cpu_sum: 6.0,
+                cpu_max: 4.0,
+                mem_sum: 6.0,
+                mem_max: 4.0,
+                rx: 6.0,
+                tx: 2.0,
+            })
+        );
         assert_eq!(raw.disks, HashMap::from([(0, 20), (1, 40)]));
         assert_eq!(raw.disk_before, Some(-10));
+    }
+
+    #[test]
+    fn query_spreads_coarse_buckets_over_finer_points() {
+        let (_dir, mut storage) = open(&[tier(10, 0)]);
+        write_samples(&mut storage, A, 10, 1..=2);
+
+        let raw = storage.query(A, 10, 30, 10).unwrap().unwrap();
+        assert_eq!(raw.rows.len(), 10);
+        for i in 0..10 {
+            let b = if i < 5 { 1.0 } else { 2.0 };
+            let row = raw.rows[&i];
+            assert!((row.n - 0.2).abs() < 1e-9, "point {i}: {row:?}");
+            assert!((row.rx - b * 0.2).abs() < 1e-9, "point {i}: {row:?}");
+            assert_eq!(row.cpu_max, b);
+        }
+    }
+
+    #[test]
+    fn query_keeps_constant_rate_flat_when_points_do_not_align_with_buckets() {
+        let (_dir, mut storage) = open(&[tier(10, 0)]);
+        let rows = (0..=5)
+            .map(|b| {
+                row(
+                    10,
+                    b,
+                    Bucket {
+                        rx: 10,
+                        ..sample(b)
+                    },
+                )
+            })
+            .collect();
+        storage.write(vec![entry(A, rows, None)]).unwrap();
+
+        let raw = storage.query(A, 0, 60, 5).unwrap().unwrap();
+        assert_eq!(raw.step, 10);
+        for i in 0..5 {
+            assert!(
+                (raw.rows[&i].rx - 12.0).abs() < 1e-9,
+                "point {i}: {:?}",
+                raw.rows[&i]
+            );
+        }
     }
 
     #[test]
@@ -1119,11 +1224,11 @@ mod tests {
     fn choose_tier_prefers_coarsest_fitting_covered_tier() {
         let candidates = [(10, Some(0)), (600, Some(0)), (60, Some(0))];
         assert_eq!(
-            Storage::choose_tier(&candidates, 100, 120),
+            Storage::choose_tier(&candidates, 100, 1300, 120),
             Some((60, Some(0)))
         );
         assert_eq!(
-            Storage::choose_tier(&candidates, 100, 600),
+            Storage::choose_tier(&candidates, 100, 6100, 600),
             Some((600, Some(0)))
         );
     }
@@ -1132,7 +1237,7 @@ mod tests {
     fn choose_tier_skips_coarser_tier_that_does_not_reach_start() {
         let candidates = [(10, Some(0)), (60, Some(500))];
         assert_eq!(
-            Storage::choose_tier(&candidates, 100, 120),
+            Storage::choose_tier(&candidates, 100, 1300, 120),
             Some((10, Some(0)))
         );
     }
@@ -1141,12 +1246,35 @@ mod tests {
     fn choose_tier_falls_back_to_fitting_tier_reaching_furthest_back() {
         let candidates = [(10, Some(300)), (60, Some(200)), (600, Some(0))];
         assert_eq!(
-            Storage::choose_tier(&candidates, 100, 120),
+            Storage::choose_tier(&candidates, 100, 1300, 120),
             Some((60, Some(200)))
         );
         assert_eq!(
-            Storage::choose_tier(&[(10, Some(300)), (60, None)], 100, 120),
+            Storage::choose_tier(&[(10, Some(300)), (60, None)], 100, 1300, 120),
             Some((10, Some(300)))
+        );
+    }
+
+    #[test]
+    fn choose_tier_skips_fitting_tier_without_data_in_range() {
+        // default tiers at t=0: 1s kept 1h, 10s kept 7d, 60s kept 1y, 600s kept forever
+        let candidates = [
+            (1, Some(-3_600)),
+            (10, Some(-604_800)),
+            (60, Some(-31_536_000)),
+            (600, Some(-1_000_000_000)),
+        ];
+        assert_eq!(
+            Storage::choose_tier(&candidates, -10_800, -10_500, 2),
+            Some((10, Some(-604_800)))
+        );
+        assert_eq!(
+            Storage::choose_tier(&[(1, Some(-100)), (10, Some(-500))], -1_000, -200, 2),
+            Some((10, Some(-500)))
+        );
+        assert_eq!(
+            Storage::choose_tier(&[(10, Some(0)), (1, Some(0))], -1_000, -500, 2),
+            Some((1, Some(0)))
         );
     }
 
@@ -1154,14 +1282,14 @@ mod tests {
     fn choose_tier_uses_finest_tier_when_none_fit() {
         let candidates = [(600, Some(0)), (60, Some(0))];
         assert_eq!(
-            Storage::choose_tier(&candidates, 100, 5),
+            Storage::choose_tier(&candidates, 100, 150, 5),
             Some((60, Some(0)))
         );
         assert_eq!(
-            Storage::choose_tier(&[(10, Some(0)), (1, Some(0))], 100, 0),
+            Storage::choose_tier(&[(10, Some(0)), (1, Some(0))], 100, 110, 0),
             Some((1, Some(0)))
         );
-        assert_eq!(Storage::choose_tier(&[], 100, 60), None);
+        assert_eq!(Storage::choose_tier(&[], 100, 700, 60), None);
     }
 
     #[test]
