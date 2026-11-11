@@ -488,7 +488,15 @@ impl OutgoingServerTransfer {
 
                 async move {
                     let mut walker = server.filesystem.async_walk_dir("").await?;
-                    while let Some(Ok(entry)) = walker.next_entry().await {
+                    while let Some(entry) = walker.next_entry().await {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(err) => {
+                                tracing::warn!(server = %server.uuid, "failed to read directory entry while transferring server: {err:#}");
+                                continue;
+                            }
+                        };
+
                         files_sender.send(entry.path).await?;
                     }
 

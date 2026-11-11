@@ -66,6 +66,18 @@ impl From<std::fs::FileType> for FileType {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<rustix::fs::FileType> for FileType {
+    fn from(ft: rustix::fs::FileType) -> Self {
+        match ft {
+            rustix::fs::FileType::RegularFile => FileType::File,
+            rustix::fs::FileType::Directory => FileType::Dir,
+            rustix::fs::FileType::Symlink => FileType::Symlink,
+            _ => FileType::Unknown,
+        }
+    }
+}
+
 pub struct AsyncReadDir(
     pub Option<cap_std::fs::ReadDir>,
     pub Option<VecDeque<std::io::Result<cap_std::fs::DirEntry>>>,
@@ -143,10 +155,15 @@ impl ListingDir {
 
                 let name = String::from_utf8_lossy(name).into_owned();
                 let file_type = match entry.file_type() {
-                    rustix::fs::FileType::RegularFile => FileType::File,
-                    rustix::fs::FileType::Directory => FileType::Dir,
-                    rustix::fs::FileType::Symlink => FileType::Symlink,
-                    _ => FileType::Unknown,
+                    rustix::fs::FileType::Unknown => rustix::fs::statat(
+                        self.0.as_fd(),
+                        entry.file_name(),
+                        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_or(FileType::Unknown, |stat| {
+                        rustix::fs::FileType::from_raw_mode(stat.st_mode).into()
+                    }),
+                    file_type => file_type.into(),
                 };
 
                 visit(file_type, name)?;

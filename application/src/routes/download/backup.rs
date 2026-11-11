@@ -45,6 +45,7 @@ mod get {
         (status = OK, body = String),
         (status = UNAUTHORIZED, body = String),
         (status = NOT_FOUND, body = String),
+        (status = RANGE_NOT_SATISFIABLE, body = String),
         (status = EXPECTATION_FAILED, body = String),
     ), params(
         (
@@ -86,13 +87,18 @@ mod get {
         let download = if payload.database {
             backup.download_database(&state).await
         } else {
-            backup
-                .download(
-                    &state,
-                    data.archive_format,
-                    ByteRange::from_headers(&headers),
-                )
-                .await
+            let range = ByteRange::from_headers(&headers);
+            if let Some(range) = range
+                && let Some(size) = backup.download_info().await.ok().and_then(|info| info.size)
+                && range.resolve(size).is_none()
+            {
+                return ApiResponse::error("range not satisfiable")
+                    .with_status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .with_header("Content-Range", &format!("bytes */{size}"))
+                    .ok();
+            }
+
+            backup.download(&state, data.archive_format, range).await
         };
 
         match download {

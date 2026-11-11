@@ -13,8 +13,8 @@ use crate::{
         usage::SpaceDelta,
         virtualfs::{
             AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
-            ByteRange, DirectoryListing, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
-            ReadableFileStream, VirtualReadableFilesystem,
+            ByteRange, DirectoryListing, DirectoryWalk, FileMetadata, FileRead, IgnoreVerdict,
+            IsIgnoredFn, ReadableFileStream, VirtualReadableFilesystem,
         },
     },
     utils::{CmpExt, PortablePermissions},
@@ -312,6 +312,16 @@ impl VirtualDdupBakArchive {
         }
     }
 
+    /// Where a tree walk goes for an entry: `None` skips it and its subtree, otherwise the
+    /// path and whether the entry itself is emitted. Directories are entered for re-included
+    /// entries beneath them even when they are not kept.
+    fn walk_verdict(verdict: IgnoreVerdict, file_type: FileType) -> Option<(PathBuf, bool)> {
+        let kept = verdict.is_kept();
+        let path = verdict.descend()?;
+
+        (kept || file_type.is_dir()).then_some((path, kept))
+    }
+
     fn tar_convert_entries(
         entry: &Entry,
         repository: &Option<Arc<ddup_bak::repository::Repository>>,
@@ -325,7 +335,8 @@ impl VirtualDdupBakArchive {
         while let Some((parent_path, entry)) = stack.pop() {
             let path = parent_path.join(entry.name());
 
-            let Some(path) = (is_ignored)(Self::ddup_bak_entry_to_file_type(entry), path).keep()
+            let file_type = Self::ddup_bak_entry_to_file_type(entry);
+            let Some((path, kept)) = Self::walk_verdict((is_ignored)(file_type, path), file_type)
             else {
                 continue;
             };
@@ -342,9 +353,11 @@ impl VirtualDdupBakArchive {
 
             match entry {
                 Entry::Directory(dir) => {
-                    entry_header.set_entry_type(tar::EntryType::Directory);
+                    if kept {
+                        entry_header.set_entry_type(tar::EntryType::Directory);
 
-                    archive.append_data(&mut entry_header, &path, std::io::empty())?;
+                        archive.append_data(&mut entry_header, &path, std::io::empty())?;
+                    }
 
                     for child in dir.entries.iter().rev() {
                         stack.push((path.clone(), child));
@@ -389,6 +402,19 @@ impl VirtualDdupBakArchive {
             ExitDir,
         }
 
+        fn enter_pending<W: Write>(
+            itaf_enc: &mut ItafEncoder<W>,
+            open: &mut [(compact_str::CompactString, Metadata, bool)],
+        ) -> Result<(), anyhow::Error> {
+            for (name, meta, entered) in open.iter_mut().filter(|(_, _, entered)| !*entered) {
+                itaf_enc.enter_dir(name, meta)?;
+                *entered = true;
+            }
+
+            Ok(())
+        }
+
+        let mut open: Vec<(compact_str::CompactString, Metadata, bool)> = Vec::new();
         let mut stack: Vec<Work> = vec![Work::Visit {
             parent_path: parent_path.to_path_buf(),
             entry,
@@ -397,7 +423,9 @@ impl VirtualDdupBakArchive {
         while let Some(work) = stack.pop() {
             let (parent_path, entry) = match work {
                 Work::ExitDir => {
-                    itaf_enc.exit_dir()?;
+                    if let Some((_, _, true)) = open.pop() {
+                        itaf_enc.exit_dir()?;
+                    }
                     continue;
                 }
                 Work::Visit { parent_path, entry } => (parent_path, entry),
@@ -405,7 +433,8 @@ impl VirtualDdupBakArchive {
 
             let path = parent_path.join(entry.name());
 
-            let Some(path) = (is_ignored)(Self::ddup_bak_entry_to_file_type(entry), path).keep()
+            let file_type = Self::ddup_bak_entry_to_file_type(entry);
+            let Some((path, kept)) = Self::walk_verdict((is_ignored)(file_type, path), file_type)
             else {
                 continue;
             };
@@ -429,7 +458,11 @@ impl VirtualDdupBakArchive {
             match entry {
                 Entry::Directory(dir) => {
                     if itaf::spec::validate_name(&name).is_ok() {
-                        itaf_enc.enter_dir(&name, &meta)?;
+                        if kept {
+                            enter_pending(itaf_enc, &mut open)?;
+                            itaf_enc.enter_dir(&name, &meta)?;
+                        }
+                        open.push((name, meta, kept));
                         stack.push(Work::ExitDir);
                         for child in dir.entries.iter().rev() {
                             stack.push(Work::Visit {
@@ -441,6 +474,7 @@ impl VirtualDdupBakArchive {
                 }
                 Entry::File(file) => {
                     if itaf::spec::validate_name(&name).is_ok() {
+                        enter_pending(itaf_enc, &mut open)?;
                         let reader = progress
                             .counting_reader(repository.entry_reader(Entry::File(file.clone()))?);
                         let mut reader =
@@ -451,6 +485,7 @@ impl VirtualDdupBakArchive {
                 }
                 Entry::Symlink(link) => {
                     if itaf::spec::validate_name(&name).is_ok() {
+                        enter_pending(itaf_enc, &mut open)?;
                         itaf_enc.add_symlink(&name, &link.target, false, &meta)?;
                         progress.increment_files();
                     }
@@ -475,13 +510,14 @@ impl VirtualDdupBakArchive {
         while let Some((parent_path, entry)) = stack.pop() {
             let path = parent_path.join(entry.name());
 
-            let Some(path) = (is_ignored)(Self::ddup_bak_entry_to_file_type(entry), path).keep()
+            let file_type = Self::ddup_bak_entry_to_file_type(entry);
+            let Some((path, kept)) = Self::walk_verdict((is_ignored)(file_type, path), file_type)
             else {
                 continue;
             };
 
             let size = match entry {
-                Entry::File(file) => file.size,
+                Entry::File(file) => file.size_real,
                 _ => 0,
             };
 
@@ -493,19 +529,23 @@ impl VirtualDdupBakArchive {
             {
                 let mtime: chrono::DateTime<chrono::Utc> = chrono::DateTime::from(entry.mtime());
 
-                options = options.last_modified_time(zip::DateTime::from_date_and_time(
+                if let Ok(mtime) = zip::DateTime::from_date_and_time(
                     mtime.year() as u16,
                     mtime.month() as u8,
                     mtime.day() as u8,
                     mtime.hour() as u8,
                     mtime.minute() as u8,
                     mtime.second() as u8,
-                )?);
+                ) {
+                    options = options.last_modified_time(mtime);
+                }
             }
 
             match entry {
                 Entry::Directory(dir) => {
-                    zip.add_directory(path.to_string_lossy(), options)?;
+                    if kept {
+                        zip.add_directory(path.to_string_lossy(), options)?;
+                    }
 
                     for child in dir.entries.iter().rev() {
                         stack.push((path.clone(), child));
@@ -522,7 +562,7 @@ impl VirtualDdupBakArchive {
                     progress.increment_files();
                 }
                 Entry::Symlink(link) => {
-                    zip.add_symlink(&link.name, &link.target, options)?;
+                    zip.add_symlink(path.to_string_lossy(), &link.target, options)?;
                     progress.increment_files();
                 }
             }
@@ -702,11 +742,9 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                         for entry in archive.entries() {
                             scratch.clear();
                             scratch.push(entry.name());
-                            match (is_ignored)(
-                                Self::ddup_bak_entry_to_file_type(entry),
-                                std::mem::take(&mut scratch),
-                            )
-                            .keep()
+                            let file_type = Self::ddup_bak_entry_to_file_type(entry);
+                            match (is_ignored)(file_type, std::mem::take(&mut scratch))
+                                .reachable(file_type)
                             {
                                 Some(kept) => scratch = kept,
                                 None => continue,
@@ -778,12 +816,11 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                         let mut scratch = PathBuf::new();
                         for entry in &dir.entries {
                             scratch.clear();
+                            scratch.push(&path);
                             scratch.push(entry.name());
-                            match (is_ignored)(
-                                Self::ddup_bak_entry_to_file_type(entry),
-                                std::mem::take(&mut scratch),
-                            )
-                            .keep()
+                            let file_type = Self::ddup_bak_entry_to_file_type(entry);
+                            match (is_ignored)(file_type, std::mem::take(&mut scratch))
+                                .reachable(file_type)
                             {
                                 Some(kept) => scratch = kept,
                                 None => continue,
@@ -1155,13 +1192,13 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
         struct IgnoreWalkDir {
-            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry)>,
+            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry, bool)>,
             is_ignored: IsIgnoredFn,
         }
 
         impl DirectoryWalk for IgnoreWalkDir {
             fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                if let Some((path, entry)) = self.queue.pop_front() {
+                while let Some((path, entry, kept)) = self.queue.pop_front() {
                     let file_type = VirtualDdupBakArchive::ddup_bak_entry_to_file_type(&entry);
 
                     if let ddup_bak::archive::entries::Entry::Directory(dir) = &entry {
@@ -1170,13 +1207,21 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
 
-                            if let Some(child_path) =
-                                (self.is_ignored)(child_type, child_path).keep()
+                            if let Some((child_path, child_kept)) =
+                                VirtualDdupBakArchive::walk_verdict(
+                                    (self.is_ignored)(child_type, child_path),
+                                    child_type,
+                                )
                             {
-                                self.queue.push_back((child_path, child.clone()));
+                                self.queue
+                                    .push_back((child_path, child.clone(), child_kept));
                             }
                         }
                     }
+                    if !kept {
+                        continue;
+                    }
+
                     return Some(Ok((file_type, path)));
                 }
                 None
@@ -1192,8 +1237,10 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if let Some(child_path) = (is_ignored)(child_type, child_path).keep() {
-                        queue.push_back((child_path, child.clone()));
+                    if let Some((child_path, kept)) =
+                        Self::walk_verdict((is_ignored)(child_type, child_path), child_type)
+                    {
+                        queue.push_back((child_path, child.clone(), kept));
                     }
                 }
             }
@@ -1201,8 +1248,10 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if let Some(child_path) = (is_ignored)(child_type, child_path).keep() {
-                    queue.push_back((child_path, child.clone()));
+                if let Some((child_path, kept)) =
+                    Self::walk_verdict((is_ignored)(child_type, child_path), child_type)
+                {
+                    queue.push_back((child_path, child.clone(), kept));
                 }
             }
         }
@@ -1215,14 +1264,14 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
         struct AsyncIgnoreWalkDir {
-            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry)>,
+            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry, bool)>,
             is_ignored: IsIgnoredFn,
         }
 
         #[async_trait::async_trait]
         impl AsyncDirectoryWalk for AsyncIgnoreWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                if let Some((path, entry)) = self.queue.pop_front() {
+                while let Some((path, entry, kept)) = self.queue.pop_front() {
                     let file_type = VirtualDdupBakArchive::ddup_bak_entry_to_file_type(&entry);
 
                     if let ddup_bak::archive::entries::Entry::Directory(dir) = &entry {
@@ -1231,16 +1280,21 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
 
-                            if let Some(child_path) = self
-                                .is_ignored
-                                .call_async(child_type, child_path)
-                                .await
-                                .keep()
+                            if let Some((child_path, child_kept)) =
+                                VirtualDdupBakArchive::walk_verdict(
+                                    self.is_ignored.call_async(child_type, child_path).await,
+                                    child_type,
+                                )
                             {
-                                self.queue.push_back((child_path, child.clone()));
+                                self.queue
+                                    .push_back((child_path, child.clone(), child_kept));
                             }
                         }
                     }
+                    if !kept {
+                        continue;
+                    }
+
                     return Some(Ok((file_type, path)));
                 }
                 None
@@ -1256,10 +1310,11 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if let Some(child_path) =
-                        is_ignored.call_async(child_type, child_path).await.keep()
-                    {
-                        queue.push_back((child_path, child.clone()));
+                    if let Some((child_path, kept)) = Self::walk_verdict(
+                        is_ignored.call_async(child_type, child_path).await,
+                        child_type,
+                    ) {
+                        queue.push_back((child_path, child.clone(), kept));
                     }
                 }
             }
@@ -1267,9 +1322,11 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if let Some(child_path) = is_ignored.call_async(child_type, child_path).await.keep()
-                {
-                    queue.push_back((child_path, child.clone()));
+                if let Some((child_path, kept)) = Self::walk_verdict(
+                    is_ignored.call_async(child_type, child_path).await,
+                    child_type,
+                ) {
+                    queue.push_back((child_path, child.clone(), kept));
                 }
             }
         }
@@ -1284,7 +1341,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
     ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         struct DdupStreamWalk {
             repository: Option<Arc<ddup_bak::repository::Repository>>,
-            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry)>,
+            queue: VecDeque<(PathBuf, ddup_bak::archive::entries::Entry, bool)>,
             is_ignored: IsIgnoredFn,
         }
 
@@ -1294,7 +1351,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 &mut self,
             ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>
             {
-                if let Some((path, entry)) = self.queue.pop_front() {
+                while let Some((path, entry, kept)) = self.queue.pop_front() {
                     let file_type = VirtualDdupBakArchive::ddup_bak_entry_to_file_type(&entry);
 
                     if let ddup_bak::archive::entries::Entry::Directory(dir) = &entry {
@@ -1302,15 +1359,20 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_path = path.join(child.name());
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
-                            if let Some(child_path) = self
-                                .is_ignored
-                                .call_async(child_type, child_path)
-                                .await
-                                .keep()
+                            if let Some((child_path, child_kept)) =
+                                VirtualDdupBakArchive::walk_verdict(
+                                    self.is_ignored.call_async(child_type, child_path).await,
+                                    child_type,
+                                )
                             {
-                                self.queue.push_back((child_path, child.clone()));
+                                self.queue
+                                    .push_back((child_path, child.clone(), child_kept));
                             }
                         }
+                    }
+
+                    if !kept {
+                        continue;
                     }
 
                     let stream: AsyncReadableFileStream = if entry.is_file() {
@@ -1356,10 +1418,11 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if let Some(child_path) =
-                        is_ignored.call_async(child_type, child_path).await.keep()
-                    {
-                        queue.push_back((child_path, child.clone()));
+                    if let Some((child_path, kept)) = Self::walk_verdict(
+                        is_ignored.call_async(child_type, child_path).await,
+                        child_type,
+                    ) {
+                        queue.push_back((child_path, child.clone(), kept));
                     }
                 }
             }
@@ -1367,9 +1430,11 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if let Some(child_path) = is_ignored.call_async(child_type, child_path).await.keep()
-                {
-                    queue.push_back((child_path, child.clone()));
+                if let Some((child_path, kept)) = Self::walk_verdict(
+                    is_ignored.call_async(child_type, child_path).await,
+                    child_type,
+                ) {
+                    queue.push_back((child_path, child.clone(), kept));
                 }
             }
         }

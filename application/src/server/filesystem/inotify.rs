@@ -204,11 +204,12 @@ impl InotifyManager {
                         "inotify event queue overflowed, rescanning every server on the next disk check"
                     );
 
-                    for server in table.servers.values() {
+                    for (uuid, server) in &table.servers {
                         server
                             .notifier
                             .signal_firewall_files(&server.notifier.path, None);
                         server.notifier.add_tree(server.notifier.path.clone());
+                        new_dirs.push((*uuid, server.notifier.path.clone()));
                     }
                 } else if flags.contains(ReadFlags::IGNORED) {
                     table.remove_dir(wd);

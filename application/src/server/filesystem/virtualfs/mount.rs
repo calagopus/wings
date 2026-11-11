@@ -335,7 +335,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
             if let Some(virtual_path) = is_ignored
                 .call_async(FileType::Dir, virtual_path)
                 .await
-                .keep()
+                .reachable(FileType::Dir)
                 && !self
                     .inner
                     .async_is_denied(FileType::Dir, &virtual_path)
@@ -354,12 +354,28 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
             }
         }
 
-        virtual_dirs.sort_unstable_by(|a, b| a.name.cmp_ascii_case_insensitive(&b.name));
-        if matches!(sort, DirectorySortingMode::NameDesc) {
-            virtual_dirs.reverse();
-        }
+        if matches!(
+            sort,
+            DirectorySortingMode::NameAsc | DirectorySortingMode::NameDesc
+        ) {
+            let descending = matches!(sort, DirectorySortingMode::NameDesc);
 
-        inner_dirs.splice(0..0, virtual_dirs);
+            inner_dirs.extend(virtual_dirs);
+            inner_dirs.sort_by(|a, b| {
+                let ordering = a
+                    .name
+                    .cmp_ascii_case_insensitive(&b.name)
+                    .then_with(|| a.name.cmp(&b.name));
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+        } else {
+            virtual_dirs.sort_unstable_by(|a, b| a.name.cmp_ascii_case_insensitive(&b.name));
+            inner_dirs.splice(0..0, virtual_dirs);
+        }
 
         let total_entries = inner_dirs.len() + inner_non_dirs.len();
 

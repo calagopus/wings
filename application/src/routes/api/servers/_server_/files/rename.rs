@@ -61,13 +61,23 @@ mod put {
             crate::server::filesystem::RenameParents::Require
         };
 
+        super::super::reject_any_protected(
+            &server,
+            &data
+                .files
+                .iter()
+                .flat_map(|file| {
+                    [
+                        Path::new(&data.root).join(&file.from),
+                        Path::new(&data.root).join(&file.to),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         let mut renamed_count = 0;
         for file in data.files {
-            let raw_from = Path::new(&data.root).join(&file.from);
-            let raw_to = Path::new(&data.root).join(&file.to);
-            super::super::reject_protected(&server, &raw_from).await?;
-            super::super::reject_protected(&server, &raw_to).await?;
-
             let from = root.join(file.from);
             if from == root {
                 continue;

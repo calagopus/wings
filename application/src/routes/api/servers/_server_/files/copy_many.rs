@@ -162,20 +162,6 @@ mod post {
                             }
 
                             let to = root.join(&file.to);
-                            if to == fs_root {
-                                continue;
-                            }
-
-                            if from == to {
-                                continue;
-                            }
-
-                            let (metadata, from) =
-                                match resolve_copy_source(&*filesystem, &from).await {
-                                    Ok(source) => source,
-                                    Err(_) => continue,
-                                };
-
                             let to_parent = match to.parent() {
                                 Some(parent) => parent,
                                 None => continue,
@@ -189,6 +175,21 @@ mod post {
                                 .filesystem
                                 .resolve_writable_fs_ignoring(&server, to_parent, &ignored)
                                 .await;
+
+                            let destination = destination_root.join(to_file_name);
+                            if destination.as_os_str().is_empty()
+                                || (filesystem.is_primary_server_fs()
+                                    && destination_filesystem.is_primary_server_fs()
+                                    && from == destination)
+                            {
+                                continue;
+                            }
+
+                            let (metadata, from) =
+                                match resolve_copy_source(&*filesystem, &from).await {
+                                    Ok(source) => source,
+                                    Err(_) => continue,
+                                };
 
                             if destination_filesystem.is_primary_server_fs()
                                 && ignored
@@ -209,7 +210,7 @@ mod post {
                                     metadata,
                                     from,
                                     filesystem.clone(),
-                                    destination_root.join(to_file_name),
+                                    destination,
                                     destination_filesystem,
                                 )
                                 .await

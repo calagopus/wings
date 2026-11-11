@@ -100,8 +100,8 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
-                            tracing::debug!("failed to read directory entry while creating itaf archive: {err:#}");
-                            break;
+                            tracing::warn!("failed to read directory entry while creating itaf archive: {err:#}");
+                            continue;
                         }
                     };
 

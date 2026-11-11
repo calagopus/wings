@@ -1,4 +1,4 @@
-use crate::io::compression::CompressionType;
+use crate::{io::compression::CompressionType, server::filesystem::cap::FileType};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -358,6 +358,51 @@ pub fn open_zip<R: Read + Seek + Clone>(reader: R) -> zip::result::ZipResult<zip
     zip::ZipArchive::with_config(config, reader.clone()).or_else(|_| zip::ZipArchive::new(reader))
 }
 
+/// p7zip convention: the high 16 bits of a 7z entry's windows attributes hold
+/// the unix `st_mode` when this bit is set.
+pub const SEVEN_ZIP_UNIX_EXTENSION: u32 = 0x8000;
+const SEVEN_ZIP_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const SEVEN_ZIP_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+
+/// Windows attributes for an entry of `file_type` with permission bits `mode`.
+/// Symlinks are stored as entries whose content is the link target.
+pub fn seven_zip_attributes(file_type: FileType, mode: u16) -> u32 {
+    let (unix_type, windows) = match file_type {
+        FileType::Dir => (S_IFDIR, SEVEN_ZIP_ATTRIBUTE_DIRECTORY),
+        FileType::Symlink => (S_IFLNK, SEVEN_ZIP_ATTRIBUTE_ARCHIVE),
+        FileType::File | FileType::Unknown => (S_IFREG, SEVEN_ZIP_ATTRIBUTE_ARCHIVE),
+    };
+
+    ((unix_type | u32::from(mode & 0o7777)) << 16) | SEVEN_ZIP_UNIX_EXTENSION | windows
+}
+
+/// The unix file type and permission bits of a 7z entry, if it carries any.
+pub fn seven_zip_unix_mode(entry: &sevenz_rust2::ArchiveEntry) -> Option<(FileType, u32)> {
+    if !entry.has_windows_attributes || entry.windows_attributes & SEVEN_ZIP_UNIX_EXTENSION == 0 {
+        return None;
+    }
+
+    let mode = entry.windows_attributes >> 16;
+    let file_type = match mode & S_IFMT {
+        S_IFDIR => FileType::Dir,
+        S_IFREG => FileType::File,
+        S_IFLNK => FileType::Symlink,
+        _ => FileType::Unknown,
+    };
+
+    Some((file_type, mode & 0o7777))
+}
+
+pub fn seven_zip_entry_is_symlink(entry: &sevenz_rust2::ArchiveEntry) -> bool {
+    !entry.is_directory()
+        && seven_zip_unix_mode(entry)
+            .is_some_and(|(file_type, _)| matches!(file_type, FileType::Symlink))
+}
+
 pub trait ReadSeek: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ReadSeek for T {}
@@ -506,9 +551,8 @@ impl Archive {
     pub async fn open(server: crate::server::Server, path: PathBuf) -> Result<Self, anyhow::Error> {
         let mut file = server.filesystem.async_open(&path).await?;
 
-        let mut header = [0; 64];
-        #[allow(clippy::unused_io_amount)]
-        file.read(&mut header).await?;
+        let mut header = Vec::with_capacity(512);
+        (&mut file).take(512).read_to_end(&mut header).await?;
         file.seek(SeekFrom::Start(0)).await?;
 
         let (compression_format, archive_format) = Self::detect(&path, &header);

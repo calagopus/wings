@@ -7,12 +7,8 @@ use crate::{
 };
 use axum::{extract::DefaultBodyLimit, http::StatusCode};
 use serde::Deserialize;
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::{Arc, LazyLock},
-};
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use tokio::sync::Mutex;
 use utoipa_axum::{
     router::{OpenApiRouter, UtoipaMethodRouterExt},
     routes,
@@ -46,15 +42,10 @@ fn issued_before_lock(payload: &FileJwtPayload, server: &crate::server::Server) 
     payload.base.issued_at.unwrap_or(0) < server.last_locked_at()
 }
 
-type UploadLocks = moka::future::Cache<(uuid::Uuid, std::path::PathBuf), Arc<Mutex<()>>>;
-static UPLOAD_LOCKS: LazyLock<UploadLocks> = LazyLock::new(|| moka::future::Cache::new(10240));
-
 /// Returns the per-file upload lock, serializing concurrent `PATCH` slices that
 /// append to the same path so their offset checks and writes cannot interleave.
-async fn upload_lock(key: (uuid::Uuid, std::path::PathBuf)) -> Arc<Mutex<()>> {
-    UPLOAD_LOCKS
-        .get_with(key, async { Arc::new(Mutex::new(())) })
-        .await
+fn upload_lock(key: (uuid::Uuid, std::path::PathBuf)) -> Arc<Mutex<()>> {
+    crate::server::filesystem::uploads::PART_LOCKS.get(key)
 }
 
 async fn authenticate(
@@ -132,75 +123,20 @@ async fn resolve_upload_target(
     })
 }
 
-const IN_PLACE_OVERWRITE_LIMIT: u64 = 64 * 1024 * 1024;
-
 async fn finalize_upload(
     server: &crate::server::Server,
     target: &UploadTarget,
     size: u64,
 ) -> Result<(), anyhow::Error> {
-    let UploadTarget {
-        root,
-        filesystem,
-        path,
-        part,
-        ..
-    } = target;
-
-    if size <= IN_PLACE_OVERWRITE_LIMIT
-        && filesystem
-            .async_metadata(path)
-            .await
-            .is_ok_and(|metadata| metadata.file_type.is_file())
-    {
-        let copied = async {
-            let mut reader = filesystem.async_read_file(part, None).await?.reader;
-            let mut writer = filesystem.async_create_file(path).await?;
-            tokio::io::copy(&mut reader, &mut writer).await?;
-            writer.shutdown().await?;
-
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-
-        match copied {
-            Ok(()) => {
-                filesystem.async_remove_file(part).await?;
-                if filesystem.is_primary_server_fs() {
-                    server
-                        .filesystem
-                        .async_allocate_in_path(root, -(size as i64), true)
-                        .await;
-                }
-
-                return Ok(());
-            }
-            Err(err) => tracing::warn!(
-                "in-place upload overwrite failed, renaming instead: {:?}",
-                err
-            ),
-        }
-    }
-
-    let replaced_size = filesystem
-        .async_symlink_metadata(path)
-        .await
-        .ok()
-        .filter(|metadata| metadata.file_type.is_file())
-        .map(|metadata| metadata.size);
-
-    filesystem.async_rename(part, path, FileType::File).await?;
-
-    if filesystem.is_primary_server_fs()
-        && let Some(replaced_size) = replaced_size
-    {
-        server
-            .filesystem
-            .async_allocate_in_path(root, -(replaced_size as i64), true)
-            .await;
-    }
-
-    Ok(())
+    crate::server::filesystem::uploads::finalize_upload(
+        server,
+        &target.root,
+        target.filesystem.as_ref(),
+        &target.path,
+        &target.part,
+        size,
+    )
+    .await
 }
 
 mod post {
@@ -339,7 +275,7 @@ mod post {
 
             filesystem.async_create_dir_all(&root, None).await?;
 
-            let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+            let lock = super::upload_lock((payload.server_uuid, part.clone()));
             let lock_guard = lock.lock_owned().await;
 
             let mut writer = filesystem.async_create_file(&part).await?;
@@ -487,7 +423,7 @@ mod head {
             filesystem, part, ..
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
-        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
         let _lock_guard = lock.lock().await;
 
         let offset = match filesystem.async_metadata(&part).await {
@@ -632,7 +568,7 @@ mod patch {
             part,
         } = &target;
 
-        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
         let lock_guard = lock.lock_owned().await;
 
         filesystem.async_create_dir_all(&root, None).await?;
@@ -827,7 +763,7 @@ mod delete {
             filesystem, part, ..
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
-        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
         let _lock_guard = lock.lock().await;
 
         if filesystem.is_primary_server_fs()

@@ -368,6 +368,8 @@ impl OperationManager {
                         err.to_string()
                     } else if let Some(err) = err.downcast_ref::<std::io::Error>() {
                         err.to_string()
+                    } else if let Some(err) = err.downcast_ref::<reqwest::Error>() {
+                        err.to_string()
                     } else if let Some(err) = err.downcast_ref::<zip::result::ZipError>() {
                         match err {
                             zip::result::ZipError::Io(err) => err.to_string(),

@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{OwnedMutexGuard, RwLock};
 use utoipa::ToSchema;
 
 pub const TRASH_DIRECTORY: &str = ".trash";
@@ -150,6 +150,12 @@ pub fn inner_path(path: &str) -> Option<PathBuf> {
     Some(inner)
 }
 
+fn is_full_at(server: &crate::server::Server, usage: u64) -> bool {
+    let limit = server.filesystem.disk_limit();
+
+    limit != 0 && usage >= limit as u64
+}
+
 fn entry_directory(uuid: uuid::Uuid) -> PathBuf {
     Path::new(TRASH_DIRECTORY).join(uuid.to_string())
 }
@@ -176,7 +182,10 @@ fn file_id(metadata: &cap_std::fs::Metadata) -> (u64, u64) {
 
 pub struct TrashManager {
     entries: RwLock<HashMap<uuid::Uuid, TrashMeta>>,
-    entry_locks: moka::future::Cache<uuid::Uuid, Arc<Mutex<()>>>,
+    entry_locks: crate::utils::KeyedLocks<uuid::Uuid>,
+    /// The last limiter usage seen and the bytes purged since, which polled limiters
+    /// (btrfs, xfs, zfs) only reflect once their next poll lands.
+    unreflected_purges: parking_lot::Mutex<(u64, u64)>,
     disk_usage: Arc<RwLock<DiskUsage>>,
     retention: AtomicU64,
     usage_threshold: AtomicU64,
@@ -191,7 +200,8 @@ impl TrashManager {
     ) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
-            entry_locks: moka::future::Cache::new(10240),
+            entry_locks: crate::utils::KeyedLocks::new(),
+            unreflected_purges: parking_lot::Mutex::new((0, 0)),
             disk_usage,
             retention: AtomicU64::new(0),
             usage_threshold: AtomicU64::new(0),
@@ -201,11 +211,18 @@ impl TrashManager {
     }
 
     async fn lock_entry(&self, uuid: uuid::Uuid) -> OwnedMutexGuard<()> {
-        self.entry_locks
-            .get_with(uuid, async { Arc::new(Mutex::new(())) })
-            .await
-            .lock_owned()
-            .await
+        self.entry_locks.lock(uuid).await
+    }
+
+    async fn projected_usage(&self, server: &crate::server::Server) -> u64 {
+        let usage = server.filesystem.limiter_usage().await;
+
+        let mut unreflected = self.unreflected_purges.lock();
+        if unreflected.0 != usage {
+            *unreflected = (usage, 0);
+        }
+
+        usage.saturating_sub(unreflected.1)
     }
 
     async fn publish_usage(&self) {
@@ -495,7 +512,11 @@ impl TrashManager {
         };
 
         let mut entries = HashMap::new();
-        while let Some(Ok((file_type, name))) = read_dir.next_entry().await {
+        while let Some(entry) = read_dir.next_entry().await {
+            let Ok((file_type, name)) = entry else {
+                continue;
+            };
+
             if !file_type.is_dir() {
                 continue;
             }
@@ -715,7 +736,6 @@ impl TrashManager {
         }
 
         self.entries.write().await.remove(&uuid);
-        self.entry_locks.invalidate(&uuid).await;
 
         if let Err(err) = filesystem.truncate_path(entry_directory(uuid)).await {
             tracing::warn!(
@@ -1056,7 +1076,12 @@ impl TrashManager {
             }
         }
 
+        let size = self.stored_size(uuid, &meta).await;
         let result = server.filesystem.truncate_path(entry_directory(uuid)).await;
+        if result.is_ok() {
+            let mut unreflected = self.unreflected_purges.lock();
+            unreflected.1 = unreflected.1.saturating_add(size);
+        }
         self.publish_usage().await;
 
         if let Err(err) = result {
@@ -1064,37 +1089,54 @@ impl TrashManager {
 
             return Err(err);
         }
-        self.entry_locks.invalidate(&uuid).await;
 
         Ok(true)
     }
 
-    async fn should_purge(
+    fn should_purge(
         &self,
         server: &crate::server::Server,
         until: PurgeUntil,
         meta: &TrashMeta,
+        usage: u64,
     ) -> bool {
         match until {
             PurgeUntil::Expired(cutoff) => meta.deleted < cutoff,
             PurgeUntil::Headroom(delta) => !server.filesystem.has_headroom(delta),
-            PurgeUntil::NotFull => server.filesystem.is_full().await,
-            PurgeUntil::BelowUsageThreshold => self.over_usage_threshold(server).await,
+            PurgeUntil::NotFull => is_full_at(server, usage),
+            PurgeUntil::BelowUsageThreshold => self.exceeds_usage_threshold(server, usage),
         }
+    }
+
+    async fn stored_size(&self, uuid: uuid::Uuid, meta: &TrashMeta) -> u64 {
+        self.disk_usage
+            .read()
+            .await
+            .get_size(&entry_directory(uuid))
+            .map_or(meta.size, |space| space.get_physical())
     }
 
     async fn purge_oldest_while(&self, server: &crate::server::Server, until: PurgeUntil) -> usize {
         let mut entries = self.entries().await;
         entries.reverse();
 
+        let mut usage = match until {
+            PurgeUntil::NotFull | PurgeUntil::BelowUsageThreshold => {
+                self.projected_usage(server).await
+            }
+            PurgeUntil::Expired(_) | PurgeUntil::Headroom(_) => 0,
+        };
+
         let mut purged = 0;
         for (uuid, meta) in entries {
-            if !self.should_purge(server, until, &meta).await {
+            if !self.should_purge(server, until, &meta, usage) {
                 break;
             }
 
+            let size = self.stored_size(uuid, &meta).await;
             if self.purge_logged(server, uuid).await {
                 purged += 1;
+                usage = usage.saturating_sub(size);
             }
         }
 
@@ -1144,7 +1186,7 @@ impl TrashManager {
             .await
     }
 
-    async fn over_usage_threshold(&self, server: &crate::server::Server) -> bool {
+    fn exceeds_usage_threshold(&self, server: &crate::server::Server, usage: u64) -> bool {
         let Some(threshold) = self.usage_threshold() else {
             return false;
         };
@@ -1154,9 +1196,13 @@ impl TrashManager {
             return false;
         }
 
-        let usage = server.filesystem.limiter_usage().await;
-
         (usage as u128) * 100 >= (limit as u128) * (threshold as u128)
+    }
+
+    async fn over_usage_threshold(&self, server: &crate::server::Server) -> bool {
+        self.usage_threshold().is_some()
+            && server.filesystem.disk_limit() > 0
+            && self.exceeds_usage_threshold(server, self.projected_usage(server).await)
     }
 
     async fn purge_over_threshold(&self, server: &crate::server::Server) -> usize {
@@ -1201,7 +1247,7 @@ impl TrashManager {
 
     pub async fn ensure_not_full(&self, server: &crate::server::Server) -> bool {
         let mut purged = 0;
-        if server.filesystem.is_full().await {
+        if is_full_at(server, self.projected_usage(server).await) {
             if self.is_empty().await {
                 return false;
             }
@@ -1209,7 +1255,7 @@ impl TrashManager {
             purged += self.purge_oldest_while(server, PurgeUntil::NotFull).await;
         }
 
-        let not_full = !server.filesystem.is_full().await;
+        let not_full = !is_full_at(server, self.projected_usage(server).await);
         if not_full {
             purged += self.purge_over_threshold(server).await;
         }

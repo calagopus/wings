@@ -56,8 +56,8 @@ pub enum DiskLimiterMode {
 
 impl DiskLimiterMode {
     /// Whether this limiter reports the scanned usage of the volume. Limiters that read usage
-    /// from the filesystem (quota groups, datasets) publish it themselves, as compression and
-    /// shared extents make it differ from the scanned size.
+    /// from the filesystem (quota groups, datasets) publish it themselves while their query
+    /// succeeds, as compression and shared extents make it differ from the scanned size.
     pub fn usage_is_scanned(self) -> bool {
         match self {
             DiskLimiterMode::None => true,

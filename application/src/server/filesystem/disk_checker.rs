@@ -41,7 +41,7 @@ impl PendingUpdate {
     }
 }
 
-fn space_delta(metadata: &cap_std::fs::Metadata) -> SpaceDelta {
+pub(super) fn space_delta(metadata: &cap_std::fs::Metadata) -> SpaceDelta {
     SpaceDelta::new(
         metadata.size_logical() as i64,
         metadata.size_physical() as i64,
@@ -106,14 +106,16 @@ fn walk_tree(cap_filesystem: &CapFilesystem, dir: &Path) -> Result<DiskUsage, an
     Ok(tree)
 }
 
+/// Replaces the usage of `dir` with a fresh walk, returning how the total changed.
 fn scan_tree(
     cap_filesystem: &CapFilesystem,
     disk_usage: &RwLock<DiskUsage>,
     dir: &Path,
-) -> Result<(), anyhow::Error> {
+) -> Result<SpaceDelta, anyhow::Error> {
     let tree = walk_tree(cap_filesystem, dir)?;
 
     let mut disk_usage = disk_usage.blocking_write();
+    let before = disk_usage.space;
     let old_tree = if dir.components().next().is_none() {
         Some(std::mem::replace(&mut *disk_usage, tree))
     } else {
@@ -122,10 +124,22 @@ fn scan_tree(
 
         old_tree
     };
+    let after = disk_usage.space;
     drop(disk_usage);
     drop(old_tree);
 
-    Ok(())
+    Ok(SpaceDelta::new(
+        after.get_logical() as i64 - before.get_logical() as i64,
+        after.get_physical() as i64 - before.get_physical() as i64,
+    ))
+}
+
+pub(super) async fn rescan_tree(
+    cap_filesystem: CapFilesystem,
+    disk_usage: Arc<RwLock<DiskUsage>>,
+    dir: PathBuf,
+) -> Result<SpaceDelta, anyhow::Error> {
+    tokio::task::spawn_blocking(move || scan_tree(&cap_filesystem, &disk_usage, &dir)).await?
 }
 
 /// Recounts the files directly inside `dir` and keeps the usage of its subdirectories,
@@ -137,7 +151,8 @@ fn scan_directory(
 ) -> Result<(), anyhow::Error> {
     let is_root = dir.components().next().is_none();
     if !is_root && disk_usage.blocking_read().get_path(dir).is_none() {
-        return scan_tree(cap_filesystem, disk_usage, dir);
+        scan_tree(cap_filesystem, disk_usage, dir)?;
+        return Ok(());
     }
 
     let mut own = UsedSpace::default();
@@ -222,6 +237,7 @@ pub struct DiskCheckerContext {
     pub use_server_notifier: Arc<AtomicBool>,
     pub last_disk_check: Arc<AtomicU64>,
     pub resource_usage: tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    pub limiter_usage_known: Arc<AtomicBool>,
 }
 
 pub async fn run(ctx: DiskCheckerContext) {
@@ -238,6 +254,7 @@ pub async fn run(ctx: DiskCheckerContext) {
         use_server_notifier,
         last_disk_check,
         resource_usage,
+        limiter_usage_known,
     } = ctx;
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -258,7 +275,8 @@ pub async fn run(ctx: DiskCheckerContext) {
             let disk_usage_cached_logical = disk_usage_cached_logical.clone();
             let disk_usage_cached_physical = disk_usage_cached_physical.clone();
             let resource_usage = resource_usage.clone();
-            let usage_is_scanned = config.load().system.disk_limiter_mode.usage_is_scanned();
+            let publish_scanned = config.load().system.disk_limiter_mode.usage_is_scanned()
+                || !limiter_usage_known.load(Ordering::Relaxed);
 
             async move {
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -287,19 +305,33 @@ pub async fn run(ctx: DiskCheckerContext) {
                             );
 
                             for tree in &modified_paths.trees {
-                                if let Some(tree) = existing_directory(&cap_filesystem, tree) {
-                                    scan_tree(&cap_filesystem, &disk_usage, tree)?;
+                                if let Some(tree) = existing_directory(&cap_filesystem, tree)
+                                    && let Err(err) = scan_tree(&cap_filesystem, &disk_usage, tree)
+                                {
+                                    tracing::warn!(
+                                        path = %tree.display(),
+                                        "failed to scan modified tree: {}",
+                                        err
+                                    );
                                 }
                             }
                             for directory in &modified_paths.directories {
                                 if let Some(directory) =
                                     existing_directory(&cap_filesystem, directory)
+                                    && let Err(err) =
+                                        scan_directory(&cap_filesystem, &disk_usage, directory)
                                 {
-                                    scan_directory(&cap_filesystem, &disk_usage, directory)?;
+                                    tracing::warn!(
+                                        path = %directory.display(),
+                                        "failed to scan modified directory: {}",
+                                        err
+                                    );
                                 }
                             }
                         }
-                        _ => scan_tree(&cap_filesystem, &disk_usage, Path::new(""))?,
+                        _ => {
+                            scan_tree(&cap_filesystem, &disk_usage, Path::new(""))?;
+                        }
                     }
 
                     let disk_usage = disk_usage.blocking_read();
@@ -309,7 +341,7 @@ pub async fn run(ctx: DiskCheckerContext) {
 
                     disk_usage_cached_logical.store(space.get_logical(), Ordering::Relaxed);
                     disk_usage_cached_physical.store(space.get_physical(), Ordering::Relaxed);
-                    if usage_is_scanned {
+                    if publish_scanned {
                         resource_usage.publish_disk_usage(space.get_physical());
                     }
                     resource_usage.publish_trash_usage(trash_space);

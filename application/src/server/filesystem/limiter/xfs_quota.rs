@@ -2,7 +2,10 @@ use crate::server::{filesystem::limiter::DiskLimiterExt, resources::ResourceUsag
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{
     fs::OpenOptions,
@@ -19,6 +22,7 @@ type DiskUsageMap = HashMap<
         u32,
         i64,
         tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+        Arc<AtomicBool>,
     ),
 >;
 
@@ -33,7 +37,7 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
             {
                 let usage_map = disk_usage_clone.read().await;
                 if !usage_map.is_empty() {
-                    for (_, mount, pid, _, _) in usage_map.values() {
+                    for (_, mount, pid, _, _, _) in usage_map.values() {
                         mount_groups.entry(mount.clone()).or_default().push(*pid);
                     }
                 }
@@ -67,10 +71,14 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
 
             {
                 let mut usage_map = disk_usage_clone.write().await;
-                for (_, _, pid, usage_ref, resource_usage) in usage_map.values_mut() {
+                for (_, _, pid, usage_ref, resource_usage, usage_known) in usage_map.values_mut() {
                     if let Some(new_usage) = results.get(pid) {
                         *usage_ref = *new_usage;
+                        usage_known.store(true, Ordering::Relaxed);
                         resource_usage.publish_disk_usage((*new_usage).max(0) as u64);
+                    } else {
+                        *usage_ref = -1;
+                        usage_known.store(false, Ordering::Relaxed);
                     }
                 }
             }
@@ -119,11 +127,12 @@ fn uuid_to_project_id(uuid: &uuid::Uuid) -> u32 {
     u32::from_be_bytes([uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3]])
 }
 
+/// Adds or removes the project entry, returning whether the file had to change.
 async fn atomic_write_etc_projects(
     project_id: u32,
     path: &Path,
     remove: bool,
-) -> Result<(), std::io::Error> {
+) -> Result<bool, std::io::Error> {
     let _lock = ETC_PROJECTS_LOCK.lock().await;
     let file_path = Path::new("/etc/projects");
     let tmp_path = Path::new("/etc/projects.tmp");
@@ -138,17 +147,17 @@ async fn atomic_write_etc_projects(
 
     for line in contents.lines() {
         if line.starts_with(&id_prefix) {
+            found = true;
             if remove {
                 continue;
             }
-            found = true;
         }
         new_contents.push_str(line);
         new_contents.push('\n');
     }
 
-    if !remove && found {
-        return Ok(());
+    if found != remove {
+        return Ok(false);
     }
     if !remove && !found {
         new_contents.push_str(&format!("{}:{}\n", project_id, path.display()));
@@ -166,7 +175,7 @@ async fn atomic_write_etc_projects(
     drop(tmp_file);
 
     tokio::fs::rename(tmp_path, file_path).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn get_mount_point(path: &Path) -> Result<PathBuf, std::io::Error> {
@@ -212,7 +221,8 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
 
         let project_id = uuid_to_project_id(&self.filesystem.uuid);
 
-        atomic_write_etc_projects(project_id, &self.filesystem.base_path, false).await?;
+        let added =
+            atomic_write_etc_projects(project_id, &self.filesystem.base_path, false).await?;
 
         let mount_point = match get_mount_point(&self.filesystem.base_path).await {
             Ok(mp) => mp,
@@ -222,19 +232,33 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
             }
         };
 
-        let output = Command::new("xfs_quota")
-            .arg("-x")
-            .arg("-c")
-            .arg(format!("project -s {project_id}"))
-            .arg(&mount_point)
-            .output()
-            .await?;
+        if added {
+            let output = Command::new("xfs_quota")
+                .arg("-x")
+                .arg("-c")
+                .arg(format!("project -s {project_id}"))
+                .arg(&mount_point)
+                .output()
+                .await;
 
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "Failed to set up XFS project quota: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+            let error = match output {
+                Ok(output) if output.status.success() => None,
+                Ok(output) => Some(std::io::Error::other(format!(
+                    "Failed to set up XFS project quota: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))),
+                Err(err) => Some(err),
+            };
+
+            if let Some(error) = error {
+                if let Err(err) =
+                    atomic_write_etc_projects(project_id, &self.filesystem.base_path, true).await
+                {
+                    tracing::warn!("failed to roll back /etc/projects entry: {}", err);
+                }
+
+                return Err(error);
+            }
         }
 
         DISK_USAGE
@@ -247,6 +271,7 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
                 project_id,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ));
 
         Ok(())
@@ -273,6 +298,7 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
                 project_id,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ),
         );
         Ok(())
@@ -341,7 +367,13 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
             "destroying xfs project quota for server"
         );
 
-        self.update_disk_limit(0).await?;
+        if let Err(err) = self.update_disk_limit(0).await {
+            tracing::warn!(
+                path = %self.filesystem.base_path.display(),
+                "failed to clear xfs disk limit: {}",
+                err
+            );
+        }
 
         let project_id = uuid_to_project_id(&self.filesystem.uuid);
 

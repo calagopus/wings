@@ -109,7 +109,7 @@ pub async fn extract_itaf(
                                 destination_path,
                                 link.target().to_path_buf(),
                                 Some(link.metadata().modified),
-                            ) {
+                            )? {
                                 break;
                             }
                         }

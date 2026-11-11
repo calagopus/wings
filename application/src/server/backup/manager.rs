@@ -12,7 +12,7 @@ use std::sync::{
 pub struct BackupManager {
     cached_backups: moka::future::Cache<uuid::Uuid, Arc<super::Backup>>,
     cached_browse_backups: moka::future::Cache<uuid::Uuid, Arc<dyn VirtualReadableFilesystem>>,
-    cached_browse_backup_locks: moka::future::Cache<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>,
+    cached_browse_backup_locks: crate::utils::KeyedLocks<uuid::Uuid>,
     cached_backup_adapters: moka::future::Cache<uuid::Uuid, BackupAdapter>,
     database_backup_restores: tokio::sync::broadcast::Sender<DatabaseBackupRestore>,
     active: AtomicUsize,
@@ -90,7 +90,7 @@ impl Default for BackupManager {
                 .time_to_live(std::time::Duration::from_mins(5))
                 .build(),
             cached_backup_adapters: moka::future::Cache::new(1024),
-            cached_browse_backup_locks: moka::future::Cache::new(10240),
+            cached_browse_backup_locks: crate::utils::KeyedLocks::new(),
             active: AtomicUsize::new(0),
         }
     }
@@ -882,21 +882,11 @@ impl BackupManager {
 
         if let Some(backup) = self.find(&server.app_state, uuid).await? {
             let server = server.clone();
-            let cached_browse_backup_locks = self.cached_browse_backup_locks.clone();
+            let lock = self.cached_browse_backup_locks.get(uuid);
             let cached_browse_backups = self.cached_browse_backups.clone();
 
             return tokio::spawn(async move {
-                let _guard = if let Some(lock) = cached_browse_backup_locks.get(&uuid).await {
-                    lock
-                } else {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    cached_browse_backup_locks
-                        .insert(uuid, Arc::clone(&lock))
-                        .await;
-
-                    lock
-                };
-                let _guard = _guard.lock().await;
+                let _guard = lock.lock().await;
 
                 if let Some(browse_backup) = cached_browse_backups.get(&uuid).await {
                     return Ok(Some(browse_backup));
@@ -917,8 +907,6 @@ impl BackupManager {
     }
 
     pub async fn invalidate_cached_browse(&self, uuid: uuid::Uuid) {
-        self.cached_browse_backup_locks.invalidate(&uuid).await;
-
         if let Some(browse) = self.cached_browse_backups.remove(&uuid).await
             && let Err(err) = browse.close().await
         {
@@ -926,7 +914,6 @@ impl BackupManager {
         }
 
         self.cached_browse_backups.run_pending_tasks().await;
-        self.cached_browse_backup_locks.run_pending_tasks().await;
     }
 }
 

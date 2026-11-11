@@ -2,7 +2,10 @@ use crate::server::{filesystem::limiter::DiskLimiterExt, resources::ResourceUsag
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{process::Command, sync::RwLock};
 
@@ -13,6 +16,7 @@ type DiskUsageMap = HashMap<
         String,
         i64,
         tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+        Arc<AtomicBool>,
     ),
 >;
 
@@ -34,45 +38,50 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
                 .arg("-H")
                 .arg("-p")
                 .arg("-o")
-                .arg("name,used")
+                .arg("name,referenced")
                 .arg("-t")
                 .arg("filesystem")
                 .output()
                 .await;
 
-            match output {
+            let stdout = match output {
                 Ok(output) if output.status.success() => {
-                    let output_str = String::from_utf8_lossy(&output.stdout);
-
-                    let mut system_usage: HashMap<&str, i64> = HashMap::new();
-
-                    for line in output_str.lines() {
-                        let mut line_split = line.split('\t');
-                        if let (Some(dataset_name), Some(usage_str)) =
-                            (line_split.next(), line_split.next())
-                            && let Ok(bytes) = usage_str.parse::<i64>()
-                        {
-                            system_usage.insert(dataset_name, bytes);
-                        }
-                    }
-
-                    let mut usage_map = disk_usage_clone.write().await;
-
-                    for (_, dataset_name, usage_ref, resource_usage) in usage_map.values_mut() {
-                        if let Some(found_usage) = system_usage.get(dataset_name.as_str()) {
-                            *usage_ref = *found_usage;
-                            resource_usage.publish_disk_usage((*found_usage).max(0) as u64);
-                        }
-                    }
+                    Some(String::from_utf8_lossy(&output.stdout).into_owned())
                 }
                 Ok(output) => {
                     tracing::error!(
                         "failed to retrieve global ZFS usage list: {}",
                         String::from_utf8_lossy(&output.stderr)
                     );
+                    None
                 }
                 Err(err) => {
                     tracing::error!("error executing zfs list command: {:?}", err);
+                    None
+                }
+            };
+
+            let mut system_usage: HashMap<&str, i64> = HashMap::new();
+            for line in stdout.as_deref().unwrap_or_default().lines() {
+                let mut line_split = line.split('\t');
+                if let (Some(dataset_name), Some(usage_str)) =
+                    (line_split.next(), line_split.next())
+                    && let Ok(bytes) = usage_str.parse::<i64>()
+                {
+                    system_usage.insert(dataset_name, bytes);
+                }
+            }
+
+            let mut usage_map = disk_usage_clone.write().await;
+            for (_, dataset_name, usage_ref, resource_usage, usage_known) in usage_map.values_mut()
+            {
+                if let Some(found_usage) = system_usage.get(dataset_name.as_str()) {
+                    *usage_ref = *found_usage;
+                    usage_known.store(true, Ordering::Relaxed);
+                    resource_usage.publish_disk_usage((*found_usage).max(0) as u64);
+                } else {
+                    *usage_ref = -1;
+                    usage_known.store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -206,6 +215,7 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
                 dataset_name,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ));
 
         Ok(())
@@ -227,6 +237,7 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
                 dataset_name,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ),
         );
 

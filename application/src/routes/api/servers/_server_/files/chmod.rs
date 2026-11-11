@@ -61,10 +61,19 @@ mod post {
     ) -> ApiResponseResult {
         let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
+        super::super::reject_any_protected(
+            &server,
+            &data
+                .files
+                .iter()
+                .map(|file| Path::new(&data.root).join(&file.file))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         let mut updated_count = 0;
         for file in data.files {
             let path = Path::new(&data.root).join(&file.file);
-            super::super::reject_protected(&server, &path).await?;
 
             let (source, filesystem) = server
                 .filesystem
@@ -85,11 +94,12 @@ mod post {
 
                 tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
                     let metadata = filesystem.symlink_metadata(&source)?;
-                    filesystem.set_permissions(
-                        &source,
-                        metadata.file_type,
-                        PortablePermissions::from_mode_file(mode),
-                    )?;
+                    let permissions = if metadata.file_type.is_dir() {
+                        PortablePermissions::from_mode_dir(mode)
+                    } else {
+                        PortablePermissions::from_mode_file(mode)
+                    };
+                    filesystem.set_permissions(&source, metadata.file_type, permissions)?;
 
                     Ok(metadata)
                 })
@@ -113,7 +123,8 @@ mod post {
                                 AsyncDirectoryWalkFn::from({
                                     let filesystem = filesystem.clone();
                                     let updated_count_arc = updated_count_arc.clone();
-                                    let mode = PortablePermissions::from_mode_file(mode);
+                                    let file_mode = PortablePermissions::from_mode_file(mode);
+                                    let dir_mode = PortablePermissions::from_mode_dir(mode);
 
                                     move |entry: VirtualWalkEntry| {
                                         let file_type = entry.file_type;
@@ -126,6 +137,12 @@ mod post {
                                             if !file_type.is_file() && !file_type.is_dir() {
                                                 return Ok(());
                                             }
+
+                                            let mode = if file_type.is_dir() {
+                                                dir_mode
+                                            } else {
+                                                file_mode
+                                            };
 
                                             if filesystem
                                                 .async_set_permissions(&path, file_type, mode)

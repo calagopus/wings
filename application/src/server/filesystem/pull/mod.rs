@@ -133,6 +133,47 @@ impl PullQueryResponse {
     }
 }
 
+struct StagedPart {
+    server: crate::server::Server,
+    filesystem: Arc<dyn VirtualWritableFilesystem>,
+    part: Option<PathBuf>,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for StagedPart {
+    fn drop(&mut self) {
+        let Some(part) = self.part.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        let server = self.server.clone();
+        let filesystem = Arc::clone(&self.filesystem);
+        let lock = self.lock.take();
+
+        tokio::spawn(async move {
+            let removed = if filesystem.is_primary_server_fs() {
+                server.filesystem.truncate_path(&part).await
+            } else {
+                filesystem.async_remove_file(&part).await
+            };
+
+            if let Err(err) = removed {
+                tracing::warn!(
+                    server = %server.uuid,
+                    "failed to remove pull staging file {}: {:?}",
+                    part.display(),
+                    err
+                );
+            }
+
+            drop(lock);
+        });
+    }
+}
+
 pub struct Download {
     pub progress: Arc<AtomicU64>,
     pub total: u64,
@@ -201,8 +242,13 @@ impl Download {
                         .url()
                         .path_segments()
                         .and_then(|mut segments| segments.next_back())
+                        .and_then(|segment| {
+                            percent_encoding::percent_decode_str(segment)
+                                .decode_utf8()
+                                .ok()
+                        })
                         .filter(|segment| crate::utils::is_single_component_file_name(segment))
-                        .map(|segment| segment.to_string())
+                        .map(|segment| segment.into_owned())
                         .unwrap_or_else(|| {
                             let random_string: String = rand::rng()
                                 .sample_iter(&rand::distr::Alphanumeric)
@@ -275,16 +321,45 @@ impl Download {
                 },
                 async move {
                     let mut run_inner = async || -> Result<(), anyhow::Error> {
-                        let mut writer = filesystem.async_create_file(&destination).await?;
+                        let part = super::uploads::part_path(&destination)
+                            .ok_or_else(|| anyhow::anyhow!("file name too long"))?;
+                        let root = destination.parent().unwrap_or(Path::new(""));
 
+                        let lock = super::uploads::PART_LOCKS
+                            .lock((server.uuid, part.clone()))
+                            .await;
+                        let mut staged = StagedPart {
+                            server: server.clone(),
+                            filesystem: Arc::clone(&filesystem),
+                            part: Some(part.clone()),
+                            lock: Some(lock),
+                        };
+
+                        let mut writer = filesystem.async_create_file(&part).await?;
+
+                        let mut written = 0;
                         while let Some(chunk) =
                             response.chunk().await.map_err(|err| err.without_url())?
                         {
                             writer.write_all(&chunk).await?;
+                            written += chunk.len() as u64;
                             progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         }
 
                         writer.shutdown().await?;
+                        drop(writer);
+
+                        super::uploads::finalize_upload(
+                            &server,
+                            root,
+                            filesystem.as_ref(),
+                            &destination,
+                            &part,
+                            written,
+                        )
+                        .await?;
+                        staged.part = None;
+
                         Ok(())
                     };
 

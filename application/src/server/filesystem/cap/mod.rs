@@ -174,6 +174,15 @@ impl CapFilesystem {
         (contents, resolved)
     }
 
+    fn link_relative_target(&self, link: &Path, target: &Path) -> (PathBuf, PathBuf) {
+        let target = match target.strip_prefix(&*self.base_path) {
+            Ok(inner) => Cow::Owned(Path::new("/").join(inner)),
+            Err(_) => Cow::Borrowed(target),
+        };
+
+        Self::resolve_symlink_contents(&self.relative_path(link), &target)
+    }
+
     fn create_dir_impl(
         inner: &cap_std::fs::Dir,
         path: &Path,
@@ -1140,11 +1149,27 @@ impl CapFilesystem {
         }
 
         let mut reader = self.open(&path)?;
+
+        #[cfg(unix)]
+        if let Some(destination_metadata) = &destination_metadata {
+            use std::os::unix::fs::MetadataExt;
+
+            let source_metadata = reader.metadata()?;
+            if source_metadata.dev() == cap_std::fs::MetadataExt::dev(destination_metadata)
+                && source_metadata.ino() == cap_std::fs::MetadataExt::ino(destination_metadata)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Source and destination are the same file",
+                ));
+            }
+        }
+
         let mut writer = destination_server.filesystem.create(&destination_path)?;
+        destination_server.filesystem.chown_file(&writer)?;
         if let Some(permissions) = permissions {
             writer.apply_permissions(permissions)?;
         }
-        destination_server.filesystem.chown_file(&writer)?;
 
         if let Some(destination_metadata) = &destination_metadata {
             destination_server.filesystem.allocate_in_path(
@@ -1468,7 +1493,8 @@ impl CapFilesystem {
         if verbatim {
             self.symlink_then(target.as_ref(), link.as_ref(), then)
         } else {
-            self.symlink_then(&self.relative_path(target.as_ref()), link.as_ref(), then)
+            let (contents, _) = self.link_relative_target(link.as_ref(), target.as_ref());
+            self.symlink_then(&contents, link.as_ref(), then)
         }
     }
 
@@ -1637,19 +1663,19 @@ impl CapFilesystem {
         target: impl AsRef<Path>,
         link: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        let target = self.relative_path(target.as_ref());
+        let (contents, _target) = self.link_relative_target(link.as_ref(), target.as_ref());
         let link = self.relative_path(link.as_ref());
 
         let inner = self.get_inner()?;
         #[cfg(unix)]
-        tokio::task::spawn_blocking(move || inner.symlink(target, link)).await??;
+        tokio::task::spawn_blocking(move || inner.symlink(contents, link)).await??;
         #[cfg(windows)]
         tokio::task::spawn_blocking(move || {
-            let metadata = inner.metadata(&target)?;
+            let metadata = inner.metadata(&_target)?;
             if metadata.is_dir() {
-                inner.symlink_dir(target, link)
+                inner.symlink_dir(contents, link)
             } else {
-                inner.symlink_file(target, link)
+                inner.symlink_file(contents, link)
             }
         })
         .await??;
@@ -1663,20 +1689,20 @@ impl CapFilesystem {
         target: impl AsRef<Path>,
         link: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        let target = self.relative_path(target.as_ref());
+        let (contents, _target) = self.link_relative_target(link.as_ref(), target.as_ref());
         let link = self.relative_path(link.as_ref());
 
         let inner = self.get_inner()?;
 
         #[cfg(unix)]
-        inner.symlink(target, link)?;
+        inner.symlink(contents, link)?;
         #[cfg(windows)]
         {
-            let metadata = inner.metadata(&target)?;
+            let metadata = inner.metadata(&_target)?;
             if metadata.is_dir() {
-                inner.symlink_dir(target, link)?;
+                inner.symlink_dir(contents, link)?;
             } else {
-                inner.symlink_file(target, link)?;
+                inner.symlink_file(contents, link)?;
             }
         }
 

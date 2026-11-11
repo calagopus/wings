@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{process::Command, sync::RwLock};
 
@@ -17,6 +20,7 @@ type DiskUsageMap = HashMap<
         u64,
         i64,
         tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+        Arc<AtomicBool>,
     ),
 >;
 
@@ -35,7 +39,7 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                for (_, mount, subvol_id, _, _) in usage_map.values() {
+                for (_, mount, subvol_id, _, _, _) in usage_map.values() {
                     mount_groups
                         .entry(mount.clone())
                         .or_default()
@@ -66,10 +70,16 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
 
             {
                 let mut usage_map = disk_usage_clone.write().await;
-                for (_, _, subvol_id, usage_ref, resource_usage) in usage_map.values_mut() {
+                for (_, _, subvol_id, usage_ref, resource_usage, usage_known) in
+                    usage_map.values_mut()
+                {
                     if let Some(new_usage) = results.get(subvol_id) {
                         *usage_ref = *new_usage;
+                        usage_known.store(true, Ordering::Relaxed);
                         resource_usage.publish_disk_usage((*new_usage).max(0) as u64);
+                    } else {
+                        *usage_ref = -1;
+                        usage_known.store(false, Ordering::Relaxed);
                     }
                 }
             }
@@ -223,6 +233,7 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
                 subvol_id,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ),
         );
 
@@ -251,6 +262,7 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
                 subvol_id,
                 -1,
                 self.filesystem.resource_usage.clone(),
+                Arc::clone(&self.filesystem.limiter_usage_known),
             ));
 
         Ok(())

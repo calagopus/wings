@@ -69,6 +69,12 @@ impl ByteRange {
             }
         };
 
+        match (start, end) {
+            (Bound::Unbounded, Bound::Unbounded) => return None,
+            (Bound::Included(start), Bound::Included(end)) if start > end => return None,
+            _ => {}
+        }
+
         Some(Self::new(start, end))
     }
 
@@ -92,26 +98,36 @@ impl ByteRange {
         matches!((&self.0, &self.1), (Bound::Unbounded, Bound::Unbounded))
     }
 
+    /// Resolves against `total` bytes into inclusive `(start, end)` offsets with the end clamped.
+    /// An unbounded start with a bounded end is a suffix range (`bytes=-N`).
+    /// `None` means the range cannot be satisfied.
+    pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
+        let suffix = match (self.0, self.1) {
+            (Bound::Unbounded, Bound::Included(n)) => n,
+            (Bound::Unbounded, Bound::Excluded(n)) => n.checked_sub(1)?,
+            range => return crate::io::range_reader::resolve_range(range, total).ok(),
+        };
+        if suffix == 0 || total == 0 {
+            return None;
+        }
+
+        Some((total.saturating_sub(suffix), total - 1))
+    }
+
     pub fn get_header_value(&self, total: u64) -> HeaderValue {
-        let range_header_value = match (&self.0, &self.1) {
-            (Bound::Included(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s, e, total),
-            (Bound::Included(s), Bound::Excluded(e)) => format!("bytes {}-{}/{}", s, e - 1, total),
-            (Bound::Included(s), Bound::Unbounded) => {
-                format!("bytes {}-{}/{}", s, total - 1, total)
-            }
-            (Bound::Excluded(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s + 1, e, total),
-            (Bound::Excluded(s), Bound::Excluded(e)) => {
-                format!("bytes {}-{}/{}", s + 1, e - 1, total)
-            }
-            (Bound::Excluded(s), Bound::Unbounded) => {
-                format!("bytes {}-{}/{}", s + 1, total - 1, total)
-            }
-            (Bound::Unbounded, Bound::Included(e)) => format!("bytes 0-{}/{}", e, total),
-            (Bound::Unbounded, Bound::Excluded(e)) => format!("bytes 0-{}/{}", e - 1, total),
-            (Bound::Unbounded, Bound::Unbounded) => format!("bytes 0-{}/{}", total - 1, total),
+        let range_header_value = match self.resolve(total) {
+            Some((start, end)) => format!("bytes {start}-{end}/{total}"),
+            None => format!("bytes */{total}"),
         };
 
         unsafe { HeaderValue::from_str(&range_header_value).unwrap_unchecked() }
+    }
+}
+
+impl crate::io::range_reader::ResolveRange for ByteRange {
+    #[inline]
+    fn resolve(&self, len: u64) -> Option<(u64, u64)> {
+        ByteRange::resolve(self, len)
     }
 }
 
@@ -541,7 +557,10 @@ pub trait AsyncDirectoryWalk {
                         }
                     });
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    error.fail(err);
+                    break;
+                }
             }
         }
 
@@ -617,7 +636,10 @@ pub trait AsyncDirectoryStreamWalk {
                         }
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    error.fail(err);
+                    break;
+                }
             }
         }
 

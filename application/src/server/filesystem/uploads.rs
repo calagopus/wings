@@ -4,17 +4,22 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
-use tokio::sync::RwLock;
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 use utoipa::ToSchema;
 
 pub const PART_SUFFIX: &str = ".upload-part";
 
 const NAME_MAX: usize = 255;
 const INACTIVE_RETENTION: chrono::Duration = chrono::Duration::hours(24);
+const IN_PLACE_OVERWRITE_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Serializes every writer of one staging file, keyed by server and part path.
+pub static PART_LOCKS: LazyLock<crate::utils::KeyedLocks<(uuid::Uuid, PathBuf)>> =
+    LazyLock::new(crate::utils::KeyedLocks::new);
 
 pub fn part_path(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_string_lossy();
@@ -232,7 +237,7 @@ impl UploadManager {
         let upload = match uploads.get(&key) {
             // a staging file abandoned by one user and picked up by another changes hands, so the
             // new upload is attributed to - and cancellable by - whoever is actually writing it
-            Some(existing) if existing.user == user => {
+            Some(existing) if existing.user == user && existing.resumable == resumable => {
                 existing.active.store(true, Ordering::Relaxed);
                 existing.set_total(total);
                 existing.set_progress(uploaded);
@@ -417,6 +422,73 @@ impl UploadManager {
             }
         });
     }
+}
+
+/// Moves a fully written staging file onto its final name.
+pub async fn finalize_upload(
+    server: &crate::server::Server,
+    root: &Path,
+    filesystem: &dyn super::virtualfs::VirtualWritableFilesystem,
+    path: &Path,
+    part: &Path,
+    size: u64,
+) -> Result<(), anyhow::Error> {
+    if size <= IN_PLACE_OVERWRITE_LIMIT
+        && filesystem
+            .async_metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.file_type.is_file())
+    {
+        let copied = async {
+            let mut reader = filesystem.async_read_file(&part, None).await?.reader;
+            let mut writer = filesystem.async_create_file(&path).await?;
+            tokio::io::copy(&mut reader, &mut writer).await?;
+            writer.shutdown().await?;
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        match copied {
+            Ok(()) => {
+                filesystem.async_remove_file(&part).await?;
+                if filesystem.is_primary_server_fs() {
+                    server
+                        .filesystem
+                        .async_allocate_in_path(root, -(size as i64), true)
+                        .await;
+                }
+
+                return Ok(());
+            }
+            Err(err) => tracing::warn!(
+                "in-place upload overwrite failed, renaming instead: {:?}",
+                err
+            ),
+        }
+    }
+
+    let replaced_size = filesystem
+        .async_symlink_metadata(&path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.file_type.is_file())
+        .map(|metadata| metadata.size);
+
+    filesystem
+        .async_rename(&part, &path, super::cap::FileType::File)
+        .await?;
+
+    if filesystem.is_primary_server_fs()
+        && let Some(replaced_size) = replaced_size
+    {
+        server
+            .filesystem
+            .async_allocate_in_path(root, -(replaced_size as i64), true)
+            .await;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -14,6 +14,8 @@ use std::{
     },
 };
 
+const FILES_IN_FLIGHT: usize = 256;
+
 pub async fn extract_ddup(
     archive: Archive,
     destination: PathBuf,
@@ -53,6 +55,7 @@ pub async fn extract_ddup(
         }
 
         let error = Arc::new(crate::threading::SharedError::new());
+        let in_flight = crate::threading::InFlightLimit::new(FILES_IN_FLIGHT);
 
         pool.in_place_scope(|scope| -> Result<(), anyhow::Error> {
             let root: Arc<Path> = Arc::from(Path::new(""));
@@ -111,6 +114,7 @@ pub async fn extract_ddup(
                     Entry::File(file) => {
                         options.on_file(&destination_path);
 
+                        let permit = in_flight.acquire();
                         let mut writer = destination_filesystem.create_file_with_metadata(
                             &destination_path,
                             Some(PortablePermissions::from_mode_file(file.mode.bits())),
@@ -123,6 +127,7 @@ pub async fn extract_ddup(
                         let error = Arc::clone(&error);
                         let progress = progress.clone();
                         scope.spawn(move |_| {
+                            let _permit = permit;
                             let run = || -> Result<(), std::io::Error> {
                                 crate::io::copy(&mut reader, &mut writer)?;
                                 writer.flush()?;

@@ -44,11 +44,20 @@ mod post {
     ) -> ApiResponseResult {
         let ignored = crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
 
+        super::super::reject_any_protected(
+            &server,
+            &data
+                .files
+                .iter()
+                .map(|file| Path::new(&data.root).join(file))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         let mut deleted_count = 0;
         let mut failed_count = 0;
         for file in data.files {
             let path = Path::new(&data.root).join(&file);
-            super::super::reject_protected(&server, &path).await?;
 
             let (source, filesystem) = server
                 .filesystem

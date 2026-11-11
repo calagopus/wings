@@ -45,6 +45,7 @@ mod get {
         (status = OK, body = String),
         (status = UNAUTHORIZED, body = String),
         (status = NOT_FOUND, body = String),
+        (status = RANGE_NOT_SATISFIABLE, body = String),
         (status = EXPECTATION_FAILED, body = String),
     ), params(
         (
@@ -100,6 +101,15 @@ mod get {
         };
 
         let range = ByteRange::from_headers(&headers);
+        if let Some(range) = range
+            && range.resolve(metadata.size).is_none()
+        {
+            return ApiResponse::error("range not satisfiable")
+                .with_status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .with_header("Content-Range", &format!("bytes */{}", metadata.size))
+                .ok();
+        }
+
         let (mut headers, response) = if filesystem.is_fast() {
             let file_read =
                 match tokio::task::spawn_blocking(move || filesystem.read_file(&path, range))

@@ -158,7 +158,22 @@ pub async fn extract_zip(
             )?;
         }
 
-        plan.sort_by(|a, b| a.path.parent().cmp(&b.path.parent()));
+        plan.sort_by(|a, b| {
+            a.path
+                .parent()
+                .cmp(&b.path.parent())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        // the sort is stable, so the retained entry has to be swapped for the
+        // later duplicate to keep the last one like unzip does
+        plan.dedup_by(|later, kept| {
+            if later.path != kept.path {
+                return false;
+            }
+
+            std::mem::swap(later, kept);
+            true
+        });
         let groups = zip_entry_groups(&plan);
 
         let mut last_parent = None;

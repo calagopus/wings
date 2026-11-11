@@ -5,7 +5,12 @@ use crate::{
         compression::CompressionLevel,
         fixed_reader::FixedReader,
     },
-    server::filesystem::{archive::Archive, virtualfs::IsIgnoredFn},
+    server::filesystem::{
+        archive::{Archive, seven_zip_attributes},
+        cap::FileType,
+        virtualfs::IsIgnoredFn,
+    },
+    utils::PortablePermissions,
 };
 use sevenz_rust2::{
     EncoderConfiguration, EncoderMethod, NtTime,
@@ -61,10 +66,11 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                 let ctime = metadata
                     .created()
                     .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
+                let mode = PortablePermissions::from(metadata.permissions()).mode();
 
                 if metadata.is_dir() {
                     if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                        directory_entries.push((relative.to_path_buf(), mtime, ctime));
+                        directory_entries.push((relative.to_path_buf(), mtime, ctime, mode));
                     }
                     progress.increment_bytes(metadata.len());
                 } else if metadata.is_file() {
@@ -82,9 +88,31 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                         entry.has_creation_date = true;
                         entry.creation_date = ctime;
                     }
+                    entry.has_windows_attributes = true;
+                    entry.windows_attributes = seven_zip_attributes(FileType::File, mode);
                     entry.size = metadata.len();
 
                     archive.push_archive_entry(entry, Some(reader))?;
+                    progress.increment_files();
+                } else if let Ok(link_target) = filesystem.read_link_contents(path) {
+                    let target = link_target.to_string_lossy();
+
+                    let mut entry =
+                        sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
+                    if let Some(mtime) = mtime {
+                        entry.has_last_modified_date = true;
+                        entry.last_modified_date = mtime;
+                    }
+                    if let Some(ctime) = ctime {
+                        entry.has_creation_date = true;
+                        entry.creation_date = ctime;
+                    }
+                    entry.has_windows_attributes = true;
+                    entry.windows_attributes = seven_zip_attributes(FileType::Symlink, mode);
+                    entry.size = target.len() as u64;
+
+                    archive.push_archive_entry(entry, Some(target.as_bytes()))?;
+                    progress.increment_bytes(metadata.len());
                     progress.increment_files();
                 }
 
@@ -92,7 +120,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
             },
         )?;
 
-        for (source_path, mtime, ctime) in directory_entries {
+        for (source_path, mtime, ctime, mode) in directory_entries {
             let mut entry =
                 sevenz_rust2::ArchiveEntry::new_directory(&source_path.to_string_lossy());
             if let Some(mtime) = mtime {
@@ -103,6 +131,8 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                 entry.has_creation_date = true;
                 entry.creation_date = ctime;
             }
+            entry.has_windows_attributes = true;
+            entry.windows_attributes = seven_zip_attributes(FileType::Dir, mode);
 
             archive.push_archive_entry(entry, None::<&[u8]>)?;
         }

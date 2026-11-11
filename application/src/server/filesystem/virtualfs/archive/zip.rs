@@ -24,37 +24,11 @@ use crate::{
 use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use std::{
+    collections::HashMap,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-pub trait BetterZipArchiveExt<R: Read + Seek> {
-    fn better_by_path(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<zip::read::ZipFile<'_, R>, zip::result::ZipError>;
-    fn better_index_for_path(&self, path: impl AsRef<Path>) -> Option<usize>;
-}
-
-impl<R: Read + Seek + Clone> BetterZipArchiveExt<R> for zip::ZipArchive<R> {
-    fn better_by_path(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<zip::read::ZipFile<'_, R>, zip::result::ZipError> {
-        match self.index_for_path(path.as_ref()) {
-            Some(index) => self.by_index(index),
-            None => self.by_name(&format!("{}/", path.as_ref().display())),
-        }
-    }
-
-    fn better_index_for_path(&self, path: impl AsRef<Path>) -> Option<usize> {
-        match self.index_for_path(path.as_ref()) {
-            Some(index) => Some(index),
-            None => self.index_for_name(&format!("{}/", path.as_ref().display())),
-        }
-    }
-}
 
 pub struct SortableZipEntry {
     pub name: PathBuf,
@@ -112,6 +86,7 @@ pub struct VirtualZipArchive {
     pub archive_created: chrono::DateTime<chrono::Utc>,
     pub mime_cache: moka::sync::Cache<usize, MimeCacheValue>,
     pub sizes: Arc<crate::server::filesystem::usage::DiskUsage>,
+    pub indices: Arc<HashMap<PathBuf, usize>>,
 }
 
 impl VirtualZipArchive {
@@ -121,14 +96,20 @@ impl VirtualZipArchive {
         archive_created: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let mut sizes = crate::server::filesystem::usage::DiskUsage::default();
+        let mut indices = HashMap::with_capacity(archive.len());
 
         for i in 0..archive.len() {
-            let Ok(entry) = archive.by_index(i) else {
+            let Ok(entry) = archive.by_index_raw(i) else {
                 continue;
             };
             let Some(name) = entry.enclosed_name() else {
                 continue;
             };
+            if name.as_os_str().is_empty() {
+                continue;
+            }
+
+            indices.insert(name.clone(), i);
 
             if entry.is_dir() {
                 let delta = SpaceDelta::new(entry.size() as i64, entry.compressed_size() as i64);
@@ -146,6 +127,44 @@ impl VirtualZipArchive {
             archive_created,
             mime_cache: moka::sync::Cache::new(10240),
             sizes: Arc::new(sizes),
+            indices: Arc::new(indices),
+        }
+    }
+
+    fn index_for_path(&self, path: &Path) -> Option<usize> {
+        self.indices.get(path).copied()
+    }
+
+    fn entry_by_path<'a>(
+        &self,
+        archive: &'a mut zip::ZipArchive<MultiReader>,
+        path: &Path,
+    ) -> Result<zip::read::ZipFile<'a, MultiReader>, zip::result::ZipError> {
+        archive.by_index(
+            self.index_for_path(path)
+                .ok_or(zip::result::ZipError::FileNotFound)?,
+        )
+    }
+
+    fn metadata_by_path<'a>(
+        &self,
+        archive: &'a mut zip::ZipArchive<MultiReader>,
+        path: &Path,
+    ) -> Result<zip::read::ZipFile<'a, MultiReader>, zip::result::ZipError> {
+        archive.by_index_raw(
+            self.index_for_path(path)
+                .ok_or(zip::result::ZipError::FileNotFound)?,
+        )
+    }
+
+    fn listing_entry(
+        archive: &mut zip::ZipArchive<MultiReader>,
+        index: usize,
+    ) -> Result<zip::read::ZipFile<'_, MultiReader>, zip::result::ZipError> {
+        if archive.by_index_data(index)?.encrypted() {
+            archive.by_index_raw(index)
+        } else {
+            archive.by_index(index)
         }
     }
 
@@ -250,7 +269,7 @@ impl VirtualZipArchive {
             MimeCacheValue::text()
         } else {
             let mut buffer = [0; 64];
-            let buffer = if entry.read_uninterrupted(&mut buffer).is_err() {
+            let buffer = if entry.encrypted() || entry.read_uninterrupted(&mut buffer).is_err() {
                 None
             } else {
                 Some(&buffer[..])
@@ -326,7 +345,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
         let mut archive = self.archive.clone();
 
-        match archive.better_by_path(path_ref) {
+        match self.metadata_by_path(&mut archive, path_ref) {
             Ok(entry) => Ok(FileMetadata {
                 file_type: Self::zip_entry_to_file_type(&entry),
                 permissions: if let Some(mode) = entry.unix_mode() {
@@ -388,12 +407,13 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let path = path.as_ref().to_path_buf();
+        let index = self.index_for_path(&path);
 
         let entry =
             tokio::task::spawn_blocking(move || -> Result<DirectoryEntry, anyhow::Error> {
-                match archive.better_index_for_path(&path) {
+                match index {
                     Some(entry_index) => {
-                        let entry = archive.by_index(entry_index)?;
+                        let entry = Self::listing_entry(&mut archive, entry_index)?;
                         Ok(Self::zip_entry_to_directory_entry(
                             &archive_created,
                             &path,
@@ -423,9 +443,9 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let mut archive = self.archive.clone();
         let path = path.as_ref();
 
-        match archive.better_index_for_path(path) {
+        match self.index_for_path(path) {
             Some(entry_index) => {
-                let entry = archive.by_index(entry_index)?;
+                let entry = Self::listing_entry(&mut archive, entry_index)?;
                 Ok(Self::zip_entry_to_directory_entry(
                     &self.archive_created,
                     path,
@@ -466,6 +486,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
+        let indices = self.indices.clone();
         let path = path.as_ref().to_path_buf();
 
         let entries =
@@ -476,10 +497,10 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                 if let Some(node) = sizes.get_path(&path) {
                     for (child_name, child_node) in node.get_entries() {
                         let child_path = path.join(child_name.as_str());
-                        let zip_index = archive.better_index_for_path(&child_path);
+                        let zip_index = indices.get(&child_path).copied();
 
                         let (modified, created) = if let Some(idx) = zip_index {
-                            let entry = archive.by_index(idx)?;
+                            let entry = archive.by_index_raw(idx)?;
                             let m =
                                 crate::server::filesystem::archive::zip_entry_get_modified_time(
                                     &entry,
@@ -496,7 +517,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             (archive_created, archive_created)
                         };
 
-                        let Some(filtered_name) = (is_ignored)(FileType::Dir, child_path).keep()
+                        let Some(filtered_name) =
+                            (is_ignored)(FileType::Dir, child_path).reachable(FileType::Dir)
                         else {
                             continue;
                         };
@@ -516,7 +538,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                 let path_len = path.components().count();
                 for i in 0..archive.len() {
-                    let entry = archive.by_index(i)?;
+                    let entry = archive.by_index_raw(i)?;
                     if entry.is_dir() {
                         continue;
                     }
@@ -533,7 +555,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     }
 
                     let file_type = Self::zip_entry_to_file_type(&entry);
-                    let Some(filtered_name) = (is_ignored)(file_type, name).keep() else {
+                    let Some(filtered_name) = (is_ignored)(file_type, name).reachable(file_type)
+                    else {
                         continue;
                     };
 
@@ -559,7 +582,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     for (zip_index, sortable) in merged.skip(start).take(per_page) {
                         match zip_index {
                             Some(idx) => {
-                                let entry = archive.by_index(idx)?;
+                                let entry = Self::listing_entry(&mut archive, idx)?;
                                 let entry_path = match entry.enclosed_name() {
                                     Some(name) => name,
                                     None => continue,
@@ -587,7 +610,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     for (zip_index, sortable) in merged {
                         match zip_index {
                             Some(idx) => {
-                                let entry = archive.by_index(idx)?;
+                                let entry = Self::listing_entry(&mut archive, idx)?;
                                 let entry_path = match entry.enclosed_name() {
                                     Some(name) => name,
                                     None => continue,
@@ -638,8 +661,11 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         impl DirectoryWalk for IgnoreWalkDir {
             fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 while self.current_index < self.archive.len() {
-                    let entry = self.archive.by_index(self.current_index).ok()?;
+                    let index = self.current_index;
                     self.current_index += 1;
+                    let Ok(entry) = self.archive.by_index_raw(index) else {
+                        continue;
+                    };
 
                     let name = match entry.enclosed_name() {
                         Some(name) => name.to_path_buf(),
@@ -683,8 +709,11 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         impl AsyncDirectoryWalk for IgnoreAsyncWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 while self.current_index < self.archive.len() {
-                    let entry = self.archive.by_index(self.current_index).ok()?;
+                    let index = self.current_index;
                     self.current_index += 1;
+                    let Ok(entry) = self.archive.by_index_raw(index) else {
+                        continue;
+                    };
 
                     let name = match entry.enclosed_name() {
                         Some(name) => name.to_path_buf(),
@@ -737,9 +766,11 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>
             {
                 while self.current_index < self.archive.len() {
-                    let entry = self.archive.by_index(self.current_index).ok()?;
                     let i = self.current_index;
                     self.current_index += 1;
+                    let Ok(entry) = self.archive.by_index_raw(i) else {
+                        continue;
+                    };
 
                     let name = match entry.enclosed_name() {
                         Some(name) => name.to_path_buf(),
@@ -796,7 +827,10 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         _range: Option<ByteRange>,
     ) -> Result<FileRead, anyhow::Error> {
         let mut archive = self.archive.clone();
-        let size = archive.better_by_path(path.as_ref())?.size();
+        let index = self
+            .index_for_path(path.as_ref())
+            .ok_or(zip::result::ZipError::FileNotFound)?;
+        let size = archive.by_index_raw(index)?.size();
 
         #[ouroboros::self_referencing]
         pub struct ZipFileReader {
@@ -818,7 +852,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             total_size: size,
             reader_range: None,
             reader: Box::new(ZipFileReader::try_new(archive, |archive| {
-                archive.better_by_path(path.as_ref())
+                archive.by_index(index)
             })?),
         })
     }
@@ -829,15 +863,17 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
     ) -> Result<AsyncFileRead, anyhow::Error> {
         let mut archive = self.archive.clone();
 
-        let size = archive.better_by_path(path.as_ref())?.size();
+        let index = self
+            .index_for_path(path.as_ref())
+            .ok_or(zip::result::ZipError::FileNotFound)?;
+        let size = archive.by_index_raw(index)?.size();
         let (pipe_reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
         let (pipe_reader, signal) =
             crate::io::fallible_reader::FallibleReader::new_with_eof(pipe_reader);
         let mut writer = writer.into_sync();
 
-        let path = path.as_ref().to_path_buf();
         crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
-            let mut entry = archive.better_by_path(&path)?;
+            let mut entry = archive.by_index(index)?;
             crate::io::pipe::copy_and_shutdown(&mut entry, &mut writer)?;
 
             Ok(())
@@ -856,7 +892,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<PathBuf, anyhow::Error> {
         let mut archive = self.archive.clone();
-        let entry = archive.better_by_path(path.as_ref())?;
+        let entry = self.entry_by_path(&mut archive, path.as_ref())?;
 
         if !entry.is_symlink() {
             return Err(anyhow::anyhow!("not a symlink"));
@@ -871,7 +907,10 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<PathBuf, anyhow::Error> {
         let mut archive = self.archive.clone();
-        let entry = archive.better_by_path(path.as_ref())?;
+        let index = self
+            .index_for_path(path.as_ref())
+            .ok_or(zip::result::ZipError::FileNotFound)?;
+        let entry = archive.by_index_raw(index)?;
 
         if !entry.is_symlink() {
             return Err(anyhow::anyhow!("not a symlink"));
@@ -879,10 +918,9 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
         drop(entry);
 
-        let path = path.as_ref().to_path_buf();
         let symlink_target =
             tokio::task::spawn_blocking(move || -> Result<String, anyhow::Error> {
-                let entry = archive.better_by_path(&path)?;
+                let entry = archive.by_index(index)?;
                 Ok(zip_entry_read_symlink_target(entry)?)
             })
             .await??;
@@ -911,7 +949,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     for i in 0..archive.len() {
-                        let entry = archive.by_index(i)?;
+                        let entry = archive.by_index_raw(i)?;
                         let name = match entry.enclosed_name() {
                             Some(name) => name,
                             None => continue,
@@ -998,9 +1036,11 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                         let mut entry_header = tar::Header::new_gnu();
                         entry_header.set_size(0);
-                        if let Some(mode) = entry.unix_mode() {
-                            entry_header.set_mode(mode);
-                        }
+                        entry_header.set_mode(entry.unix_mode().unwrap_or(if entry.is_dir() {
+                            0o755
+                        } else {
+                            0o644
+                        }));
                         entry_header.set_mtime(
                             zip_entry_get_modified_time(&entry)
                                 .map(|dt| {
@@ -1066,7 +1106,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     let mut entries: Vec<(PathBuf, usize)> = Vec::new();
                     for i in 0..archive.len() {
-                        let entry = archive.by_index(i)?;
+                        let entry = archive.by_index_raw(i)?;
                         if entry.is_dir() {
                             continue;
                         }

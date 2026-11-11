@@ -284,6 +284,7 @@ pub struct Filesystem {
     use_server_notifier: Arc<AtomicBool>,
 
     resource_usage: tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    limiter_usage_known: Arc<AtomicBool>,
     disk_limit: AtomicI64,
     disk_usage_delta_cached: Arc<AtomicI64>,
     disk_usage_cached_logical: Arc<AtomicU64>,
@@ -294,7 +295,8 @@ pub struct Filesystem {
     disk_ignored: arc_swap::ArcSwap<IgnoreList>,
     mount_gateways: arc_swap::ArcSwap<Vec<PathBuf>>,
 
-    pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
+    pub archive_fs_cache:
+        moka::future::Cache<(PathBuf, MimeCacheKey), Arc<dyn VirtualReadableFilesystem>>,
     pub operations: operations::OperationManager,
     pub uploads: uploads::UploadManager,
     pub trash: trash::TrashManager,
@@ -332,6 +334,7 @@ impl Filesystem {
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
         let disk_check_completed = Arc::new(tokio::sync::Notify::new());
         let last_disk_check = Arc::new(AtomicU64::new(0));
+        let limiter_usage_known = Arc::new(AtomicBool::new(false));
 
         Self {
             uuid,
@@ -353,6 +356,7 @@ impl Filesystem {
                 use_server_notifier: Arc::clone(&use_server_notifier),
                 last_disk_check: Arc::clone(&last_disk_check),
                 resource_usage: resource_usage.clone(),
+                limiter_usage_known: Arc::clone(&limiter_usage_known),
             })),
             config: Arc::clone(&config),
 
@@ -364,6 +368,7 @@ impl Filesystem {
 
             trash: trash::TrashManager::new(resource_usage.clone(), Arc::clone(&disk_usage)),
             resource_usage,
+            limiter_usage_known,
             disk_limit: AtomicI64::new(disk_limit as i64),
             disk_usage_delta_cached: Arc::new(AtomicI64::new(0)),
             disk_usage_cached_logical,
@@ -758,11 +763,6 @@ impl Filesystem {
         self.disk_limit.load(Ordering::Relaxed)
     }
 
-    #[inline]
-    pub async fn is_full(&self) -> bool {
-        self.disk_limit() != 0 && self.limiter_usage().await >= self.disk_limit() as u64
-    }
-
     /// Checks whether `delta` additional bytes would still fit within the disk limit,
     /// without reserving them. Writers that go through [`file::ServerFile`] account for
     /// their own bytes, so callers that only want to fail early must not allocate here.
@@ -900,25 +900,23 @@ impl Filesystem {
             };
             let archive_path = self.diff_key(&archive_path).await;
 
-            if self
-                .async_metadata(&archive_path)
-                .await
-                .ok()
-                .is_none_or(|m| !m.is_file())
-            {
-                break 'archivefs;
-            }
+            let archive_key = match self.async_metadata(&archive_path).await {
+                Ok(metadata) if metadata.is_file() => MimeCacheKey::from(&metadata),
+                _ => break 'archivefs,
+            };
+            let cache_key = (archive_path, archive_key);
 
-            if let Some(archive_fs) = self.archive_fs_cache.get(&archive_path).await {
+            if let Some(archive_fs) = self.archive_fs_cache.get(&cache_key).await {
                 return (inner_path.to_path_buf(), archive_fs);
             }
+            let archive_path = &cache_key.0;
 
             let archive_fs: Arc<dyn VirtualReadableFilesystem> =
                 match archive_path.extension().and_then(|ext| ext.to_str()) {
                     Some("zip") => {
                         match virtualfs::archive::zip::VirtualZipArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -936,7 +934,7 @@ impl Filesystem {
                     Some("7z") => {
                         match virtualfs::archive::seven_zip::VirtualSevenZipArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -954,7 +952,7 @@ impl Filesystem {
                     Some("ddup") => {
                         match virtualfs::archive::ddup_bak::VirtualDdupBakArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -973,7 +971,7 @@ impl Filesystem {
                 };
 
             self.archive_fs_cache
-                .insert(archive_path, archive_fs.clone())
+                .insert(cache_key, archive_fs.clone())
                 .await;
 
             return (inner_path.to_path_buf(), archive_fs);
@@ -1002,21 +1000,26 @@ impl Filesystem {
                     relative_target: PathBuf::from(relative_target),
                 });
 
-                if match_result.is_none() {
-                    let relative_target_path = Path::new(relative_target);
-                    if path.starts_with(relative_target_path)
-                        && let Ok(inner_path) = path.strip_prefix(relative_target_path)
-                    {
-                        match_result =
-                            Some((inner_path.to_path_buf(), source_path, mount.read_only));
-                    }
+                let relative_target_path = Path::new(relative_target);
+                let depth = relative_target_path.components().count();
+                if match_result
+                    .as_ref()
+                    .is_none_or(|(_, _, _, matched_depth)| depth > *matched_depth)
+                    && let Ok(inner_path) = path.strip_prefix(relative_target_path)
+                {
+                    match_result = Some((
+                        inner_path.to_path_buf(),
+                        source_path,
+                        mount.read_only,
+                        depth,
+                    ));
                 }
             }
 
             (match_result, infos)
         };
 
-        if let Some((inner_path, source_path, read_only)) = mount_match {
+        if let Some((inner_path, source_path, read_only, _)) = mount_match {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let mut fs = cap_fs.get_virtual(server.clone());
@@ -1078,14 +1081,19 @@ impl Filesystem {
                 crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
             };
 
-            let mut result: Option<(PathBuf, PathBuf, bool)> = None;
+            let mut result: Option<(PathBuf, PathBuf, bool, usize)> = None;
             for mount in &server_config.mounts {
                 let Some(relative_target) = mount.container_relative_target() else {
                     continue;
                 };
 
                 let relative_target_path = Path::new(relative_target);
-                if !path.starts_with(relative_target_path) {
+                let depth = relative_target_path.components().count();
+                if !path.starts_with(relative_target_path)
+                    || result
+                        .as_ref()
+                        .is_some_and(|(_, _, _, matched_depth)| depth <= *matched_depth)
+                {
                     continue;
                 }
 
@@ -1094,14 +1102,18 @@ impl Filesystem {
                 };
 
                 if let Ok(inner_path) = path.strip_prefix(relative_target_path) {
-                    result = Some((inner_path.to_path_buf(), source_path, mount.read_only));
-                    break;
+                    result = Some((
+                        inner_path.to_path_buf(),
+                        source_path,
+                        mount.read_only,
+                        depth,
+                    ));
                 }
             }
             result
         };
 
-        if let Some((inner_path, source_path, read_only)) = mount_match {
+        if let Some((inner_path, source_path, read_only, _)) = mount_match {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let mut fs = cap_fs.get_virtual(server.clone());
@@ -1125,7 +1137,7 @@ impl Filesystem {
                             fs = fs.with_is_ignored(ignored);
                         }
 
-                        return (inner_path, Arc::new(fs));
+                        return (path, Arc::new(fs));
                     }
                 }
             }
@@ -1166,26 +1178,56 @@ impl Filesystem {
         let metadata = self.async_symlink_metadata(&path).await?;
 
         if metadata.is_dir() {
+            let key = self.diff_key(&path).await;
             let threads = self.config.load().api.file_delete_threads;
-            self.async_remove_dir_all(&path, threads).await?;
+            let result = self.async_remove_dir_all(&path, threads).await;
 
-            let mut disk_usage = self.disk_usage.write().await;
-            if let Some(removed) = disk_usage.remove_path(&path) {
-                drop(disk_usage);
-                self.try_update_atomics(
-                    usage::SpaceDelta::new(
-                        -(removed.space.get_logical() as i64),
-                        -(removed.space.get_physical() as i64),
-                    ),
-                    false,
-                );
+            let delta = if result.is_ok() || self.async_symlink_metadata(&key).await.is_err() {
+                self.disk_usage
+                    .write()
+                    .await
+                    .remove_path(&key)
+                    .map(|removed| {
+                        usage::SpaceDelta::new(
+                            -(removed.space.get_logical() as i64),
+                            -(removed.space.get_physical() as i64),
+                        )
+                    })
+            } else {
+                match disk_checker::rescan_tree(
+                    self.cap_filesystem.clone(),
+                    Arc::clone(&self.disk_usage),
+                    key,
+                )
+                .await
+                {
+                    Ok(delta) => Some(delta),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "failed to rescan partially removed directory: {}",
+                            err
+                        );
+                        None
+                    }
+                }
+            };
+
+            if let Some(delta) = delta {
+                self.try_update_atomics(delta, true);
             }
+            result?;
         } else {
-            let size = metadata.len() as i64;
+            let removed = disk_checker::space_delta(&metadata);
             self.async_remove_file(&path).await?;
 
             if let Some(parent) = path.parent() {
-                self.async_allocate_in_path(parent, -size, false).await;
+                self.async_allocate_in_path(
+                    parent,
+                    usage::SpaceDelta::new(-removed.logical, -removed.physical),
+                    false,
+                )
+                .await;
             }
         }
 
@@ -1246,9 +1288,18 @@ impl Filesystem {
             self.async_create_chowned_dir_all(parent, None).await?;
         }
 
-        let old_metadata = self.async_metadata(&old_path).await?;
-        let new_metadata = self.async_metadata(&new_path).await.ok();
+        let old_metadata = self.async_symlink_metadata(&old_path).await?;
+        let new_metadata = self.async_symlink_metadata(&new_path).await.ok();
         let is_dir = old_metadata.is_dir();
+
+        #[cfg(unix)]
+        let same_file = new_metadata.as_ref().is_some_and(|new_metadata| {
+            use cap_std::fs::MetadataExt;
+
+            new_metadata.dev() == old_metadata.dev() && new_metadata.ino() == old_metadata.ino()
+        });
+        #[cfg(not(unix))]
+        let same_file = false;
 
         let old_parent = self
             .async_canonicalize(match old_path.parent() {
@@ -1265,6 +1316,10 @@ impl Filesystem {
             .await
             .unwrap_or_default();
 
+        let abs_old_path = old_parent.join(match old_path.file_name() {
+            Some(name) => name,
+            None => return Err(anyhow::anyhow!("failed to get old path file name")),
+        });
         let abs_new_path = new_parent.join(match new_path.file_name() {
             Some(name) => name,
             None => return Err(anyhow::anyhow!("failed to get new path file name")),
@@ -1273,10 +1328,14 @@ impl Filesystem {
         self.async_rename(&old_path, &self.cap_filesystem, &new_path)
             .await?;
 
+        if same_file {
+            return Ok(());
+        }
+
         if is_dir {
             let mut disk_usage = self.disk_usage.write().await;
 
-            let path = disk_usage.remove_path(&old_path);
+            let path = disk_usage.remove_path(&abs_old_path);
             if let Some(path) = path {
                 disk_usage.add_directory(
                     &abs_new_path
@@ -1287,19 +1346,26 @@ impl Filesystem {
                 );
             }
         } else {
-            let size = old_metadata.len() as i64;
+            let moved = disk_checker::space_delta(&old_metadata);
+            let added = match new_metadata {
+                Some(new_metadata) => {
+                    let replaced = disk_checker::space_delta(&new_metadata);
 
-            if let Some(new_metadata) = new_metadata {
-                let new_size = new_metadata.len() as i64;
-                let size_delta = new_size - size;
+                    usage::SpaceDelta::new(
+                        moved.logical - replaced.logical,
+                        moved.physical - replaced.physical,
+                    )
+                }
+                None => moved,
+            };
 
-                self.async_allocate_in_path(&old_parent, -size, true).await;
-                self.async_allocate_in_path(&new_parent, size_delta, true)
-                    .await;
-            } else {
-                self.async_allocate_in_path(&old_parent, -size, true).await;
-                self.async_allocate_in_path(&new_parent, size, true).await;
-            }
+            self.async_allocate_in_path(
+                &old_parent,
+                usage::SpaceDelta::new(-moved.logical, -moved.physical),
+                true,
+            )
+            .await;
+            self.async_allocate_in_path(&new_parent, added, true).await;
         }
 
         self.uploads.forget(&old_path, &self.cap_filesystem).await;
@@ -1343,15 +1409,47 @@ impl Filesystem {
                         .await?;
                 }
 
-                let mut writer = destination_filesystem
-                    .async_create_file_with_permissions(
-                        &destination_path,
-                        Some(metadata.permissions),
-                    )
-                    .await?;
+                if destination_filesystem.is_primary_server_fs() {
+                    let mut writer = destination_filesystem
+                        .async_create_file_with_permissions(
+                            &destination_path,
+                            Some(metadata.permissions),
+                        )
+                        .await?;
 
-                tokio::io::copy(&mut reader, &mut writer).await?;
-                writer.shutdown().await?;
+                    tokio::io::copy(&mut reader, &mut writer).await?;
+                    writer.shutdown().await?;
+                } else {
+                    // Both sides may be the same file on one mount, which creating the
+                    // destination in place would truncate before it is read.
+                    let staging = destination_path
+                        .with_file_name(format!(".calagopus-copy-{}", uuid::Uuid::new_v4()));
+
+                    let result = async {
+                        let mut writer = destination_filesystem
+                            .async_create_file_with_permissions(
+                                &staging,
+                                Some(metadata.permissions),
+                            )
+                            .await?;
+
+                        tokio::io::copy(&mut reader, &mut writer).await?;
+                        writer.shutdown().await?;
+
+                        destination_filesystem
+                            .async_rename(&staging, &destination_path, cap::FileType::File)
+                            .await
+                    }
+                    .await;
+
+                    if result.is_err() {
+                        destination_filesystem
+                            .async_remove_file(&staging)
+                            .await
+                            .ok();
+                    }
+                    result?;
+                }
             }
 
             progress.increment_files();
@@ -1565,6 +1663,7 @@ impl Filesystem {
             .system
             .disk_limiter_mode
             .usage_is_scanned()
+            || !self.limiter_usage_known.load(Ordering::Relaxed)
         {
             self.resource_usage
                 .publish_disk_usage(self.get_physical_cached_size());
@@ -1581,15 +1680,18 @@ impl Filesystem {
     /// - `ignorant`: If `true`, ignores disk limit checks
     ///
     /// Returns `true` if allocation was successful, `false` if it would exceed disk limit
-    pub async fn async_allocate_in_path(&self, path: &Path, delta: i64, ignorant: bool) -> bool {
+    pub async fn async_allocate_in_path(
+        &self,
+        path: &Path,
+        delta: impl Into<usage::SpaceDelta>,
+        ignorant: bool,
+    ) -> bool {
+        let delta: usage::SpaceDelta = delta.into();
         if !self.try_update_atomics(delta, ignorant) {
             return false;
         }
 
-        self.disk_usage
-            .write()
-            .await
-            .update_size(path, delta.into());
+        self.disk_usage.write().await.update_size(path, delta);
 
         true
     }
@@ -2522,10 +2624,7 @@ impl Filesystem {
         metadata: Metadata,
     ) -> PreparedDirectoryEntry {
         let symlink_destination = if metadata.is_symlink() {
-            match filesystem.async_read_link(&path).await {
-                Ok(link) => filesystem.async_canonicalize(link).await.ok(),
-                Err(_) => None,
-            }
+            filesystem.async_canonicalize(&path).await.ok()
         } else {
             None
         };
@@ -2556,10 +2655,7 @@ impl Filesystem {
         metadata: Metadata,
     ) -> PreparedDirectoryEntry {
         let symlink_destination = if metadata.is_symlink() {
-            match filesystem.read_link(&path) {
-                Ok(link) => filesystem.canonicalize(link).ok(),
-                Err(_) => None,
-            }
+            filesystem.canonicalize(&path).ok()
         } else {
             None
         };

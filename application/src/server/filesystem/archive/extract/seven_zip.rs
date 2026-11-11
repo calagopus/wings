@@ -1,7 +1,11 @@
-use super::super::{Archive, ExtractOptions, create::ArchiveProgress};
+use super::super::{
+    Archive, ExtractOptions, ZIP_SYMLINK_MAX_BYTES, create::ArchiveProgress,
+    seven_zip_entry_is_symlink, seven_zip_unix_mode, zip_entry_read_symlink_target,
+};
 use crate::{
     io::abort::{AbortGuard, AbortReader},
     server::filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem},
+    utils::PortablePermissions,
 };
 use std::{
     io::{Read, Write},
@@ -94,10 +98,13 @@ pub async fn extract_seven_zip(
                             return skip(reader);
                         }
 
+                        let mode = seven_zip_unix_mode(entry).map(|(_, mode)| mode);
+
                         if entry.is_directory() {
-                            if let Err(err) =
-                                destination_filesystem.create_dir_all(&destination_path, None)
-                            {
+                            if let Err(err) = destination_filesystem.create_dir_all(
+                                &destination_path,
+                                mode.map(PortablePermissions::from_mode_dir),
+                            ) {
                                 return Err(sevenz_rust2::Error::Other(err.to_string().into()));
                             }
                         } else {
@@ -120,8 +127,38 @@ pub async fn extract_seven_zip(
                                 None
                             };
 
+                            if seven_zip_entry_is_symlink(entry) {
+                                if !(1..=ZIP_SYMLINK_MAX_BYTES).contains(&entry.size()) {
+                                    return skip(reader);
+                                }
+
+                                let link = zip_entry_read_symlink_target(&mut *reader)?;
+                                skip(reader)?;
+
+                                if let Err(err) = destination_filesystem
+                                    .create_symlink_with_metadata(
+                                        &link,
+                                        &destination_path,
+                                        modified_time,
+                                    )
+                                {
+                                    tracing::debug!(
+                                        path = %destination_path.display(),
+                                        "failed to create symlink from archive: {:#?}",
+                                        err
+                                    );
+                                }
+
+                                progress.increment_files();
+                                return Ok(true);
+                            }
+
                             let mut writer = destination_filesystem
-                                .create_file(&destination_path)
+                                .create_file_with_metadata(
+                                    &destination_path,
+                                    mode.map(PortablePermissions::from_mode_file),
+                                    modified_time,
+                                )
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                             let mut reader = progress.counting_reader(reader);
@@ -129,17 +166,6 @@ pub async fn extract_seven_zip(
                             crate::io::copy_shared(&mut read_buffer, &mut reader, &mut writer)?;
                             writer.flush()?;
                             drop(writer);
-
-                            if let Some(modified_time) = modified_time {
-                                destination_filesystem
-                                    .set_times(
-                                        &destination_path,
-                                        FileType::File,
-                                        modified_time,
-                                        None,
-                                    )
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                            }
 
                             progress.increment_files();
                         }
@@ -155,33 +181,71 @@ pub async fn extract_seven_zip(
         if let Some(err) = error.take() {
             Err(err.into())
         } else {
-            for entry in archive.files {
-                if entry.is_directory() {
-                    let path = entry.name();
-                    if path.starts_with('/') || path.starts_with('\\') {
-                        continue;
-                    }
+            for (index, entry) in archive.files.iter().enumerate() {
+                let directory = entry.is_directory();
+                let stream_less = archive
+                    .stream_map
+                    .file_block_index
+                    .get(index)
+                    .is_some_and(Option::is_none);
+                if !directory && (!stream_less || entry.is_anti_item()) {
+                    continue;
+                }
 
-                    let Some(destination_path) = options.resolve(&destination, Path::new(path))
-                    else {
-                        continue;
-                    };
+                let path = entry.name();
+                if path.starts_with('/') || path.starts_with('\\') {
+                    continue;
+                }
 
-                    if destination_filesystem.is_ignored(&destination_path, FileType::Dir) {
-                        continue;
-                    }
+                let Some(destination_path) = options.resolve(&destination, Path::new(path)) else {
+                    continue;
+                };
 
-                    destination_filesystem.create_dir_all(&destination_path, None)?;
+                if destination_filesystem
+                    .is_ignored(&destination_path, FileType::from_is_dir(directory))
+                {
+                    continue;
+                }
 
-                    if entry.has_last_modified_date {
+                let unix_mode = seven_zip_unix_mode(entry);
+                let modified_time = entry
+                    .has_last_modified_date
+                    .then(|| entry.last_modified_date.into());
+
+                if directory {
+                    destination_filesystem.create_dir_all(
+                        &destination_path,
+                        unix_mode.map(|(_, mode)| PortablePermissions::from_mode_dir(mode)),
+                    )?;
+
+                    if let Some(modified_time) = modified_time {
                         destination_filesystem.set_times(
                             &destination_path,
                             FileType::Dir,
-                            entry.last_modified_date.into(),
+                            modified_time,
                             None,
                         )?;
                     }
+
+                    continue;
                 }
+
+                if seven_zip_entry_is_symlink(entry) {
+                    continue;
+                }
+
+                options.on_file(&destination_path);
+
+                if let Some(parent) = destination_path.parent() {
+                    destination_filesystem.create_dir_all(&parent, None)?;
+                }
+
+                destination_filesystem.create_file_with_metadata(
+                    &destination_path,
+                    unix_mode.map(|(_, mode)| PortablePermissions::from_mode_file(mode)),
+                    modified_time,
+                )?;
+                progress.increment_files();
             }
 
             Ok(())

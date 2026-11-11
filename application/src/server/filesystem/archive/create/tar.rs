@@ -62,11 +62,9 @@ fn append_entry<W: Write>(
     } else if let Ok(link_target) = filesystem.read_link_contents(path) {
         header.set_entry_type(tar::EntryType::Symlink);
 
-        if header.set_link_name(link_target).is_ok() {
-            archive.append_data(&mut header, relative, std::io::empty())?;
-            progress.increment_bytes(metadata.len());
-            progress.increment_files();
-        }
+        archive.append_link(&mut header, relative, link_target)?;
+        progress.increment_bytes(metadata.len());
+        progress.increment_files();
     }
 
     Ok(())

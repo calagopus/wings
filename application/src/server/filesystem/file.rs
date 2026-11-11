@@ -36,7 +36,8 @@ fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) ->
 }
 
 /// Opens `path` with `options`, runs `check` on the opened file and only then
-/// truncates it when asked, so nothing is lost before the check passes. Returns
+/// truncates it when asked, so nothing is lost before the check passes. An empty
+/// file the open created is removed again when the check rejects it. Returns
 /// the file, its size before truncation and its metadata from before truncation.
 fn open_and_check(
     server: &crate::server::Server,
@@ -47,8 +48,18 @@ fn open_and_check(
 ) -> Result<(std::fs::File, u64, Option<std::fs::Metadata>), anyhow::Error> {
     options.truncate(false);
 
+    let missing = server
+        .filesystem
+        .metadata(path)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
     let file = server.filesystem.open_with(path, options)?;
-    check(&file)?;
+    if let Err(err) = check(&file) {
+        if missing {
+            remove_created(server, &file);
+        }
+
+        return Err(err);
+    }
     let metadata = file.metadata().ok();
     let previous_size = metadata
         .as_ref()
@@ -60,6 +71,26 @@ fn open_and_check(
 
     Ok((file, previous_size, metadata))
 }
+
+#[cfg(target_os = "linux")]
+fn remove_created(server: &crate::server::Server, file: &std::fs::File) {
+    if !file.metadata().is_ok_and(|metadata| metadata.len() == 0) {
+        return;
+    }
+
+    if let Ok(created) = server.filesystem.opened_relative_path(file)
+        && let Err(err) = server.filesystem.remove_file(&created)
+    {
+        tracing::debug!(
+            path = %created.display(),
+            "failed to remove file created before a rejected open: {:?}",
+            err
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_created(_server: &crate::server::Server, _file: &std::fs::File) {}
 
 fn parent_components(
     server: &crate::server::Server,
@@ -654,17 +685,28 @@ impl AsyncRead for AsyncServerFile {
 
 impl Drop for AsyncServerFile {
     fn drop(&mut self) {
-        let leftover = self.accumulated_bytes + self.allocating_bytes;
-        if leftover != 0 {
+        let in_progress = self.allocation_in_progress.take();
+        let accumulated = self.accumulated_bytes;
+        if in_progress.is_some() || accumulated != 0 {
             let server = self.server.clone();
             let parent = self.parent.clone();
+            let allocating = self.allocating_bytes;
             let ignorant = self.ignorant;
 
             tokio::spawn(async move {
-                server
-                    .filesystem
-                    .async_allocate_in_path_iterator(&parent, leftover, ignorant)
-                    .await;
+                let mut leftover = accumulated;
+                if let Some(in_progress) = in_progress
+                    && !in_progress.await
+                {
+                    leftover += allocating;
+                }
+
+                if leftover != 0 {
+                    server
+                        .filesystem
+                        .async_allocate_in_path_iterator(&parent, leftover, ignorant)
+                        .await;
+                }
             });
         }
 

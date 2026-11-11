@@ -64,10 +64,10 @@ type GroupLockKey = (
     Option<compact_str::CompactString>,
     compact_str::CompactString,
 );
-type GroupLocks = moka::future::Cache<GroupLockKey, Arc<tokio::sync::Mutex<()>>>;
-static GROUP_LOCKS: LazyLock<GroupLocks> = LazyLock::new(|| moka::future::Cache::new(10240));
+static GROUP_LOCKS: LazyLock<crate::utils::KeyedLocks<GroupLockKey>> =
+    LazyLock::new(crate::utils::KeyedLocks::new);
 
-async fn group_lock(config: &PbsConfig, backup_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+fn group_lock(config: &PbsConfig, backup_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = (
         config.base_url().into(),
         config.datastore.clone(),
@@ -75,9 +75,7 @@ async fn group_lock(config: &PbsConfig, backup_id: &str) -> Arc<tokio::sync::Mut
         backup_id.into(),
     );
 
-    GROUP_LOCKS
-        .get_with(key, async { Arc::new(tokio::sync::Mutex::new(())) })
-        .await
+    GROUP_LOCKS.get(key)
 }
 
 pub struct PbsBackup {
@@ -167,7 +165,7 @@ impl BackupCreateExt for PbsBackup {
 
         let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
 
-        let group_lock = group_lock(&config, &backup_id).await;
+        let group_lock = group_lock(&config, &backup_id);
         let _group_guard = group_lock.lock().await;
 
         let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
@@ -356,7 +354,7 @@ impl BackupStreamCreateExt for PbsBackup {
         let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
         let compression_threads = state.config.load().system.backups.pbs.create_threads;
 
-        let group_lock = group_lock(&config, &backup_id).await;
+        let group_lock = group_lock(&config, &backup_id);
         let _group_guard = group_lock.lock().await;
 
         let mut writer = PbsBackupWriter::connect(&config, &backup_id, backup_time).await?;
@@ -944,7 +942,7 @@ impl BackupExt for PbsBackup {
             .invalidate_cached_browse(self.uuid)
             .await;
 
-        let group_lock = group_lock(&self.config, &self.backup_id).await;
+        let group_lock = group_lock(&self.config, &self.backup_id);
         let _group_guard = group_lock.lock().await;
 
         let client = PbsClient::new(self.config.clone())?;

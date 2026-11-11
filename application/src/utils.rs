@@ -675,6 +675,48 @@ pub fn aligned_interval(period: std::time::Duration) -> tokio::time::Interval {
     interval
 }
 
+/// A map of per-key async mutexes. An entry lives exactly as long as someone holds its
+/// mutex, so two callers asking for the same key always share one mutex, unlike a
+/// bounded cache, which can evict or refuse an entry that is still in use.
+pub struct KeyedLocks<K> {
+    locks:
+        parking_lot::Mutex<std::collections::HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K: std::hash::Hash + Eq> KeyedLocks<K> {
+    pub fn new() -> Self {
+        Self {
+            locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: K) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock();
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+
+        if locks.len() >= locks.capacity() {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, std::sync::Arc::downgrade(&lock));
+
+        lock
+    }
+
+    pub async fn lock(&self, key: K) -> tokio::sync::OwnedMutexGuard<()> {
+        self.get(key).lock_owned().await
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

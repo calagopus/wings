@@ -46,6 +46,7 @@ pub async fn extract_tar(
         let mut archive = tar::Archive::new(budget.reader(reader));
         archive.set_ignore_zeros(true);
         let mut directory_entries = chunked_vec::ChunkedVec::new();
+        let mut hard_links = Vec::new();
         let entries = archive.entries()?;
 
         super::writers::with_writers(
@@ -92,7 +93,9 @@ pub async fn extract_tar(
                                 directory_entries.push((destination_path, modified_time));
                             }
                         }
-                        tar::EntryType::Regular => {
+                        tar::EntryType::Regular
+                        | tar::EntryType::GNUSparse
+                        | tar::EntryType::Continuous => {
                             options.on_file(&destination_path);
 
                             let permissions =
@@ -124,8 +127,20 @@ pub async fn extract_tar(
                                     .checked_add(std::time::Duration::from_secs(modified_time))
                             });
 
-                            if !writers.symlink(destination_path, link, modified_time) {
+                            if !writers.symlink(destination_path, link, modified_time)? {
                                 break;
+                            }
+                        }
+                        tar::EntryType::Link => {
+                            let Some(target) = entry.link_name()? else {
+                                continue;
+                            };
+                            if target.as_os_str().is_empty() {
+                                continue;
+                            }
+
+                            if let Some(target) = options.resolve(&destination, &target) {
+                                hard_links.push((destination_path, target));
                             }
                         }
                         _ => {}
@@ -135,6 +150,23 @@ pub async fn extract_tar(
                 Ok(())
             },
         )?;
+
+        for (path, target) in hard_links {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                destination_filesystem.create_dir_all(&parent, None)?;
+            }
+
+            if let Err(err) = destination_filesystem.create_hard_link(&target, &path) {
+                tracing::debug!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "failed to create hardlink from archive: {:#?}",
+                    err
+                );
+            }
+        }
 
         for (destination_path, modified_time) in directory_entries {
             destination_filesystem.set_times(

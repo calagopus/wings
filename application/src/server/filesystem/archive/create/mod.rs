@@ -71,10 +71,10 @@ fn walk_sources(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         "failed to read directory entry while creating archive: {err:#}"
                     );
-                    break;
+                    continue;
                 }
             };
 

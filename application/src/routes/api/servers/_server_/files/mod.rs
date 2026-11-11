@@ -4,7 +4,7 @@ use crate::{
     server::{Server, filesystem::VIRTUAL_PATH_MESSAGE},
 };
 use axum::http::StatusCode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use utoipa_axum::router::OpenApiRouter;
 
 mod chmod;
@@ -39,6 +39,14 @@ async fn reject_protected(server: &Server, path: &Path) -> Result<(), ApiRespons
         return Err(
             ApiResponse::error(VIRTUAL_PATH_MESSAGE).with_status(StatusCode::EXPECTATION_FAILED)
         );
+    }
+
+    Ok(())
+}
+
+async fn reject_any_protected(server: &Server, paths: &[PathBuf]) -> Result<(), ApiResponse> {
+    for path in paths {
+        reject_protected(server, path).await?;
     }
 
     Ok(())

@@ -207,18 +207,25 @@ impl Writers<'_> {
         path: PathBuf,
         link: PathBuf,
         modified_time: Option<std::time::SystemTime>,
-    ) -> bool {
+    ) -> Result<bool, anyhow::Error> {
         let Some(sender) = self.senders.get(shard(&path, self.senders.len())) else {
-            return true;
+            return Ok(true);
         };
 
-        sender
+        if let Some(parent) = path.parent()
+            && self.last_parent.as_deref() != Some(parent)
+        {
+            self.destination_filesystem.create_dir_all(&parent, None)?;
+            self.last_parent = Some(parent.to_path_buf());
+        }
+
+        Ok(sender
             .send_blocking(Job::Symlink {
                 path,
                 link,
                 modified_time,
             })
-            .is_ok()
+            .is_ok())
     }
 }
 
