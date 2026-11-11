@@ -2,7 +2,7 @@ use crate::{
     config::ResourceHistoryTier,
     server::{
         resource_history::{
-            accumulator::{ServerTrack, Span},
+            accumulator::{Limits, ServerTrack, Span},
             storage::{Batch, Entry, Storage},
         },
         state::ServerState,
@@ -63,6 +63,7 @@ pub struct HistoryPoint {
     pub network_tx_bytes: Option<u64>,
 }
 
+/// Configured limits, excluding memory overhead and CPU boosts, `0` is unlimited.
 #[derive(ToSchema, Serialize, Debug, PartialEq)]
 pub struct HistoryLimits {
     pub since: chrono::DateTime<chrono::Utc>,
@@ -308,33 +309,49 @@ impl ResourceHistory {
 
     async fn sample(&self, server_manager: &crate::server::manager::ServerManager, ts: i64) {
         let servers = server_manager.get_servers().await;
-        let mut new = Vec::new();
+        let mut samples = Vec::with_capacity(servers.len());
+        let mut seen = HashSet::with_capacity(servers.len());
 
+        for server in servers.iter() {
+            seen.insert(server.uuid);
+
+            if server.is_transferring() {
+                continue;
+            }
+
+            let limits = {
+                let configuration = server.configuration.read().await;
+                Limits {
+                    memory: configuration.build.memory_limit.max(0) * 1024,
+                    cpu: configuration.build.cpu_limit.max(0),
+                }
+            };
+
+            samples.push((
+                server.uuid,
+                server.resource_usage(),
+                server.state.get_state(),
+                limits,
+            ));
+        }
+        drop(servers);
+
+        let mut new = Vec::new();
         {
             let mut tracks = self.tracks.lock();
-            let mut seen = HashSet::with_capacity(servers.len());
 
-            for server in servers.iter() {
-                seen.insert(server.uuid);
-
-                if server.is_transferring() {
-                    continue;
-                }
-
-                let usage = server.resource_usage();
-                let state = server.state.get_state();
-                match tracks.servers.get_mut(&server.uuid) {
+            for (uuid, usage, state, limits) in samples {
+                match tracks.servers.get_mut(&uuid) {
                     Some(track) => {
-                        track.push(ts, &usage);
+                        track.push(ts, &usage, limits);
                         track.push_state(ts, state);
                     }
-                    None => new.push((server.uuid, usage, state)),
+                    None => new.push((uuid, usage, state, limits)),
                 }
             }
 
             tracks.servers.retain(|uuid, _| seen.contains(uuid));
         }
-        drop(servers);
 
         if new.is_empty() {
             return;
@@ -362,10 +379,10 @@ impl ResourceHistory {
 
         let mut tracks = self.tracks.lock();
         let steps = tracks.steps.clone();
-        for (uuid, usage, state) in new {
-            let (limits, span) = resumed.get(&uuid).copied().unwrap_or_default();
-            let mut track = ServerTrack::new(&steps, limits, span);
-            track.push(ts, &usage);
+        for (uuid, usage, state, limits) in new {
+            let (stored, span) = resumed.get(&uuid).copied().unwrap_or_default();
+            let mut track = ServerTrack::new(&steps, stored, span);
+            track.push(ts, &usage, limits);
             track.push_state(ts, state);
             tracks.servers.insert(uuid, track);
         }

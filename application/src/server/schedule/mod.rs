@@ -36,7 +36,13 @@ impl ScheduleResourceMetric {
         }
 
         let limit = match self {
-            Self::Cpu => usage.cpu_limit_absolute as f64,
+            Self::Cpu => match server.configuration.read().await.build.cpu_limit {
+                limit if limit > 0 => limit as f64,
+                _ => {
+                    std::thread::available_parallelism().map_or(1, |threads| threads.get()) as f64
+                        * 100.0
+                }
+            },
             Self::Memory => {
                 server.configuration.read().await.build.memory_limit.max(0) as f64 * 1024.0 * 1024.0
             }

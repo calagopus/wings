@@ -150,7 +150,7 @@ impl ServerTrack {
         }
     }
 
-    pub fn push(&mut self, ts: i64, usage: &ResourceUsage) {
+    pub fn push(&mut self, ts: i64, usage: &ResourceUsage, limits: Limits) {
         let running = usage.state != ServerState::Offline && usage.memory_limit_bytes > 0;
         let network = (usage.network.rx_bytes, usage.network.tx_bytes);
         let (rx, tx) = match self.network.replace(network) {
@@ -182,15 +182,9 @@ impl ServerTrack {
             }
         }
 
-        if running && usage.memory_limit_bytes > 0 {
-            let limits = Limits {
-                memory: (usage.memory_limit_bytes >> 10) as i64,
-                cpu: usage.cpu_limit_absolute as i64,
-            };
-            if self.limits != Some(limits) {
-                self.limits = Some(limits);
-                self.pending_limits = Some((ts, limits));
-            }
+        if running && self.limits != Some(limits) {
+            self.limits = Some(limits);
+            self.pending_limits = Some((ts, limits));
         }
     }
 
@@ -248,6 +242,11 @@ mod tests {
         }
     }
 
+    const LIMITS: Limits = Limits {
+        memory: 1 << 20,
+        cpu: 100,
+    };
+
     fn find(rows: &[Row], step: u64, b: i64) -> Option<Bucket> {
         rows.iter()
             .find(|row| row.step == step && row.b == b)
@@ -258,9 +257,9 @@ mod tests {
     #[test]
     fn network_first_sample_is_zero_and_reset_counts_new_value() {
         let mut track = ServerTrack::new(&[10], None, None);
-        track.push(0, &usage(ServerState::Running, 0.0, 0, 0, 1000, 50));
-        track.push(1, &usage(ServerState::Running, 0.0, 0, 0, 1500, 80));
-        track.push(2, &usage(ServerState::Running, 0.0, 0, 0, 200, 10));
+        track.push(0, &usage(ServerState::Running, 0.0, 0, 0, 1000, 50), LIMITS);
+        track.push(1, &usage(ServerState::Running, 0.0, 0, 0, 1500, 80), LIMITS);
+        track.push(2, &usage(ServerState::Running, 0.0, 0, 0, 200, 10), LIMITS);
 
         let (rows, _) = track.drain();
         let bucket = find(&rows, 10, 0).unwrap();
@@ -271,15 +270,25 @@ mod tests {
     #[test]
     fn only_running_samples_count_and_disk_is_latest() {
         let mut track = ServerTrack::new(&[10], None, None);
-        track.push(0, &usage(ServerState::Running, 2.5, 2048, 1 << 10, 0, 0));
+        track.push(
+            0,
+            &usage(ServerState::Running, 2.5, 2048, 1 << 10, 0, 0),
+            LIMITS,
+        );
         track.push(
             1,
             &usage(ServerState::Starting, 4.0, 4096 + 1023, 2 << 10, 0, 0),
+            LIMITS,
         );
-        track.push(2, &usage(ServerState::Running, -1.0, 0, 3 << 10, 0, 0));
+        track.push(
+            2,
+            &usage(ServerState::Running, -1.0, 0, 3 << 10, 0, 0),
+            LIMITS,
+        );
         track.push(
             3,
             &usage(ServerState::Offline, 50.0, 1 << 20, 5 << 10, 0, 0),
+            LIMITS,
         );
 
         let (rows, _) = track.drain();
@@ -301,8 +310,13 @@ mod tests {
                 memory_limit_bytes: 0,
                 ..usage(ServerState::Starting, 0.0, 0, 3 << 10, 0, 0)
             },
+            LIMITS,
         );
-        track.push(1, &usage(ServerState::Starting, 1.0, 0, 3 << 10, 0, 0));
+        track.push(
+            1,
+            &usage(ServerState::Starting, 1.0, 0, 3 << 10, 0, 0),
+            LIMITS,
+        );
 
         let (rows, _) = track.drain();
         let bucket = find(&rows, 10, 0).unwrap();
@@ -314,8 +328,8 @@ mod tests {
     #[test]
     fn samples_land_in_every_tier_with_euclidean_bucket_index() {
         let mut track = ServerTrack::new(&[10, 60], None, None);
-        track.push(-1, &usage(ServerState::Running, 1.0, 0, 0, 0, 0));
-        track.push(59, &usage(ServerState::Running, 1.0, 0, 0, 0, 0));
+        track.push(-1, &usage(ServerState::Running, 1.0, 0, 0, 0, 0), LIMITS);
+        track.push(59, &usage(ServerState::Running, 1.0, 0, 0, 0, 0), LIMITS);
 
         let (rows, _) = track.drain();
         assert_eq!(find(&rows, 10, -1).unwrap().n, 1);
@@ -327,11 +341,11 @@ mod tests {
     #[test]
     fn filling_bucket_is_drained_incrementally() {
         let mut track = ServerTrack::new(&[10], None, None);
-        track.push(0, &usage(ServerState::Running, 1.0, 0, 0, 0, 0));
-        track.push(1, &usage(ServerState::Running, 1.0, 0, 0, 0, 0));
+        track.push(0, &usage(ServerState::Running, 1.0, 0, 0, 0, 0), LIMITS);
+        track.push(1, &usage(ServerState::Running, 1.0, 0, 0, 0, 0), LIMITS);
         assert_eq!(find(&track.drain().0, 10, 0).unwrap().n, 2);
 
-        track.push(2, &usage(ServerState::Running, 1.0, 0, 0, 0, 0));
+        track.push(2, &usage(ServerState::Running, 1.0, 0, 0, 0, 0), LIMITS);
         let (rows, _) = track.drain();
         assert_eq!(rows.len(), 1);
         assert_eq!(find(&rows, 10, 0).unwrap().n, 1);
@@ -340,50 +354,38 @@ mod tests {
     #[test]
     fn idle_bucket_with_unchanged_disk_is_omitted() {
         let mut track = ServerTrack::new(&[10], None, None);
-        track.push(0, &usage(ServerState::Offline, 0.0, 0, 4096, 0, 0));
+        track.push(0, &usage(ServerState::Offline, 0.0, 0, 4096, 0, 0), LIMITS);
         assert_eq!(find(&track.drain().0, 10, 0).unwrap().disk, 4);
 
-        track.push(10, &usage(ServerState::Offline, 0.0, 0, 4096, 0, 0));
+        track.push(10, &usage(ServerState::Offline, 0.0, 0, 4096, 0, 0), LIMITS);
         assert!(track.drain().0.is_empty());
 
-        track.push(20, &usage(ServerState::Offline, 0.0, 0, 8192, 0, 0));
+        track.push(20, &usage(ServerState::Offline, 0.0, 0, 8192, 0, 0), LIMITS);
         assert_eq!(find(&track.drain().0, 10, 2).unwrap().disk, 8);
 
-        track.push(30, &usage(ServerState::Offline, 0.0, 0, 8192, 100, 0));
+        track.push(
+            30,
+            &usage(ServerState::Offline, 0.0, 0, 8192, 100, 0),
+            LIMITS,
+        );
         assert_eq!(find(&track.drain().0, 10, 3).unwrap().rx, 100);
     }
 
     #[test]
     fn limits_are_pending_once_and_only_when_running_and_changed() {
-        let limited = |state, memory_limit: u64, cpu_limit| ResourceUsage {
-            memory_limit_bytes: memory_limit,
-            cpu_limit_absolute: cpu_limit,
-            ..usage(state, 0.0, 0, 0, 0, 0)
-        };
-        let initial = Limits {
-            memory: 1024,
-            cpu: 100,
-        };
-        let mut track = ServerTrack::new(&[10], Some(initial), None);
+        let limits = |memory, cpu| Limits { memory, cpu };
+        let mut track = ServerTrack::new(&[10], Some(limits(1024, 100)), None);
 
-        track.push(1, &limited(ServerState::Running, 1 << 20, 100));
-        track.push(2, &limited(ServerState::Running, 0, 300));
-        track.push(3, &limited(ServerState::Offline, 2 << 20, 300));
+        let running = usage(ServerState::Running, 0.0, 0, 0, 0, 0);
+        let offline = usage(ServerState::Offline, 0.0, 0, 0, 0, 0);
+        track.push(1, &running, limits(1024, 100));
+        track.push(3, &offline, limits(2048, 300));
         assert_eq!(track.drain().1, None);
 
-        track.push(5, &limited(ServerState::Running, 2 << 20, 200));
-        assert_eq!(
-            track.drain().1,
-            Some((
-                5,
-                Limits {
-                    memory: 2048,
-                    cpu: 200
-                }
-            ))
-        );
+        track.push(5, &running, limits(2048, 200));
+        assert_eq!(track.drain().1, Some((5, limits(2048, 200))));
 
-        track.push(6, &limited(ServerState::Running, 2 << 20, 200));
+        track.push(6, &running, limits(2048, 200));
         assert_eq!(track.drain().1, None);
     }
 

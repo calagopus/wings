@@ -63,17 +63,20 @@ impl SshCliCommand for StatsCommand {
                 format!("{cpu_limit}%")
             }
         ));
-        out.push(format!(
-            "  Memory Usage: {} / {} ({:.2}%)",
-            human_bytes::human_bytes(resource_usage.memory_bytes as f64),
-            if memory_limit == 0 {
-                "Unlimited".to_string()
-            } else {
-                human_bytes::human_bytes((memory_limit * 1024 * 1024) as f64)
-            },
-            (resource_usage.memory_bytes as f64 / resource_usage.memory_limit_bytes as f64 * 100.0)
-                .min(100.0)
-        ));
+        out.push(if memory_limit > 0 {
+            let memory_limit = (memory_limit * 1024 * 1024) as f64;
+            format!(
+                "  Memory Usage: {} / {} ({:.2}%)",
+                human_bytes::human_bytes(resource_usage.memory_bytes as f64),
+                human_bytes::human_bytes(memory_limit),
+                resource_usage.memory_bytes as f64 / memory_limit * 100.0
+            )
+        } else {
+            format!(
+                "  Memory Usage: {} / Unlimited",
+                human_bytes::human_bytes(resource_usage.memory_bytes as f64)
+            )
+        });
         out.push(format!(
             "  Disk Usage: {} / {} ({:.2}%)",
             human_bytes::human_bytes(resource_usage.disk_bytes as f64),
