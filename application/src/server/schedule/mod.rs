@@ -53,7 +53,7 @@ impl ScheduleResourceMetric {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ScheduleTrigger {
     Cron {
@@ -139,81 +139,6 @@ pub fn next_cron_occurrence<Tz: chrono::TimeZone>(
     }
 }
 
-impl PartialEq for ScheduleTrigger {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                ScheduleTrigger::Cron {
-                    schedule: s1,
-                    week_interval: w1,
-                    week_anchor: a1,
-                },
-                ScheduleTrigger::Cron {
-                    schedule: s2,
-                    week_interval: w2,
-                    week_anchor: a2,
-                },
-            ) => s1 == s2 && w1 == w2 && a1 == a2,
-            (
-                ScheduleTrigger::PowerAction { action: a1 },
-                ScheduleTrigger::PowerAction { action: a2 },
-            ) => a1 == a2,
-            (
-                ScheduleTrigger::ServerState { state: s1 },
-                ScheduleTrigger::ServerState { state: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::BackupStatus { status: s1 },
-                ScheduleTrigger::BackupStatus { status: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::DatabaseBackupStatus { status: s1 },
-                ScheduleTrigger::DatabaseBackupStatus { status: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::ScheduleCompletion {
-                    schedule: s1,
-                    successful: su1,
-                },
-                ScheduleTrigger::ScheduleCompletion {
-                    schedule: s2,
-                    successful: su2,
-                },
-            ) => s1 == s2 && su1 == su2,
-            (
-                ScheduleTrigger::ResourceUsage {
-                    metric: m1,
-                    comparator: c1,
-                    value: v1,
-                    percentage: p1,
-                    for_seconds: f1,
-                },
-                ScheduleTrigger::ResourceUsage {
-                    metric: m2,
-                    comparator: c2,
-                    value: v2,
-                    percentage: p2,
-                    for_seconds: f2,
-                },
-            ) => m1 == m2 && c1 == c2 && v1 == v2 && p1 == p2 && f1 == f2,
-            (
-                ScheduleTrigger::ConsoleLine {
-                    contains: c1,
-                    case_insensitive: ci1,
-                    output_into: o1,
-                },
-                ScheduleTrigger::ConsoleLine {
-                    contains: c2,
-                    case_insensitive: ci2,
-                    output_into: o2,
-                },
-            ) => c1 == c2 && ci1 == ci2 && o1 == o2,
-            (ScheduleTrigger::Crash, ScheduleTrigger::Crash) => true,
-            _ => false,
-        }
-    }
-}
-
 #[derive(Debug, ToSchema, Serialize)]
 pub struct ApiScheduleCompletionStatus {
     pub uuid: uuid::Uuid,
@@ -252,6 +177,25 @@ impl ScheduleExecutionContext {
                 self.variables.get(&variable.variable)
             }
         }
+    }
+
+    pub fn resolve_required<'a>(
+        &'a self,
+        parameter: &'a actions::ScheduleDynamicParameter,
+        name: &str,
+    ) -> Result<&'a compact_str::CompactString, Cow<'static, str>> {
+        self.resolve_parameter(parameter)
+            .ok_or_else(|| format!("unable to resolve parameter `{name}` into a string.").into())
+    }
+
+    pub fn resolve_optional<'a>(
+        &'a self,
+        parameter: Option<&'a actions::ScheduleDynamicParameter>,
+        name: &str,
+    ) -> Result<Option<&'a compact_str::CompactString>, Cow<'static, str>> {
+        parameter
+            .map(|parameter| self.resolve_required(parameter, name))
+            .transpose()
     }
 
     pub fn get_variable_by_str(&self, variable: &str) -> Option<&compact_str::CompactString> {

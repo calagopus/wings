@@ -9,7 +9,6 @@ use crate::{
     server::filesystem::{cap::CapFilesystem, virtualfs::IsIgnoredFn},
     utils::PortablePermissions,
 };
-use chrono::{Datelike, Timelike};
 use positioned_io::ReadAt;
 use std::{
     collections::VecDeque,
@@ -155,19 +154,10 @@ impl Entry {
             }
         };
 
-        let mtime = metadata.modified().ok().and_then(|mtime| {
-            let mtime: chrono::DateTime<chrono::Utc> = chrono::DateTime::from(mtime.into_std());
-
-            zip::DateTime::from_date_and_time(
-                mtime.year() as u16,
-                mtime.month() as u8,
-                mtime.day() as u8,
-                mtime.hour() as u8,
-                mtime.minute() as u8,
-                mtime.second() as u8,
-            )
+        let mtime = metadata
+            .modified()
             .ok()
-        });
+            .and_then(|mtime| crate::server::filesystem::archive::zip_datetime(mtime.into_std()));
 
         Some(Self {
             name: relative.to_string_lossy().into_owned(),

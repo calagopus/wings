@@ -1,4 +1,5 @@
 use crate::utils::{PortablePermissions, PortablePermissionsApplier};
+use futures::ready;
 use positioned_io::{ReadAt, WriteAt};
 use std::{
     future::Future,
@@ -190,22 +191,6 @@ impl ServerFile {
         }
     }
 
-    /// Wraps an already opened file, accounting only for what is written past
-    /// `initial_size`.
-    ///
-    /// Positions are counted from this handle, not from the file, so `initial_size`
-    /// must be `0` for an `O_APPEND` handle: writes there land at the end of the file
-    /// while the handle's own position starts at zero, and any other value would leave
-    /// that many appended bytes uncharged.
-    pub fn new_file(
-        server: crate::server::Server,
-        destination: &Path,
-        file: std::fs::File,
-        initial_size: u64,
-    ) -> Result<Self, anyhow::Error> {
-        Self::wrap(server, destination, file, 0, initial_size)
-    }
-
     fn wrap(
         server: crate::server::Server,
         destination: &Path,
@@ -227,11 +212,16 @@ impl ServerFile {
         })
     }
 
-    /// Skip Disk Limit Checks
-    #[allow(dead_code)]
-    pub fn ignorant(mut self) -> Self {
-        self.ignorant = true;
-        self
+    fn file(&self) -> std::io::Result<&std::fs::File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
+    }
+
+    fn file_mut(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
     }
 
     /// Skip Disk Limit Checks if `ignorant` is set
@@ -243,17 +233,13 @@ impl ServerFile {
     pub fn sync_all(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_ref() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file()?;
 
         file.sync_all()
     }
 
     pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
-        let Some(file) = self.file.as_ref() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file()?;
 
         file.metadata()
     }
@@ -280,9 +266,7 @@ impl ServerFile {
 
 impl Write for ServerFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let written = file.write(buf)?;
 
@@ -304,9 +288,7 @@ impl Write for ServerFile {
     fn flush(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Write::flush(file)
     }
@@ -316,9 +298,7 @@ impl Seek for ServerFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let new_pos = file.seek(pos)?;
 
@@ -330,9 +310,7 @@ impl Seek for ServerFile {
 
 impl Read for ServerFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         file.read(buf)
     }
@@ -340,9 +318,7 @@ impl Read for ServerFile {
 
 impl ReadAt for ServerFile {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_ref() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file()?;
 
         file.read_at(pos, buf)
     }
@@ -350,9 +326,7 @@ impl ReadAt for ServerFile {
 
 impl WriteAt for ServerFile {
     fn write_at(&mut self, pos: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let written = file.write_at(pos, buf)?;
         let end = pos.saturating_add(written as u64);
@@ -374,9 +348,7 @@ impl WriteAt for ServerFile {
     fn flush(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Write::flush(file)
     }
@@ -459,8 +431,13 @@ impl AsyncServerFile {
         Ok(file)
     }
 
-    /// Async counterpart of [`ServerFile::new_file`], with the same `initial_size`
-    /// requirement for `O_APPEND` handles.
+    /// Wraps an already opened file, accounting only for what is written past
+    /// `initial_size`.
+    ///
+    /// Positions are counted from this handle, not from the file, so `initial_size`
+    /// must be `0` for an `O_APPEND` handle: writes there land at the end of the file
+    /// while the handle's own position starts at zero, and any other value would leave
+    /// that many appended bytes uncharged.
     pub fn new_file(
         server: crate::server::Server,
         destination: &Path,
@@ -493,11 +470,10 @@ impl AsyncServerFile {
         })
     }
 
-    /// Skip Disk Limit Checks
-    #[allow(dead_code)]
-    pub fn ignorant(mut self) -> Self {
-        self.ignorant = true;
-        self
+    fn file_mut(&mut self) -> std::io::Result<&mut tokio::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
     }
 
     /// Skip Disk Limit Checks if `ignorant` is set
@@ -556,15 +532,9 @@ impl AsyncWrite for AsyncServerFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         let result = Pin::new(file).poll_write(cx, buf);
 
@@ -587,49 +557,29 @@ impl AsyncWrite for AsyncServerFile {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
         if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
-            match self.poll_allocation(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(self.poll_allocation(cx))?;
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
         if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
-            match self.poll_allocation(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(self.poll_allocation(cx))?;
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_shutdown(cx)
     }
@@ -641,23 +591,15 @@ impl AsyncSeek for AsyncServerFile {
             self.start_allocation();
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).start_seek(position)
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         let result = Pin::new(file).poll_complete(cx);
 
@@ -675,9 +617,7 @@ impl AsyncRead for AsyncServerFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_read(cx, buf)
     }

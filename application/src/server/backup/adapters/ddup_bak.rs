@@ -21,7 +21,6 @@ use crate::{
     },
     utils::PortablePermissions,
 };
-use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
 use ignore::WalkBuilder;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
@@ -199,15 +198,7 @@ impl DdupBakBackup {
                 let mtime: chrono::DateTime<chrono::Utc> = chrono::DateTime::from(entry.mtime());
 
                 options = options.last_modified_time(
-                    zip::DateTime::from_date_and_time(
-                        mtime.year() as u16,
-                        mtime.month() as u8,
-                        mtime.day() as u8,
-                        mtime.hour() as u8,
-                        mtime.minute() as u8,
-                        mtime.second() as u8,
-                    )
-                    .unwrap_or_default(),
+                    crate::server::filesystem::archive::zip_datetime(mtime).unwrap_or_default(),
                 );
             }
 
@@ -321,13 +312,6 @@ impl DdupBakBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for DdupBakBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let repository = get_repository(&state.config).await?;
-        let path = repository.archive_path(&uuid.to_string())?;
-
-        Ok(tokio::fs::metadata(&path).await.is_ok())
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,

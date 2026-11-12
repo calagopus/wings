@@ -140,38 +140,20 @@ mod post {
             .await?;
 
         if data.foreground {
-            match task.await {
-                Ok(Some(Ok(()))) => {}
-                Ok(None) => {
-                    return ApiResponse::error("archive decompression aborted by another source")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Ok(Some(Err(err))) => {
+            crate::routes::await_operation(
+                task,
+                "archive decompression aborted by another source",
+                "failed to decompress archive",
+                |err| {
                     tracing::error!(
                         server = %server.uuid,
                         root = %root.display(),
                         "failed to decompress archive: {:#?}",
                         err,
-                    );
-
-                    return ApiResponse::error(&format!("failed to decompress archive: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        root = %root.display(),
-                        "failed to decompress archive: {:#?}",
-                        err,
-                    );
-
-                    return ApiResponse::error("failed to decompress archive")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            }
+                    )
+                },
+            )
+            .await?;
 
             ApiResponse::new_serialized(Response {}).ok()
         } else {

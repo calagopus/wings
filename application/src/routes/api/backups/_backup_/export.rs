@@ -196,40 +196,21 @@ mod post {
             .await?;
 
         if data.foreground {
-            match task.await {
-                Ok(Some(Ok(()))) => {}
-                Ok(None) => {
-                    return ApiResponse::error("backup export aborted by another source")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Ok(Some(Err(err))) => {
+            crate::routes::await_operation(
+                task,
+                "backup export aborted by another source",
+                "failed to export backup",
+                |err| {
                     tracing::error!(
                         server = %server.uuid,
                         backup = %backup_id,
                         destination = %destination_path.display(),
                         "failed to export backup: {:#?}",
                         err,
-                    );
-
-                    return ApiResponse::error(&format!("failed to export backup: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        backup = %backup_id,
-                        destination = %destination_path.display(),
-                        "failed to export backup: {:#?}",
-                        err,
-                    );
-
-                    return ApiResponse::error("failed to export backup")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            }
+                    )
+                },
+            )
+            .await?;
 
             ApiResponse::new_serialized(
                 destination_filesystem

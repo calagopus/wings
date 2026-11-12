@@ -1,4 +1,4 @@
-use super::DockerCompatJsonExt;
+use super::DockerExt;
 use anyhow::Context;
 use std::{
     path::{Path, PathBuf},

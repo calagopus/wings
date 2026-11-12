@@ -375,10 +375,6 @@ impl BackupStreamExt for WingsBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for WingsBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        Ok(Self::get_first_file_name(&state.config, uuid).await.is_ok())
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
@@ -445,115 +441,38 @@ impl BackupCreateExt for WingsBackup {
                         .as_bytes(),
                 );
 
-                let file = match server
-                    .app_state
-                    .config
-                    .load()
-                    .system
-                    .backups
-                    .wings
-                    .archive_format
-                {
-                    ArchiveFormat::Tar
-                    | ArchiveFormat::TarGz
-                    | ArchiveFormat::TarXz
-                    | ArchiveFormat::TarLzip
-                    | ArchiveFormat::TarBz2
-                    | ArchiveFormat::TarLz4
-                    | ArchiveFormat::TarZstd => {
-                        crate::server::filesystem::archive::create::create_tar(
-                            server.filesystem.clone(),
-                            writer,
-                            Path::new(""),
-                            sources,
-                            progress.clone(),
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::CreateTarOptions {
-                                compression_type: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .wings
-                                    .archive_format
-                                    .compression_format(),
-                                compression_level: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .compression_level,
-                                threads: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .wings
-                                    .create_threads,
-                            },
-                        )
-                        .await
-                    }
-                    ArchiveFormat::Zip => {
-                        crate::server::filesystem::archive::create::create_zip(
-                            server.filesystem.clone(),
-                            writer,
-                            Path::new(""),
-                            sources,
-                            progress.clone(),
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::CreateZipOptions {
-                                compression_level: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .compression_level,
-                                threads: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .wings
-                                    .create_threads,
-                            },
-                        )
-                        .await
-                    }
-                    ArchiveFormat::SevenZip => {
-                        crate::server::filesystem::archive::create::create_7z(
-                            server.filesystem.clone(),
-                            writer,
-                            Path::new(""),
-                            sources,
-                            progress.clone(),
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::Create7zOptions {
-                                compression_level: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .compression_level,
-                                threads: server
-                                    .app_state
-                                    .config
-                                    .load()
-                                    .system
-                                    .backups
-                                    .wings
-                                    .create_threads,
-                            },
-                        )
-                        .await
-                    }
-                }?;
+                let file = crate::server::filesystem::archive::create::create_archive(
+                    server
+                        .app_state
+                        .config
+                        .load()
+                        .system
+                        .backups
+                        .wings
+                        .archive_format,
+                    server.filesystem.clone(),
+                    writer,
+                    Path::new(""),
+                    sources,
+                    progress.clone(),
+                    ignore.into(),
+                    server
+                        .app_state
+                        .config
+                        .load()
+                        .system
+                        .backups
+                        .compression_level,
+                    server
+                        .app_state
+                        .config
+                        .load()
+                        .system
+                        .backups
+                        .wings
+                        .create_threads,
+                )
+                .await?;
 
                 tokio::task::spawn_blocking(move || file.into_inner().sync_all()).await??;
 

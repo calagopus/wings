@@ -573,6 +573,7 @@ impl Server {
                             tokio::spawn(async move {
                                 if let Err(err) = server_clone
                                     .stop_with_kill_timeout(
+                                        None,
                                         std::time::Duration::from_secs(30),
                                         false,
                                     )
@@ -1596,7 +1597,7 @@ impl Server {
                 server.restarting.store(true, Ordering::SeqCst);
 
                 if server.state.get_state() != state::ServerState::Stopping
-                    && let Err(err) = server.stop(None, true).await
+                    && let Err(err) = server.stop(aquire_timeout, true).await
                 {
                     server.restarting.store(false, Ordering::SeqCst);
 
@@ -1630,6 +1631,7 @@ impl Server {
 
     pub async fn stop_with_kill_timeout(
         &self,
+        aquire_timeout: Option<std::time::Duration>,
         timeout: std::time::Duration,
         skip_schedules: bool,
     ) -> Result<(), anyhow::Error> {
@@ -1648,7 +1650,7 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             if server.state.get_state() != state::ServerState::Stopping {
-                server.stop(None, skip_schedules).await?;
+                server.stop(aquire_timeout, skip_schedules).await?;
             }
 
             if server
@@ -1685,7 +1687,8 @@ impl Server {
         match (action, kill_timeout) {
             (ServerPowerAction::Start, _) => self.start(aquire_timeout, false).await,
             (ServerPowerAction::Stop, Some(timeout)) => {
-                self.stop_with_kill_timeout(timeout, false).await
+                self.stop_with_kill_timeout(aquire_timeout, timeout, false)
+                    .await
             }
             (ServerPowerAction::Stop, None) => self.stop(aquire_timeout, false).await,
             (ServerPowerAction::Restart, Some(timeout)) => {

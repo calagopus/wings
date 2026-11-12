@@ -102,8 +102,6 @@ async fn fingerprint(
     filesystem: &crate::server::filesystem::cap::CapFilesystem,
     path: &Path,
 ) -> Result<Option<Fingerprint>, std::io::Error> {
-    use cap_std::fs::MetadataExt;
-
     let metadata = match filesystem.async_metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -114,10 +112,25 @@ async fn fingerprint(
         return Ok(None);
     }
 
+    #[cfg(unix)]
+    let (ino, mtime, mtime_nsec) = {
+        use cap_std::fs::MetadataExt;
+
+        (metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (ino, mtime, mtime_nsec) = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or((0, 0, 0), |duration| {
+            (0, duration.as_secs() as i64, duration.subsec_nanos() as i64)
+        });
+
     Ok(Some(Fingerprint {
-        ino: metadata.ino(),
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
+        ino,
+        mtime,
+        mtime_nsec,
         size: metadata.len(),
     }))
 }

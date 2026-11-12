@@ -25,7 +25,6 @@ use crate::{
     },
     utils::{CmpExt, PortablePermissions},
 };
-use chrono::{Datelike, Timelike};
 use compact_str::CompactString;
 use serde::Deserialize;
 use sha2::Digest;
@@ -359,31 +358,6 @@ impl KopiaBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for KopiaBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let remote = match state.config.client.backup_kopia_configuration(uuid).await {
-            Ok(remote) => remote,
-            Err(err) => {
-                super::log_configuration_error("kopia", uuid, &err);
-                return Ok(false);
-            }
-        };
-
-        let config_file = Self::get_config_file_path(&state.config, &remote);
-        let cache_dir = Self::get_cache_dir_path(&state.config, &remote);
-
-        if Self::ensure_connected(&config_file, &cache_dir, &remote)
-            .await
-            .is_err()
-        {
-            return Ok(false);
-        }
-
-        Ok(Self::find_snapshot(&config_file, &remote, uuid)
-            .await
-            .unwrap_or(None)
-            .is_some())
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
@@ -879,16 +853,10 @@ impl BackupExt for KopiaBackup {
                                 .large_file(size >= u32::MAX as u64);
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match header.entry_type() {
@@ -2088,16 +2056,10 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
 
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match file_type {

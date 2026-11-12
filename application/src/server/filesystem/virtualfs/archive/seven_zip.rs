@@ -21,7 +21,6 @@ use crate::{
     },
     utils::{CmpExt, PortablePermissions},
 };
-use chrono::{Datelike, Timelike};
 use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use std::{
@@ -1220,14 +1219,9 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                                 std::time::SystemTime::from(entry.last_modified_date),
                             );
 
-                            if let Ok(mtime) = zip::DateTime::from_date_and_time(
-                                mtime.year() as u16,
-                                mtime.month() as u8,
-                                mtime.day() as u8,
-                                mtime.hour() as u8,
-                                mtime.minute() as u8,
-                                mtime.second() as u8,
-                            ) {
+                            if let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
+                            {
                                 zip_options = zip_options.last_modified_time(mtime);
                             }
                         }

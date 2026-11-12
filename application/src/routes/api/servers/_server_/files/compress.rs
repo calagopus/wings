@@ -115,153 +115,85 @@ mod post {
         let total = Arc::new(AtomicU64::new(0));
         let files_processed = Arc::new(AtomicU64::new(0));
 
-        let (identifier, task) =
-            server
-                .filesystem
-                .operations
-                .add_operation(
-                    crate::server::filesystem::operations::FilesystemOperation::Compress {
-                        path: PathBuf::from(&data.root),
-                        files: data.files.iter().map(PathBuf::from).collect(),
-                        destination_path: PathBuf::from(&data.root).join(archive_name),
-                        start_time: chrono::Utc::now(),
-                        bytes_processed: progress.clone(),
-                        bytes_total: total.clone(),
-                        files_processed: files_processed.clone(),
-                    },
-                    {
-                        let root = root.clone();
-                        let server = server.0.clone();
-                        let filesystem = filesystem.clone();
-                        let destination_path = destination_path.clone();
-                        let destination_filesystem = destination_filesystem.clone();
+        let (identifier, task) = server
+            .filesystem
+            .operations
+            .add_operation(
+                crate::server::filesystem::operations::FilesystemOperation::Compress {
+                    path: PathBuf::from(&data.root),
+                    files: data.files.iter().map(PathBuf::from).collect(),
+                    destination_path: PathBuf::from(&data.root).join(archive_name),
+                    start_time: chrono::Utc::now(),
+                    bytes_processed: progress.clone(),
+                    bytes_total: total.clone(),
+                    files_processed: files_processed.clone(),
+                },
+                {
+                    let root = root.clone();
+                    let server = server.0.clone();
+                    let filesystem = filesystem.clone();
+                    let destination_path = destination_path.clone();
+                    let destination_filesystem = destination_filesystem.clone();
 
-                        async move {
-                            let mut ignored: IsIgnoredFn =
-                                server.filesystem.get_ignored().into();
-                            if let Some(request_ignored) = request_ignored {
-                                ignored = ignored.merge(request_ignored);
-                            }
-                            if let Some(excluded_destination) = excluded_destination {
-                                ignored = ignored.excluding(excluded_destination);
-                            }
-
-                            let writer = tokio::task::spawn_blocking(move || {
-                                destination_filesystem.create_seekable_file(&destination_path)
-                            })
-                            .await??;
-
-                            let total_size = crate::server::filesystem::virtualfs::total_size(
-                                filesystem.clone(),
-                                data.files.iter().map(|file| root.join(file)).collect(),
-                            )
-                            .await?;
-
-                            total.store(total_size, std::sync::atomic::Ordering::Relaxed);
-
-                            match data.format {
-                            ArchiveFormat::Tar
-                            | ArchiveFormat::TarGz
-                            | ArchiveFormat::TarXz
-                            | ArchiveFormat::TarLzip
-                            | ArchiveFormat::TarBz2
-                            | ArchiveFormat::TarLz4
-                            | ArchiveFormat::TarZstd => {
-                                crate::server::filesystem::archive::create::create_tar(
-                                    server.filesystem.clone(),
-                                    writer,
-                                    &root,
-                                    data.files,
-                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored,
-                                    crate::server::filesystem::archive::create::CreateTarOptions {
-                                        compression_type: data.format.compression_format(),
-                                        compression_level: state.config.load()
-                                            .system
-                                            .backups
-                                            .compression_level,
-                                        threads: state.config.load().api.file_compression_threads,
-                                    },
-                                )
-                                .await
-                            }
-                            ArchiveFormat::Zip => {
-                                crate::server::filesystem::archive::create::create_zip(
-                                    server.filesystem.clone(),
-                                    writer,
-                                    &root,
-                                    data.files,
-                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored,
-                                    crate::server::filesystem::archive::create::CreateZipOptions {
-                                        compression_level: state.config.load()
-                                            .system
-                                            .backups
-                                            .compression_level,
-                                        threads: state.config.load().api.file_compression_threads,
-                                    },
-                                )
-                                .await
-                            }
-                            ArchiveFormat::SevenZip => {
-                                crate::server::filesystem::archive::create::create_7z(
-                                    server.filesystem.clone(),
-                                    writer,
-                                    &root,
-                                    data.files,
-                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored,
-                                    crate::server::filesystem::archive::create::Create7zOptions {
-                                        compression_level: state.config.load()
-                                            .system
-                                            .backups
-                                            .compression_level,
-                                        threads: state.config.load().api.file_compression_threads,
-                                    },
-                                )
-                                .await
-                            }
-                        }?;
-
-                            Ok(())
+                    async move {
+                        let mut ignored: IsIgnoredFn = server.filesystem.get_ignored().into();
+                        if let Some(request_ignored) = request_ignored {
+                            ignored = ignored.merge(request_ignored);
                         }
-                    },
-                )
-                .await?;
+                        if let Some(excluded_destination) = excluded_destination {
+                            ignored = ignored.excluding(excluded_destination);
+                        }
+
+                        let writer = tokio::task::spawn_blocking(move || {
+                            destination_filesystem.create_seekable_file(&destination_path)
+                        })
+                        .await??;
+
+                        let total_size = crate::server::filesystem::virtualfs::total_size(
+                            filesystem.clone(),
+                            data.files.iter().map(|file| root.join(file)).collect(),
+                        )
+                        .await?;
+
+                        total.store(total_size, std::sync::atomic::Ordering::Relaxed);
+
+                        crate::server::filesystem::archive::create::create_archive(
+                            data.format,
+                            server.filesystem.clone(),
+                            writer,
+                            &root,
+                            data.files,
+                            crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                progress,
+                                files_processed,
+                            ),
+                            ignored,
+                            state.config.load().system.backups.compression_level,
+                            state.config.load().api.file_compression_threads,
+                        )
+                        .await?;
+
+                        Ok(())
+                    }
+                },
+            )
+            .await?;
 
         if data.foreground {
-            match task.await {
-                Ok(Some(Ok(()))) => {}
-                Ok(None) => {
-                    return ApiResponse::error("archive compression aborted by another source")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Ok(Some(Err(err))) => {
+            crate::routes::await_operation(
+                task,
+                "archive compression aborted by another source",
+                "failed to compress files",
+                |err| {
                     tracing::error!(
                         server = %server.uuid,
                         root = %root.display(),
                         "failed to compress files: {:#?}",
                         err,
-                    );
-
-                    return ApiResponse::error(&format!("failed to compress files: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        root = %root.display(),
-                        "failed to compress files: {:#?}",
-                        err,
-                    );
-
-                    return ApiResponse::error("failed to compress files")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            }
+                    )
+                },
+            )
+            .await?;
 
             ApiResponse::new_serialized(
                 destination_filesystem

@@ -6,6 +6,7 @@ use std::{
 };
 use utoipa::ToSchema;
 
+pub mod controller;
 pub mod iptables;
 pub mod nftables;
 pub mod noop;

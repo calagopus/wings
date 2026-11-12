@@ -1,4 +1,5 @@
 use crate::{io::compression::CompressionType, server::filesystem::cap::FileType};
+use chrono::{Datelike, Timelike};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -268,6 +269,21 @@ impl StreamableArchiveFormat {
                 | StreamableArchiveFormat::ItafZstd
         )
     }
+}
+
+/// The zip (DOS) timestamp for `time`, or `None` when it falls outside 1980..=2107.
+pub fn zip_datetime(time: impl Into<chrono::DateTime<chrono::Utc>>) -> Option<zip::DateTime> {
+    let time = time.into();
+
+    zip::DateTime::from_date_and_time(
+        u16::try_from(time.year()).ok()?,
+        time.month() as u8,
+        time.day() as u8,
+        time.hour() as u8,
+        time.minute() as u8,
+        time.second() as u8,
+    )
+    .ok()
 }
 
 pub fn zip_entry_get_modified_time(
@@ -781,6 +797,55 @@ impl Archive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // zip_datetime
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, s)
+            .unwrap()
+            .and_utc()
+    }
+
+    #[test]
+    fn zip_datetime_accepts_the_dos_range_bounds() {
+        let first = zip_datetime(utc(1980, 1, 1, 0, 0, 0)).unwrap();
+        assert_eq!(
+            (
+                first.year(),
+                first.month(),
+                first.day(),
+                first.hour(),
+                first.minute(),
+                first.second()
+            ),
+            (1980, 1, 1, 0, 0, 0)
+        );
+
+        let last = zip_datetime(utc(2107, 12, 31, 23, 59, 58)).unwrap();
+        assert_eq!(
+            (
+                last.year(),
+                last.month(),
+                last.day(),
+                last.hour(),
+                last.minute(),
+                last.second()
+            ),
+            (2107, 12, 31, 23, 59, 58)
+        );
+    }
+
+    #[test]
+    fn zip_datetime_rejects_times_outside_the_dos_range() {
+        assert!(zip_datetime(utc(1979, 12, 31, 23, 59, 59)).is_none());
+        assert!(zip_datetime(utc(2108, 1, 1, 0, 0, 0)).is_none());
+        assert!(zip_datetime(std::time::SystemTime::UNIX_EPOCH).is_none());
+        // 67536 as u16 == 2000
+        assert!(zip_datetime(utc(67536, 1, 1, 0, 0, 0)).is_none());
+        assert!(zip_datetime(utc(-1, 1, 1, 0, 0, 0)).is_none());
+    }
 
     // zip_entry_read_symlink_target
 

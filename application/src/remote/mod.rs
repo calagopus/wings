@@ -1,9 +1,5 @@
-use crate::server::{
-    activity::ApiActivity, permissions::Permissions, schedule::ApiScheduleCompletionStatus,
-};
-use client::Client;
+use crate::server::permissions::Permissions;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
 
 pub mod backups;
 pub mod client;
@@ -89,6 +85,22 @@ impl ResponseExt for reqwest::Response {
     }
 }
 
+pub trait RequestBuilderExt: Sized {
+    async fn send_remote(self) -> Result<reqwest::Response, anyhow::Error>;
+
+    async fn send_remote_json<T: DeserializeOwned>(self) -> Result<T, anyhow::Error>;
+}
+
+impl RequestBuilderExt for reqwest::RequestBuilder {
+    async fn send_remote(self) -> Result<reqwest::Response, anyhow::Error> {
+        self.send().await?.error_for_remote_status().await
+    }
+
+    async fn send_remote_json<T: DeserializeOwned>(self) -> Result<T, anyhow::Error> {
+        into_json(self.send_remote().await?.text().await?)
+    }
+}
+
 #[derive(Deserialize, Serialize, Default)]
 pub struct Pagination {
     current_page: usize,
@@ -115,30 +127,6 @@ pub struct SftpAuth {
     pub as_of: Option<i64>,
 }
 
-pub async fn get_sftp_auth(
-    client: &Client,
-    r#type: AuthenticationType,
-    username: &str,
-    password: &str,
-) -> Result<SftpAuth, anyhow::Error> {
-    into_json(
-        client
-            .client
-            .post(format!("{}/sftp/auth", client.url))
-            .json(&json!({
-                "type": r#type,
-                "username": username,
-                "password": password,
-            }))
-            .send()
-            .await?
-            .error_for_remote_status()
-            .await?
-            .text()
-            .await?,
-    )
-}
-
 #[derive(Deserialize)]
 pub struct UserServerPermissions {
     pub user: uuid::Uuid,
@@ -153,75 +141,4 @@ pub struct UserServerPermissions {
 pub struct PermissionsBatch {
     pub as_of: i64,
     pub entries: Vec<UserServerPermissions>,
-}
-
-pub async fn get_permissions(
-    client: &Client,
-    entries: &[(uuid::Uuid, uuid::Uuid)],
-) -> Result<PermissionsBatch, anyhow::Error> {
-    into_json(
-        client
-            .client
-            .post(format!("{}/permissions", client.url))
-            .json(&json!({
-                "entries": entries
-                    .iter()
-                    .map(|(server, user)| json!({ "server": server, "user": user }))
-                    .collect::<Vec<_>>(),
-            }))
-            .send()
-            .await?
-            .error_for_remote_status()
-            .await?
-            .text()
-            .await?,
-    )
-}
-
-pub async fn send_activity(
-    client: &Client,
-    activity: Vec<ApiActivity>,
-) -> Result<(), anyhow::Error> {
-    client
-        .client
-        .post(format!("{}/activity", client.url))
-        .json(&json!({
-            "data": activity,
-        }))
-        .send()
-        .await?
-        .error_for_remote_status()
-        .await?;
-
-    Ok(())
-}
-
-pub async fn send_schedule_status(
-    client: &Client,
-    schedules: Vec<ApiScheduleCompletionStatus>,
-) -> Result<(), anyhow::Error> {
-    client
-        .client
-        .post(format!("{}/schedule", client.url))
-        .json(&json!({
-            "data": schedules,
-        }))
-        .send()
-        .await?
-        .error_for_remote_status()
-        .await?;
-
-    Ok(())
-}
-
-pub async fn reset_state(client: &Client) -> Result<(), anyhow::Error> {
-    client
-        .client
-        .post(format!("{}/servers/reset", client.url))
-        .send()
-        .await?
-        .error_for_remote_status()
-        .await?;
-
-    Ok(())
 }

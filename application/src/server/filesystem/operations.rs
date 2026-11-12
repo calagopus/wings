@@ -162,6 +162,31 @@ type OperationHandle<T> = (
     tokio::task::JoinHandle<Option<Result<T, anyhow::Error>>>,
 );
 
+/// Waits for an operation task started in the foreground. `log` receives the
+/// operation or join error; the returned message is `aborted` when the operation
+/// was aborted, `"{failed}: {err}"` when it failed and `failed` when the task panicked.
+pub async fn await_operation<T>(
+    task: tokio::task::JoinHandle<Option<Result<T, anyhow::Error>>>,
+    aborted: &'static str,
+    failed: &'static str,
+    log: impl FnOnce(&dyn std::fmt::Debug),
+) -> Result<T, std::borrow::Cow<'static, str>> {
+    match task.await {
+        Ok(Some(Ok(value))) => Ok(value),
+        Ok(None) => Err(aborted.into()),
+        Ok(Some(Err(err))) => {
+            log(&err);
+
+            Err(format!("{failed}: {err}").into())
+        }
+        Err(err) => {
+            log(&err);
+
+            Err(failed.into())
+        }
+    }
+}
+
 pub struct OperationManager {
     operations: Arc<RwLock<HashMap<uuid::Uuid, Operation>>>,
     sender: tokio::sync::broadcast::Sender<crate::server::websocket::WebsocketMessage>,

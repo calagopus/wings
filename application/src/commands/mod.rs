@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use clap::{Arg, ArgMatches, Args, Command};
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
@@ -18,6 +16,7 @@ pub type ExecutorFunc = dyn Fn(
 
 pub enum CommandMapEntry {
     Command(Box<ExecutorFunc>),
+    #[allow(dead_code)]
     Group(HashMap<&'static str, CommandMapEntry>),
 }
 
@@ -116,6 +115,7 @@ impl CliCommandGroupBuilder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn add_group<F: FnOnce(CliCommandGroupBuilder) -> CliCommandGroupBuilder>(
         mut self,
         name: &'static str,

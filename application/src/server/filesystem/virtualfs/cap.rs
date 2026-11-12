@@ -12,10 +12,7 @@ use crate::{
         archive::StreamableArchiveFormat,
         cap::ListingDir,
         listing::{ListingWork, check_aborted},
-        virtualfs::{
-            AsyncReadableWritableSeekableFileStream, DirectoryWalk,
-            ReadableWritableSeekableFileStream,
-        },
+        virtualfs::{AsyncReadableWritableSeekableFileStream, DirectoryWalk},
     },
     utils::{CmpExt, PortablePermissions, PortablePermissionsApplier},
 };
@@ -1479,15 +1476,6 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         Ok(())
     }
 
-    fn remove_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
-        let path = self.check_write(FileType::Dir, path.as_ref(), false)?;
-
-        let file_delete_threads = self.server.app_state.config.load().api.file_delete_threads;
-        self.inner.remove_dir_all(path, file_delete_threads)?;
-
-        Ok(())
-    }
-
     async fn async_remove_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1504,13 +1492,6 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         Ok(())
     }
 
-    fn remove_file(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
-        let path = self.check_write(FileType::File, path.as_ref(), false)?;
-
-        self.inner.remove_file(path)?;
-
-        Ok(())
-    }
     async fn async_remove_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1728,31 +1709,6 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             Ok(Box::new(file))
         }
     }
-    fn open_file_with_options(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        options: cap_std::fs::OpenOptions,
-    ) -> Result<ReadableWritableSeekableFileStream, anyhow::Error> {
-        let path = self.check_write(FileType::File, path.as_ref(), true)?;
-
-        let file = self.inner.open_with(&path, options)?;
-        self.check_opened(&path, &file)?;
-
-        if self.is_primary_server_fs {
-            self.server.filesystem.chown_file(&file)?;
-            let file = crate::server::filesystem::file::ServerFile::new_file(
-                self.server.clone(),
-                &path,
-                file,
-                0,
-            )?
-            .ignorant_if(self.ignore_quota);
-
-            Ok(Box::new(file))
-        } else {
-            Ok(Box::new(file))
-        }
-    }
     async fn async_open_file_with_options(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1830,37 +1786,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
 
         Ok(())
     }
-    async fn async_set_times(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
-        modification_time: std::time::SystemTime,
-        access_time: Option<std::time::SystemTime>,
-    ) -> Result<(), anyhow::Error> {
-        let path = self
-            .async_check_write(file_type, path.as_ref(), !file_type.is_symlink())
-            .await?;
 
-        self.inner
-            .async_set_times(path, modification_time, access_time)
-            .await?;
-
-        Ok(())
-    }
-
-    fn rename(
-        &self,
-        from: &(dyn AsRef<Path> + Send + Sync),
-        to: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
-    ) -> Result<(), anyhow::Error> {
-        let from = self.check_write(file_type, from.as_ref(), false)?;
-        let to = self.check_write(file_type, to.as_ref(), false)?;
-
-        self.inner.rename(from, &self.inner, to)?;
-
-        Ok(())
-    }
     async fn async_rename(
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),

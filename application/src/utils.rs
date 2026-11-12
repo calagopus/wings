@@ -385,6 +385,12 @@ impl PortablePermissions {
         self.mode
     }
 
+    #[cfg(not(unix))]
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.mode & 0o200 == 0
+    }
+
     /// Whether creating something with this mode through a mode-taking syscall (e.g. `mkdirat`)
     /// may lose bits to the process umask, meaning a follow-up chmod is required.
     /// The umask is read once from `/proc/self/status`; if unavailable this is always `true`.

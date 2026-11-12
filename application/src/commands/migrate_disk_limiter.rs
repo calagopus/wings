@@ -1,9 +1,14 @@
+#[cfg(unix)]
 use crate::server::filesystem::{cap::CapFilesystem, limiter::DiskLimiterExt};
 use clap::{Args, FromArgMatches};
 use colored::Colorize;
+#[cfg(unix)]
 use dialoguer::{Confirm, theme::ColorfulTheme};
-use std::{path::Path, sync::Arc};
+#[cfg(unix)]
+use std::path::Path;
+use std::sync::Arc;
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetMode {
     BtrfsSubvolume,
@@ -58,191 +63,202 @@ impl crate::commands::CliCommand<MigrateDiskLimiterArgs> for MigrateDiskLimiterC
                     }
                 };
 
-                let mode = match args.mode.as_deref() {
-                    Some("btrfs-subvolume" | "btrfs") => TargetMode::BtrfsSubvolume,
-                    Some("zfs-dataset" | "zfs") => TargetMode::ZfsDataset,
-                    Some(_) => {
-                        eprintln!(
-                            "{}",
-                            "invalid --mode, expected 'btrfs-subvolume' or 'zfs-dataset'".red()
-                        );
-                        return Ok(1);
-                    }
-                    None => match config.load().system.disk_limiter_mode {
-                        crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume => {
-                            TargetMode::BtrfsSubvolume
-                        }
-                        crate::server::filesystem::limiter::DiskLimiterMode::ZfsDataset => {
-                            TargetMode::ZfsDataset
-                        }
-                        _ => {
-                            eprintln!(
-                                "{}",
-                                "the configured disk_limiter_mode is not btrfs_subvolume or zfs_dataset; pass --mode explicitly".red()
-                            );
-                            return Ok(1);
-                        }
-                    },
-                };
-
-                if !args.yes {
-                    println!(
-                        "{}",
-                        "the wings daemon must be stopped before migrating disk limiters, otherwise running servers may lose data.".yellow()
-                    );
-
-                    let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                        .with_prompt("is the wings daemon stopped and do you want to continue?")
-                        .default(false)
-                        .interact()?;
-
-                    if !confirm {
-                        return Ok(1);
-                    }
-                }
-
-                let raw_servers = match config.client.servers().await {
-                    Ok(servers) => servers,
-                    Err(err) => {
-                        eprintln!(
-                            "{} {:#?}",
-                            "failed to fetch servers from remote:".red(),
-                            err
-                        );
-                        return Ok(1);
-                    }
-                };
-
-                let app_state = Arc::new(crate::routes::AppState {
-                    start_time: std::time::Instant::now(),
-                    container_type: crate::routes::AppContainerType::None,
-                    version: crate::full_version(),
-
-                    config: Arc::clone(&config),
-                    executor: Arc::new(crate::server::executor::noop::NoopExecutor),
-                    stats_manager: Arc::new(crate::stats::StatsManager::default()),
-                    server_manager: Arc::new(crate::server::manager::ServerManager::new(
-                        &raw_servers,
-                    )),
-                    resource_history: Arc::new(
-                        crate::server::resource_history::ResourceHistory::new(&config),
-                    ),
-                    backup_manager: Arc::new(
-                        crate::server::backup::manager::BackupManager::default(),
-                    ),
-                    inotify_manager: Arc::new(
-                        crate::server::filesystem::inotify::InotifyManager::new(),
-                    ),
-                    websocket_limiter: Arc::new(
-                        crate::server::websocket::limiter::WebsocketLimiter::new(Arc::clone(
-                            &config,
-                        )),
-                    ),
-                    mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
-                        config.load().api.directory_entry_limit,
-                    )),
-                    fingerprint_cache: crate::routes::FingerprintCache::default(),
-                    listing_work: Arc::new(
-                        crate::server::filesystem::listing::ListingWork::default(),
-                    ),
-                    #[cfg(unix)]
-                    tundra: None,
-                });
-
-                let mut migrated = 0;
-                let mut skipped = 0;
-                let mut failed = 0;
-
-                for raw_server in raw_servers {
-                    let uuid = raw_server.settings.uuid;
-                    if !args.server.is_empty() && !args.server.contains(&uuid) {
-                        continue;
-                    }
-
-                    let disk_limit = raw_server.settings.build.disk_space * 1024 * 1024;
-                    let base_path = config.data_path(uuid);
-
-                    if tokio::fs::metadata(&base_path).await.is_err() {
-                        println!("{} {}", "skipping (no data directory):".dimmed(), uuid);
-                        skipped += 1;
-                        continue;
-                    }
-
-                    let already_migrated = match mode {
-                        TargetMode::BtrfsSubvolume => tokio::fs::metadata(&base_path)
-                            .await
-                            .map(|m| std::os::unix::fs::MetadataExt::ino(&m) == 256),
-                        TargetMode::ZfsDataset => tokio::process::Command::new("zfs")
-                            .arg("list")
-                            .arg("-H")
-                            .arg("-o")
-                            .arg("mountpoint")
-                            .arg(&base_path)
-                            .output()
-                            .await
-                            .map(|o| {
-                                o.status.success()
-                                    && Path::new(String::from_utf8_lossy(&o.stdout).trim())
-                                        == base_path
-                            }),
-                    };
-                    match already_migrated {
-                        Ok(true) => {
-                            println!("{} {}", "skipping (already migrated):".dimmed(), uuid);
-                            skipped += 1;
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            eprintln!("{} {}: {}", "failed to inspect, skipping:".red(), uuid, err);
-                            failed += 1;
-                            continue;
-                        }
-                    }
-
-                    if args.dry_run {
-                        println!("{} {} -> {:?}", "would migrate:".cyan(), uuid, mode);
-                        migrated += 1;
-                        continue;
-                    }
-
-                    let server = crate::server::Server::new(
-                        raw_server.settings,
-                        raw_server.process_configuration,
-                        app_state.clone(),
-                    );
-
-                    server.filesystem.disk_checker.abort();
-
-                    print!("{} {} ... ", "migrating".cyan(), uuid);
-
-                    match migrate_server(mode, &server.filesystem, &base_path, disk_limit).await {
-                        Ok(()) => {
-                            println!("{}", "done".green());
-                            migrated += 1;
-                        }
-                        Err(err) => {
-                            println!("{}", "failed".red());
-                            eprintln!("  {} {}", "error:".red(), err);
-                            failed += 1;
-                        }
-                    }
-                }
-
-                println!(
-                    "\n{} {} migrated, {} skipped, {} failed",
-                    "summary:".bold(),
-                    migrated,
-                    skipped,
-                    failed
-                );
-
-                Ok(if failed > 0 { 1 } else { 0 })
+                run(config, args).await
             })
         })
     }
 }
 
+#[cfg(unix)]
+async fn run(
+    config: Arc<crate::config::Config>,
+    args: MigrateDiskLimiterArgs,
+) -> Result<i32, anyhow::Error> {
+    let mode = match args.mode.as_deref() {
+        Some("btrfs-subvolume" | "btrfs") => TargetMode::BtrfsSubvolume,
+        Some("zfs-dataset" | "zfs") => TargetMode::ZfsDataset,
+        Some(_) => {
+            eprintln!(
+                "{}",
+                "invalid --mode, expected 'btrfs-subvolume' or 'zfs-dataset'".red()
+            );
+            return Ok(1);
+        }
+        None => match config.load().system.disk_limiter_mode {
+            crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume => {
+                TargetMode::BtrfsSubvolume
+            }
+            crate::server::filesystem::limiter::DiskLimiterMode::ZfsDataset => {
+                TargetMode::ZfsDataset
+            }
+            _ => {
+                eprintln!(
+                    "{}",
+                    "the configured disk_limiter_mode is not btrfs_subvolume or zfs_dataset; pass --mode explicitly".red()
+                );
+                return Ok(1);
+            }
+        },
+    };
+
+    if !args.yes {
+        println!(
+            "{}",
+            "the wings daemon must be stopped before migrating disk limiters, otherwise running servers may lose data.".yellow()
+        );
+
+        let confirm = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("is the wings daemon stopped and do you want to continue?")
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            return Ok(1);
+        }
+    }
+
+    let raw_servers = match config.client.servers().await {
+        Ok(servers) => servers,
+        Err(err) => {
+            eprintln!(
+                "{} {:#?}",
+                "failed to fetch servers from remote:".red(),
+                err
+            );
+            return Ok(1);
+        }
+    };
+
+    let app_state = Arc::new(crate::routes::AppState {
+        start_time: std::time::Instant::now(),
+        container_type: crate::routes::AppContainerType::None,
+        version: crate::full_version(),
+
+        config: Arc::clone(&config),
+        executor: Arc::new(crate::server::executor::noop::NoopExecutor),
+        stats_manager: Arc::new(crate::stats::StatsManager::default()),
+        server_manager: Arc::new(crate::server::manager::ServerManager::new(&raw_servers)),
+        resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
+            &config,
+        )),
+        backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
+        inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
+        websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
+            Arc::clone(&config),
+        )),
+        mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
+            config.load().api.directory_entry_limit,
+        )),
+        fingerprint_cache: crate::routes::FingerprintCache::default(),
+        listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
+        #[cfg(unix)]
+        tundra: None,
+    });
+
+    let mut migrated = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    for raw_server in raw_servers {
+        let uuid = raw_server.settings.uuid;
+        if !args.server.is_empty() && !args.server.contains(&uuid) {
+            continue;
+        }
+
+        let disk_limit = raw_server.settings.build.disk_space * 1024 * 1024;
+        let base_path = config.data_path(uuid);
+
+        if tokio::fs::metadata(&base_path).await.is_err() {
+            println!("{} {}", "skipping (no data directory):".dimmed(), uuid);
+            skipped += 1;
+            continue;
+        }
+
+        let already_migrated = match mode {
+            TargetMode::BtrfsSubvolume => tokio::fs::metadata(&base_path)
+                .await
+                .map(|m| std::os::unix::fs::MetadataExt::ino(&m) == 256),
+            TargetMode::ZfsDataset => tokio::process::Command::new("zfs")
+                .arg("list")
+                .arg("-H")
+                .arg("-o")
+                .arg("mountpoint")
+                .arg(&base_path)
+                .output()
+                .await
+                .map(|o| {
+                    o.status.success()
+                        && Path::new(String::from_utf8_lossy(&o.stdout).trim()) == base_path
+                }),
+        };
+        match already_migrated {
+            Ok(true) => {
+                println!("{} {}", "skipping (already migrated):".dimmed(), uuid);
+                skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("{} {}: {}", "failed to inspect, skipping:".red(), uuid, err);
+                failed += 1;
+                continue;
+            }
+        }
+
+        if args.dry_run {
+            println!("{} {} -> {:?}", "would migrate:".cyan(), uuid, mode);
+            migrated += 1;
+            continue;
+        }
+
+        let server = crate::server::Server::new(
+            raw_server.settings,
+            raw_server.process_configuration,
+            app_state.clone(),
+        );
+
+        server.filesystem.disk_checker.abort();
+
+        print!("{} {} ... ", "migrating".cyan(), uuid);
+
+        match migrate_server(mode, &server.filesystem, &base_path, disk_limit).await {
+            Ok(()) => {
+                println!("{}", "done".green());
+                migrated += 1;
+            }
+            Err(err) => {
+                println!("{}", "failed".red());
+                eprintln!("  {} {}", "error:".red(), err);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\n{} {} migrated, {} skipped, {} failed",
+        "summary:".bold(),
+        migrated,
+        skipped,
+        failed
+    );
+
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+#[cfg(not(unix))]
+async fn run(
+    _config: Arc<crate::config::Config>,
+    _args: MigrateDiskLimiterArgs,
+) -> Result<i32, anyhow::Error> {
+    eprintln!(
+        "{}",
+        "disk limiter migration is only supported on unix".red()
+    );
+
+    Ok(1)
+}
+
+#[cfg(unix)]
 async fn migrate_server(
     mode: TargetMode,
     filesystem: &crate::server::filesystem::Filesystem,
@@ -373,14 +389,4 @@ fn copy_tree(
     drop(guard);
 
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn copy_tree(
-    _source: &cap_std::fs::Dir,
-    _destination: &cap_std::fs::Dir,
-) -> Result<(), anyhow::Error> {
-    Err(anyhow::anyhow!(
-        "disk limiter migration is only supported on unix"
-    ))
 }

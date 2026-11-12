@@ -342,7 +342,7 @@ impl OutgoingServerTransfer {
         let old_task = self.task.replace(tokio::spawn(async move {
             if server.state.get_state() != super::state::ServerState::Offline
                 && let Err(err) = server
-                    .stop_with_kill_timeout(std::time::Duration::from_secs(15), true)
+                    .stop_with_kill_timeout(None, std::time::Duration::from_secs(15), true)
                     .await
             {
                 tracing::error!(

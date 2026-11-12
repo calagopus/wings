@@ -55,6 +55,14 @@ pub enum DiskLimiterMode {
 }
 
 impl DiskLimiterMode {
+    pub fn is_btrfs_subvolume(self) -> bool {
+        match self {
+            #[cfg(unix)]
+            DiskLimiterMode::BtrfsSubvolume => true,
+            _ => false,
+        }
+    }
+
     /// Whether this limiter reports the scanned usage of the volume. Limiters that read usage
     /// from the filesystem (quota groups, datasets) publish it themselves while their query
     /// succeeds, as compression and shared extents make it differ from the scanned size.

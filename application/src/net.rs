@@ -1,9 +1,5 @@
 use crate::io::SafeSliceExt;
-use hickory_resolver::{
-    TokioResolver,
-    config::LookupIpStrategy,
-    lookup_ip::{LookupIp, LookupIpIter},
-};
+use hickory_resolver::{TokioResolver, config::LookupIpStrategy};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::{
     net::SocketAddr,
@@ -75,51 +71,28 @@ impl Resolve for BlockedIpResolver {
 
         Box::pin(async move {
             let lookup = resolver.state.lookup_ip(name.as_str()).await?;
-            let addrs: Addrs = Box::new(SocketAddrs::new(
-                Arc::clone(&resolver.config),
-                resolver.selector,
-                resolver.context,
-                lookup,
-                |l| l.iter(),
-            ));
+            let BlockedIpResolver {
+                config,
+                selector,
+                context,
+                ..
+            } = resolver;
+            let addrs: Addrs = Box::new(
+                lookup
+                    .into_iter()
+                    .filter(move |ip| {
+                        let blocked = is_blocked_ip(selector(&config.load()), ip);
+                        if blocked {
+                            tracing::warn!("blocking internal IP address in {context}: {ip}");
+                        }
+
+                        !blocked
+                    })
+                    .map(|ip| SocketAddr::new(ip, 0)),
+            );
 
             Ok(addrs)
         })
-    }
-}
-
-#[ouroboros::self_referencing]
-struct SocketAddrs {
-    config: Arc<crate::config::Config>,
-    selector: fn(&crate::config::InnerConfig) -> &Vec<cidr::IpCidr>,
-    context: &'static str,
-    lookup: LookupIp,
-
-    #[borrows(mut lookup)]
-    #[covariant]
-    iter: LookupIpIter<'this>,
-}
-
-impl Iterator for SocketAddrs {
-    type Item = SocketAddr;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self
-            .with_iter_mut(|iter| iter.next())
-            .map(|ip_addr| SocketAddr::new(ip_addr, 0))?;
-
-        let config = self.borrow_config().load();
-        if is_blocked_ip((self.borrow_selector())(&config), &next.ip()) {
-            tracing::warn!(
-                "blocking internal IP address in {}: {}",
-                self.borrow_context(),
-                next.ip()
-            );
-
-            return self.next();
-        }
-
-        Some(next)
     }
 }
 

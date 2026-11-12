@@ -459,38 +459,20 @@ mod post {
                 .await;
 
             if data.foreground {
-                match destination_task.await {
-                    Ok(Some(Ok(()))) => {}
-                    Ok(None) => {
-                        return ApiResponse::error("copy process aborted by another source")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Ok(Some(Err(err))) => {
+                crate::routes::await_operation(
+                    destination_task,
+                    "copy process aborted by another source",
+                    "failed to copy to a remote",
+                    |err| {
                         tracing::error!(
                             server = %server.uuid,
                             root = %root.display(),
                             "failed to copy to a remote: {:#?}",
                             err,
-                        );
-
-                        return ApiResponse::error(&format!("failed to copy to a remote: {err}"))
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            root = %root.display(),
-                            "failed to copy to a remote: {:#?}",
-                            err,
-                        );
-
-                        return ApiResponse::error("failed to copy to a remote")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                }
+                        )
+                    },
+                )
+                .await?;
 
                 ApiResponse::new_serialized(Response { skipped }).ok()
             } else {
@@ -508,7 +490,7 @@ mod post {
                 .add_operation(
                     crate::server::filesystem::operations::FilesystemOperation::CopyRemote {
                         server: server.uuid,
-                        path: root.clone(),
+                        path: PathBuf::from(&data.root),
                         files: data.files.iter().map(|file| PathBuf::from(&file.from)).collect(),
                         destination_server: data.destination_server,
                         destination_path: PathBuf::from(data.destination_path),
@@ -637,38 +619,20 @@ mod post {
                 .await?;
 
             if data.foreground {
-                match task.await {
-                    Ok(Some(Ok(()))) => {}
-                    Ok(None) => {
-                        return ApiResponse::error("copy process aborted by another source")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Ok(Some(Err(err))) => {
+                crate::routes::await_operation(
+                    task,
+                    "copy process aborted by another source",
+                    "failed to copy to a remote",
+                    |err| {
                         tracing::error!(
                             server = %server.uuid,
                             root = %root.display(),
                             "failed to copy to a remote: {:#?}",
                             err,
-                        );
-
-                        return ApiResponse::error(&format!("failed to copy to a remote: {err}"))
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            root = %root.display(),
-                            "failed to copy to a remote: {:#?}",
-                            err,
-                        );
-
-                        return ApiResponse::error("failed to copy to a remote")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                }
+                        )
+                    },
+                )
+                .await?;
 
                 ApiResponse::new_serialized(Response { skipped }).ok()
             } else {

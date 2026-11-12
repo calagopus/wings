@@ -176,8 +176,6 @@ pub trait WriteSeek: Write + std::io::Seek {}
 impl<T: Write + std::io::Seek> WriteSeek for T {}
 pub trait AsyncWriteSeek: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin {}
 impl<T: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin> AsyncWriteSeek for T {}
-pub trait ReadWriteSeek: Read + Write + std::io::Seek {}
-impl<T: Read + Write + std::io::Seek> ReadWriteSeek for T {}
 pub trait AsyncReadWriteSeek:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin
 {

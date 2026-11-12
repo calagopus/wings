@@ -11,6 +11,8 @@ pub mod kopia;
 pub mod pbs;
 pub mod restic;
 pub mod s3;
+mod snapshot_dir;
+mod tree;
 pub mod wings;
 pub mod zfs;
 

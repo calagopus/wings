@@ -308,7 +308,6 @@ impl Backup {
 
 #[async_trait::async_trait]
 pub trait BackupFindExt {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error>;
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,

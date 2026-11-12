@@ -1,10 +1,23 @@
+use super::RequestBuilderExt;
 use crate::server::{
-    activity::ApiActivity, backup::adapters::BackupAdapter, installation::InstallationScript,
-    schedule::ApiScheduleCompletionStatus,
+    activity::ApiActivity,
+    backup::adapters::BackupAdapter,
+    installation::InstallationScript,
+    schedule::{ApiScheduleCompletionStatus, actions::ResolvedBackupSelector},
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fmt::Debug;
+
+#[derive(Serialize)]
+struct SelectorBody<'a, T> {
+    schedule_uuid: Option<uuid::Uuid>,
+    #[serde(flatten)]
+    selector: &'a ResolvedBackupSelector,
+    #[serde(flatten)]
+    extra: T,
+}
 
 pub struct Client {
     pub(super) config: crate::config::RemoteQuery,
@@ -134,10 +147,27 @@ impl Client {
         tracing::debug!("getting sftp auth");
 
         self.retry(
-            || super::get_sftp_auth(self, r#type, username, password),
+            || self.raw_get_sftp_auth(r#type, username, password),
             Self::retry_sftp_auth_errors,
         )
         .await
+    }
+
+    async fn raw_get_sftp_auth(
+        &self,
+        r#type: super::AuthenticationType,
+        username: &str,
+        password: &str,
+    ) -> Result<super::SftpAuth, anyhow::Error> {
+        self.client
+            .post(format!("{}/sftp/auth", self.url))
+            .json(&json!({
+                "type": r#type,
+                "username": username,
+                "password": password,
+            }))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self, entries))]
@@ -148,17 +178,41 @@ impl Client {
         tracing::debug!("getting permissions of {} users", entries.len());
 
         self.retry(
-            || super::get_permissions(self, entries),
+            || self.raw_get_permissions(entries),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_get_permissions(
+        &self,
+        entries: &[(uuid::Uuid, uuid::Uuid)],
+    ) -> Result<super::PermissionsBatch, anyhow::Error> {
+        self.client
+            .post(format!("{}/permissions", self.url))
+            .json(&json!({
+                "entries": entries
+                    .iter()
+                    .map(|(server, user)| json!({ "server": server, "user": user }))
+                    .collect::<Vec<_>>(),
+            }))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn send_activity(&self, activity: Vec<ApiActivity>) -> Result<(), anyhow::Error> {
         tracing::debug!("sending {} activity to remote", activity.len());
 
-        super::send_activity(self, activity).await
+        self.client
+            .post(format!("{}/activity", self.url))
+            .json(&json!({
+                "data": activity,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -168,15 +222,32 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::debug!("sending {} schedule status to remote", schedules.len());
 
-        super::send_schedule_status(self, schedules).await
+        self.client
+            .post(format!("{}/schedule", self.url))
+            .json(&json!({
+                "data": schedules,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn reset_state(&self) -> Result<(), anyhow::Error> {
         tracing::info!("resetting remote state");
 
-        self.retry(|| super::reset_state(self), Self::skip_client_errors)
+        self.retry(|| self.raw_reset_state(), Self::skip_client_errors)
             .await
+    }
+
+    async fn raw_reset_state(&self) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/servers/reset", self.url))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     pub async fn servers(&self) -> Result<Vec<super::servers::RawServer>, anyhow::Error> {
@@ -188,10 +259,7 @@ impl Client {
         loop {
             tracing::info!("fetching page {} of servers", page);
             let (new_servers, pagination) = self
-                .retry(
-                    || super::servers::get_servers_paged(self, page),
-                    Self::skip_client_errors,
-                )
+                .retry(|| self.raw_servers_page(page), Self::skip_client_errors)
                 .await?;
             servers.extend(new_servers);
 
@@ -207,15 +275,44 @@ impl Client {
         Ok(servers)
     }
 
+    async fn raw_servers_page(
+        &self,
+        page: usize,
+    ) -> Result<(Vec<super::servers::RawServer>, super::Pagination), anyhow::Error> {
+        let response: Response = self
+            .client
+            .get(format!(
+                "{}/servers?page={}&per_page={}",
+                self.url, page, self.config.boot_servers_per_page
+            ))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize, Default)]
+        struct Response {
+            data: Vec<super::servers::RawServer>,
+            meta: super::Pagination,
+        }
+
+        Ok((response.data, response.meta))
+    }
+
     pub async fn server(
         &self,
         uuid: uuid::Uuid,
     ) -> Result<super::servers::RawServer, anyhow::Error> {
-        self.retry(
-            || super::servers::get_server(self, uuid),
-            Self::skip_client_errors,
-        )
-        .await
+        self.retry(|| self.raw_server(uuid), Self::skip_client_errors)
+            .await
+    }
+
+    async fn raw_server(
+        &self,
+        uuid: uuid::Uuid,
+    ) -> Result<super::servers::RawServer, anyhow::Error> {
+        self.client
+            .get(format!("{}/servers/{}", self.url, uuid))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -226,10 +323,20 @@ impl Client {
         tracing::info!("fetching server install script");
 
         self.retry(
-            || super::servers::get_server_install_script(self, uuid),
+            || self.raw_server_install_script(uuid),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_server_install_script(
+        &self,
+        uuid: uuid::Uuid,
+    ) -> Result<InstallationScript, anyhow::Error> {
+        self.client
+            .get(format!("{}/servers/{}/install", self.url, uuid))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -242,10 +349,28 @@ impl Client {
         tracing::info!("setting server install status");
 
         self.retry(
-            || super::servers::set_server_install(self, uuid, successful, reinstalled),
+            || self.raw_set_server_install(uuid, successful, reinstalled),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_server_install(
+        &self,
+        uuid: uuid::Uuid,
+        successful: bool,
+        reinstalled: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/servers/{}/install", self.url, uuid))
+            .json(&json!({
+                "successful": successful,
+                "reinstall": reinstalled
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -258,10 +383,33 @@ impl Client {
         tracing::info!("setting server transfer status");
 
         self.retry(
-            || super::servers::set_server_transfer(self, uuid, successful, received_backups),
+            || self.raw_set_server_transfer(uuid, successful, received_backups),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_server_transfer(
+        &self,
+        uuid: uuid::Uuid,
+        successful: bool,
+        received_backups: &crate::server::backup::transfer::ReceivedBackups,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!(
+                "{}/servers/{}/transfer/{}",
+                self.url,
+                uuid,
+                if successful { "success" } else { "failure" }
+            ))
+            .json(&json!({
+                "backups": received_backups.uuids,
+                "backup_migrations": received_backups.migrations,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -274,7 +422,17 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("setting server startup variable");
 
-        super::servers::set_server_startup_variable(self, uuid, schedule, env_variable, value).await
+        self.client
+            .put(format!("{}/servers/{}/startup/variables", self.url, uuid))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "env_variable": env_variable,
+                "value": value,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -286,7 +444,16 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("setting server startup command");
 
-        super::servers::set_server_startup_command(self, uuid, schedule, command).await
+        self.client
+            .put(format!("{}/servers/{}/startup/command", self.url, uuid))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "command": command,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -298,7 +465,19 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("setting server startup docker image");
 
-        super::servers::set_server_startup_docker_image(self, uuid, schedule, image).await
+        self.client
+            .put(format!(
+                "{}/servers/{}/startup/docker-image",
+                self.url, uuid
+            ))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "image": image,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -310,10 +489,24 @@ impl Client {
         tracing::info!("setting backup status");
 
         self.retry(
-            || super::backups::set_backup_status(self, uuid, data),
+            || self.raw_set_backup_status(uuid, data),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_backup_status(
+        &self,
+        uuid: uuid::Uuid,
+        data: &super::backups::RawServerBackup,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/backups/{}", self.url, uuid))
+            .json(data)
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -325,10 +518,26 @@ impl Client {
         tracing::info!("setting backup deletion status");
 
         self.retry(
-            || super::backups::set_backup_deletion_status(self, uuid, successful),
+            || self.raw_set_backup_deletion_status(uuid, successful),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_backup_deletion_status(
+        &self,
+        uuid: uuid::Uuid,
+        successful: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/backups/{}/deletion", self.url, uuid))
+            .json(&json!({
+                "successful": successful,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -341,10 +550,28 @@ impl Client {
         tracing::info!("setting backup restore status");
 
         self.retry(
-            || super::backups::set_backup_restore_status(self, server, uuid, successful),
+            || self.raw_set_backup_restore_status(server, uuid, successful),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_backup_restore_status(
+        &self,
+        server: uuid::Uuid,
+        uuid: uuid::Uuid,
+        successful: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/backups/{}/restore", self.url, uuid))
+            .json(&json!({
+                "server_uuid": server,
+                "successful": successful,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -357,17 +584,28 @@ impl Client {
         tracing::info!("setting database backup restore status");
 
         self.retry(
-            || {
-                super::backups::set_database_backup_restore_status(
-                    self,
-                    uuid,
-                    database_instance,
-                    successful,
-                )
-            },
+            || self.raw_set_database_backup_restore_status(uuid, database_instance, successful),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_set_database_backup_restore_status(
+        &self,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+        successful: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .post(format!("{}/backups/{}/database/restore", self.url, uuid))
+            .json(&json!({
+                "database_instance": database_instance,
+                "successful": successful,
+            }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -378,7 +616,13 @@ impl Client {
     ) -> Result<reqwest::Response, anyhow::Error> {
         tracing::info!("opening database backup source stream");
 
-        super::backups::database_backup_source(self, uuid, database_instance).await
+        self.stream_client
+            .get(format!(
+                "{}/backups/{}/database/source?instance={}",
+                self.url, uuid, database_instance
+            ))
+            .send_remote()
+            .await
     }
 
     #[tracing::instrument(skip(self, body))]
@@ -390,7 +634,17 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("streaming database backup into restore target");
 
-        super::backups::database_backup_restore_target(self, uuid, database_instance, body).await
+        self.stream_client
+            .post(format!(
+                "{}/backups/{}/database/restore-target?instance={}",
+                self.url, uuid, database_instance
+            ))
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -404,15 +658,31 @@ impl Client {
     ) -> Result<(BackupAdapter, uuid::Uuid, compact_str::CompactString), anyhow::Error> {
         tracing::info!("creating database backup");
 
-        super::backups::create_database_backup(
-            self,
-            server,
-            schedule,
-            database_instance,
-            name,
-            backup_group,
-        )
-        .await
+        let response: Response = self
+            .client
+            .post(format!("{}/servers/{}/backups", self.url, server))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "name": name,
+                "backup_group_uuid": backup_group,
+                "database_instance_uuid": database_instance,
+                "ignored_files": [],
+            }))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            adapter: BackupAdapter,
+            uuid: uuid::Uuid,
+            extension: Option<compact_str::CompactString>,
+        }
+
+        let extension = response
+            .extension
+            .ok_or_else(|| anyhow::anyhow!("panel did not return a database dump extension"))?;
+
+        Ok((response.adapter, response.uuid, extension))
     }
 
     #[tracing::instrument(skip(self))]
@@ -424,10 +694,30 @@ impl Client {
         tracing::info!("getting backup upload urls");
 
         self.retry(
-            || super::backups::backup_upload_urls(self, uuid, size),
+            || self.raw_backup_upload_urls(uuid, size),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_backup_upload_urls(
+        &self,
+        uuid: uuid::Uuid,
+        size: u64,
+    ) -> Result<(u64, Vec<String>), anyhow::Error> {
+        let response: Response = self
+            .client
+            .get(format!("{}/backups/{}?size={}", self.url, uuid, size))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            parts: Vec<String>,
+            part_size: u64,
+        }
+
+        Ok((response.part_size, response.parts))
     }
 
     #[tracing::instrument(skip(self))]
@@ -439,10 +729,33 @@ impl Client {
         tracing::info!("getting backup S3 part URLs");
 
         self.retry(
-            || super::backups::backup_s3_part_urls(self, uuid, from_part),
+            || self.raw_backup_s3_part_urls(uuid, from_part),
             Self::skip_client_errors,
         )
         .await
+    }
+
+    async fn raw_backup_s3_part_urls(
+        &self,
+        uuid: uuid::Uuid,
+        from_part: usize,
+    ) -> Result<(u64, Vec<String>), anyhow::Error> {
+        let response: Response = self
+            .client
+            .get(format!(
+                "{}/backups/{}/s3/parts?from_part={}",
+                self.url, uuid, from_part
+            ))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            parts: Vec<String>,
+            part_size: u64,
+        }
+
+        Ok((response.part_size, response.parts))
     }
 
     #[tracing::instrument(skip(self))]
@@ -452,7 +765,10 @@ impl Client {
     ) -> Result<super::backups::ResticBackupConfiguration, anyhow::Error> {
         tracing::info!("getting restic backup configuration");
 
-        super::backups::backup_restic_configuration(self, uuid).await
+        self.client
+            .get(format!("{}/backups/{}/restic", self.url, uuid))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -462,7 +778,10 @@ impl Client {
     ) -> Result<super::backups::PbsBackupConfiguration, anyhow::Error> {
         tracing::info!("getting proxmox backup server backup configuration");
 
-        super::backups::backup_pbs_configuration(self, uuid).await
+        self.client
+            .get(format!("{}/backups/{}/pbs", self.url, uuid))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -472,7 +791,10 @@ impl Client {
     ) -> Result<super::backups::KopiaBackupConfiguration, anyhow::Error> {
         tracing::info!("getting kopia backup configuration");
 
-        super::backups::backup_kopia_configuration(self, uuid).await
+        self.client
+            .get(format!("{}/backups/{}/kopia", self.url, uuid))
+            .send_remote_json()
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -486,20 +808,33 @@ impl Client {
     ) -> Result<(BackupAdapter, uuid::Uuid), anyhow::Error> {
         tracing::info!("creating backup");
 
-        super::backups::create_backup(self, server, schedule, name, backup_group, ignored_files)
-            .await
+        let response: Response = self
+            .client
+            .post(format!("{}/servers/{}/backups", self.url, server))
+            .json(&json!({
+                "schedule_uuid": schedule,
+                "name": name,
+                "backup_group_uuid": backup_group,
+                "ignored_files": ignored_files,
+            }))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            adapter: BackupAdapter,
+            uuid: uuid::Uuid,
+        }
+
+        Ok((response.adapter, response.uuid))
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn restore_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
         truncate_directory: bool,
         restore_startup: bool,
     ) -> Result<
@@ -512,157 +847,199 @@ impl Client {
     > {
         tracing::info!("requesting backup restore");
 
-        super::backups::restore_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-            truncate_directory,
-            restore_startup,
-        )
-        .await
+        let response: Response = self
+            .client
+            .post(format!("{}/servers/{}/backups/restore", self.url, server))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: json!({
+                    "truncate_directory": truncate_directory,
+                    "restore_startup": restore_startup,
+                }),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            adapter: BackupAdapter,
+            uuid: uuid::Uuid,
+            download_url: Option<compact_str::CompactString>,
+        }
+
+        Ok((response.adapter, response.uuid, response.download_url))
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn restore_database_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
         source_database_instance: Option<uuid::Uuid>,
         database_instance: Option<uuid::Uuid>,
         request_uuid: uuid::Uuid,
     ) -> Result<(uuid::Uuid, uuid::Uuid), anyhow::Error> {
         tracing::info!("requesting database backup restore");
 
-        super::backups::restore_database_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-            source_database_instance,
-            database_instance,
-            request_uuid,
-        )
-        .await
+        let response: Response = self
+            .client
+            .post(format!(
+                "{}/servers/{}/backups/restore-database",
+                self.url, server
+            ))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: json!({
+                    "source_database_instance_uuid": source_database_instance,
+                    "database_instance_uuid": database_instance,
+                    "request_uuid": request_uuid,
+                }),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            uuid: uuid::Uuid,
+            database_instance_uuid: uuid::Uuid,
+            request_uuid: Option<uuid::Uuid>,
+        }
+
+        if response.request_uuid != Some(request_uuid) {
+            return Err(anyhow::anyhow!(
+                "panel does not support tracking database backup restore requests"
+            ));
+        }
+
+        Ok((response.uuid, response.database_instance_uuid))
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn delete_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         tracing::info!("requesting backup deletion");
 
-        super::backups::delete_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-        )
-        .await
+        let response: Response = self
+            .client
+            .delete(format!("{}/servers/{}/backups", self.url, server))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: (),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            uuid: uuid::Uuid,
+        }
+
+        Ok(response.uuid)
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn delete_database_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
         database_instance: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         tracing::info!("requesting database backup deletion");
 
-        super::backups::delete_database_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-            database_instance,
-        )
-        .await
+        let response: Response = self
+            .client
+            .delete(format!("{}/servers/{}/backups", self.url, server))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: json!({
+                    "kind": "database_instance",
+                    "database_instance_uuid": database_instance,
+                }),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            uuid: uuid::Uuid,
+        }
+
+        Ok(response.uuid)
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn move_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
         target_backup_group: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         tracing::info!("requesting backup move");
 
-        super::backups::move_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-            target_backup_group,
-        )
-        .await
+        let response: Response = self
+            .client
+            .patch(format!("{}/servers/{}/backups", self.url, server))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: json!({
+                    "target_backup_group_uuid": target_backup_group,
+                }),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            uuid: uuid::Uuid,
+        }
+
+        Ok(response.uuid)
     }
 
     #[tracing::instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub async fn move_database_backup(
         &self,
         server: uuid::Uuid,
         schedule: Option<uuid::Uuid>,
-        backup: Option<uuid::Uuid>,
-        backup_name: Option<&str>,
-        backup_group: Option<uuid::Uuid>,
-        oldest: bool,
+        selector: &ResolvedBackupSelector,
         target_backup_group: Option<uuid::Uuid>,
         database_instance: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         tracing::info!("requesting database backup move");
 
-        super::backups::move_database_backup(
-            self,
-            server,
-            schedule,
-            backup,
-            backup_name,
-            backup_group,
-            oldest,
-            target_backup_group,
-            database_instance,
-        )
-        .await
+        let response: Response = self
+            .client
+            .patch(format!("{}/servers/{}/backups", self.url, server))
+            .json(&SelectorBody {
+                schedule_uuid: schedule,
+                selector,
+                extra: json!({
+                    "target_backup_group_uuid": target_backup_group,
+                    "kind": "database_instance",
+                    "database_instance_uuid": database_instance,
+                }),
+            })
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            uuid: uuid::Uuid,
+        }
+
+        Ok(response.uuid)
     }
 
     #[cfg(unix)]
@@ -670,7 +1047,10 @@ impl Client {
     pub async fn tundra_state(&self) -> Result<super::tundra::TunnelState, anyhow::Error> {
         tracing::debug!("fetching tundra state");
 
-        super::tundra::get_state(self).await
+        self.client
+            .get(format!("{}/tunnel/state", self.url))
+            .send_remote_json()
+            .await
     }
 
     #[cfg(unix)]
@@ -681,7 +1061,13 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("publishing the tundra certificate digest");
 
-        super::tundra::store_cert(self, cert_sha256).await
+        self.client
+            .post(format!("{}/tunnel/cert", self.url))
+            .json(&json!({ "cert_sha256": cert_sha256 }))
+            .send_remote()
+            .await?;
+
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -689,6 +1075,20 @@ impl Client {
     pub async fn tundra_connect_token(&self, target: uuid::Uuid) -> Result<String, anyhow::Error> {
         tracing::debug!("requesting a tundra connect token");
 
-        super::tundra::get_connect_token(self, target).await
+        let response: Response = self
+            .client
+            .get(format!(
+                "{}/tunnel/connect-token?target={}",
+                self.url, target
+            ))
+            .send_remote_json()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            jwt: String,
+        }
+
+        Ok(response.jwt)
     }
 }

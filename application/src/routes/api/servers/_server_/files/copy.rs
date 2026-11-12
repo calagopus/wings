@@ -239,38 +239,20 @@ mod post {
             .await?;
 
         if data.foreground {
-            match task.await {
-                Ok(Some(Ok(()))) => {}
-                Ok(None) => {
-                    return ApiResponse::error("file copy aborted by another source")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Ok(Some(Err(err))) => {
+            crate::routes::await_operation(
+                task,
+                "file copy aborted by another source",
+                "failed to copy file",
+                |err| {
                     tracing::error!(
                         server = %server.uuid,
                         root = %root.display(),
                         "failed to copy file: {:#?}",
                         err,
-                    );
-
-                    return ApiResponse::error(&format!("failed to copy file: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        root = %root.display(),
-                        "failed to copy file: {:#?}",
-                        err,
-                    );
-
-                    return ApiResponse::error("failed to copy file")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            }
+                    )
+                },
+            )
+            .await?;
 
             ApiResponse::new_serialized(
                 destination_filesystem

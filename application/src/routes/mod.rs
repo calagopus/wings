@@ -351,6 +351,20 @@ impl<'a> ApiError<'a> {
     }
 }
 
+pub async fn await_operation<T>(
+    task: tokio::task::JoinHandle<Option<Result<T, anyhow::Error>>>,
+    aborted: &'static str,
+    failed: &'static str,
+    log: impl FnOnce(&dyn std::fmt::Debug),
+) -> Result<T, crate::response::ApiResponse> {
+    crate::server::filesystem::operations::await_operation(task, aborted, failed, log)
+        .await
+        .map_err(|err| {
+            crate::response::ApiResponse::error(&err)
+                .with_status(axum::http::StatusCode::EXPECTATION_FAILED)
+        })
+}
+
 pub type State = Arc<AppState>;
 pub type GetState = axum::extract::State<State>;
 

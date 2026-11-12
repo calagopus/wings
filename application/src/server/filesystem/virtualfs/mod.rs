@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::{
     io::{
         compression::CompressionLevel,
@@ -144,7 +142,6 @@ pub type WritableFileStream = Box<dyn std::io::Write + Send + Sync>;
 pub type AsyncWritableFileStream = Box<dyn AsyncWrite + Unpin + Send>;
 pub type WritableSeekableFileStream = Box<dyn crate::io::WriteSeek + Send + Sync>;
 pub type AsyncWritableSeekableFileStream = Box<dyn crate::io::AsyncWriteSeek + Send>;
-pub type ReadableWritableSeekableFileStream = Box<dyn crate::io::ReadWriteSeek + Send>;
 pub type AsyncReadableWritableSeekableFileStream = Box<dyn crate::io::AsyncReadWriteSeek + Send>;
 
 pub struct DirectoryListing {
@@ -311,6 +308,7 @@ pub struct FileMetadata {
     pub permissions: PortablePermissions,
     pub size: u64,
     pub modified: Option<std::time::SystemTime>,
+    #[allow(dead_code)]
     pub created: Option<std::time::SystemTime>,
 }
 
@@ -371,26 +369,6 @@ impl VirtualWalkEntry {
         }
     }
 
-    pub fn metadata(
-        &self,
-        filesystem: &dyn VirtualReadableFilesystem,
-    ) -> Result<FileMetadata, anyhow::Error> {
-        match &self.source {
-            Some(source) => Ok(source.metadata()?.into()),
-            None => filesystem.symlink_metadata(&self.path),
-        }
-    }
-
-    pub async fn async_metadata(
-        &self,
-        filesystem: &dyn VirtualReadableFilesystem,
-    ) -> Result<FileMetadata, anyhow::Error> {
-        match &self.source {
-            Some(source) => Ok(source.async_metadata().await?.into()),
-            None => filesystem.async_symlink_metadata(&self.path).await,
-        }
-    }
-
     /// Metadata taken straight from the directory entry the walker read (a single
     /// `statx` on the parent directory), when this walk has one.
     pub fn source_metadata(&self) -> Option<Result<cap_std::fs::Metadata, std::io::Error>> {
@@ -412,14 +390,6 @@ pub trait DirectoryWalk {
             self.next_entry()?
                 .map(|(file_type, path)| VirtualWalkEntry::new(file_type, path)),
         )
-    }
-
-    fn run_multithreaded(
-        &mut self,
-        threads: usize,
-        func: DirectoryWalkFn,
-    ) -> Result<(), anyhow::Error> {
-        self.run_multithreaded_filtered(threads, None, func)
     }
 
     fn run_multithreaded_filtered(
@@ -789,24 +759,6 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error>;
-    async fn async_walk_dir_files<'a>(
-        &'a self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        file_paths: Vec<PathBuf>,
-        is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let root_path = path.as_ref().to_path_buf();
-        let is_ignored = move |file_type, path: PathBuf| {
-            let stripped_path = path.strip_prefix(&root_path).unwrap_or(&path);
-            if file_paths.iter().any(|p| stripped_path.starts_with(p)) {
-                is_ignored(file_type, path)
-            } else {
-                IgnoreVerdict::Skip
-            }
-        };
-        self.async_walk_dir(path, IsIgnoredFn::from(is_ignored))
-            .await
-    }
     async fn async_walk_dir_stream<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -901,12 +853,10 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         permissions: Option<PortablePermissions>,
     ) -> Result<(), anyhow::Error>;
-    fn remove_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
     async fn async_remove_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
-    fn remove_file(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
     async fn async_remove_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -984,11 +934,6 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<AsyncWritableSeekableFileStream, anyhow::Error>;
-    fn open_file_with_options(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        options: cap_std::fs::OpenOptions,
-    ) -> Result<ReadableWritableSeekableFileStream, anyhow::Error>;
     async fn async_open_file_with_options(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1013,19 +958,6 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         file_type: FileType,
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
-    ) -> Result<(), anyhow::Error>;
-    async fn async_set_times(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
-        modification_time: std::time::SystemTime,
-        access_time: Option<std::time::SystemTime>,
-    ) -> Result<(), anyhow::Error>;
-    fn rename(
-        &self,
-        from: &(dyn AsRef<Path> + Send + Sync),
-        to: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
     ) -> Result<(), anyhow::Error>;
     async fn async_rename(
         &self,

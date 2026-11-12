@@ -294,54 +294,7 @@ fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
     None
 }
 
-#[async_trait::async_trait]
-trait DockerServerConfigurationExt {
-    async fn convert_mounts(
-        &self,
-        config: &crate::config::Config,
-        filesystem: &crate::server::filesystem::Filesystem,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Vec<bollard::plugin::Mount>;
-
-    #[cfg(unix)]
-    async fn convert_devices(
-        &self,
-        config: &crate::config::Config,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Vec<bollard::models::DeviceMapping>;
-
-    fn convert_allocations_bindings(&self) -> bollard::models::PortMap;
-    fn convert_allocations_docker_bindings(
-        &self,
-        config: &crate::config::Config,
-    ) -> bollard::models::PortMap;
-    fn convert_allocations_exposed(&self) -> Vec<String>;
-    fn convert_firewall_spec(
-        &self,
-        config: &crate::config::Config,
-    ) -> crate::server::firewall::FirewallServerSpec;
-
-    async fn container_config(
-        &self,
-        config: &crate::config::Config,
-        client: &bollard::Docker,
-        filesystem: &crate::server::filesystem::Filesystem,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Result<bollard::plugin::ContainerCreateBody, anyhow::Error>;
-    fn container_update_config(
-        &self,
-        config: &crate::config::Config,
-    ) -> bollard::plugin::ContainerUpdateBody;
-
-    fn installer_resources(&self, config: &crate::config::Config) -> bollard::models::Resources;
-    fn security_opt(
-        &self,
-        config: &crate::config::Config,
-    ) -> Result<Vec<String>, serde_json::Error>;
-}
-
-#[async_trait::async_trait]
-impl DockerServerConfigurationExt for crate::server::configuration::ServerConfiguration {
+impl crate::server::configuration::ServerConfiguration {
     async fn convert_mounts(
         &self,
         config: &crate::config::Config,
@@ -808,8 +761,7 @@ fn is_transient_json_error(err: &bollard::errors::Error) -> bool {
     )
 }
 
-#[async_trait::async_trait]
-trait DockerCompatJsonExt {
+trait DockerExt {
     async fn list_containers_settled(
         &self,
         options: Option<bollard::query_parameters::ListContainersOptions>,
@@ -820,10 +772,18 @@ trait DockerCompatJsonExt {
         container_id: &str,
         options: Option<bollard::query_parameters::InspectContainerOptions>,
     ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error>;
+
+    async fn remove_container_forgiving(
+        &self,
+        container_id: &str,
+    ) -> Result<(), bollard::errors::Error>;
+
+    async fn write_cfs_burst(&self, container_id: &str, multiple: f64);
+    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config);
+    async fn clear_cfs_burst(&self, container_id: &str);
 }
 
-#[async_trait::async_trait]
-impl DockerCompatJsonExt for bollard::Docker {
+impl DockerExt for bollard::Docker {
     async fn list_containers_settled(
         &self,
         options: Option<bollard::query_parameters::ListContainersOptions>,
@@ -871,18 +831,7 @@ impl DockerCompatJsonExt for bollard::Docker {
 
         self.inspect_container(container_id, options).await
     }
-}
 
-#[async_trait::async_trait]
-trait DockerRemoveExt {
-    async fn remove_container_forgiving(
-        &self,
-        container_id: &str,
-    ) -> Result<(), bollard::errors::Error>;
-}
-
-#[async_trait::async_trait]
-impl DockerRemoveExt for bollard::Docker {
     async fn remove_container_forgiving(
         &self,
         container_id: &str,
@@ -944,17 +893,7 @@ impl DockerRemoveExt for bollard::Docker {
             },
         }
     }
-}
 
-#[async_trait::async_trait]
-trait DockerCfsBurstExt {
-    async fn write_cfs_burst(&self, container_id: &str, multiple: f64);
-    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config);
-    async fn clear_cfs_burst(&self, container_id: &str);
-}
-
-#[async_trait::async_trait]
-impl DockerCfsBurstExt for bollard::Docker {
     async fn write_cfs_burst(&self, container_id: &str, multiple: f64) {
         for attempt in 0..2 {
             let inspect = match self.inspect_container_settled(container_id, None).await {
@@ -2974,7 +2913,6 @@ async fn find_running_container(
 #[async_trait::async_trait]
 impl super::ServerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
-        self.app_config.ensure_docker_network(&self.docker).await?;
         self.firewall.boot().await?;
 
         if std::env::var("OCI_CONTAINER").is_ok() {
@@ -3172,7 +3110,9 @@ impl super::ServerExecutor for DockerExecutor {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![server.uuid.to_string()],
+                    // `[<name>.]<uuid>` (see container_name) but not `<uuid>_installer` etc.;
+                    // docker matches names with a leading slash, podman without
+                    vec![format!(r"^/?([A-Za-z0-9_-]*\.)?{}$", server.uuid)],
                 )])),
                 ..Default::default()
             }))

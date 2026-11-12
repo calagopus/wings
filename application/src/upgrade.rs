@@ -411,7 +411,9 @@ pub fn wait_for_previous_process() {
     };
 
     let pid = sysinfo::Pid::from_u32(pid);
-    let mut system = sysinfo::System::new();
+    let Ok(mut system) = sysinfo::System::new() else {
+        return;
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
     while std::time::Instant::now() < deadline {

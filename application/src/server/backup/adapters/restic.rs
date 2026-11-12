@@ -1,3 +1,4 @@
+use super::tree::{FileMeta, TreeEntry, TreeNode, TreeWalk};
 use crate::{
     io::{
         SafeSliceExt, SafeWriteExt, UninterruptedReadExt,
@@ -7,7 +8,6 @@ use crate::{
     models::DirectoryEntry,
     remote::backups::{RawServerBackup, ResticBackupConfiguration, ResticConfigurationSource},
     response::ApiResponse,
-    routes::MimeCacheValue,
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
@@ -16,7 +16,6 @@ use crate::{
         filesystem::{
             archive::StreamableArchiveFormat,
             cap::FileType,
-            encode_mode,
             virtualfs::{
                 AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead,
                 AsyncReadableFileStream, ByteRange, DirectoryListing, DirectoryWalk, FileMetadata,
@@ -24,9 +23,8 @@ use crate::{
             },
         },
     },
-    utils::{CmpExt, PortablePermissions, StdoutTakeExt, TokioStdoutTakeExt},
+    utils::{CmpExt, StdoutTakeExt, TokioStdoutTakeExt},
 };
-use chrono::{Datelike, Timelike};
 use compact_str::{CompactString, ToCompactString};
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use serde::Deserialize;
@@ -56,7 +54,6 @@ static REPOSITORY_LOCKS: LazyLock<RepositoryLocks> =
     LazyLock::new(|| moka::future::Cache::new(10240));
 
 const RESTIC_STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
-const MAX_TREE_DEPTH: usize = 1024;
 const MAX_BROWSE_ENTRIES: usize = 10_000_000;
 const RESTIC_LOCK_EXIT_CODE: i32 = 11;
 const RESTIC_STDIN_REPLAY_LIMIT: usize = 1024 * 1024;
@@ -93,154 +90,44 @@ pub struct ResticDirectoryEntry {
     mtime: chrono::DateTime<chrono::Utc>,
 }
 
-struct ResticFileMeta {
-    file_type: FileType,
-    mode: u32,
-    size: u64,
-    mtime: chrono::DateTime<chrono::Utc>,
-}
+fn build_tree(entries: Vec<ResticDirectoryEntry>) -> TreeNode {
+    let mut root = TreeNode::default();
 
-#[derive(Default)]
-pub struct ResticTreeNode {
-    size: u64,
-    mtime: chrono::DateTime<chrono::Utc>,
-    mode: u32,
-    has_explicit_entry: bool,
-    dirs: thin_vec::ThinVec<(CompactString, ResticTreeNode)>,
-    files: thin_vec::ThinVec<(CompactString, ResticFileMeta)>,
-}
+    for entry in entries {
+        let Some(components) = entry
+            .path
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<&str>>>()
+        else {
+            continue;
+        };
 
-// drops the tree iteratively, recursive dropping would overflow the stack on deeply nested trees
-impl Drop for ResticTreeNode {
-    fn drop(&mut self) {
-        while let Some((_, mut node)) = self.dirs.pop() {
-            self.dirs.append(&mut node.dirs);
-        }
-    }
-}
+        let tree_entry = match entry.r#type {
+            ResticEntryType::Dir => TreeEntry::Dir {
+                mode: entry.mode,
+                mtime: entry.mtime,
+            },
+            ResticEntryType::File | ResticEntryType::Symlink => TreeEntry::File(FileMeta {
+                file_type: match entry.r#type {
+                    ResticEntryType::File => FileType::File,
+                    ResticEntryType::Symlink => FileType::Symlink,
+                    ResticEntryType::Dir => FileType::Dir,
+                },
+                mode: entry.mode,
+                size: entry.size.unwrap_or(0),
+                mtime: entry.mtime,
+                symlink: (),
+            }),
+        };
 
-impl ResticTreeNode {
-    fn build(entries: Vec<ResticDirectoryEntry>) -> Self {
-        let mut root = ResticTreeNode::default();
-
-        for entry in entries {
-            root.insert(entry);
-        }
-        root.sort_files();
-        root.aggregate_sizes();
-        root
-    }
-
-    fn insert(&mut self, entry: ResticDirectoryEntry) {
-        let mut components: Vec<&str> = Vec::new();
-        for component in entry.path.components() {
-            let Component::Normal(name) = component else {
-                return;
-            };
-            let Some(name) = name.to_str() else {
-                return;
-            };
-
-            components.push(name);
-        }
-
-        if components.is_empty() || components.len() > MAX_TREE_DEPTH {
-            return;
-        }
-
-        match entry.r#type {
-            ResticEntryType::Dir => {
-                let node = self.upsert_dir_path(&components);
-                node.has_explicit_entry = true;
-                node.mtime = entry.mtime;
-                node.mode = entry.mode;
-            }
-            ResticEntryType::File | ResticEntryType::Symlink => {
-                let (leaf, parents) = match components.split_last() {
-                    Some(v) => v,
-                    None => return,
-                };
-
-                let parent = self.upsert_dir_path(parents);
-                let meta = ResticFileMeta {
-                    file_type: match entry.r#type {
-                        ResticEntryType::File => FileType::File,
-                        ResticEntryType::Symlink => FileType::Symlink,
-                        ResticEntryType::Dir => FileType::Dir,
-                    },
-                    mode: entry.mode,
-                    size: entry.size.unwrap_or(0),
-                    mtime: entry.mtime,
-                };
-
-                parent.files.push((leaf.to_compact_string(), meta));
-            }
-        }
+        root.insert(&components, tree_entry);
     }
 
-    fn sort_files(&mut self) {
-        self.files.reverse();
-        self.files.sort_by(|(a, _), (b, _)| a.cmp(b));
-        self.files.dedup_by(|(a, _), (b, _)| a == b);
-        for (_, child) in self.dirs.iter_mut() {
-            child.sort_files();
-        }
-    }
-
-    fn upsert_dir_path(&mut self, components: &[&str]) -> &mut ResticTreeNode {
-        let mut current = self;
-        for name in components {
-            let idx = match current.dirs.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
-                Ok(idx) => idx,
-                Err(idx) => {
-                    current
-                        .dirs
-                        .insert(idx, (name.to_compact_string(), ResticTreeNode::default()));
-                    idx
-                }
-            };
-            // SAFETY: `idx` is guaranteed to be a valid index into `current.dirs` due to the logic above.
-            current = unsafe { &mut current.dirs.get_unchecked_mut(idx).1 };
-        }
-        current
-    }
-
-    fn aggregate_sizes(&mut self) -> u64 {
-        let mut total: u64 = self.files.iter().map(|(_, m)| m.size).sum();
-        for (_, child) in self.dirs.iter_mut() {
-            total = total.saturating_add(child.aggregate_sizes());
-        }
-        self.size = total;
-        total
-    }
-
-    fn lookup_dir(&self, path: &Path) -> Option<&ResticTreeNode> {
-        if path == Path::new("") || path == Path::new("/") {
-            return Some(self);
-        }
-        let mut current = self;
-        for component in path.components() {
-            let name = component.as_os_str().to_str()?;
-            let idx = current
-                .dirs
-                .binary_search_by(|(n, _)| n.as_str().cmp(name))
-                .ok()?;
-            current = &current.dirs.get(idx)?.1;
-        }
-        Some(current)
-    }
-
-    fn lookup_file(&self, path: &Path) -> Option<&ResticFileMeta> {
-        let parent_path = path.parent()?;
-        let leaf = path.file_name()?.to_str()?;
-
-        let parent = self.lookup_dir(parent_path)?;
-        let idx = parent
-            .files
-            .binary_search_by(|(n, _)| n.as_str().cmp(leaf))
-            .ok()?;
-        Some(&parent.files.get(idx)?.1)
-    }
+    root.finish()
 }
 
 pub struct ResticBackup {
@@ -459,120 +346,6 @@ impl ResticBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for ResticBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        if RESTIC_BACKUP_CACHE.read().await.contains_key(&uuid) {
-            return Ok(true);
-        }
-
-        if tokio::fs::metadata(
-            state
-                .config
-                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
-        )
-        .await
-        .is_ok()
-        {
-            let configuration = Arc::new(Self::system_configuration(&state.config));
-            let output = match Self::command(&state.config, &configuration)
-                .arg("--json")
-                .arg("--no-lock")
-                .arg("snapshots")
-                .output()
-                .await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to check restic backup existence: {:#?}",
-                        err
-                    ));
-                }
-            };
-
-            if output.status.success() {
-                let snapshots: Vec<ResticSnapshot> =
-                    serde_json::from_slice(&output.stdout).unwrap_or_default();
-
-                let mut found = false;
-                let mut cache = RESTIC_BACKUP_CACHE.write().await;
-                for snapshot in snapshots {
-                    let snapshot_uuid = match snapshot.tags.first() {
-                        Some(tag) => match uuid::Uuid::parse_str(tag) {
-                            Ok(uuid) => uuid,
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    if snapshot_uuid == uuid {
-                        found = true;
-                    }
-
-                    cache.insert(snapshot_uuid, (snapshot, Arc::clone(&configuration)));
-                }
-                drop(cache);
-
-                if found {
-                    return Ok(true);
-                }
-            }
-        }
-
-        let configuration = state.config.client.backup_restic_configuration(uuid).await;
-        if let Err(err) = &configuration {
-            super::log_configuration_error("restic", uuid, err);
-        }
-
-        if let Ok(configuration) = configuration {
-            let output = match ResticBackup::command(&state.config, &configuration)
-                .arg("--json")
-                .arg("--no-lock")
-                .arg("snapshots")
-                .output()
-                .await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to check restic backup existence: {:#?}",
-                        err
-                    ));
-                }
-            };
-
-            if output.status.success() {
-                let snapshots: Vec<ResticSnapshot> =
-                    serde_json::from_slice(&output.stdout).unwrap_or_default();
-                let configuration = Arc::new(configuration.clone());
-
-                let mut found = false;
-                let mut cache = RESTIC_BACKUP_CACHE.write().await;
-                for snapshot in snapshots {
-                    let snapshot_uuid = match snapshot.tags.first() {
-                        Some(tag) => match uuid::Uuid::parse_str(tag) {
-                            Ok(uuid) => uuid,
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    if snapshot_uuid == uuid {
-                        found = true;
-                    }
-
-                    cache.insert(snapshot_uuid, (snapshot, Arc::clone(&configuration)));
-                }
-                drop(cache);
-
-                if found {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
@@ -1221,16 +994,10 @@ impl BackupExt for ResticBackup {
                                 .large_file(header.size()? >= u32::MAX as u64);
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match header.entry_type() {
@@ -1635,7 +1402,7 @@ impl BackupExt for ResticBackup {
             );
         }
 
-        let tree = tokio::task::block_in_place(|| ResticTreeNode::build(entries));
+        let tree = tokio::task::block_in_place(|| build_tree(entries));
 
         Ok(Arc::new(VirtualResticBackup {
             server: server.clone(),
@@ -1700,71 +1467,10 @@ pub struct VirtualResticBackup {
     pub short_id: String,
     pub server_path: PathBuf,
     pub configuration: Arc<ResticBackupConfiguration>,
-    pub tree: Arc<ResticTreeNode>,
+    pub tree: Arc<TreeNode>,
 }
 
-impl VirtualResticBackup {
-    fn directory_entry_from_dir_node(path: &Path, node: &ResticTreeNode) -> DirectoryEntry {
-        let detected_mime = MimeCacheValue::directory();
-        let mode = if node.mode != 0 { node.mode } else { 0o755 };
-
-        DirectoryEntry {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            mode: encode_mode(mode),
-            mode_bits: compact_str::format_compact!("{:o}", mode & 0o777),
-            size: node.size,
-            size_physical: node.size,
-            editable: false,
-            inner_editable: false,
-            directory: true,
-            file: false,
-            symlink: false,
-            r#virtual: true,
-            mime: detected_mime.mime,
-            modified: node.mtime,
-            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-        }
-    }
-
-    fn directory_entry_from_file_meta(
-        path: &Path,
-        meta: &ResticFileMeta,
-        buffer: Option<&[u8]>,
-    ) -> DirectoryEntry {
-        let detected_mime = if meta.file_type.is_symlink() {
-            MimeCacheValue::symlink()
-        } else if meta.file_type.is_file() && meta.size == 0 {
-            MimeCacheValue::text()
-        } else {
-            crate::utils::detect_mime_type(path, buffer)
-        };
-
-        DirectoryEntry {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            mode: encode_mode(meta.mode),
-            mode_bits: compact_str::format_compact!("{:o}", meta.mode & 0o777),
-            size: meta.size,
-            size_physical: meta.size,
-            editable: meta.file_type.is_file() && detected_mime.valid_utf8,
-            inner_editable: meta.file_type.is_file() && detected_mime.valid_inner_utf8,
-            directory: false,
-            file: meta.file_type.is_file(),
-            symlink: meta.file_type.is_symlink(),
-            r#virtual: true,
-            mime: detected_mime.mime,
-            modified: meta.mtime,
-            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-        }
-    }
-}
+impl VirtualResticBackup {}
 
 #[async_trait::async_trait]
 impl VirtualReadableFilesystem for VirtualResticBackup {
@@ -1776,48 +1482,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<FileMetadata, anyhow::Error> {
-        let path_ref = path.as_ref();
-
-        if path_ref == Path::new("") || path_ref == Path::new("/") {
-            return Ok(FileMetadata {
-                file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode_dir(0o755),
-                size: 0,
-                modified: None,
-                created: None,
-            });
-        }
-
-        if let Some(node) = self.tree.lookup_dir(path_ref) {
-            let mode = if node.mode != 0 { node.mode } else { 0o755 };
-            let modified = if node.has_explicit_entry {
-                Some(node.mtime.into())
-            } else {
-                None
-            };
-            return Ok(FileMetadata {
-                file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode_dir(mode),
-                size: 0,
-                modified,
-                created: None,
-            });
-        }
-
-        if let Some(meta) = self.tree.lookup_file(path_ref) {
-            return Ok(FileMetadata {
-                file_type: meta.file_type,
-                permissions: PortablePermissions::from_mode_file(meta.mode),
-                size: meta.size,
-                modified: Some(meta.mtime.into()),
-                created: None,
-            });
-        }
-
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.metadata(path.as_ref())
     }
     async fn async_metadata(
         &self,
@@ -1843,18 +1508,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path_ref = path.as_ref();
-
-        if let Some(node) = self.tree.lookup_dir(path_ref) {
-            return Ok(Self::directory_entry_from_dir_node(path_ref, node));
-        }
-        if let Some(meta) = self.tree.lookup_file(path_ref) {
-            return Ok(Self::directory_entry_from_file_meta(path_ref, meta, None));
-        }
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.lookup_entry(path.as_ref(), None)
     }
 
     fn directory_entry_buffer(
@@ -1862,22 +1516,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path_ref = path.as_ref();
-
-        if let Some(node) = self.tree.lookup_dir(path_ref) {
-            return Ok(Self::directory_entry_from_dir_node(path_ref, node));
-        }
-        if let Some(meta) = self.tree.lookup_file(path_ref) {
-            return Ok(Self::directory_entry_from_file_meta(
-                path_ref,
-                meta,
-                Some(buffer),
-            ));
-        }
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.lookup_entry(path.as_ref(), Some(buffer))
     }
     async fn async_directory_entry_buffer(
         &self,
@@ -1909,14 +1548,8 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         };
 
         enum Child<'a> {
-            Dir {
-                path: PathBuf,
-                node: &'a ResticTreeNode,
-            },
-            File {
-                path: PathBuf,
-                meta: &'a ResticFileMeta,
-            },
+            Dir { path: PathBuf, node: &'a TreeNode },
+            File { path: PathBuf, meta: &'a FileMeta },
         }
 
         let mut dir_children: Vec<Child<'_>> = Vec::new();
@@ -1988,10 +1621,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         for child in target {
             match child {
                 Child::Dir { path, node } => {
-                    entries.push(Self::directory_entry_from_dir_node(&path, node));
+                    entries.push(node.to_directory_entry(&path));
                 }
                 Child::File { path, meta } => {
-                    entries.push(Self::directory_entry_from_file_meta(&path, meta, None));
+                    entries.push(meta.to_directory_entry(&path, None));
                 }
             }
         }
@@ -2007,95 +1640,18 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let start = self.tree.lookup_dir(path.as_ref());
-        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
-
-        if let Some(start) = start {
-            fn walk(
-                node: &ResticTreeNode,
-                current_path: &Path,
-                is_ignored: &IsIgnoredFn,
-                out: &mut Vec<(FileType, PathBuf)>,
-            ) {
-                for (name, meta) in node.files.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
-                        out.push((meta.file_type, filtered));
-                    }
-                }
-                for (name, child) in node.dirs.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
-                        out.push((FileType::Dir, filtered));
-                    }
-                    walk(child, &child_path, is_ignored, out);
-                }
-            }
-
-            walk(start, path.as_ref(), &is_ignored, &mut flat);
-        }
-
-        struct TreeWalk {
-            items: std::vec::IntoIter<(FileType, PathBuf)>,
-        }
-
-        impl DirectoryWalk for TreeWalk {
-            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.items.next().map(Ok)
-            }
-        }
-
-        Ok(Box::new(TreeWalk {
-            items: flat.into_iter(),
-        }))
+        Ok(Box::new(TreeWalk::new(
+            self.tree.walk(path.as_ref(), &is_ignored),
+        )))
     }
     async fn async_walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let start = self.tree.lookup_dir(path.as_ref());
-        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
-
-        if let Some(start) = start {
-            fn walk(
-                node: &ResticTreeNode,
-                current_path: &Path,
-                is_ignored: &IsIgnoredFn,
-                out: &mut Vec<(FileType, PathBuf)>,
-            ) {
-                for (name, meta) in node.files.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
-                        out.push((meta.file_type, filtered));
-                    }
-                }
-                for (name, child) in node.dirs.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
-                        out.push((FileType::Dir, filtered));
-                    }
-                    walk(child, &child_path, is_ignored, out);
-                }
-            }
-
-            walk(start, path.as_ref(), &is_ignored, &mut flat);
-        }
-
-        struct TreeWalk {
-            items: std::vec::IntoIter<(FileType, PathBuf)>,
-        }
-
-        #[async_trait::async_trait]
-        impl AsyncDirectoryWalk for TreeWalk {
-            async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.items.next().map(Ok)
-            }
-        }
-
-        Ok(Box::new(TreeWalk {
-            items: flat.into_iter(),
-        }))
+        Ok(Box::new(TreeWalk::new(
+            self.tree.walk(path.as_ref(), &is_ignored),
+        )))
     }
 
     async fn async_walk_dir_stream<'a>(
@@ -2432,16 +1988,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match header.entry_type() {
@@ -2797,17 +2347,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     if let Ok(mtime) = header.mtime()
                                         && let Some(mtime) =
                                             chrono::DateTime::from_timestamp(mtime as i64, 0)
+                                        && let Some(mtime) =
+                                            crate::server::filesystem::archive::zip_datetime(mtime)
                                     {
-                                        options = options.last_modified_time(
-                                            zip::DateTime::from_date_and_time(
-                                                mtime.year() as u16,
-                                                mtime.month() as u8,
-                                                mtime.day() as u8,
-                                                mtime.hour() as u8,
-                                                mtime.minute() as u8,
-                                                mtime.second() as u8,
-                                            )?,
-                                        );
+                                        options = options.last_modified_time(mtime);
                                     }
 
                                     match header.entry_type() {
@@ -2841,21 +2384,18 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             } => {
                                 let mut child = spawn_restic(false, &entry_path)?;
 
-                                let options: zip::write::FileOptions<'_, '_, ()> =
+                                let mut options: zip::write::FileOptions<'_, '_, ()> =
                                     zip::write::FileOptions::default()
                                         .compression_level(Some(
                                             compression_level.to_deflate_level() as i64,
                                         ))
                                         .unix_permissions(mode)
-                                        .large_file(size >= u32::MAX as u64)
-                                        .last_modified_time(zip::DateTime::from_date_and_time(
-                                            mtime.year() as u16,
-                                            mtime.month() as u8,
-                                            mtime.day() as u8,
-                                            mtime.hour() as u8,
-                                            mtime.minute() as u8,
-                                            mtime.second() as u8,
-                                        )?);
+                                        .large_file(size >= u32::MAX as u64);
+                                if let Some(mtime) =
+                                    crate::server::filesystem::archive::zip_datetime(mtime)
+                                {
+                                    options = options.last_modified_time(mtime);
+                                }
 
                                 zip.start_file(entry_path.to_string_lossy(), options)?;
                                 progress.increment_files();

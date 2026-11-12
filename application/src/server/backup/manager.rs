@@ -666,7 +666,7 @@ impl BackupManager {
             ));
         }
         if let Err(err) = server
-            .stop_with_kill_timeout(std::time::Duration::from_secs(30), false)
+            .stop_with_kill_timeout(None, std::time::Duration::from_secs(30), false)
             .await
         {
             tracing::error!(

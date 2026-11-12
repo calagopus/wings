@@ -183,6 +183,15 @@ impl CapFilesystem {
         Self::resolve_symlink_contents(&self.relative_path(link), &target)
     }
 
+    async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, std::io::Error> + Send + 'static,
+    ) -> Result<T, std::io::Error> {
+        let filesystem = self.clone();
+
+        tokio::task::spawn_blocking(move || f(&filesystem)).await?
+    }
+
     fn create_dir_impl(
         inner: &cap_std::fs::Dir,
         path: &Path,
@@ -236,16 +245,12 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         permissions: Option<PortablePermissions>,
     ) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || Self::create_dir_impl(&inner, &path, permissions))
-            .await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.create_dir(path, permissions))
+            .await
     }
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn create_dir(
         &self,
         path: impl AsRef<Path>,
@@ -262,20 +267,10 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         permissions: Option<PortablePermissions>,
     ) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
-        if path.as_os_str().is_empty() {
-            if let Some(permissions) = permissions {
-                self.async_set_permissions(&path, permissions).await?;
-            }
+        let path = path.as_ref().to_path_buf();
 
-            return Ok(());
-        }
-
-        let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || Self::create_dir_all_impl(&inner, &path, permissions))
-            .await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.create_dir_all(path, permissions))
+            .await
     }
 
     pub fn create_dir_all(
@@ -301,12 +296,10 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         threads: usize,
     ) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let self_clone = self.clone();
-        tokio::task::spawn_blocking(move || self_clone.remove_dir_all(path, threads)).await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.remove_dir_all(path, threads))
+            .await
     }
 
     pub fn remove_dir_all(
@@ -562,12 +555,10 @@ impl CapFilesystem {
     }
 
     pub async fn async_remove_file(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.remove_file(path)).await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.remove_file(path))
+            .await
     }
 
     pub fn remove_file(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
@@ -597,14 +588,12 @@ impl CapFilesystem {
         to_dir: &CapFilesystem,
         to: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        let from = self.relative_path(from.as_ref());
-        let to = self.relative_path(to.as_ref());
+        let from = from.as_ref().to_path_buf();
+        let to_dir = to_dir.clone();
+        let to = to.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let to_inner = to_dir.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.rename(from, &to_inner, to)).await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.rename(from, &to_dir, to))
+            .await
     }
 
     pub fn rename(
@@ -624,17 +613,10 @@ impl CapFilesystem {
     }
 
     pub async fn async_metadata(&self, path: impl AsRef<Path>) -> Result<Metadata, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let metadata = if path.components().next().is_none() {
-            cap_std::fs::Metadata::from_just_metadata(tokio::fs::metadata(&*self.base_path).await?)
-        } else {
-            let inner = self.get_inner()?;
-
-            tokio::task::spawn_blocking(move || inner.metadata(path)).await??
-        };
-
-        Ok(metadata)
+        self.blocking(move |filesystem| filesystem.metadata(path))
+            .await
     }
 
     pub fn metadata(&self, path: impl AsRef<Path>) -> Result<Metadata, std::io::Error> {
@@ -655,19 +637,10 @@ impl CapFilesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<Metadata, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let metadata = if path.components().next().is_none() {
-            cap_std::fs::Metadata::from_just_metadata(
-                tokio::fs::symlink_metadata(&*self.base_path).await?,
-            )
-        } else {
-            let inner = self.get_inner()?;
-
-            tokio::task::spawn_blocking(move || Self::stat_beneath(&inner, &path)).await??
-        };
-
-        Ok(metadata)
+        self.blocking(move |filesystem| filesystem.symlink_metadata(path))
+            .await
     }
 
     pub fn symlink_metadata(&self, path: impl AsRef<Path>) -> Result<Metadata, std::io::Error> {
@@ -711,16 +684,10 @@ impl CapFilesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<PathBuf, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
-        if path.components().next().is_none() {
-            return Ok(path);
-        }
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let canonicalized =
-            tokio::task::spawn_blocking(move || Self::canonicalize_beneath(&inner, path)).await??;
-
-        Ok(canonicalized)
+        self.blocking(move |filesystem| filesystem.canonicalize(path))
+            .await
     }
 
     /// Canonicalizes every directory component while leaving the final component
@@ -740,11 +707,8 @@ impl CapFilesystem {
     ) -> Result<PathBuf, std::io::Error> {
         let path = path.as_ref().to_path_buf();
 
-        let self_clone = self.clone();
-        let path =
-            tokio::task::spawn_blocking(move || self_clone.try_canonicalize_parent(path)).await??;
-
-        Ok(path)
+        self.blocking(move |filesystem| filesystem.try_canonicalize_parent(path))
+            .await
     }
 
     pub fn canonicalize_parent(&self, path: impl AsRef<Path>) -> PathBuf {
@@ -845,12 +809,10 @@ impl CapFilesystem {
     }
 
     pub async fn async_read_link(&self, path: impl AsRef<Path>) -> Result<PathBuf, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let link = tokio::task::spawn_blocking(move || inner.read_link(path)).await??;
-
-        Ok(link)
+        self.blocking(move |filesystem| filesystem.read_link(path))
+            .await
     }
 
     pub fn read_link(&self, path: impl AsRef<Path>) -> Result<PathBuf, std::io::Error> {
@@ -929,12 +891,13 @@ impl CapFilesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<tokio::fs::File, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let file = tokio::task::spawn_blocking(move || inner.open(path)).await??;
+        let file = self
+            .blocking(move |filesystem| filesystem.open(path))
+            .await?;
 
-        Ok(tokio::fs::File::from_std(file.into_std()))
+        Ok(tokio::fs::File::from_std(file))
     }
 
     pub fn open(&self, path: impl AsRef<Path>) -> Result<std::fs::File, std::io::Error> {
@@ -1037,12 +1000,13 @@ impl CapFilesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<tokio::fs::File, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let file = tokio::task::spawn_blocking(move || inner.create(path)).await??;
+        let file = self
+            .blocking(move |filesystem| filesystem.create(path))
+            .await?;
 
-        Ok(tokio::fs::File::from_std(file.into_std()))
+        Ok(tokio::fs::File::from_std(file))
     }
 
     pub async fn async_create_with_permissions(
@@ -1235,22 +1199,10 @@ impl CapFilesystem {
         path: impl AsRef<Path>,
         permissions: PortablePermissions,
     ) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        if path.components().next().is_none() {
-            if let Some(permissions) = permissions.into_std_permissions() {
-                tokio::fs::set_permissions(&*self.base_path, permissions).await?;
-            }
-        } else {
-            let inner = self.get_inner()?;
-
-            tokio::task::spawn_blocking(move || {
-                Self::set_permissions_impl(&inner, &path, permissions)
-            })
-            .await??;
-        }
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.set_permissions(path, permissions))
+            .await
     }
 
     pub fn set_permissions(
@@ -1330,13 +1282,8 @@ impl CapFilesystem {
     ) -> Result<(), std::io::Error> {
         let path = path.as_ref().to_path_buf();
 
-        let self_clone = self.clone();
-        tokio::task::spawn_blocking(move || {
-            self_clone.set_times(path, modification_time, access_time)
-        })
-        .await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.set_times(path, modification_time, access_time))
+            .await
     }
 
     pub fn set_times(
@@ -1544,11 +1491,8 @@ impl CapFilesystem {
         let target = target.as_ref().to_path_buf();
         let link = link.as_ref().to_path_buf();
 
-        let self_clone = self.clone();
-        tokio::task::spawn_blocking(move || {
-            self_clone.symlink_with_modified(target, link, modified)
-        })
-        .await?
+        self.blocking(move |filesystem| filesystem.symlink_with_modified(target, link, modified))
+            .await
     }
 
     /// Runs `op` on the last component of `path` relative to its parent
@@ -1637,10 +1581,8 @@ impl CapFilesystem {
     ) -> Result<(), std::io::Error> {
         let path = path.as_ref().to_path_buf();
 
-        let self_clone = self.clone();
-        tokio::task::spawn_blocking(move || self_clone.lchown(path, uid, gid)).await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.lchown(path, uid, gid))
+            .await
     }
 
     #[cfg(target_os = "linux")]
@@ -1663,27 +1605,13 @@ impl CapFilesystem {
         target: impl AsRef<Path>,
         link: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        let (contents, _target) = self.link_relative_target(link.as_ref(), target.as_ref());
-        let link = self.relative_path(link.as_ref());
+        let target = target.as_ref().to_path_buf();
+        let link = link.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        #[cfg(unix)]
-        tokio::task::spawn_blocking(move || inner.symlink(contents, link)).await??;
-        #[cfg(windows)]
-        tokio::task::spawn_blocking(move || {
-            let metadata = inner.metadata(&_target)?;
-            if metadata.is_dir() {
-                inner.symlink_dir(contents, link)
-            } else {
-                inner.symlink_file(contents, link)
-            }
-        })
-        .await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.symlink(target, link))
+            .await
     }
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn symlink(
         &self,
         target: impl AsRef<Path>,
@@ -1743,14 +1671,12 @@ impl CapFilesystem {
         dst_dir: &CapFilesystem,
         link: impl AsRef<Path>,
     ) -> Result<(), std::io::Error> {
-        let target = self.relative_path(target.as_ref());
-        let link = self.relative_path(link.as_ref());
+        let target = target.as_ref().to_path_buf();
+        let dst_dir = dst_dir.clone();
+        let link = link.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let dst_inner = dst_dir.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.hard_link(target, &dst_inner, link)).await??;
-
-        Ok(())
+        self.blocking(move |filesystem| filesystem.hard_link(target, &dst_dir, link))
+            .await
     }
 
     pub fn hard_link(
@@ -1787,17 +1713,11 @@ impl CapFilesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<AsyncReadDir, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
+        let path = path.as_ref().to_path_buf();
 
-        let inner = self.get_inner()?;
-        let read_dir = tokio::task::spawn_blocking(move || {
-            if path.components().next().is_none() {
-                inner.entries()
-            } else {
-                inner.read_dir(path)
-            }
-        })
-        .await??;
+        let ReadDir(read_dir) = self
+            .blocking(move |filesystem| filesystem.read_dir(path))
+            .await?;
 
         Ok(AsyncReadDir(
             Some(read_dir),

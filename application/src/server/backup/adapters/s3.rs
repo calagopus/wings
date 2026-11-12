@@ -754,11 +754,6 @@ impl S3Backup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for S3Backup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let path = Self::get_file_name(&state.config, uuid);
-        Ok(tokio::fs::metadata(&path).await.is_ok())
-    }
-
     async fn find(
         _state: &crate::routes::State,
         uuid: uuid::Uuid,

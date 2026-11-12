@@ -552,6 +552,12 @@ async fn main_rt() {
             },
         );
 
+        drop(config_ref);
+
+        if let Err(err) = config.ensure_docker_network(&docker).await {
+            exit_error!("failed to boot server executor: {:?}", err);
+        }
+
         let own_container =
             crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
         let firewall =
@@ -585,9 +591,7 @@ async fn main_rt() {
     tracing::info!("cleaning up stale temporary files from previous runs");
     config.cleanup_tmp_directory().await;
 
-    if config.load().system.disk_limiter_mode
-        == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
-    {
+    if config.load().system.disk_limiter_mode.is_btrfs_subvolume() {
         tracing::info!("cleaning up stale btrfs send snapshots from previous runs");
         crate::server::backup::adapters::btrfs::BtrfsBackup::cleanup_stale_btrfs_send_snapshots(
             &config,

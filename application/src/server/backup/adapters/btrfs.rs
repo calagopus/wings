@@ -1,3 +1,4 @@
+use super::snapshot_dir::SnapshotDir;
 use crate::{
     remote::backups::RawServerBackup,
     response::ApiResponse,
@@ -7,7 +8,7 @@ use crate::{
             BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
-            archive::{Archive, StreamableArchiveFormat},
+            archive::StreamableArchiveFormat,
             virtualfs::{ByteRange, VirtualReadableFilesystem},
         },
     },
@@ -15,12 +16,9 @@ use crate::{
 use compact_str::ToCompactString;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::AtomicU64},
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::process::Command;
 
 pub struct BtrfsBackup {
     uuid: uuid::Uuid,
@@ -200,123 +198,36 @@ impl BtrfsBackup {
         tokio::fs::remove_dir_all(send_dir).await.ok();
     }
 
+    fn snapshot_dir(config: &crate::config::Config, uuid: uuid::Uuid) -> SnapshotDir {
+        SnapshotDir {
+            root: Self::get_subvolume_path(config, uuid),
+            ignore_path: Self::get_ignore_path(config, uuid),
+            what: "btrfs backup subvolume",
+        }
+    }
+
     pub async fn open_archive_stream(
         &self,
         state: &crate::routes::State,
         archive_format: StreamableArchiveFormat,
         compression_level: crate::io::compression::CompressionLevel,
     ) -> Result<crate::io::fallible_reader::FalliblePipeReader, anyhow::Error> {
-        let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
-
-        if tokio::fs::metadata(&subvolume_path).await.is_err() {
-            return Err(anyhow::anyhow!(
-                "btrfs backup subvolume does not exist: {}",
-                subvolume_path.display()
-            ));
-        }
-
-        let filesystem =
-            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
-        let names = filesystem.async_read_dir_all(Path::new("")).await?;
-        let ignore = Self::get_ignore(&state.config, self.uuid).await?;
-        let threads = state.config.load().api.file_compression_threads;
-
-        let (reader, writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
-        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
-
-        tokio::spawn(async move {
-            let writer = writer.into_sync();
-
-            let result = match archive_format {
-                StreamableArchiveFormat::Zip => {
-                    crate::server::filesystem::archive::create::create_zip_streaming(
-                        filesystem,
-                        writer,
-                        Path::new(""),
-                        names,
-                        crate::server::filesystem::archive::create::ArchiveProgress::default(),
-                        ignore.into(),
-                        crate::server::filesystem::archive::create::CreateZipOptions {
-                            compression_level,
-                            threads,
-                        },
-                    )
-                    .await
-                    .map(|inner| inner.into_inner())
-                }
-                f if f.is_itaf() => crate::server::filesystem::archive::create::create_itaf(
-                    filesystem,
-                    writer,
-                    Path::new(""),
-                    names,
-                    crate::server::filesystem::archive::create::ArchiveProgress::default(),
-                    ignore.into(),
-                    crate::server::filesystem::archive::create::CreateItafOptions {
-                        compression_type: f.compression_format(),
-                        compression_level,
-                        threads,
-                        crc_enabled: true,
-                    },
-                )
-                .await
-                .map(|inner| inner.into_inner()),
-                f => crate::server::filesystem::archive::create::create_tar(
-                    filesystem,
-                    writer,
-                    Path::new(""),
-                    names,
-                    crate::server::filesystem::archive::create::ArchiveProgress::default(),
-                    ignore.into(),
-                    crate::server::filesystem::archive::create::CreateTarOptions {
-                        compression_type: f.compression_format(),
-                        compression_level,
-                        threads,
-                    },
-                )
-                .await
-                .map(|inner| inner.into_inner()),
-            };
-
-            match result {
-                Ok(mut inner) => {
-                    inner.shutdown().await.ok();
-                    signal.succeed();
-                }
-                Err(err) => {
-                    tracing::error!("failed to create archive for btrfs backup: {err}");
-                    signal.fail(err);
-                }
-            }
-        });
-
-        Ok(reader)
-    }
-
-    pub async fn get_ignore(
-        config: &crate::config::Config,
-        uuid: uuid::Uuid,
-    ) -> Result<crate::server::filesystem::ignore_list::IgnoreList, anyhow::Error> {
-        let ignored_path = Self::get_ignore_path(config, uuid);
-        let ignore_content = tokio::fs::read_to_string(&ignored_path)
+        Self::snapshot_dir(&state.config, self.uuid)
+            .archive_stream(&state.config, archive_format, compression_level)
             .await
-            .unwrap_or_default();
-
-        Ok(crate::server::filesystem::ignore_list::IgnoreList::from_lines(ignore_content.lines())?)
     }
 }
 
 #[async_trait::async_trait]
 impl BackupFindExt for BtrfsBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let path = Self::get_backup_path(&state.config, uuid);
-        Ok(tokio::fs::metadata(&path).await.is_ok())
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
-        if Self::exists(state, uuid).await? {
+        if tokio::fs::metadata(Self::get_backup_path(&state.config, uuid))
+            .await
+            .is_ok()
+        {
             Ok(Some(Backup::Btrfs(Self { uuid })))
         } else {
             Ok(None)
@@ -504,140 +415,21 @@ impl BackupExt for BtrfsBackup {
         total: Arc<AtomicU64>,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
-        let subvolume_path = Self::get_subvolume_path(&server.app_state.config, self.uuid);
-
-        if tokio::fs::metadata(&subvolume_path).await.is_err() {
-            return Err(anyhow::anyhow!(
-                "btrfs backup subvolume does not exist: {}",
-                subvolume_path.display()
-            ));
-        }
-
-        let filesystem =
-            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
-        let ignore = Self::get_ignore(&server.app_state.config, self.uuid).await?;
-
-        let total_task = {
-            let filesystem = filesystem.clone();
-            let ignore = ignore.clone();
-
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let mut walker = filesystem
-                        .walk_dir(Path::new(""))?
-                        .with_is_ignored(ignore.into());
-                    while let Some(Ok(entry)) = walker.next_entry() {
-                        let metadata = match entry.metadata() {
-                            Ok(metadata) => metadata,
-                            Err(_) => continue,
-                        };
-
-                        total.fetch_add(metadata.len(), Ordering::Relaxed);
-                    }
-
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await?
-            }
-        };
-
-        let server = server.clone();
-        let restore_task = async move {
-            let directory_entries = Arc::new(parking_lot::Mutex::new(Vec::new()));
-
-            filesystem
-                .async_walk_dir(Path::new(""))
-                .await?
-                .with_is_ignored(ignore.into())
-                .with_inline_dirs()
-                .run_multithreaded(
-                    server.app_state.config.load().system.backups.btrfs.restore_threads,
-                    Arc::new({
-                        let server = server.clone();
-                        let filesystem = filesystem.clone();
-                        let progress = progress.clone();
-                        let directory_entries = Arc::clone(&directory_entries);
-
-                        move |entry: crate::server::filesystem::cap::WalkEntry| {
-                            let server = server.clone();
-                            let filesystem = filesystem.clone();
-                            let progress = progress.clone();
-                            let directory_entries = Arc::clone(&directory_entries);
-
-                            async move {
-                                let metadata = match entry.async_metadata().await {
-                                    Ok(metadata) => metadata,
-                                    Err(_) => return Ok(()),
-                                };
-                                let path = entry.path;
-
-                                if metadata.is_file() {
-                                    super::log_restoring(&server, &path);
-
-                                    let permissions = Some(crate::utils::PortablePermissions::from_mode_file(
-                                        cap_std::fs::PermissionsExt::mode(&metadata.permissions()),
-                                    ));
-                                    let modified_time = metadata.modified().ok().map(|modified_time| modified_time.into_std());
-                                    let bytes = progress.clone_bytes();
-
-                                    super::create_with_parent(&server, &path, || {
-                                        filesystem.async_quota_copy(
-                                            &path,
-                                            &path,
-                                            &server,
-                                            permissions,
-                                            modified_time,
-                                            bytes.as_ref(),
-                                        )
-                                    })
-                                    .await?;
-                                    progress.increment_files();
-                                } else if metadata.is_dir() {
-                                    server
-                                        .filesystem
-                                        .async_create_chowned_dir_all(&path, Some(metadata.permissions().into()))
-                                        .await?;
-                                    if let Ok(modified_time) = metadata.modified() {
-                                        let mut directory_entries = directory_entries.lock();
-                                        if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                                            directory_entries.push((path, modified_time.into_std()));
-                                        }
-                                    }
-                                } else if metadata.is_symlink() && let Ok(target) = filesystem.async_read_link(&path).await {
-                                    let modified_time = metadata.modified().ok().map(|modified_time| modified_time.into_std());
-                                    if let Err(err) = super::create_with_parent(&server, &path, || {
-                                        server.filesystem.async_symlink_with_modified(&target, &path, modified_time)
-                                    })
-                                    .await
-                                    {
-                                        tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
-                                    } else {
-                                        progress.increment_files();
-                                    }
-                                }
-
-                                Ok(())
-                            }
-                        }
-                    }),
-                ).await?;
-
-            let directory_entries = std::mem::take(&mut *directory_entries.lock());
-            tokio::task::spawn_blocking(move || {
-                for (path, modified_time) in directory_entries {
-                    server.filesystem.set_times(&path, modified_time, None)?;
-                }
-
-                Ok::<(), std::io::Error>(())
-            })
-            .await??;
-
-            Ok::<(), anyhow::Error>(())
-        };
-
-        let (_, _) = tokio::try_join!(total_task, restore_task)?;
-
-        Ok(())
+        Self::snapshot_dir(&server.app_state.config, self.uuid)
+            .restore(
+                server,
+                progress,
+                total,
+                server
+                    .app_state
+                    .config
+                    .load()
+                    .system
+                    .backups
+                    .btrfs
+                    .restore_threads,
+            )
+            .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
@@ -706,24 +498,9 @@ impl BackupExt for BtrfsBackup {
         &self,
         server: &crate::server::Server,
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
-        let subvolume_path = Self::get_subvolume_path(&server.app_state.config, self.uuid);
-
-        if tokio::fs::metadata(&subvolume_path).await.is_err() {
-            return Err(anyhow::anyhow!(
-                "btrfs backup subvolume does not exist: {}",
-                subvolume_path.display()
-            ));
-        }
-
-        let filesystem =
-            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
-        let ignore = Self::get_ignore(&server.app_state.config, self.uuid).await?;
-
-        Ok(Arc::new(
-            filesystem
-                .get_virtual(server.clone())
-                .with_is_ignored(ignore.into()),
-        ))
+        Self::snapshot_dir(&server.app_state.config, self.uuid)
+            .browse(server)
+            .await
     }
 }
 

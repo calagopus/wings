@@ -134,9 +134,7 @@ impl BackupSender {
                     return form;
                 };
 
-                let native_stream = if capabilities.disk_limiter_mode
-                    == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
-                {
+                let native_stream = if capabilities.disk_limiter_mode.is_btrfs_subvolume() {
                     match backup
                         .open_send_stream(&self.state, self.btrfs_parent.as_deref())
                         .await

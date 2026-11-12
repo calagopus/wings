@@ -1,14 +1,17 @@
 use crate::{
     io::{
+        compression::CompressionLevel,
         counting_reader::{AsyncCountingReader, CountingReader},
         counting_writer::CountingWriter,
     },
     server::filesystem::{
+        archive::ArchiveFormat,
         cap::{CapFilesystem, FileType},
         virtualfs::IsIgnoredFn,
     },
 };
 use std::{
+    io::{Seek, Write},
     path::Path,
     sync::{
         Arc,
@@ -28,6 +31,74 @@ pub use pxar::*;
 pub use seven_zip::*;
 pub use tar::*;
 pub use zip::*;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_archive<W: Write + Seek + Send + 'static>(
+    format: ArchiveFormat,
+    filesystem: CapFilesystem,
+    destination: W,
+    base: &Path,
+    sources: Vec<impl AsRef<Path> + Send + 'static>,
+    progress: ArchiveProgress,
+    is_ignored: IsIgnoredFn,
+    compression_level: CompressionLevel,
+    threads: usize,
+) -> Result<W, anyhow::Error> {
+    match format {
+        ArchiveFormat::Tar
+        | ArchiveFormat::TarGz
+        | ArchiveFormat::TarXz
+        | ArchiveFormat::TarLzip
+        | ArchiveFormat::TarBz2
+        | ArchiveFormat::TarLz4
+        | ArchiveFormat::TarZstd => {
+            create_tar(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                CreateTarOptions {
+                    compression_type: format.compression_format(),
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+        ArchiveFormat::Zip => {
+            create_zip(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                CreateZipOptions {
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+        ArchiveFormat::SevenZip => {
+            create_7z(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                Create7zOptions {
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+    }
+}
 
 fn walk_sources(
     filesystem: &CapFilesystem,
