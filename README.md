@@ -146,6 +146,23 @@ system:
     per_server_disk_budget: 209715200
     maintenance_interval: 3600
 
+  crash_history:
+    # whether to keep the last console output, exit code and oom state of every detected crash
+    enabled: true
+    # how many console lines to keep per crash
+    lines: 2000
+    # max uncompressed bytes of console output per crash, older lines are cut first
+    record_size_cap: 524288
+    zstd_level: 3
+    # per-server retention, 0 disables the respective limit
+    max_records: 10
+    # in seconds
+    max_age: 2592000
+    # compressed bytes
+    per_server_disk_budget: 2097152
+    # seconds to wait for the console output before storing the crash without it
+    capture_timeout: 5
+
   backups:
     # what compression level to use? best_speed, good_speed, good_compression, best_compression (higher compression = more CPU usage, better compression)
     compression_level: best_speed

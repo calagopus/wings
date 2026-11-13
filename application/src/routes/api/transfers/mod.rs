@@ -407,6 +407,42 @@ mod post {
                                         err
                                     );
                                 }
+                            } else if field.name() == Some("crash-history") {
+                                let path = state.crash_history.import_path(server.uuid);
+                                let mut file = match std::fs::File::create(&path) {
+                                    Ok(file) => file,
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "failed to create crash history database: {:#?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                let mut written = true;
+                                while let Some(chunk) = runtime.block_on(field.chunk())? {
+                                    if let Err(err) = file.write_all(&chunk) {
+                                        tracing::error!(
+                                            "failed to write crash history database chunk: {:#?}",
+                                            err
+                                        );
+                                        written = false;
+                                        break;
+                                    }
+                                }
+                                drop(file);
+
+                                if !written {
+                                    std::fs::remove_file(&path).ok();
+                                } else if let Err(err) =
+                                    runtime.block_on(state.crash_history.import(server.uuid))
+                                {
+                                    tracing::error!(
+                                        "failed to import crash history database: {:#?}",
+                                        err
+                                    );
+                                }
                             } else if field.name().is_some_and(|n| n.starts_with("backup-")) {
                                 backup_receiver.handle_field(&runtime, field)?;
                             }

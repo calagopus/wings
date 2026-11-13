@@ -20,6 +20,7 @@ pub mod backup;
 pub mod bandwidth;
 pub mod collab;
 pub mod configuration;
+pub mod crash_history;
 pub mod diff;
 pub mod executor;
 pub mod filesystem;
@@ -704,6 +705,12 @@ impl Server {
                                     return;
                                 }
 
+                                let crash = server
+                                    .app_state
+                                    .crash_history
+                                    .capture(&server, exit_code, oom_killed)
+                                    .await;
+
                                 server.activity.log_activity(activity::Activity {
                                     event: activity::ActivityEvent::CrashDetected,
                                     user: None,
@@ -711,6 +718,7 @@ impl Server {
                                     metadata: Some(json!({
                                         "exit_code": exit_code,
                                         "oom_killed": oom_killed,
+                                        "crash": crash,
                                     })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
@@ -1803,6 +1811,7 @@ impl Server {
             .resource_history
             .delete_server(self.uuid)
             .await;
+        self.app_state.crash_history.delete_server(self.uuid).await;
 
         self.diff.destroy().await;
         let result = self.filesystem.destroy().await;

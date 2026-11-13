@@ -345,6 +345,31 @@ fn system_file_history_maintenance_interval() -> u64 {
     3600
 }
 
+fn system_crash_history_enabled() -> bool {
+    true
+}
+fn system_crash_history_lines() -> usize {
+    2000
+}
+fn system_crash_history_record_size_cap() -> u64 {
+    512 * 1024
+}
+fn system_crash_history_zstd_level() -> i32 {
+    3
+}
+fn system_crash_history_max_records() -> u64 {
+    10
+}
+fn system_crash_history_max_age() -> u64 {
+    30 * 24 * 60 * 60
+}
+fn system_crash_history_per_server_disk_budget() -> u64 {
+    2 * 1024 * 1024
+}
+fn system_crash_history_capture_timeout() -> u64 {
+    5
+}
+
 fn system_resource_history_enabled() -> bool {
     true
 }
@@ -1074,6 +1099,30 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
+            pub crash_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemCrashHistory {
+                #[serde(default = "system_crash_history_enabled")]
+                pub enabled: bool,
+
+                #[serde(default = "system_crash_history_lines")]
+                pub lines: usize,
+                #[serde(default = "system_crash_history_record_size_cap")]
+                pub record_size_cap: u64,
+                #[serde(default = "system_crash_history_zstd_level")]
+                pub zstd_level: i32,
+
+                #[serde(default = "system_crash_history_max_records")]
+                pub max_records: u64,
+                #[serde(default = "system_crash_history_max_age")]
+                pub max_age: u64,
+                #[serde(default = "system_crash_history_per_server_disk_budget")]
+                pub per_server_disk_budget: u64,
+
+                #[serde(default = "system_crash_history_capture_timeout")]
+                pub capture_timeout: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
             pub resource_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemResourceHistory {
                 #[serde(default = "system_resource_history_enabled")]
                 pub enabled: bool,
@@ -1534,6 +1583,19 @@ nestify::nest! {
         pub ignore_panel_config_updates: bool,
         #[serde(default)]
         pub ignore_panel_wings_upgrades: bool,
+    }
+}
+
+impl SystemCrashHistory {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        let max = crate::server::crash_history::MAX_RECORD_SIZE;
+        if self.record_size_cap > max {
+            return Err(anyhow::anyhow!(
+                "system.crash_history.record_size_cap may be at most {max} bytes"
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -2044,6 +2106,7 @@ impl Config {
             ));
         }
 
+        cfg.system.crash_history.validate()?;
         cfg.system.resource_history.validate()?;
 
         if cfg.remote.is_empty() {

@@ -300,6 +300,7 @@ pub struct AppState {
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub resource_history: Arc<crate::server::resource_history::ResourceHistory>,
+    pub crash_history: Arc<crate::server::crash_history::CrashHistory>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
@@ -325,6 +326,9 @@ impl AppState {
             resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
                 &Arc::new(crate::config::Config::mock()),
             )),
+            crash_history: Arc::new(crate::server::crash_history::CrashHistory::new(&Arc::new(
+                crate::config::Config::mock(),
+            ))),
             backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
             inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
             websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(

@@ -141,6 +141,7 @@ async fn run(
         resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
             &config,
         )),
+        crash_history: Arc::new(crate::server::crash_history::CrashHistory::new(&config)),
         backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
