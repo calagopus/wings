@@ -131,12 +131,19 @@ mod ktls {
                         return Ok(MaybeKtlsStream::Rustls(Box::new(stream)));
                     }
 
-                    match ::ktls::config_ktls_server(stream).await {
-                        Ok(stream) => Ok(MaybeKtlsStream::Ktls(stream)),
-                        Err(err) => Err(io::Error::other(format!(
-                            "failed to hand connection off to kernel tls: {err}"
-                        ))),
-                    }
+                    let (drained, tcp) = ::ktls::config_ktls_server(stream)
+                        .await
+                        .map_err(|err| {
+                            io::Error::other(format!(
+                                "failed to hand connection off to kernel tls: {err}"
+                            ))
+                        })?
+                        .into_raw();
+
+                    Ok(MaybeKtlsStream::Ktls {
+                        stream: KtlsStream::new(tcp, None),
+                        drained: drained.filter(|d| !d.is_empty()).map(|d| (0, d)),
+                    })
                 })
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"));
@@ -162,7 +169,10 @@ mod ktls {
     }
 
     pub enum MaybeKtlsStream {
-        Ktls(KtlsStream<TcpStream>),
+        Ktls {
+            stream: KtlsStream<TcpStream>,
+            drained: Option<(usize, Vec<u8>)>,
+        },
         Rustls(Box<TlsStream<CorkStream<TcpStream>>>),
     }
 
@@ -174,7 +184,22 @@ mod ktls {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             match self.get_mut() {
-                Self::Ktls(stream) => Pin::new(stream).poll_read(cx, buf),
+                Self::Ktls { stream, drained } => {
+                    if let Some((offset, bytes)) = drained
+                        && buf.remaining() > 0
+                    {
+                        let rest = bytes.get(*offset..).unwrap_or_default();
+                        let len = rest.len().min(buf.remaining());
+                        buf.put_slice(rest.get(..len).unwrap_or_default());
+                        *offset += len;
+                        if *offset >= bytes.len() {
+                            *drained = None;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    Pin::new(stream).poll_read(cx, buf)
+                }
                 Self::Rustls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
             }
         }
@@ -188,7 +213,7 @@ mod ktls {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             match self.get_mut() {
-                Self::Ktls(stream) => Pin::new(stream).poll_write(cx, buf),
+                Self::Ktls { stream, .. } => Pin::new(stream).poll_write(cx, buf),
                 Self::Rustls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
             }
         }
@@ -200,7 +225,9 @@ mod ktls {
             bufs: &[io::IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
             match self.get_mut() {
-                Self::Ktls(stream) => Pin::new(stream.get_mut()).poll_write_vectored(cx, bufs),
+                Self::Ktls { stream, .. } => {
+                    Pin::new(stream.get_mut()).poll_write_vectored(cx, bufs)
+                }
                 Self::Rustls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
             }
         }
@@ -208,7 +235,7 @@ mod ktls {
         #[inline]
         fn is_write_vectored(&self) -> bool {
             match self {
-                Self::Ktls(stream) => stream.get_ref().is_write_vectored(),
+                Self::Ktls { stream, .. } => stream.get_ref().is_write_vectored(),
                 Self::Rustls(stream) => stream.is_write_vectored(),
             }
         }
@@ -216,7 +243,7 @@ mod ktls {
         #[inline]
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.get_mut() {
-                Self::Ktls(stream) => Pin::new(stream).poll_flush(cx),
+                Self::Ktls { stream, .. } => Pin::new(stream).poll_flush(cx),
                 Self::Rustls(stream) => Pin::new(&mut **stream).poll_flush(cx),
             }
         }
@@ -224,9 +251,64 @@ mod ktls {
         #[inline]
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.get_mut() {
-                Self::Ktls(stream) => Pin::new(stream).poll_shutdown(cx),
+                Self::Ktls { stream, .. } => Pin::new(stream).poll_shutdown(cx),
                 Self::Rustls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        const DRAINED: &[u8] = b"0123456789abcde";
+        const SOCKET: &[u8] = b"from-the-socket";
+
+        async fn ktls_with_drained() -> MaybeKtlsStream {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let mut peer = TcpStream::connect(addr).await.expect("connect");
+            let (tcp, _) = listener.accept().await.expect("accept");
+
+            peer.write_all(SOCKET).await.expect("peer write");
+            peer.shutdown().await.expect("peer shutdown");
+
+            MaybeKtlsStream::Ktls {
+                stream: KtlsStream::new(tcp, None),
+                drained: Some((0, DRAINED.to_vec())),
+            }
+        }
+
+        fn expected() -> Vec<u8> {
+            [DRAINED, SOCKET].concat()
+        }
+
+        // MaybeKtlsStream
+
+        #[tokio::test]
+        async fn ktls_serves_drained_bytes_first_when_read_bytewise() {
+            let mut stream = ktls_with_drained().await;
+            let mut out = Vec::new();
+            for _ in 0..expected().len() {
+                out.push(stream.read_u8().await.expect("read byte"));
+            }
+            assert_eq!(out, expected());
+            assert_eq!(
+                stream.read_u8().await.err().map(|e| e.kind()),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+        }
+
+        #[tokio::test]
+        async fn ktls_serves_drained_bytes_first_with_large_read() {
+            let mut stream = ktls_with_drained().await;
+            let mut out = vec![0; expected().len()];
+            stream.read_exact(&mut out).await.expect("read_exact");
+            assert_eq!(out, expected());
         }
     }
 }
