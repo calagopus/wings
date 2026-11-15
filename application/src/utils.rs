@@ -450,6 +450,40 @@ impl CmpExt for Path {
     }
 }
 
+/// serde-saphyr expands every alias into a full copy of its anchor, so a few hundred KB of
+/// aliases can materialize into many GB; YAML parsed from untrusted input never needs them.
+/// The remaining options keep alias-free YAML parsing identical to serde_norway.
+pub fn yaml_deserialize_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        alias_limits: serde_saphyr::alias_limits! {
+            max_alias_expansions_per_anchor: 0,
+        },
+        strict_booleans: true,
+        leading_zero_numbers_as_strings: true,
+        underscored_numbers_as_strings: true,
+        non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::PassThrough,
+    }
+}
+
+/// Whether the error comes from a budget or alias limit rather than malformed YAML.
+pub fn is_yaml_limit_error(mut err: &serde_saphyr::Error) -> bool {
+    while let serde_saphyr::Error::AliasError { error, .. }
+    | serde_saphyr::Error::WithSnippet { error, .. } = err
+    {
+        err = error;
+    }
+
+    matches!(
+        err,
+        serde_saphyr::Error::Budget { .. }
+            | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
+            | serde_saphyr::Error::AliasReplayCounterOverflow { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
