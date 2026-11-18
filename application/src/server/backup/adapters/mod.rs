@@ -1,9 +1,13 @@
 use crate::{
     io::compression::{CompressionType, reader::AsyncCompressionReader},
     remote::backups::RawServerBackup,
-    server::backup::{Backup, DumpReader, DumpSource},
+    server::{
+        backup::{Backup, DumpReader, DumpSource},
+        filesystem::archive::{Archive, ArchiveType, ExtractOptions},
+    },
+    utils::TokioStdoutTakeExt,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 pub mod btrfs;
 pub mod ddup_bak;
@@ -77,6 +81,111 @@ async fn create_with_parent<T, Fut: Future<Output = Result<T, std::io::Error>>>(
         }
         result => result,
     }
+}
+
+fn spawn_stderr_capture(
+    stderr: tokio::process::ChildStderr,
+    limit: usize,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut output = String::new();
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if output.len() < limit {
+                        output.push_str(&String::from_utf8_lossy(&line));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        output
+    })
+}
+
+async fn restore_tar_command(
+    server: &crate::server::Server,
+    tool: &str,
+    mut command: tokio::process::Command,
+    progress: crate::server::filesystem::archive::create::ArchiveProgress,
+    total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stderr_limit: usize,
+) -> Result<(), anyhow::Error> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child.take_stdout()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+    let stderr_task = spawn_stderr_capture(stderr, stderr_limit);
+
+    let (destination, destination_filesystem) =
+        server.filesystem.resolve_writable_fs(server, "").await;
+
+    let extracted = Archive::from_stream(
+        server.clone(),
+        CompressionType::None,
+        ArchiveType::Tar,
+        tokio_util::io::SyncIoBridge::new(stdout),
+        None,
+    )
+    .extract(
+        destination,
+        destination_filesystem,
+        progress,
+        Some(total),
+        ExtractOptions {
+            on_file: Some(std::sync::Arc::new({
+                let server = server.clone();
+
+                move |path| log_restoring(&server, path)
+            })),
+            count_written: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    if extracted.is_err() {
+        child.start_kill().ok();
+    }
+
+    let status = child.wait().await?;
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if let Err(err) = extracted {
+        if !status.success() && !stderr.trim().is_empty() {
+            return Err(err.context(format!("{tool} failed: {}", stderr.trim_end())));
+        }
+
+        return Err(err);
+    }
+
+    if !status.success() {
+        let mut message = compact_str::format_compact!("failed to restore {tool} backup");
+        if !stderr.is_empty() {
+            message.push_str(":\n");
+            message.push_str(stderr.trim_end());
+        }
+
+        return Err(anyhow::anyhow!("{}", message));
+    }
+
+    server.filesystem.rerun_disk_checker();
+
+    Ok(())
 }
 
 async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyhow::Error> {

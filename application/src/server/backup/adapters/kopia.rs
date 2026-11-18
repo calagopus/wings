@@ -167,13 +167,14 @@ impl KopiaBackup {
         config: &crate::config::Config,
         mut policy: tokio::process::Command,
         uuid: uuid::Uuid,
-    ) {
+    ) -> Result<(), anyhow::Error> {
         let retry_limit = config.load().system.backups.kopia.retry_limit;
         let mut attempt = 0;
 
-        while let Ok(output) = policy.output().await {
+        loop {
+            let output = policy.output().await?;
             if output.status.success() {
-                return;
+                return Ok(());
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -189,12 +190,11 @@ impl KopiaBackup {
                 continue;
             }
 
-            tracing::warn!(
+            return Err(anyhow::anyhow!(
                 "failed to apply ignore policy for Kopia backup {}: {}",
                 uuid,
                 stderr
-            );
-            return;
+            ));
         }
     }
 
@@ -491,15 +491,15 @@ impl BackupCreateExt for KopiaBackup {
                 .arg("set")
                 .arg(&source_path)
                 .arg("--clear-ignore");
-            Self::apply_policy(&server.app_state.config, policy, uuid).await;
+            Self::apply_policy(&server.app_state.config, policy, uuid).await?;
 
             for batch in ignore_lines.chunks(KOPIA_IGNORE_BATCH) {
                 let mut policy = Self::get_tokio_command(&config_file, &remote);
                 policy.arg("policy").arg("set").arg(&source_path);
                 for line in batch {
-                    policy.arg("--add-ignore").arg(line);
+                    policy.arg(format!("--add-ignore={line}"));
                 }
-                Self::apply_policy(&server.app_state.config, policy, uuid).await;
+                Self::apply_policy(&server.app_state.config, policy, uuid).await?;
             }
         }
 
@@ -932,16 +932,13 @@ impl BackupExt for KopiaBackup {
     ) -> Result<(), anyhow::Error> {
         total.store(self.total_size, Ordering::Relaxed);
 
-        let mut child = Self::get_tokio_command(&self.config_file, &self.remote)
-            .arg("--progress")
-            .arg("--progress-update-interval")
-            .arg("1s")
+        let mut command = Self::get_tokio_command(&self.config_file, &self.remote);
+        command
             .arg("restore")
             .arg(&self.root_oid)
-            .arg(&server.filesystem.base_path)
-            .arg("--overwrite-files")
-            .arg("--overwrite-directories")
-            .arg("--overwrite-symlinks")
+            .arg("/dev/stdout")
+            .arg("--mode")
+            .arg("tar")
             .arg(format!(
                 "--parallel={}",
                 server
@@ -952,40 +949,17 @@ impl BackupExt for KopiaBackup {
                     .backups
                     .kopia
                     .restore_threads
-            ))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            ));
 
-        if let Some(stderr) = child.stderr.take() {
-            let mut segments = tokio::io::BufReader::new(stderr).split(b'\r');
-            while let Ok(Some(segment)) = segments.next_segment().await {
-                let line = compact_str::CompactString::from_utf8_lossy(segment.trim_ascii());
-                if line.is_empty() {
-                    continue;
-                }
-
-                let Some(restored) = Self::extract_parenthesised_bytes(&line, "Processed ") else {
-                    continue;
-                };
-
-                progress.store_bytes(restored);
-                if let Some(enqueued) = Self::extract_parenthesised_bytes(&line, " of ") {
-                    total.store(enqueued, Ordering::Relaxed);
-                }
-                server.log_daemon(line);
-            }
-        }
-
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("failed to restore Kopia backup"));
-        }
-
-        progress.store_bytes(total.load(Ordering::Relaxed));
-        server.filesystem.rerun_disk_checker();
-
-        Ok(())
+        super::restore_tar_command(
+            server,
+            "Kopia",
+            command,
+            progress,
+            total,
+            KOPIA_STDERR_CAPTURE_LIMIT,
+        )
+        .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {

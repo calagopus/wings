@@ -317,31 +317,6 @@ impl ResticBackup {
             }
         }
     }
-
-    fn spawn_stderr_capture(
-        stderr: tokio::process::ChildStderr,
-    ) -> tokio::task::JoinHandle<String> {
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr);
-            let mut output = String::new();
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if output.len() < RESTIC_STDERR_CAPTURE_LIMIT {
-                            output.push_str(&line);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            output
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -823,7 +798,7 @@ impl BackupStreamCreateExt for ResticBackup {
 
                 (replay, result)
             });
-            let stderr_task = Self::spawn_stderr_capture(stderr);
+            let stderr_task = super::spawn_stderr_capture(stderr, RESTIC_STDERR_CAPTURE_LIMIT);
 
             let mut line_reader = tokio::io::BufReader::new(stdout).lines();
 
@@ -1214,13 +1189,9 @@ impl BackupExt for ResticBackup {
     ) -> Result<(), anyhow::Error> {
         total.store(self.total_bytes_processed, Ordering::Relaxed);
 
-        let mut child = ResticBackup::command(&server.app_state.config, &self.configuration)
-            .arg("--json")
+        let mut command = ResticBackup::command(&server.app_state.config, &self.configuration);
+        command
             .arg("--no-lock")
-            .arg("restore")
-            .arg(format!("{}:{}", self.short_id, self.server_path.display()))
-            .arg("--target")
-            .arg(&server.filesystem.base_path)
             .arg("--limit-download")
             .arg(
                 (server
@@ -1233,55 +1204,21 @@ impl BackupExt for ResticBackup {
                     .as_kib())
                 .to_compact_string(),
             )
-            .arg("-vv")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .arg("dump")
+            .arg("--archive")
+            .arg("tar")
+            .arg(format!("{}:{}", self.short_id, self.server_path.display()))
+            .arg("/");
 
-        let stdout = child.take_stdout()?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| std::io::Error::other("No stderr available"))?;
-        let mut line_reader = tokio::io::BufReader::new(stdout).lines();
-
-        let stderr_task = Self::spawn_stderr_capture(stderr);
-
-        while let Ok(Some(line)) = line_reader.next_line().await {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
-                && json.get("message_type").and_then(|v| v.as_str()) == Some("verbose_status")
-            {
-                let Some(item) = json.get("item").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let size = json.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-
-                if size == 0 {
-                    continue;
-                }
-
-                progress.increment_bytes(size);
-                progress.increment_files();
-
-                super::log_restoring(server, Path::new(item));
-            }
-        }
-
-        let status = child.wait().await?;
-        let stderr_output = stderr_task.await.unwrap_or_default();
-
-        if !status.success() {
-            let mut message = compact_str::CompactString::from("failed to restore restic backup");
-            if !stderr_output.is_empty() {
-                message.push_str(":\n");
-                message.push_str(stderr_output.trim_end());
-            }
-            return Err(anyhow::anyhow!("{}", message));
-        }
-
-        server.filesystem.rerun_disk_checker();
-
-        Ok(())
+        super::restore_tar_command(
+            server,
+            "restic",
+            command,
+            progress,
+            total,
+            RESTIC_STDERR_CAPTURE_LIMIT,
+        )
+        .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
@@ -1355,7 +1292,7 @@ impl BackupExt for ResticBackup {
             .take()
             .ok_or_else(|| std::io::Error::other("No stderr available"))?;
 
-        let stderr_task = Self::spawn_stderr_capture(stderr);
+        let stderr_task = super::spawn_stderr_capture(stderr, RESTIC_STDERR_CAPTURE_LIMIT);
 
         let mut entries = Vec::new();
         let mut truncated = false;

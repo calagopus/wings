@@ -14,7 +14,7 @@ use futures::{FutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io::Write,
     pin::Pin,
     str::FromStr,
@@ -294,6 +294,7 @@ pub struct ReceivedBackups {
 pub struct BackupReceiver {
     state: crate::routes::State,
     listener: AbortListener,
+    allowed: HashSet<uuid::Uuid>,
 
     received: ReceivedBackups,
     checksum: Option<String>,
@@ -301,10 +302,15 @@ pub struct BackupReceiver {
 
 impl BackupReceiver {
     #[inline]
-    pub fn new(state: crate::routes::State, listener: AbortListener) -> Self {
+    pub fn new(
+        state: crate::routes::State,
+        listener: AbortListener,
+        allowed: HashSet<uuid::Uuid>,
+    ) -> Self {
         Self {
             state,
             listener,
+            allowed,
             received: ReceivedBackups::default(),
             checksum: None,
         }
@@ -367,6 +373,12 @@ impl BackupReceiver {
                     .strip_prefix("backup-ignore-")
                     .and_then(|n| uuid::Uuid::from_str(n).ok())
                 {
+                    if !self.allowed.contains(&uuid) {
+                        return Err(anyhow::anyhow!(
+                            "transfer contains an ignore file for backup {uuid}, which does not belong to the server"
+                        ));
+                    }
+
                     let backup_path =
                         crate::server::backup::adapters::btrfs::BtrfsBackup::get_backup_path(
                             &self.state.config,
@@ -398,6 +410,12 @@ impl BackupReceiver {
                 return Ok(());
             }
         };
+
+        if !self.allowed.contains(&uuid) {
+            return Err(anyhow::anyhow!(
+                "transfer contains backup {uuid}, which does not belong to the server"
+            ));
+        }
 
         let file_name = match field.file_name() {
             Some(name) => name.to_string(),
@@ -437,7 +455,7 @@ impl BackupReceiver {
                     .state
                     .config
                     .resolve_as_path(|cfg| &cfg.system.backup_directory)
-                    .join(file_name);
+                    .join(format!("{uuid}.{}", format.extension()));
                 let reader =
                     tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
                         std::io::Error::other(format!("failed to read multipart field: {err}"))

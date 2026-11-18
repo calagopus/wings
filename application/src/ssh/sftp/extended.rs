@@ -919,6 +919,17 @@ pub async fn handle_extended(
                 return Err(StatusCode::Failure);
             }
 
+            if !sftp_session.has_permission(Permission::FileDelete)
+                && sftp_session
+                    .server
+                    .filesystem
+                    .async_symlink_metadata(&new_path)
+                    .await
+                    .is_ok()
+            {
+                return Err(StatusCode::PermissionDenied);
+            }
+
             let activity = Activity {
                 event: ActivityEvent::SftpRename,
                 user: Some(sftp_session.user_uuid),

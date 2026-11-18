@@ -923,13 +923,16 @@ impl BackupStreamExt for S3Backup {
         let response = get_download_client(&state.config)
             .get(url)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .and_then(|response| response.error_for_status())
+            .map_err(|err| err.without_url())?;
         let content_length = response.content_length();
 
         let reader = AsyncLimitedReader::new_with_bytes_per_second(
             tokio_util::io::StreamReader::new(
-                response.bytes_stream().map_err(std::io::Error::other),
+                response
+                    .bytes_stream()
+                    .map_err(|err| std::io::Error::other(err.without_url())),
             ),
             state.config.load().system.backups.read_limit.as_bytes(),
         );

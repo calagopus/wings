@@ -232,6 +232,16 @@ mod post {
             }
         };
 
+        let allowed_backups: std::collections::HashSet<uuid::Uuid> = {
+            let configuration = server.configuration.read().await;
+            configuration
+                .backups
+                .iter()
+                .chain(&configuration.database_backups)
+                .copied()
+                .collect()
+        };
+
         let handle = tokio::spawn({
             let runtime = tokio::runtime::Handle::current();
             let server = server.clone();
@@ -251,6 +261,7 @@ mod post {
                             crate::server::backup::transfer::BackupReceiver::new(
                                 state.0.clone(),
                                 listener.clone(),
+                                allowed_backups,
                             );
 
                         loop {

@@ -36,6 +36,23 @@ pub fn split_image_reference(image: &str) -> (&str, &str) {
     }
 }
 
+fn registry_matches(registry: &str, image: &str) -> bool {
+    let registry = registry.trim_end_matches('/');
+    let (registry_host, registry_path) = registry.split_once('/').unwrap_or((registry, ""));
+    let Some((image_host, image_path)) = image.split_once('/') else {
+        return false;
+    };
+
+    if registry_host.is_empty() || !registry_host.eq_ignore_ascii_case(image_host) {
+        return false;
+    }
+
+    registry_path.is_empty()
+        || image_path
+            .strip_prefix(registry_path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':', '@']))
+}
+
 pub fn registry_credentials(
     config: &crate::config::InnerConfig,
     image: &str,
@@ -44,7 +61,8 @@ pub fn registry_credentials(
         .docker
         .registries
         .iter()
-        .find(|(registry, _)| image.starts_with(registry.as_str()))
+        .filter(|(registry, _)| registry_matches(registry, image))
+        .max_by_key(|(registry, _)| registry.len())
         .map(|(registry, config)| bollard::auth::DockerCredentials {
             username: Some(config.username.clone()),
             password: Some(config.password.clone()),
@@ -3985,5 +4003,130 @@ mod tests {
             binds,
             Some(vec!["/devices/a:/home/container:rw,idmap".to_string()])
         );
+    }
+
+    // registry_matches
+
+    #[test]
+    fn registry_host_must_equal_the_image_host_exactly() {
+        for (registry, image, expected) in [
+            ("ghcr.io", "ghcr.io/org/img:tag", true),
+            ("GHCR.io", "ghcr.IO/img", true),
+            ("ghcr.io/", "ghcr.io/img", true),
+            (
+                "registry.example.com:5000",
+                "registry.example.com:5000/img",
+                true,
+            ),
+            ("ghcr.io", "ghcr.io.example.com/img", false),
+            ("ghcr.io", "evilghcr.io/img", false),
+            (
+                "registry.example.com:5000",
+                "registry.example.com:5001/img",
+                false,
+            ),
+            (
+                "registry.example.com:5000",
+                "registry.example.com/img",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                registry_matches(registry, image),
+                expected,
+                "{registry} vs {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostless_images_and_empty_registry_hosts_never_match() {
+        for (registry, image) in [
+            ("ubuntu", "ubuntu:latest"),
+            ("docker.io", "ubuntu:latest"),
+            ("", "ghcr.io/img"),
+            ("", "/img"),
+            ("/org", "/org/img"),
+            ("/org", "ghcr.io/org/img"),
+        ] {
+            assert!(!registry_matches(registry, image), "{registry} vs {image}");
+        }
+    }
+
+    #[test]
+    fn registry_path_prefix_must_end_at_a_component_boundary() {
+        for (image, expected) in [
+            ("host:5000/org/img", true),
+            ("host:5000/org/img:tag", true),
+            ("host:5000/org:tag", true),
+            ("host:5000/org@sha256:abcdef", true),
+            ("host:5000/organisation/img", false),
+            ("host:5000/other/img", false),
+        ] {
+            assert_eq!(
+                registry_matches("host:5000/org", image),
+                expected,
+                "{image}"
+            );
+            assert_eq!(
+                registry_matches("host:5000/org/", image),
+                expected,
+                "{image} (trailing slash)"
+            );
+        }
+    }
+
+    // registry_credentials
+
+    fn config_with_registries(registries: &[&str]) -> crate::config::InnerConfig {
+        let mut config = crate::config::InnerConfig::default();
+        for registry in registries {
+            config.docker.registries.insert(
+                registry.to_string(),
+                crate::config::DockerRegistryConfiguration {
+                    username: format!("user-{registry}"),
+                    password: format!("pass-{registry}"),
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn the_most_specific_matching_registry_supplies_the_credentials() {
+        let config = config_with_registries(&["ghcr.io", "ghcr.io/org", "ghcr.io/org/team"]);
+
+        let credentials = registry_credentials(&config, "ghcr.io/org/team/img:tag").unwrap();
+        assert_eq!(
+            credentials.username.as_deref(),
+            Some("user-ghcr.io/org/team")
+        );
+        assert_eq!(
+            credentials.password.as_deref(),
+            Some("pass-ghcr.io/org/team")
+        );
+        assert_eq!(
+            credentials.serveraddress.as_deref(),
+            Some("ghcr.io/org/team")
+        );
+
+        let credentials = registry_credentials(&config, "ghcr.io/org/other").unwrap();
+        assert_eq!(credentials.serveraddress.as_deref(), Some("ghcr.io/org"));
+
+        let credentials = registry_credentials(&config, "ghcr.io/elsewhere/img").unwrap();
+        assert_eq!(credentials.serveraddress.as_deref(), Some("ghcr.io"));
+    }
+
+    #[test]
+    fn lookalike_or_unconfigured_hosts_get_no_registry_credentials() {
+        let config = config_with_registries(&["ghcr.io"]);
+
+        for image in [
+            "ghcr.io.attacker.tld/img",
+            "docker.io/library/ubuntu",
+            "ubuntu:latest",
+        ] {
+            assert!(registry_credentials(&config, image).is_none(), "{image}");
+        }
     }
 }
