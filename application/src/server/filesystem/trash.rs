@@ -379,6 +379,65 @@ impl TrashManager {
         false
     }
 
+    /// Whether moving `inner` of an entry (the whole payload when empty) out to
+    /// `target` would carry along something hidden at its original place or at
+    /// `target`, or, with `overwrite`, replace a directory holding something hidden.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_carries_ignored(
+        &self,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        meta: &TrashMeta,
+        inner: &Path,
+        file_type: FileType,
+        target: &Path,
+        overwrite: bool,
+        ignored: &RequestIgnored,
+    ) -> bool {
+        let mut source = payload_path(uuid, &meta.name);
+        let mut original = PathBuf::from(meta.path.as_str());
+        if !inner.as_os_str().is_empty() {
+            source.push(inner);
+            original.push(inner);
+        }
+
+        if ignored
+            .contains_ignored(server, file_type, &source, &[&original, target])
+            .await
+        {
+            return true;
+        }
+
+        overwrite
+            && ignored
+                .contains_ignored(
+                    server,
+                    server.filesystem.probe_file_type(target).await,
+                    target,
+                    &[target],
+                )
+                .await
+    }
+
+    /// Whether removing the payload of an entry would destroy something hidden at
+    /// its original place.
+    pub async fn payload_holds_ignored(
+        &self,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        meta: &TrashMeta,
+        ignored: &RequestIgnored,
+    ) -> bool {
+        ignored
+            .contains_ignored(
+                server,
+                meta.file_type(),
+                &payload_path(uuid, &meta.name),
+                &[Path::new(meta.path.as_str())],
+            )
+            .await
+    }
+
     pub async fn inner_file_type(
         &self,
         server: &crate::server::Server,
@@ -2207,6 +2266,134 @@ mod tests {
 
             assert_eq!(server.filesystem.trash.run_maintenance(&server).await, 0);
             assert!(server.filesystem.trash.get(entry.uuid).await.is_some());
+        });
+    }
+
+    async fn trash_plugins(server: &Server) -> TrashEntry {
+        let root = root(server);
+        std::fs::create_dir_all(root.join("plugins/Vault")).unwrap();
+        std::fs::write(root.join("plugins/Vault/config.yml"), b"secret").unwrap();
+        std::fs::write(root.join("plugins/Vault/other.yml"), b"public").unwrap();
+
+        server
+            .filesystem
+            .trash
+            .trash(server, Path::new("plugins"), TrashSource::Api)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn restore_carries_ignored_flags_hidden_payload_contents() {
+        Server::with_mock(|server| async move {
+            let entry = trash_plugins(&server).await;
+            let meta = server.filesystem.trash.get(entry.uuid).await.unwrap();
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let trash = &server.filesystem.trash;
+
+            assert!(
+                trash
+                    .restore_carries_ignored(
+                        &server,
+                        entry.uuid,
+                        &meta,
+                        Path::new(""),
+                        FileType::Dir,
+                        Path::new("elsewhere"),
+                        false,
+                        &ignored
+                    )
+                    .await
+            );
+            assert!(
+                trash
+                    .restore_carries_ignored(
+                        &server,
+                        entry.uuid,
+                        &meta,
+                        Path::new("Vault"),
+                        FileType::Dir,
+                        Path::new("vault"),
+                        false,
+                        &ignored
+                    )
+                    .await
+            );
+
+            let unrelated = RequestIgnored::compile(&["world/level.dat"]).unwrap();
+            assert!(
+                !trash
+                    .restore_carries_ignored(
+                        &server,
+                        entry.uuid,
+                        &meta,
+                        Path::new(""),
+                        FileType::Dir,
+                        Path::new("elsewhere"),
+                        false,
+                        &unrelated
+                    )
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn restore_carries_ignored_flags_overwriting_a_hiding_directory() {
+        Server::with_mock(|server| async move {
+            let root = root(&server);
+            let entry = trash_world(&server).await;
+            let meta = server.filesystem.trash.get(entry.uuid).await.unwrap();
+            std::fs::create_dir_all(root.join("plugins/Vault")).unwrap();
+            std::fs::write(root.join("plugins/Vault/config.yml"), b"secret").unwrap();
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let trash = &server.filesystem.trash;
+
+            for (overwrite, expected) in [(false, false), (true, true)] {
+                assert_eq!(
+                    trash
+                        .restore_carries_ignored(
+                            &server,
+                            entry.uuid,
+                            &meta,
+                            Path::new(""),
+                            FileType::Dir,
+                            Path::new("plugins"),
+                            overwrite,
+                            &ignored
+                        )
+                        .await,
+                    expected,
+                    "overwrite {overwrite}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn payload_holds_ignored_only_for_hidden_contents() {
+        Server::with_mock(|server| async move {
+            let plugins = trash_plugins(&server).await;
+            let world = trash_world(&server).await;
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let trash = &server.filesystem.trash;
+
+            let meta = trash.get(plugins.uuid).await.unwrap();
+            assert!(
+                trash
+                    .payload_holds_ignored(&server, plugins.uuid, &meta, &ignored)
+                    .await
+            );
+
+            let meta = trash.get(world.uuid).await.unwrap();
+            assert!(
+                !trash
+                    .payload_holds_ignored(&server, world.uuid, &meta, &ignored)
+                    .await
+            );
         });
     }
 

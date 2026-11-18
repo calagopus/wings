@@ -1,7 +1,10 @@
 use super::State;
 use crate::{
-    response::ApiResponse,
-    server::{Server, filesystem::VIRTUAL_PATH_MESSAGE},
+    response::{ApiResponse, ApiResponseResult},
+    server::{
+        Server,
+        filesystem::{IGNORED_CONTENTS_MESSAGE, VIRTUAL_PATH_MESSAGE},
+    },
 };
 use axum::http::StatusCode;
 use std::path::{Path, PathBuf};
@@ -50,6 +53,12 @@ async fn reject_any_protected(server: &Server, paths: &[PathBuf]) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn ignored_contents_error() -> ApiResponseResult {
+    ApiResponse::error(IGNORED_CONTENTS_MESSAGE)
+        .with_status(StatusCode::EXPECTATION_FAILED)
+        .ok()
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {

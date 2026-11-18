@@ -9,6 +9,28 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+async fn is_database_dump(filesystem: &dyn VirtualReadableFilesystem, uuid: uuid::Uuid) -> bool {
+    let Ok(listing) = filesystem
+        .async_read_dir(
+            &"",
+            Some(2),
+            1,
+            Default::default(),
+            crate::models::DirectorySortingMode::default(),
+        )
+        .await
+    else {
+        return false;
+    };
+    let prefix = format!("{uuid}.");
+
+    listing.total_entries == 1
+        && listing
+            .entries
+            .first()
+            .is_some_and(|entry| !entry.directory && entry.name.starts_with(&prefix))
+}
+
 pub struct BackupManager {
     cached_backups: moka::future::Cache<uuid::Uuid, Arc<super::Backup>>,
     cached_browse_backups: moka::future::Cache<uuid::Uuid, Arc<dyn VirtualReadableFilesystem>>,
@@ -125,8 +147,12 @@ impl BackupManager {
     }
 
     pub async fn fast_contains(&self, server: &crate::server::Server, uuid: uuid::Uuid) -> bool {
-        self.cached_backups.contains_key(&uuid)
-            || server.configuration.read().await.backups.contains(&uuid)
+        if self.cached_backups.contains_key(&uuid) {
+            return true;
+        }
+
+        let configuration = server.configuration.read().await;
+        configuration.backups.contains(&uuid) || configuration.database_backups.contains(&uuid)
     }
 
     pub async fn create(
@@ -426,7 +452,12 @@ impl BackupManager {
             }))
             .build(),
         )?;
-        server.configuration.write().await.backups.push(uuid);
+        server
+            .configuration
+            .write()
+            .await
+            .database_backups
+            .push(uuid);
         self.cached_backup_adapters.insert(uuid, adapter).await;
 
         Ok(backup)
@@ -893,6 +924,11 @@ impl BackupManager {
                 }
 
                 let browse_backup = backup.browse(&server).await?;
+                if is_database_dump(&*browse_backup, uuid).await {
+                    browse_backup.close().await.ok();
+
+                    return Err(anyhow::anyhow!("database backups cannot be browsed"));
+                }
 
                 cached_browse_backups
                     .insert(uuid, Arc::clone(&browse_backup))
@@ -1052,5 +1088,45 @@ mod tests {
 
             wait.await
         })
+    }
+
+    // is_database_dump
+    #[test]
+    fn database_dump_is_a_lone_regular_file_named_after_the_backup() {
+        crate::server::Server::with_mock(|server| async move {
+            let uuid = uuid::Uuid::new_v4();
+            let dump = format!("{uuid}.sql");
+            let other = format!("{}.sql", uuid::Uuid::new_v4());
+            let bare = uuid.to_string();
+
+            let cases: [(&[&str], &[&str], bool); 6] = [
+                (&[dump.as_str()], &[], true),
+                (&[other.as_str()], &[], false),
+                (&[], &[dump.as_str()], false),
+                (&[dump.as_str(), "extra.txt"], &[], false),
+                (&[], &[], false),
+                (&[bare.as_str()], &[], false),
+            ];
+
+            for (files, dirs, expected) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                for file in files {
+                    std::fs::write(temp.path().join(file), b"dump").unwrap();
+                }
+                for dir in dirs {
+                    std::fs::create_dir(temp.path().join(dir)).unwrap();
+                }
+                let filesystem = crate::server::filesystem::cap::CapFilesystem::new(temp.path())
+                    .await
+                    .unwrap()
+                    .get_virtual(server.clone());
+
+                assert_eq!(
+                    is_database_dump(&filesystem, uuid).await,
+                    expected,
+                    "{files:?} {dirs:?}"
+                );
+            }
+        });
     }
 }

@@ -56,6 +56,7 @@ mod post {
 
         let mut deleted_count = 0;
         let mut failed_count = 0;
+        let mut kept_ignored = false;
         for file in data.files {
             let path = Path::new(&data.root).join(&file);
 
@@ -80,6 +81,14 @@ mod post {
                     continue;
                 }
 
+                if ignored
+                    .contains_ignored(&server, metadata.file_type, &source, &[&source])
+                    .await
+                {
+                    kept_ignored = true;
+                    continue;
+                }
+
                 if metadata.file_type.is_file() {
                     let path = server.filesystem.diff_key(&source).await;
 
@@ -90,6 +99,11 @@ mod post {
 
                 server.filesystem.truncate_path(&source).await
             } else if metadata.file_type.is_dir() {
+                if filesystem.async_holds_ignored(&source, &[]).await {
+                    kept_ignored = true;
+                    continue;
+                }
+
                 filesystem.async_remove_dir_all(&source).await
             } else {
                 filesystem.async_remove_file(&source).await
@@ -108,6 +122,10 @@ mod post {
                     failed_count += 1;
                 }
             }
+        }
+
+        if kept_ignored {
+            return super::super::ignored_contents_error();
         }
 
         if failed_count > 0 {

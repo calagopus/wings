@@ -24,6 +24,7 @@ use tokio::{
 
 pub mod archive;
 pub mod cap;
+pub mod filtered;
 pub mod functions;
 pub mod mount;
 
@@ -653,6 +654,11 @@ pub trait VirtualReadableFilesystem: Send + Sync {
     fn is_writable(&self) -> bool {
         false
     }
+    /// The cap filesystem this is, so a request can take its own copy of a shared
+    /// one and judge entries by the paths symlinks lead to.
+    fn as_virtual_cap(&self) -> Option<&cap::VirtualCapFilesystem> {
+        None
+    }
 
     fn backing_server(&self) -> &crate::server::Server;
 
@@ -857,6 +863,10 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
+    /// Whether the directory at `directory` holds an entry this filesystem hides,
+    /// where it is now or re-rooted under any of `roots`, so moving or removing the
+    /// directory would take it along. Anything unreadable counts as hidden.
+    async fn async_holds_ignored(&self, directory: &Path, roots: &[&Path]) -> bool;
     async fn async_remove_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -965,4 +975,17 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         to: &(dyn AsRef<Path> + Send + Sync),
         file_type: FileType,
     ) -> Result<(), anyhow::Error>;
+
+    /// Copies the regular file at `source` on `source_server`'s own filesystem to
+    /// `destination` here, through the server's quota accounting. Only a primary
+    /// server filesystem can do this, and `destination` is judged like any other
+    /// file created here.
+    async fn async_quota_copy_from(
+        &self,
+        source_server: &crate::server::Server,
+        source: &Path,
+        destination: &Path,
+        permissions: Option<PortablePermissions>,
+        progress: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<u64, anyhow::Error>;
 }

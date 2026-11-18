@@ -234,7 +234,7 @@ pub async fn stream_source_file(
     command: &mut StreamingCommand,
     write_batch: impl Fn(&mut Vec<u8>, &[cidr::IpCidr]),
 ) -> Result<LoadStats, LoadError> {
-    let file = filesystem.async_open(path).await?;
+    let file = filesystem.async_open_regular(path).await?;
     let mut reader = tokio::io::BufReader::new(file);
 
     let mut stats = LoadStats::default();

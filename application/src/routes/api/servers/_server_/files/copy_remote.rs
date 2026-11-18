@@ -290,7 +290,6 @@ mod post {
                         let root = root.clone();
                         let files = Arc::new(data.files.clone());
                         let filesystem = filesystem.clone();
-                        let destination_server = destination_server.clone();
                         let destination_path = Arc::new(destination_path);
                         let destination_filesystem = destination_filesystem.clone();
                         let bytes_processed = bytes_processed.clone();
@@ -314,7 +313,6 @@ mod post {
                                             let filesystem = filesystem.clone();
                                             let source_path = Arc::new(root);
                                             let files = Arc::clone(&files);
-                                            let destination_server = destination_server.clone();
                                             let destination_path = Arc::new(destination_path);
                                             let destination_filesystem = destination_filesystem.clone();
                                             let bytes_processed = Arc::clone(&bytes_processed);
@@ -327,7 +325,6 @@ mod post {
                                                 let filesystem = filesystem.clone();
                                                 let source_path = Arc::clone(&source_path);
                                                 let files = Arc::clone(&files);
-                                                let destination_server = destination_server.clone();
                                                 let destination_path = Arc::clone(&destination_path);
                                                 let destination_filesystem = destination_filesystem.clone();
                                                 let bytes_processed = Arc::clone(&bytes_processed);
@@ -366,14 +363,12 @@ mod post {
                                                         if filesystem.is_primary_server_fs()
                                                             && destination_filesystem.is_primary_server_fs()
                                                         {
-                                                            server
-                                                                .filesystem
-                                                                .async_quota_copy(
+                                                            destination_filesystem
+                                                                .async_quota_copy_from(
+                                                                    &server,
                                                                     &source_path,
                                                                     &destination_path,
-                                                                    &destination_server,
                                                                     Some(metadata.permissions),
-                                                                    None,
                                                                     Some(&bytes_processed),
                                                                 )
                                                                 .await?;

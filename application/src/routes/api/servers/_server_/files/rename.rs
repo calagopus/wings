@@ -77,6 +77,7 @@ mod put {
         .await?;
 
         let mut renamed_count = 0;
+        let mut kept_ignored = false;
         for file in data.files {
             let from = root.join(file.from);
             if from == root {
@@ -114,6 +115,19 @@ mod put {
                 continue;
             }
 
+            let holds_ignored = if filesystem.is_primary_server_fs() {
+                ignored
+                    .contains_ignored(&server, from_metadata.file_type, &from, &[&from, &to])
+                    .await
+            } else {
+                from_metadata.file_type.is_dir()
+                    && filesystem.async_holds_ignored(&from, &[&to]).await
+            };
+            if holds_ignored {
+                kept_ignored = true;
+                continue;
+            }
+
             if filesystem.is_primary_server_fs() {
                 let from_path = server
                     .filesystem
@@ -148,6 +162,10 @@ mod put {
             {
                 renamed_count += 1;
             }
+        }
+
+        if kept_ignored {
+            return super::super::ignored_contents_error();
         }
 
         ApiResponse::new_serialized(Response {

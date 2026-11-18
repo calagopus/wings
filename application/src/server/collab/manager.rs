@@ -64,6 +64,87 @@ fn decode_awareness(update: &[u8]) -> Option<Vec<AwarenessEntry>> {
     Some(entries)
 }
 
+fn is_plain_text_update(update: &[u8]) -> bool {
+    use yrs::block::{
+        BLOCK_GC_REF_NUMBER, BLOCK_ITEM_DELETED_REF_NUMBER, BLOCK_ITEM_STRING_REF_NUMBER,
+        BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
+    };
+
+    fn read_id(cursor: &mut Cursor) -> Option<()> {
+        cursor.read_var::<u64>().ok()?;
+        cursor.read_var::<u32>().ok()?;
+
+        Some(())
+    }
+
+    fn blocks(cursor: &mut Cursor) -> Option<()> {
+        let clients: u32 = cursor.read_var().ok()?;
+        for _ in 0..clients {
+            let blocks: u32 = cursor.read_var().ok()?;
+            cursor.read_var::<u64>().ok()?;
+            let mut clock = u64::from(cursor.read_var::<u32>().ok()?);
+
+            for _ in 0..blocks {
+                let info = cursor.read_u8().ok()?;
+
+                let len = if info == BLOCK_GC_REF_NUMBER || info == BLOCK_SKIP_REF_NUMBER {
+                    u64::from(cursor.read_var::<u32>().ok()?)
+                } else {
+                    if info & HAS_ORIGIN != 0 {
+                        read_id(cursor)?;
+                    }
+                    if info & HAS_RIGHT_ORIGIN != 0 {
+                        read_id(cursor)?;
+                    }
+                    if info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0
+                        && (cursor.read_var::<u32>().ok()? != 1
+                            || cursor.read_string().ok()? != "content"
+                            || info & HAS_PARENT_SUB != 0)
+                    {
+                        return None;
+                    }
+
+                    match info & 0b1111 {
+                        BLOCK_ITEM_DELETED_REF_NUMBER => u64::from(cursor.read_var::<u32>().ok()?),
+                        BLOCK_ITEM_STRING_REF_NUMBER => {
+                            cursor.read_string().ok()?.encode_utf16().count() as u64
+                        }
+                        _ => return None,
+                    }
+                };
+
+                clock = clock.checked_add(len)?;
+                if clock > u64::from(u32::MAX) {
+                    return None;
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    fn delete_set(cursor: &mut Cursor) -> Option<()> {
+        let clients: u32 = cursor.read_var().ok()?;
+        for _ in 0..clients {
+            cursor.read_var::<u64>().ok()?;
+            let ranges: u32 = cursor.read_var().ok()?;
+            for _ in 0..ranges {
+                let clock = u64::from(cursor.read_var::<u32>().ok()?);
+                let len = u64::from(cursor.read_var::<u32>().ok()?);
+                if clock + len > u64::from(u32::MAX) {
+                    return None;
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    let mut cursor = Cursor::new(update);
+
+    blocks(&mut cursor).is_some() && delete_set(&mut cursor).is_some() && !cursor.has_content()
+}
+
 fn encode_awareness_removal(clients: &HashMap<u64, u64>) -> Vec<u8> {
     let mut update = Vec::new();
     update.write_var(clients.len() as u64);
@@ -1025,6 +1106,10 @@ impl CollabManager {
             }
         };
 
+        if !is_plain_text_update(&update) {
+            return Err(CollabError::User("invalid update encoding"));
+        }
+
         let decoded =
             Update::decode_v1(&update).map_err(|_| CollabError::User("invalid update encoding"))?;
 
@@ -1791,5 +1876,117 @@ mod tests {
         assert!(!doc.bom);
         assert_eq!(doc.bom_len(), 0);
         assert_eq!(doc.to_disk_bytes(doc.content()), raw);
+    }
+
+    // is_plain_text_update
+    #[test]
+    fn plain_text_update_accepts_what_a_text_editor_sends() {
+        let (client, text, updates) = client_updates(&[(0, "hello"), (5, " world"), (0, "> ")]);
+        for update in &updates {
+            assert!(is_plain_text_update(update));
+        }
+
+        let before = client.transact().state_vector();
+        {
+            let mut txn = client.transact_mut();
+            text.remove_range(&mut txn, 2, 6);
+        }
+        assert!(is_plain_text_update(
+            &client.transact().encode_diff_v1(&before)
+        ));
+
+        let (other, other_text, _) = client_updates(&[(0, "other")]);
+        {
+            let mut txn = other.transact_mut();
+            other_text.remove_range(&mut txn, 1, 2);
+        }
+        {
+            let mut txn = client.transact_mut();
+            txn.apply_update(
+                Update::decode_v1(&other.transact().encode_diff_v1(&StateVector::default()))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let full = client
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        assert!(is_plain_text_update(&full));
+
+        let empty = Doc::new();
+        assert!(is_plain_text_update(
+            &empty
+                .transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        ));
+    }
+
+    #[test]
+    fn plain_text_update_refuses_embeds_maps_and_other_roots() {
+        use yrs::Map;
+
+        let embed = Doc::new();
+        let text = embed.get_or_insert_text("content");
+        {
+            let mut txn = embed.transact_mut();
+            text.insert(&mut txn, 0, "ab");
+            text.insert_embed(&mut txn, 1, true);
+        }
+
+        let map = Doc::new();
+        let root = map.get_or_insert_map("m");
+        {
+            let mut txn = map.transact_mut();
+            root.insert(&mut txn, "key", "value");
+        }
+
+        let renamed = Doc::new();
+        let other = renamed.get_or_insert_text("notes");
+        {
+            let mut txn = renamed.transact_mut();
+            other.insert(&mut txn, 0, "hello");
+        }
+
+        for doc in [&embed, &map, &renamed] {
+            assert!(!is_plain_text_update(
+                &doc.transact()
+                    .encode_state_as_update_v1(&StateVector::default())
+            ));
+        }
+    }
+
+    #[test]
+    fn plain_text_update_refuses_truncated_and_garbage_bytes() {
+        use crate::io::SafeSliceExt;
+
+        let (_client, _text, updates) = client_updates(&[(0, "hello")]);
+        let update = updates.first().unwrap();
+        for len in 0..update.len() {
+            assert!(
+                !is_plain_text_update(update.get_slice(..len).unwrap()),
+                "{len}"
+            );
+        }
+
+        for garbage in [
+            b"not a yjs update".as_slice(),
+            &[0xff; 32],
+            &[0x01, 0x01, 0x01],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80],
+        ] {
+            assert!(!is_plain_text_update(garbage), "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn plain_text_update_refuses_deeply_nested_values_without_decoding() {
+        let mut update = vec![0x01, 0x01, 0x01, 0x00, 0x08, 0x01, 0x07];
+        update.extend_from_slice(b"content");
+        update.push(0x01);
+        for _ in 0..400_000 {
+            update.extend_from_slice(&[0x75, 0x01]);
+        }
+
+        assert!(!is_plain_text_update(&update));
     }
 }

@@ -448,16 +448,40 @@ pub async fn handle_extended(
                 }
             }
 
+            let check = {
+                let server = sftp_session.server.clone();
+                let user_uuid = sftp_session.user_uuid;
+
+                move |file: &std::fs::File| {
+                    #[cfg(target_os = "linux")]
+                    if super::SftpSession::is_ignored_server(
+                        &server,
+                        user_uuid,
+                        &server.filesystem.opened_relative_path(file)?,
+                        FileType::File,
+                    ) {
+                        return Err(anyhow::anyhow!(std::io::Error::from(
+                            std::io::ErrorKind::NotFound
+                        )));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = (file, &server, user_uuid);
+
+                    Ok(())
+                }
+            };
+
             sftp_session
                 .server
                 .filesystem
-                .async_quota_copy(
+                .async_quota_copy_checked(
                     &source_path,
                     &destination_path,
                     &sftp_session.server,
                     None,
                     None,
                     None,
+                    check,
                 )
                 .await
                 .map_err(|_| StatusCode::NoSuchFile)?;
@@ -887,6 +911,10 @@ pub async fn handle_extended(
                 || sftp_session
                     .async_is_ignored(&new_path, old_metadata.file_type().into())
                     .await
+                || (old_metadata.is_dir()
+                    && sftp_session
+                        .async_contains_ignored(&old_path, &[&old_path, &new_path])
+                        .await)
             {
                 return Err(StatusCode::Failure);
             }

@@ -60,6 +60,7 @@ mod post {
 
         let mut restored = Vec::new();
         let mut conflicts = Vec::new();
+        let mut kept_ignored = false;
         for RestoreEntry { uuid, path } in data.entries {
             let Some(meta) = server
                 .filesystem
@@ -80,6 +81,25 @@ mod post {
                 .await
                 || server.filesystem.async_is_protected_path(&target).await
             {
+                continue;
+            }
+
+            if server
+                .filesystem
+                .trash
+                .restore_carries_ignored(
+                    &server,
+                    uuid,
+                    &meta,
+                    Path::new(""),
+                    meta.file_type(),
+                    &target,
+                    data.overwrite,
+                    &ignored,
+                )
+                .await
+            {
+                kept_ignored = true;
                 continue;
             }
 
@@ -118,6 +138,10 @@ mod post {
                     );
                 }
             }
+        }
+
+        if kept_ignored {
+            return super::super::super::ignored_contents_error();
         }
 
         ApiResponse::new_serialized(Response {

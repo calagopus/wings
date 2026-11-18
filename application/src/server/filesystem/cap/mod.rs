@@ -851,7 +851,7 @@ impl CapFilesystem {
     ) -> Result<Vec<u8>, std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
-        let mut file = self.async_open(path).await?;
+        let mut file = self.async_open_regular(path).await?;
         let mut content = Vec::new();
 
         let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
@@ -895,6 +895,42 @@ impl CapFilesystem {
 
         let file = self
             .blocking(move |filesystem| filesystem.open(path))
+            .await?;
+
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    /// Like [`Self::open`], but refuses anything other than a regular file, without
+    /// blocking on a FIFO or device that was put in its place.
+    pub fn open_regular(&self, path: impl AsRef<Path>) -> Result<std::fs::File, std::io::Error> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+        }
+
+        let file = self.open_with(path, options)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+
+        Ok(file)
+    }
+
+    pub async fn async_open_regular(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<tokio::fs::File, std::io::Error> {
+        let path = path.as_ref().to_path_buf();
+
+        let file = self
+            .blocking(move |filesystem| filesystem.open_regular(path))
             .await?;
 
         Ok(tokio::fs::File::from_std(file))
@@ -1048,6 +1084,32 @@ impl CapFilesystem {
         modified: Option<std::time::SystemTime>,
         progress: Option<&Arc<AtomicU64>>,
     ) -> Result<u64, std::io::Error> {
+        self.async_quota_copy_checked(
+            path,
+            destination_path,
+            destination_server,
+            permissions,
+            modified,
+            progress,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Like [`Self::async_quota_copy`], but runs `check` on the opened destination
+    /// before it is truncated, so a destination swapped in after it was judged is
+    /// refused without being overwritten.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn async_quota_copy_checked(
+        &self,
+        path: impl AsRef<Path>,
+        destination_path: impl AsRef<Path>,
+        destination_server: &crate::server::Server,
+        permissions: Option<PortablePermissions>,
+        modified: Option<std::time::SystemTime>,
+        progress: Option<&Arc<AtomicU64>>,
+        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static,
+    ) -> Result<u64, std::io::Error> {
         let (guard, listener) = AbortGuard::new();
 
         let bytes_copied = tokio::task::spawn_blocking({
@@ -1066,6 +1128,7 @@ impl CapFilesystem {
                     modified,
                     progress.as_ref(),
                     listener,
+                    check,
                 )
             }
         })
@@ -1086,6 +1149,7 @@ impl CapFilesystem {
         modified: Option<std::time::SystemTime>,
         progress: Option<&Arc<AtomicU64>>,
         listener: AbortListener,
+        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
     ) -> Result<u64, std::io::Error> {
         let path = self.relative_path(path.as_ref());
         let destination_path = destination_server
@@ -1112,7 +1176,23 @@ impl CapFilesystem {
             ));
         }
 
-        let mut reader = self.open(&path)?;
+        let mut source_options = OpenOptions::new();
+        source_options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+
+            source_options.custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            );
+        }
+        let mut reader = self.open_with(&path, source_options)?;
+        if !reader.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Source path is not a file",
+            ));
+        }
 
         #[cfg(unix)]
         if let Some(destination_metadata) = &destination_metadata {
@@ -1129,7 +1209,38 @@ impl CapFilesystem {
             }
         }
 
-        let mut writer = destination_server.filesystem.create(&destination_path)?;
+        let mut destination_options = OpenOptions::new();
+        destination_options.write(true).create(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+
+            destination_options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+        }
+        let mut writer = destination_server
+            .filesystem
+            .open_with(&destination_path, destination_options)?;
+        if !writer.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Destination path exists and is not a file",
+            ));
+        }
+        if let Err(err) = check(&writer) {
+            #[cfg(target_os = "linux")]
+            if destination_metadata.is_none()
+                && writer.metadata().is_ok_and(|metadata| metadata.len() == 0)
+                && let Ok(created) = destination_server.filesystem.opened_relative_path(&writer)
+            {
+                destination_server.filesystem.remove_file(&created).ok();
+            }
+
+            return Err(match err.downcast::<std::io::Error>() {
+                Ok(err) => err,
+                Err(err) => std::io::Error::other(err),
+            });
+        }
+        writer.set_len(0)?;
         destination_server.filesystem.chown_file(&writer)?;
         if let Some(permissions) = permissions {
             writer.apply_permissions(permissions)?;
@@ -3848,5 +3959,85 @@ mod tests {
         assert_eq!(mtime(dir.path().join("async")), NEW_MTIME);
         assert_ne!(mtime(dir.path().join("untouched")), NEW_MTIME);
         assert_eq!(mtime(dir.path().join("target")), target_before);
+    }
+
+    // CapFilesystem::open_regular
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_refuses_fifos_and_directories_without_blocking() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("fifo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = filesystem.clone();
+        std::thread::spawn(move || {
+            let results = ["fifo", "dir"].map(|path| worker.open_regular(path).map(|_| ()));
+            sender.send(results).unwrap();
+        });
+        let [fifo, dir_result] = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("open_regular blocked");
+        assert_eq!(fifo.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            dir_result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut filesystem.open_regular("file").unwrap(), &mut contents)
+            .unwrap();
+        assert_eq!(contents, "x");
+    }
+
+    // CapFilesystem::async_open_regular
+
+    #[cfg(unix)]
+    #[test]
+    fn async_open_regular_refuses_fifos_and_directories_without_blocking() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            std::fs::write(temp.path().join("file"), "x")?;
+            std::fs::create_dir(temp.path().join("dir"))?;
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                temp.path().join("fifo"),
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o644),
+                0,
+            )?;
+
+            for path in ["fifo", "dir"] {
+                let err = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fs.async_open_regular(path),
+                )
+                .await
+                .expect("async_open_regular blocked")
+                .unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{path}");
+            }
+
+            let mut contents = String::new();
+            tokio::io::AsyncReadExt::read_to_string(
+                &mut fs.async_open_regular("file").await?,
+                &mut contents,
+            )
+            .await?;
+            assert_eq!(contents, "x");
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
     }
 }

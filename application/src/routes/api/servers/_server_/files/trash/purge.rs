@@ -39,19 +39,35 @@ mod post {
         let ignored = crate::routes::token::ignored(&server, &data.ignored, "entry not found")?;
 
         let mut entries = Vec::with_capacity(data.entries.len());
+        let mut kept_ignored = false;
         for uuid in data.entries {
-            if server
+            let Some(meta) = server
                 .filesystem
                 .trash
                 .get_visible(&server, uuid, &ignored)
                 .await
-                .is_some()
+            else {
+                continue;
+            };
+
+            if server
+                .filesystem
+                .trash
+                .payload_holds_ignored(&server, uuid, &meta, &ignored)
+                .await
             {
-                entries.push(uuid);
+                kept_ignored = true;
+                continue;
             }
+
+            entries.push(uuid);
         }
 
         let deleted = server.filesystem.trash.purge_many(&server, entries).await;
+
+        if kept_ignored {
+            return super::super::super::ignored_contents_error();
+        }
 
         ApiResponse::new_serialized(Response { deleted }).ok()
     }

@@ -82,6 +82,7 @@ mod post {
 
         let mut restored = Vec::new();
         let mut conflicts = Vec::new();
+        let mut kept_ignored = false;
         for RestoreFile { from, to } in data.files {
             let Some(inner) = inner_path(&from).filter(|inner| !inner.as_os_str().is_empty())
             else {
@@ -116,6 +117,25 @@ mod post {
                 .await
                 || server.filesystem.async_is_protected_path(&target).await
             {
+                continue;
+            }
+
+            if server
+                .filesystem
+                .trash
+                .restore_carries_ignored(
+                    &server,
+                    entry_id,
+                    &meta,
+                    &inner,
+                    file_type,
+                    &target,
+                    data.overwrite,
+                    &ignored,
+                )
+                .await
+            {
+                kept_ignored = true;
                 continue;
             }
 
@@ -169,6 +189,10 @@ mod post {
             .trash
             .visible_entry(&server, entry_id, &ignored)
             .await;
+
+        if kept_ignored {
+            return super::super::super::super::ignored_contents_error();
+        }
 
         ApiResponse::new_serialized(Response {
             restored,

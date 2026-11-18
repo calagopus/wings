@@ -929,6 +929,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
     fn is_writable(&self) -> bool {
         self.is_writable
     }
+    fn as_virtual_cap(&self) -> Option<&VirtualCapFilesystem> {
+        Some(self)
+    }
 
     fn backing_server(&self) -> &crate::server::Server {
         &self.server
@@ -942,6 +945,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata: FileMetadata = metadata.into();
 
         self.check_reachable(metadata.file_type, path.as_ref())?;
+        if self.check_links {
+            self.check_resolved(metadata.file_type, path.as_ref())?;
+        }
 
         Ok(metadata)
     }
@@ -954,6 +960,10 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
         self.async_check_reachable(metadata.file_type, path.as_ref())
             .await?;
+        if self.check_links {
+            self.async_check_resolved(metadata.file_type, path.as_ref())
+                .await?;
+        }
 
         Ok(metadata)
     }
@@ -1440,6 +1450,50 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
 #[async_trait::async_trait]
 impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
+    async fn async_holds_ignored(&self, directory: &Path, roots: &[&Path]) -> bool {
+        let Some(is_ignored) = self.is_ignored.clone() else {
+            return false;
+        };
+
+        let directory = self.inner.relative_path(directory);
+        let roots: Vec<PathBuf> = std::iter::once(directory.clone())
+            .chain(roots.iter().map(|root| self.inner.relative_path(root)))
+            .collect();
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let Ok(mut walk) = inner.walk_dir(&directory) else {
+                return true;
+            };
+
+            while let Some(entry) = walk.next_entry() {
+                let Ok(entry) = entry else {
+                    return true;
+                };
+
+                let file_type = entry.file_type();
+                if matches!(file_type, FileType::Unknown) {
+                    return true;
+                }
+
+                let Ok(relative) = entry.path.strip_prefix(&directory) else {
+                    return true;
+                };
+
+                if roots
+                    .iter()
+                    .any(|root| is_ignored(file_type, root.join(relative)).keep().is_none())
+                {
+                    return true;
+                }
+            }
+
+            false
+        })
+        .await
+        .unwrap_or(true)
+    }
+
     fn create_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -1585,7 +1639,10 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
         let link = self.check_write(FileType::File, link.as_ref(), false)?;
-        let original = self.check_ignored(FileType::File, original.as_ref())?;
+        let mut original = self.check_ignored(FileType::File, original.as_ref())?;
+        if let Some(resolved) = self.written_target(&original, false)? {
+            original = self.check_ignored(FileType::File, resolved)?;
+        }
 
         self.inner.hard_link(original, &self.inner, &link)?;
 
@@ -1803,6 +1860,44 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.inner.async_rename(from, &self.inner, to).await?;
 
         Ok(())
+    }
+
+    async fn async_quota_copy_from(
+        &self,
+        source_server: &crate::server::Server,
+        source: &Path,
+        destination: &Path,
+        permissions: Option<PortablePermissions>,
+        progress: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<u64, anyhow::Error> {
+        if !self.is_primary_server_fs {
+            return Err(anyhow::anyhow!(
+                "quota copies only write to the primary server filesystem"
+            ));
+        }
+
+        let destination = self
+            .async_check_write(FileType::File, destination, true)
+            .await?;
+        let check = {
+            let this = self.clone();
+            let destination = destination.clone();
+
+            move |file: &std::fs::File| this.check_opened(&destination, file)
+        };
+
+        Ok(source_server
+            .filesystem
+            .async_quota_copy_checked(
+                source,
+                &destination,
+                &self.server,
+                permissions,
+                None,
+                progress,
+                check,
+            )
+            .await?)
     }
 }
 
@@ -3042,6 +3137,232 @@ mod tests {
             }
             fixture.fs.async_read_file(&"file-link", None).await?;
             fixture.fs.async_read_file(&"nested/data.bin", None).await?;
+
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_fs_checking_links_refuses_request_denied_files_behind_a_dir_symlink() {
+        with_one_blocking_worker(|| async {
+            let (_server_temp, server) = Server::mock_in_tempdir().await;
+            let snapshot = tempfile::tempdir()?;
+            std::fs::create_dir_all(snapshot.path().join("plugins/Vault"))?;
+            std::fs::write(snapshot.path().join("plugins/Vault/config.yml"), b"secret")?;
+            std::fs::write(snapshot.path().join("plugins/Vault/other.yml"), b"other")?;
+            std::os::unix::fs::symlink("plugins", snapshot.path().join("peek"))?;
+
+            let filter =
+                crate::server::filesystem::RequestIgnored::compile(&["plugins/Vault/config.yml"])
+                    .unwrap()
+                    .lexical_filter(&server, Path::new(""));
+            let mut fs = CapFilesystem::new(snapshot.path())
+                .await?
+                .get_virtual(server.clone())
+                .with_is_ignored(filter);
+            fs.is_primary_server_fs = false;
+            fs.check_links = true;
+
+            assert!(read_async(&fs, "plugins/Vault/config.yml").await.is_err());
+            assert!(read_async(&fs, "peek/Vault/config.yml").await.is_err());
+            assert!(fs.async_metadata(&"peek/Vault/config.yml").await.is_err());
+            assert_eq!(read_async(&fs, "peek/Vault/other.yml").await?, b"other");
+
+            let listing = fs
+                .async_read_dir(&"peek/Vault", None, 1, IsIgnoredFn::default(), NameAsc)
+                .await?;
+            let names: Vec<_> = listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            assert_eq!(names, ["other.yml"]);
+
+            let mut walk = fs
+                .async_walk_dir(&"peek/Vault", IsIgnoredFn::default())
+                .await?;
+            let mut paths = Vec::new();
+            while let Some(entry) = walk.next_entry().await {
+                paths.push(entry?.1);
+            }
+            let names: Vec<_> = paths.iter().filter_map(|path| path.file_name()).collect();
+            assert!(names.iter().any(|name| *name == "other.yml"));
+            assert!(!names.iter().any(|name| *name == "config.yml"));
+
+            let mut unchecked = fs.clone();
+            unchecked.check_links = false;
+            assert!(
+                read_async(&unchecked, "plugins/Vault/config.yml")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                read_async(&unchecked, "peek/Vault/config.yml").await?,
+                b"secret"
+            );
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::async_quota_copy_from
+    #[cfg(unix)]
+    #[test]
+    fn quota_copy_from_refuses_denied_destinations_and_leaves_them_untouched() {
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+            let root = fixture.server.filesystem.base_path.clone();
+            std::os::unix::fs::symlink("denied.txt", root.join("alias.txt"))?;
+
+            let copied = fixture
+                .fs
+                .async_quota_copy_from(
+                    &fixture.server,
+                    Path::new("a.txt"),
+                    Path::new("copy.txt"),
+                    None,
+                    None,
+                )
+                .await?;
+            assert_eq!(copied, 5);
+            assert_eq!(std::fs::read(root.join("copy.txt"))?, b"hello");
+
+            for destination in ["denied.txt", "alias.txt"] {
+                assert!(
+                    fixture
+                        .fs
+                        .async_quota_copy_from(
+                            &fixture.server,
+                            Path::new("a.txt"),
+                            Path::new(destination),
+                            None,
+                            None,
+                        )
+                        .await
+                        .is_err(),
+                    "{destination}"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("denied.txt"))?,
+                    b"hidden",
+                    "{destination}"
+                );
+            }
+
+            let merged =
+                fixture
+                    .fs
+                    .clone()
+                    .with_is_ignored(IsIgnoredFn::from(IgnoreList::from_lines([
+                        "/request-denied-new.txt",
+                    ])?));
+            assert!(
+                merged
+                    .async_quota_copy_from(
+                        &fixture.server,
+                        Path::new("a.txt"),
+                        Path::new("request-denied-new.txt"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(std::fs::symlink_metadata(root.join("request-denied-new.txt")).is_err());
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn quota_copy_from_refuses_non_primary_filesystems() {
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+            fixture.fs.is_primary_server_fs = false;
+
+            assert!(
+                fixture
+                    .fs
+                    .async_quota_copy_from(
+                        &fixture.server,
+                        Path::new("a.txt"),
+                        Path::new("copy.txt"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_copy_from_does_not_follow_a_symlinked_source() {
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+
+            assert!(
+                fixture
+                    .fs
+                    .async_quota_copy_from(
+                        &fixture.server,
+                        Path::new("file-link"),
+                        Path::new("copy.txt"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::create_hard_link
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_through_a_symlinked_parent_checks_the_original() {
+        use std::os::unix::fs::MetadataExt;
+
+        with_one_blocking_worker(|| async {
+            let mut fixture = ListingFixture::new(0).await?;
+            fixture.fs.is_writable = true;
+            let root = fixture.server.filesystem.base_path.clone();
+            std::fs::create_dir(root.join("secret"))?;
+            std::fs::write(root.join("secret/key.txt"), b"key")?;
+            std::fs::write(root.join("secret/ok.txt"), b"ok")?;
+            std::os::unix::fs::symlink("secret", root.join("peek"))?;
+            fixture
+                .server
+                .filesystem
+                .update_ignored(&["/secret/key.txt"])
+                .await;
+
+            let fs = fixture.fs.clone();
+            let (denied, allowed) = std::thread::spawn(move || {
+                (
+                    fs.create_hard_link(&"peek/key.txt", &"stolen.txt"),
+                    fs.create_hard_link(&"peek/ok.txt", &"fine.txt"),
+                )
+            })
+            .join()
+            .expect("hard link worker panicked");
+
+            assert!(denied.is_err());
+            assert!(std::fs::symlink_metadata(root.join("stolen.txt")).is_err());
+            allowed?;
+            assert_eq!(
+                std::fs::metadata(root.join("fine.txt"))?.ino(),
+                std::fs::metadata(root.join("secret/ok.txt"))?.ino()
+            );
 
             Ok(())
         });

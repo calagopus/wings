@@ -230,6 +230,20 @@ impl SftpSession {
                 .await
     }
 
+    async fn async_contains_ignored(&self, directory: &Path, roots: &[&Path]) -> bool {
+        self.server
+            .filesystem
+            .async_contains_ignored(
+                directory,
+                roots,
+                self.server
+                    .user_permissions
+                    .ignored_list(self.user_uuid)
+                    .as_ref(),
+            )
+            .await
+    }
+
     #[inline]
     fn is_ignored_root(path: &Path) -> bool {
         path == Path::new("/") || path == Path::new(".") || path == Path::new("")
@@ -792,6 +806,10 @@ impl russh_sftp::server::Handler for SftpSession {
             || self
                 .async_is_ignored(&new_path, old_metadata.file_type().into())
                 .await
+            || (old_metadata.is_dir()
+                && self
+                    .async_contains_ignored(&old_path, &[&old_path, &new_path])
+                    .await)
         {
             return Err(StatusCode::Failure);
         }

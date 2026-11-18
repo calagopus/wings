@@ -152,6 +152,7 @@ mod post {
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
         let mut failed_count = 0;
+        let mut kept_ignored = false;
         for file in data.files {
             let path = Path::new(&data.root).join(&file);
 
@@ -180,6 +181,14 @@ mod post {
                 continue;
             }
 
+            if ignored
+                .contains_ignored(&server, metadata.file_type, &source, &[&source])
+                .await
+            {
+                kept_ignored = true;
+                continue;
+            }
+
             match server
                 .filesystem
                 .trash
@@ -198,6 +207,10 @@ mod post {
                     failed_count += 1;
                 }
             }
+        }
+
+        if kept_ignored {
+            return super::super::ignored_contents_error();
         }
 
         if failed_count > 0 {

@@ -12,10 +12,7 @@ mod post {
         io::abort::AbortGuard,
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::filesystem::{
-            archive::{ExtractOptions, create::ArchiveProgress},
-            cap::FileType,
-        },
+        server::filesystem::archive::{ExtractOptions, create::ArchiveProgress},
     };
     use axum::{
         extract::Multipart,
@@ -40,6 +37,9 @@ mod post {
         pub root: compact_str::CompactString,
 
         pub destination_path: compact_str::CompactString,
+
+        #[serde(flatten)]
+        pub ignored_files: crate::routes::token::IgnoredFiles,
     }
 
     impl crate::routes::token::TokenPayload for FileTransferJwtPayload {
@@ -126,16 +126,17 @@ mod post {
         let total = Arc::new(AtomicU64::new(total_bytes));
         let files_processed = Arc::new(AtomicU64::new(0));
 
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "destination not found")?;
+
         let (root, filesystem) = server
             .filesystem
-            .resolve_writable_fs(&server, &payload.destination_path)
+            .resolve_writable_fs_ignoring(&server, &payload.destination_path, &ignored)
             .await;
 
         if filesystem.is_primary_server_fs()
-            && server
-                .filesystem
-                .async_is_ignored_subtree(&root, FileType::Dir)
-                .await
+            && ignored.is_ignored_subtree_resolved(&server, &root).await
         {
             return ApiResponse::error("destination not found")
                 .with_status(StatusCode::NOT_FOUND)

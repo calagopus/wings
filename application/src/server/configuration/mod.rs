@@ -314,6 +314,8 @@ nestify::nest! {
         #[serde(default)]
         pub backups: Vec<uuid::Uuid>,
         #[serde(default)]
+        pub database_backups: Vec<uuid::Uuid>,
+        #[serde(default)]
         pub schedules: Vec<Schedule>,
 
         #[schema(inline)]
@@ -490,6 +492,7 @@ impl ServerConfiguration {
             environment: HashMap::new(),
             labels: HashMap::new(),
             backups: Vec::new(),
+            database_backups: Vec::new(),
             schedules: Vec::new(),
             allocations: ServerConfigurationAllocations {
                 force_outgoing_ip: false,

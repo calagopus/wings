@@ -57,6 +57,10 @@ mod post {
 
         let server = crate::routes::token::server(&state, subject).await?;
 
+        let ignored = payload
+            .ignored_files
+            .request_ignored(&server, "file not found")?;
+
         let mut entries = Vec::with_capacity(data.files.len());
         for path_raw in data.files {
             let path = Path::new(&payload.destination_path).join(&path_raw);
@@ -65,7 +69,10 @@ mod post {
                 continue;
             };
 
-            let (parent, filesystem) = server.filesystem.resolve_writable_fs(&server, parent).await;
+            let (parent, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, parent, &ignored)
+                .await;
 
             let Ok(mut entry) = filesystem
                 .async_directory_entry(&parent.join(file_name))

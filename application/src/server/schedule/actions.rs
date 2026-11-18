@@ -3,7 +3,7 @@ use crate::{
     server::{
         activity::{Activity, ActivityEvent},
         filesystem::{
-            RenameParents,
+            RenameParents, RequestIgnored,
             archive::ArchiveFormat,
             cap::FileType,
             trash::TrashSource,
@@ -1444,6 +1444,18 @@ impl ScheduleAction {
                         Err(_) => continue,
                     };
 
+                    let ignored = RequestIgnored::default();
+                    if filesystem.is_primary_server_fs()
+                        && (ignored
+                            .is_ignored_resolved_parent(server, &source, metadata.file_type)
+                            .await
+                            || ignored
+                                .contains_ignored(server, metadata.file_type, &source, &[&source])
+                                .await)
+                    {
+                        continue;
+                    }
+
                     let result = if filesystem.is_primary_server_fs() {
                         if trash {
                             server
@@ -1456,6 +1468,10 @@ impl ScheduleAction {
                             server.filesystem.truncate_path(&source).await
                         }
                     } else if metadata.file_type.is_dir() {
+                        if filesystem.async_holds_ignored(&source, &[]).await {
+                            continue;
+                        }
+
                         filesystem.async_remove_dir_all(&source).await
                     } else {
                         filesystem.async_remove_file(&source).await
@@ -1528,6 +1544,18 @@ impl ScheduleAction {
                                     .async_is_ignored(&to, from_metadata.file_type)
                                     .await))
                     {
+                        continue;
+                    }
+
+                    let holds_ignored = if filesystem.is_primary_server_fs() {
+                        RequestIgnored::default()
+                            .contains_ignored(server, from_metadata.file_type, &from, &[&from, &to])
+                            .await
+                    } else {
+                        from_metadata.file_type.is_dir()
+                            && filesystem.async_holds_ignored(&from, &[&to]).await
+                    };
+                    if holds_ignored {
                         continue;
                     }
 

@@ -85,6 +85,18 @@ mod post {
                     .is_ignored_resolved_parent(&server, destination, file_type)
                     .await
                 || server.filesystem.async_is_protected_path(destination).await
+                || ignored
+                    .contains_ignored(
+                        &server,
+                        server.filesystem.probe_file_type(destination).await,
+                        destination,
+                        &[
+                            destination,
+                            &std::path::Path::new(meta.path.as_str())
+                                .join(restoration.inner.as_str()),
+                        ],
+                    )
+                    .await
             {
                 unavailable.push(id);
                 continue;

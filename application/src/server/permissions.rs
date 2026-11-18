@@ -310,6 +310,14 @@ impl UserPermissionsMap {
         .unwrap_or(false)
     }
 
+    pub fn ignored_list(&self, user_uuid: uuid::Uuid) -> Option<IgnoreList> {
+        self.with_user(user_uuid, |_, ignored| match ignored {
+            IgnoredFiles::Matcher(list) => Some(list.clone()),
+            IgnoredFiles::Unrestricted | IgnoredFiles::Unusable => None,
+        })
+        .flatten()
+    }
+
     pub fn is_ignored(
         &self,
         server: &crate::server::Server,
@@ -541,13 +549,8 @@ impl Permissions {
 
     #[inline]
     pub fn has_permission(&self, permission: Permission) -> bool {
-        if (self.0.contains(&Permission::All) && !permission.is_admin())
+        (self.0.contains(&Permission::All) && !permission.is_admin())
             || self.0.contains(&permission)
-        {
-            return true;
-        }
-
-        false
     }
 
     #[inline]
@@ -924,6 +927,36 @@ mod tests {
             assert!(permissions.is_ignored(&server, user, "server.log", FileType::File));
             assert!(permissions.is_ignored(&server, user, "anything.txt", FileType::File));
             assert!(permissions.is_ignored(&server, user, "sub", FileType::Dir));
+        });
+    }
+
+    #[test]
+    fn map_ignored_list_only_for_a_usable_matcher() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let (matcher, unrestricted, unusable) = (
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+            );
+            let ignored: &[&str] = &["plugins/Vault/config.yml"];
+            let broken: &[&str] = &["[abc", "*.log"];
+            permissions.set_pushed_permissions(matcher, read(), Some(ignored));
+            permissions.grant(unrestricted, &[Permission::FileRead]);
+            permissions.set_pushed_permissions(unusable, read(), Some(broken));
+
+            let list = permissions.ignored_list(matcher).unwrap();
+            assert!(list.is_ignored(
+                std::path::Path::new("plugins/Vault/config.yml"),
+                FileType::File
+            ));
+            assert!(!list.is_ignored(
+                std::path::Path::new("plugins/Vault/other.yml"),
+                FileType::File
+            ));
+            assert!(permissions.ignored_list(unrestricted).is_none());
+            assert!(permissions.ignored_list(unusable).is_none());
+            assert!(permissions.ignored_list(uuid::Uuid::new_v4()).is_none());
         });
     }
 

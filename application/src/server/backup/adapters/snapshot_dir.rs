@@ -255,11 +255,10 @@ impl SnapshotDir {
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
         let (filesystem, ignore) = self.open().await?;
 
-        Ok(Arc::new(
-            filesystem
-                .get_virtual(server.clone())
-                .with_is_ignored(ignore.into()),
-        ))
+        let mut filesystem = filesystem.get_virtual(server.clone());
+        filesystem.check_links = true;
+
+        Ok(Arc::new(filesystem.with_is_ignored(ignore.into())))
     }
 }
 

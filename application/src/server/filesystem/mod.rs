@@ -149,6 +149,27 @@ impl RequestIgnored {
                 .await
     }
 
+    /// Whether moving or removing the directory at `directory` would carry along an
+    /// entry that is hidden at its current location or would be at any of `roots`,
+    /// the places its contents are judged at. Point checks on the directory itself
+    /// cannot see a pattern that names something deeper inside it.
+    pub async fn contains_ignored(
+        &self,
+        server: &crate::server::Server,
+        file_type: cap::FileType,
+        directory: &Path,
+        roots: &[&Path],
+    ) -> bool {
+        if !file_type.is_dir() || !self.applies(server) {
+            return false;
+        }
+
+        server
+            .filesystem
+            .async_contains_ignored(directory, roots, self.0.as_ref())
+            .await
+    }
+
     fn applies(&self, server: &crate::server::Server) -> bool {
         self.0.is_some() || !server.filesystem.disk_ignored.load().is_empty()
     }
@@ -180,6 +201,26 @@ impl RequestIgnored {
         self.0
             .as_ref()
             .map(|matcher| Filesystem::subuser_deny_filter(server, matcher.clone()))
+    }
+
+    /// A filter judging each entry by its own path placed under `root`, without
+    /// resolving links against the live filesystem, for filesystems whose entries
+    /// stand for server paths: a backup mirrors the server root, a mount sits at its
+    /// target.
+    fn lexical_filter(&self, server: &crate::server::Server, root: &Path) -> IsIgnoredFn {
+        let server = server.clone();
+        let ignored = self.clone();
+        let root = root.to_path_buf();
+
+        IsIgnoredFn::from(move |file_type, path: PathBuf| {
+            let mut match_path = root.clone();
+            match_path.extend(
+                path.components()
+                    .filter(|component| matches!(component, std::path::Component::Normal(_))),
+            );
+
+            ignored.verdict_as(&server, file_type, &match_path, path)
+        })
     }
 
     /// [`IgnoreList::verdict_as`] over the server's deny-list and this request's,
@@ -264,7 +305,12 @@ pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     }
 }
 
+#[cfg(target_os = "linux")]
+const ZFS_SUPER_MAGIC: u64 = 0x2fc12fc1;
+
 pub const VIRTUAL_PATH_MESSAGE: &str = "path is a mount point or virtual directory";
+pub const IGNORED_CONTENTS_MESSAGE: &str =
+    "a directory contains files you cannot access, so it was left in place";
 
 pub struct Filesystem {
     uuid: uuid::Uuid,
@@ -294,6 +340,7 @@ pub struct Filesystem {
     pub disk_check_completed: Arc<tokio::sync::Notify>,
     disk_ignored: arc_swap::ArcSwap<IgnoreList>,
     mount_gateways: arc_swap::ArcSwap<Vec<PathBuf>>,
+    zfs_dataset_root: AtomicBool,
 
     pub archive_fs_cache:
         moka::future::Cache<(PathBuf, MimeCacheKey), Arc<dyn VirtualReadableFilesystem>>,
@@ -378,6 +425,7 @@ impl Filesystem {
             disk_check_completed,
             disk_ignored: arc_swap::ArcSwap::from_pointee(disk_ignored),
             mount_gateways: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            zfs_dataset_root: AtomicBool::new(false),
 
             archive_fs_cache: moka::future::CacheBuilder::new(8)
                 .time_to_idle(std::time::Duration::from_mins(1))
@@ -480,12 +528,32 @@ impl Filesystem {
     /// a mount point or one of its parents belongs. Directories stay allowed there,
     /// which is what the container runtime creates itself.
     pub fn is_virtual_write_target(&self, path: &Path, file_type: cap::FileType) -> bool {
-        self.is_backups_virtual(path) || (!file_type.is_dir() && self.is_mount_gateway(path))
+        self.is_backups_virtual(path)
+            || self.is_zfs_control_path(path)
+            || (!file_type.is_dir() && self.is_mount_gateway(path))
+    }
+
+    /// Whether `path` lies in the control directory a ZFS dataset root exposes its
+    /// snapshots under, which hold copies no deny-list or backup mount check sees.
+    fn is_zfs_control_path(&self, path: &Path) -> bool {
+        self.zfs_dataset_root.load(Ordering::Relaxed)
+            && self
+                .relative_path_cow(path)
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == ".zfs")
+    }
+
+    /// Whether a symlink still has to be resolved to tell if it leads somewhere
+    /// virtual, when no deny-list would resolve it anyway.
+    fn resolves_virtual_links(&self, file_type: cap::FileType) -> bool {
+        file_type.is_symlink() && self.zfs_dataset_root.load(Ordering::Relaxed)
     }
 
     /// Whether [`Self::is_ignored`] can return true for any path at all.
     pub fn may_ignore(&self) -> bool {
         self.config.load().system.backups.mounting.enabled
+            || self.zfs_dataset_root.load(Ordering::Relaxed)
             || !self.mount_gateways.load().is_empty()
             || !self.disk_ignored.load().is_empty()
     }
@@ -493,7 +561,16 @@ impl Filesystem {
     /// Whether `path` may not be removed, renamed or replaced at all, also when it is
     /// a directory. Resolves the parent chain so a symlink cannot reach around it.
     pub async fn async_is_protected_path(&self, path: &Path) -> bool {
-        if self.is_backups_virtual(path) || self.is_mount_gateway(path) {
+        if self.is_backups_virtual(path)
+            || self.is_zfs_control_path(path)
+            || self.is_mount_gateway(path)
+        {
+            return true;
+        }
+
+        if self.zfs_dataset_root.load(Ordering::Relaxed)
+            && self.is_zfs_control_path(&self.diff_key(path).await)
+        {
             return true;
         }
 
@@ -622,11 +699,13 @@ impl Filesystem {
         }
 
         let disk_ignored = self.disk_ignored.load();
-        if disk_ignored.is_empty() {
+        if disk_ignored.is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
-        disk_ignored.is_ignored(&self.ignore_path(path, file_type), file_type)
+        let path = self.ignore_path(path, file_type);
+
+        self.is_zfs_control_path(&path) || disk_ignored.is_ignored(&path, file_type)
     }
 
     pub async fn async_is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
@@ -634,13 +713,13 @@ impl Filesystem {
             return true;
         }
 
-        if self.disk_ignored.load().is_empty() {
+        if self.disk_ignored.load().is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
         let path = self.async_ignore_path(path, file_type).await;
 
-        self.disk_ignored.load().is_ignored(&path, file_type)
+        self.is_zfs_control_path(&path) || self.disk_ignored.load().is_ignored(&path, file_type)
     }
 
     /// Like [`Self::async_is_ignored`], but false for a directory the denylist only
@@ -651,15 +730,100 @@ impl Filesystem {
             return true;
         }
 
-        if self.disk_ignored.load().is_empty() {
+        if self.disk_ignored.load().is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
         let path = self.async_ignore_path(path, file_type).await;
 
-        self.disk_ignored
-            .load()
-            .is_ignored_subtree(&path, file_type)
+        self.is_zfs_control_path(&path)
+            || self
+                .disk_ignored
+                .load()
+                .is_ignored_subtree(&path, file_type)
+    }
+
+    /// Walks the real directory `directory` and reports whether any entry beneath it,
+    /// re-rooted onto any of `roots` (each also taken with its parents resolved), is
+    /// excluded by the deny-list or `list`. Entries are judged by their own path, not
+    /// what they link to, since the caller acts on the links themselves. Anything that
+    /// cannot be read counts as hidden.
+    pub async fn async_contains_ignored(
+        &self,
+        directory: &Path,
+        roots: &[&Path],
+        list: Option<&IgnoreList>,
+    ) -> bool {
+        let denylist = self.disk_ignored.load_full();
+        if denylist.is_empty() && list.is_none() {
+            return false;
+        }
+
+        let mut match_roots = Vec::with_capacity(roots.len() * 2);
+        for root in roots {
+            for root in [
+                self.relative_path(root),
+                self.async_canonicalize_parent(root).await,
+            ] {
+                if !match_roots.contains(&root) {
+                    match_roots.push(root);
+                }
+            }
+        }
+
+        let directory = self.relative_path(directory);
+        let cap_filesystem = self.cap_filesystem.clone();
+        let list = list.cloned();
+
+        tokio::task::spawn_blocking(move || {
+            Self::contains_ignored_impl(
+                &cap_filesystem,
+                &directory,
+                &match_roots,
+                &denylist,
+                list.as_ref(),
+            )
+        })
+        .await
+        .unwrap_or(true)
+    }
+
+    fn contains_ignored_impl(
+        cap_filesystem: &cap::CapFilesystem,
+        directory: &Path,
+        roots: &[PathBuf],
+        denylist: &IgnoreList,
+        list: Option<&IgnoreList>,
+    ) -> bool {
+        let Ok(mut walk) = cap_filesystem.walk_dir(directory) else {
+            return true;
+        };
+
+        while let Some(entry) = walk.next_entry() {
+            let Ok(entry) = entry else {
+                return true;
+            };
+
+            let file_type = entry.file_type();
+            if matches!(file_type, cap::FileType::Unknown) {
+                return true;
+            }
+
+            let Ok(inner) = entry.path.strip_prefix(directory) else {
+                return true;
+            };
+
+            for root in roots {
+                let path = root.join(inner);
+                if denylist.is_ignored(&path, file_type)
+                    || list.is_some_and(|list| list.is_ignored(&path, file_type))
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn ignore_path<'a>(&self, path: &'a Path, file_type: cap::FileType) -> Cow<'a, Path> {
@@ -843,8 +1007,13 @@ impl Filesystem {
                 None => break 'backupfs,
             };
 
-            if !server.configuration.read().await.backups.contains(&uuid) {
-                break 'backupfs;
+            {
+                let configuration = server.configuration.read().await;
+                if !configuration.backups.contains(&uuid)
+                    || configuration.database_backups.contains(&uuid)
+                {
+                    break 'backupfs;
+                }
             }
 
             match self.app_state.backup_manager.browse(server, uuid).await {
@@ -854,7 +1023,25 @@ impl Filesystem {
                         Err(_) => PathBuf::new(),
                     };
 
-                    return (path, backup);
+                    if !ignored.applies(server) {
+                        return (path, backup);
+                    }
+
+                    let is_ignored = ignored.lexical_filter(server, Path::new(""));
+                    if let Some(filesystem) = backup.as_virtual_cap() {
+                        let mut filesystem = filesystem.clone();
+                        filesystem.check_links = true;
+
+                        return (path, Arc::new(filesystem.with_is_ignored(is_ignored)));
+                    }
+
+                    return (
+                        path,
+                        Arc::new(virtualfs::filtered::VirtualFilteredFilesystem {
+                            inner: backup,
+                            is_ignored,
+                        }),
+                    );
                 }
                 Ok(None) => break 'backupfs,
                 Err(err) => {
@@ -1004,7 +1191,7 @@ impl Filesystem {
                 let depth = relative_target_path.components().count();
                 if match_result
                     .as_ref()
-                    .is_none_or(|(_, _, _, matched_depth)| depth > *matched_depth)
+                    .is_none_or(|(_, _, _, matched_depth, _)| depth > *matched_depth)
                     && let Ok(inner_path) = path.strip_prefix(relative_target_path)
                 {
                     match_result = Some((
@@ -1012,6 +1199,7 @@ impl Filesystem {
                         source_path,
                         mount.read_only,
                         depth,
+                        relative_target_path.to_path_buf(),
                     ));
                 }
             }
@@ -1019,12 +1207,10 @@ impl Filesystem {
             (match_result, infos)
         };
 
-        if let Some((inner_path, source_path, read_only, _)) = mount_match {
+        if let Some((inner_path, source_path, read_only, _, target)) = mount_match {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
-                    let mut fs = cap_fs.get_virtual(server.clone());
-                    fs.is_primary_server_fs = false;
-                    fs.is_writable = !read_only;
+                    let fs = Self::mount_virtual_fs(server, cap_fs, read_only, &target, ignored);
 
                     return (inner_path, Arc::new(fs));
                 }
@@ -1055,6 +1241,27 @@ impl Filesystem {
         )
     }
 
+    /// A mount source as a filesystem whose entries are judged by the denylist and
+    /// `ignored` at the server path they appear under, `target` joined with their own.
+    fn mount_virtual_fs(
+        server: &crate::server::Server,
+        cap_fs: cap::CapFilesystem,
+        read_only: bool,
+        target: &Path,
+        ignored: &RequestIgnored,
+    ) -> virtualfs::cap::VirtualCapFilesystem {
+        let mut fs = cap_fs.get_virtual(server.clone());
+        fs.is_primary_server_fs = false;
+        fs.is_writable = !read_only;
+
+        if !ignored.applies(server) {
+            return fs;
+        }
+
+        fs.check_links = true;
+        fs.with_is_ignored(ignored.lexical_filter(server, target))
+    }
+
     pub async fn resolve_writable_fs(
         &self,
         server: &crate::server::Server,
@@ -1070,6 +1277,7 @@ impl Filesystem {
         path: impl AsRef<Path>,
         ignored: &RequestIgnored,
     ) -> (PathBuf, Arc<dyn VirtualWritableFilesystem>) {
+        let request_ignored = ignored;
         let ignored = ignored.filter(server);
         let path = self.relative_path(path.as_ref());
 
@@ -1081,7 +1289,7 @@ impl Filesystem {
                 crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
             };
 
-            let mut result: Option<(PathBuf, PathBuf, bool, usize)> = None;
+            let mut result: Option<(PathBuf, PathBuf, bool, usize, PathBuf)> = None;
             for mount in &server_config.mounts {
                 let Some(relative_target) = mount.container_relative_target() else {
                     continue;
@@ -1092,7 +1300,7 @@ impl Filesystem {
                 if !path.starts_with(relative_target_path)
                     || result
                         .as_ref()
-                        .is_some_and(|(_, _, _, matched_depth)| depth <= *matched_depth)
+                        .is_some_and(|(_, _, _, matched_depth, _)| depth <= *matched_depth)
                 {
                     continue;
                 }
@@ -1107,18 +1315,18 @@ impl Filesystem {
                         source_path,
                         mount.read_only,
                         depth,
+                        relative_target_path.to_path_buf(),
                     ));
                 }
             }
             result
         };
 
-        if let Some((inner_path, source_path, read_only, _)) = mount_match {
+        if let Some((inner_path, source_path, read_only, _, target)) = mount_match {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
-                    let mut fs = cap_fs.get_virtual(server.clone());
-                    fs.is_primary_server_fs = false;
-                    fs.is_writable = !read_only;
+                    let fs =
+                        Self::mount_virtual_fs(server, cap_fs, read_only, &target, request_ignored);
 
                     return (inner_path, Arc::new(fs));
                 }
@@ -1386,14 +1594,12 @@ impl Filesystem {
     ) -> Result<(), anyhow::Error> {
         if metadata.file_type.is_file() {
             if filesystem.is_primary_server_fs() && destination_filesystem.is_primary_server_fs() {
-                server
-                    .filesystem
-                    .async_quota_copy(
+                destination_filesystem
+                    .async_quota_copy_from(
+                        filesystem.backing_server(),
                         &path,
                         &destination_path,
-                        server,
                         Some(metadata.permissions),
-                        None,
                         progress.clone_bytes().as_ref(),
                     )
                     .await?;
@@ -1533,14 +1739,12 @@ impl Filesystem {
                                 tokio::io::copy(&mut reader, &mut writer).await?;
                                 writer.shutdown().await?;
                             } else {
-                                server
-                                    .filesystem
-                                    .async_quota_copy(
+                                destination_filesystem
+                                    .async_quota_copy_from(
+                                        &server,
                                         &path,
                                         &destination_path,
-                                        &server,
                                         Some(metadata.permissions),
-                                        None,
                                         progress.clone_bytes().as_ref(),
                                     )
                                     .await?;
@@ -2311,6 +2515,11 @@ impl Filesystem {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        self.zfs_dataset_root.store(
+            rustix::fs::fstatfs(&dir).is_ok_and(|stat| stat.f_type as u64 == ZFS_SUPER_MAGIC),
+            Ordering::Relaxed,
+        );
         self.cap_filesystem.inner.store(Some(Arc::new(dir)));
 
         self.ensure_trash_directory().await;
@@ -3083,6 +3292,84 @@ mod tests {
     }
 
     #[test]
+    fn zfs_control_dir_is_hidden_and_protected_on_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let filesystem = &server.filesystem;
+            filesystem.zfs_dataset_root.store(true, Ordering::Relaxed);
+
+            for (path, expected) in [
+                (".zfs", true),
+                (".zfs/snapshot/backup-x/file", true),
+                ("/.zfs/snapshot", true),
+                ("./.zfs", true),
+                ("sub/.zfs", false),
+                (".zfsx", false),
+            ] {
+                let path = Path::new(path);
+                for file_type in [FileType::Dir, FileType::File] {
+                    assert_eq!(
+                        filesystem.is_virtual_write_target(path, file_type),
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                    assert_eq!(
+                        filesystem.is_ignored(path, file_type),
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                    assert_eq!(
+                        filesystem.async_is_ignored(path, file_type).await,
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                }
+                assert_eq!(
+                    filesystem.async_is_protected_path(path).await,
+                    expected,
+                    "{path:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn zfs_control_dir_is_ordinary_off_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let filesystem = &server.filesystem;
+            let path = Path::new(".zfs");
+
+            for file_type in [FileType::Dir, FileType::File] {
+                assert!(!filesystem.is_virtual_write_target(path, file_type));
+                assert!(!filesystem.is_ignored(path, file_type));
+                assert!(!filesystem.async_is_ignored(path, file_type).await);
+            }
+            assert!(!filesystem.async_is_protected_path(path).await);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_into_zfs_control_dir_is_ignored_on_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join(".zfs/snapshot")).unwrap();
+            std::os::unix::fs::symlink(".zfs/snapshot", root.join("link")).unwrap();
+            server.filesystem.update_ignored(&[] as &[&str]).await;
+            server
+                .filesystem
+                .zfs_dataset_root
+                .store(true, Ordering::Relaxed);
+
+            assert!(
+                server
+                    .filesystem
+                    .async_is_ignored(Path::new("link"), FileType::Symlink)
+                    .await
+            );
+        });
+    }
+
+    #[test]
     fn root_is_never_ignored() {
         tokio_test::block_on(async {
             let state = crate::routes::AppState::mock();
@@ -3415,5 +3702,371 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    fn write_vault(root: &Path, directory: &str) {
+        std::fs::create_dir_all(root.join(directory).join("Vault")).unwrap();
+        std::fs::write(root.join(directory).join("Vault/config.yml"), b"secret").unwrap();
+        std::fs::write(root.join(directory).join("Vault/other.yml"), b"public").unwrap();
+    }
+
+    // RequestIgnored::contains_ignored
+    #[test]
+    fn contains_ignored_sees_a_pattern_naming_a_deeper_entry() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            write_vault(&root, "mods");
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+
+            let plugins = Path::new("plugins");
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+
+            let mods = Path::new("mods");
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, mods, &[mods])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_judges_contents_at_the_destination() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "p2");
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let p2 = Path::new("p2");
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, p2, &[p2, Path::new("other")])
+                    .await
+            );
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, p2, &[p2, Path::new("plugins")])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_resolves_a_symlinked_destination_parent() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join("plugins")).unwrap();
+            std::os::unix::fs::symlink("plugins", root.join("alias")).unwrap();
+            std::fs::create_dir_all(root.join("staging")).unwrap();
+            std::fs::write(root.join("staging/config.yml"), b"secret").unwrap();
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let staging = Path::new("staging");
+
+            assert!(
+                ignored
+                    .contains_ignored(
+                        &server,
+                        FileType::Dir,
+                        staging,
+                        &[staging, Path::new("alias/Vault")]
+                    )
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_applies_the_denylist_without_a_request_list() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            let plugins = Path::new("plugins");
+            let ignored = RequestIgnored::default();
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+
+            server
+                .filesystem
+                .update_ignored(&["plugins/Vault/config.yml"])
+                .await;
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_matches_unanchored_patterns_deep_in_the_tree() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join("cfg/a/b")).unwrap();
+            std::fs::write(root.join("cfg/a/b/secret.key"), b"key").unwrap();
+            std::fs::write(root.join("cfg/a/b/public.txt"), b"txt").unwrap();
+            let cfg = Path::new("cfg");
+
+            let ignored = RequestIgnored::compile(&["*.key"]).unwrap();
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, cfg, &[cfg])
+                    .await
+            );
+
+            let ignored = RequestIgnored::compile(&["*.pem"]).unwrap();
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, cfg, &[cfg])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_is_false_for_files() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            let ignored = RequestIgnored::compile(&["*.yml"]).unwrap();
+            let file = Path::new("plugins/Vault/other.yml");
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::File, file, &[file])
+                    .await
+            );
+        });
+    }
+
+    async fn mount_mods(server: &crate::server::Server) -> tempfile::TempDir {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("sub")).unwrap();
+        std::fs::write(source.path().join("sub/secret.key"), b"key").unwrap();
+        std::fs::write(source.path().join("secret.jar"), b"secret").unwrap();
+        std::fs::write(source.path().join("ok.jar"), b"ok").unwrap();
+
+        let source_path: compact_str::CompactString = source.path().to_string_lossy().into();
+        server
+            .app_state
+            .config
+            .mutate_in_place_for_testing()
+            .allowed_mounts = vec![source_path.clone()];
+        let mount = crate::server::configuration::Mount {
+            default: false,
+            target: "/home/container/mods".into(),
+            source: source_path,
+            read_only: false,
+        };
+        server
+            .configuration
+            .write()
+            .await
+            .mounts
+            .push(mount.clone());
+        server.filesystem.update_mounts(&[mount]);
+
+        source
+    }
+
+    async fn readable_in_mount(
+        server: &crate::server::Server,
+        path: &str,
+        ignored: &RequestIgnored,
+    ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
+        let (path, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(server, Path::new(path), ignored)
+            .await;
+        assert!(!filesystem.is_primary_server_fs());
+
+        (path, filesystem)
+    }
+
+    async fn mount_root_names(
+        server: &crate::server::Server,
+        ignored: &RequestIgnored,
+    ) -> Vec<String> {
+        let (root, filesystem) = readable_in_mount(server, "mods", ignored).await;
+        let listing = filesystem
+            .async_read_dir(
+                &root,
+                None,
+                1,
+                IsIgnoredFn::default(),
+                crate::models::DirectorySortingMode::NameAsc,
+            )
+            .await
+            .unwrap();
+
+        listing
+            .entries
+            .into_iter()
+            .map(|entry| entry.name.to_string())
+            .collect()
+    }
+
+    async fn readable_contents(
+        server: &crate::server::Server,
+        path: &str,
+        ignored: &RequestIgnored,
+    ) -> Option<Vec<u8>> {
+        let (path, filesystem) = readable_in_mount(server, path, ignored).await;
+        filesystem.async_metadata(&path).await.ok()?;
+        let mut read = filesystem.async_read_file(&path, None).await.ok()?;
+        let mut contents = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut read.reader, &mut contents)
+            .await
+            .ok()?;
+
+        Some(contents)
+    }
+
+    // Filesystem::resolve_readable_fs_ignoring
+    #[test]
+    fn resolve_readable_fs_ignoring_hides_request_ignored_entries_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods/secret.jar"]).unwrap();
+
+            let names = mount_root_names(&server, &ignored).await;
+            assert!(!names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert!(names.contains(&"ok.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &ignored).await,
+                None
+            );
+            assert_eq!(
+                readable_contents(&server, "mods/ok.jar", &ignored)
+                    .await
+                    .as_deref(),
+                Some(&b"ok"[..])
+            );
+
+            let unfiltered = RequestIgnored::default();
+            let names = mount_root_names(&server, &unfiltered).await;
+            assert!(names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &unfiltered)
+                    .await
+                    .as_deref(),
+                Some(&b"secret"[..])
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_readable_fs_ignoring_applies_the_denylist_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            server.filesystem.update_ignored(&["mods/secret.jar"]).await;
+            let ignored = RequestIgnored::default();
+
+            let names = mount_root_names(&server, &ignored).await;
+            assert!(!names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert!(names.contains(&"ok.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &ignored).await,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_readable_fs_ignoring_hides_a_mount_named_by_the_list() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods"]).unwrap();
+
+            for path in ["mods/ok.jar", "mods/sub/secret.key"] {
+                let (path, filesystem) = server
+                    .filesystem
+                    .resolve_readable_fs_ignoring(&server, Path::new(path), &ignored)
+                    .await;
+                assert!(
+                    filesystem.async_read_file(&path, None).await.is_err(),
+                    "{}",
+                    path.display()
+                );
+            }
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/ok.jar", &ignored)
+                .await;
+            assert!(filesystem.async_create_file(&path).await.is_err());
+        });
+    }
+
+    // Filesystem::resolve_writable_fs_ignoring
+    #[test]
+    fn resolve_writable_fs_ignoring_refuses_ignored_entries_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods/secret.jar"]).unwrap();
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/secret.jar", &ignored)
+                .await;
+            assert!(!filesystem.is_primary_server_fs());
+            assert!(filesystem.async_create_file(&path).await.is_err());
+            assert!(filesystem.async_remove_file(&path).await.is_err());
+            assert_eq!(
+                std::fs::read(source.path().join("secret.jar")).unwrap(),
+                b"secret"
+            );
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/ok.jar", &ignored)
+                .await;
+            assert!(filesystem.async_create_file(&path).await.is_ok());
+            assert!(filesystem.async_remove_file(&path).await.is_ok());
+            assert!(!source.path().join("ok.jar").exists());
+        });
+    }
+
+    // VirtualWritableFilesystem::async_holds_ignored
+    #[test]
+    fn async_holds_ignored_judges_mount_entries_at_their_server_path() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let holds = |patterns: &'static [&'static str], roots: &'static [&'static str]| {
+                let server = server.clone();
+                async move {
+                    let ignored = if patterns.is_empty() {
+                        RequestIgnored::default()
+                    } else {
+                        RequestIgnored::compile(patterns).unwrap()
+                    };
+                    let (directory, filesystem) = server
+                        .filesystem
+                        .resolve_writable_fs_ignoring(&server, "mods/sub", &ignored)
+                        .await;
+                    assert!(!filesystem.is_primary_server_fs());
+                    let roots: Vec<&Path> = if roots.is_empty() {
+                        vec![directory.as_path()]
+                    } else {
+                        roots.iter().map(Path::new).collect()
+                    };
+
+                    filesystem.async_holds_ignored(&directory, &roots).await
+                }
+            };
+
+            assert!(holds(&["mods/sub/secret.key"], &[]).await);
+            assert!(holds(&["mods/dest/secret.key"], &["dest"]).await);
+            assert!(!holds(&["mods/other/secret.key"], &["dest"]).await);
+            assert!(!holds(&[], &["dest"]).await);
+        });
     }
 }
