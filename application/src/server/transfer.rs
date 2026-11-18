@@ -280,7 +280,7 @@ impl OutgoingServerTransfer {
             .http1_only();
 
         if let Some(proxy) = proxy {
-            match reqwest::Proxy::all(proxy.url()) {
+            match reqwest::Proxy::https(proxy.url()) {
                 Ok(proxy) => builder = builder.proxy(proxy),
                 Err(err) => {
                     tracing::debug!("failed to construct transfer proxy definition: {}", err);
@@ -644,6 +644,7 @@ impl OutgoingServerTransfer {
             }
 
             let proxy = match reqwest::Url::parse(&url) {
+                Ok(parsed) if parsed.scheme() != "https" => None,
                 Ok(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
                     (Some(host), Some(port)) => {
                         crate::net::CongestionControlProxy::start(
