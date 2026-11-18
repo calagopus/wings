@@ -118,7 +118,7 @@ mod tests {
         Ok(jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(state.config.load().token.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(state.config.load().token.as_bytes())?,
         )?)
     }
 

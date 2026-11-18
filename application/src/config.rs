@@ -1903,7 +1903,8 @@ impl Config {
 
     #[cfg(test)]
     pub fn mock() -> Self {
-        let inner = InnerConfig::default();
+        let mut inner = InnerConfig::default();
+        inner.token = "test-token".into();
         let client = crate::remote::client::Client::new(&inner, true);
         let jwt = crate::remote::jwt::JwtClient::new(&inner).expect("failed to create jwt client");
 

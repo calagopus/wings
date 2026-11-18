@@ -319,8 +319,9 @@ mod tests {
     fn client_with_max_uses(max_jwt_uses: usize) -> JwtClient {
         let mut config = crate::config::InnerConfig::default();
         config.api.max_jwt_uses = max_jwt_uses;
+        config.token = "test-token".into();
 
-        JwtClient::new(&config)
+        JwtClient::new(&config).expect("failed to create jwt client")
     }
 
     fn payload(subject: Option<&str>, credential: Option<uuid::Uuid>, iat: i64) -> BasePayload {
