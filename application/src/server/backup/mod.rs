@@ -58,7 +58,9 @@ impl BackupStream {
 pub type DumpReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 pub type DumpSource = futures::future::BoxFuture<'static, Result<DumpReader, anyhow::Error>>;
 
-const DATABASE_DUMP_EXTENSIONS: &[&str] = &["sql", "archive", "rdb", "dump"];
+/// `zip` doubles as a file backup archive name, an uncompressed `{uuid}.zip` is
+/// found as a zip archive and only read as a dump by the database paths
+const DATABASE_DUMP_EXTENSIONS: &[&str] = &["sql", "archive", "rdb", "dump", "zip"];
 
 pub fn validate_dump_extension(extension: &str) -> Result<(), anyhow::Error> {
     if DATABASE_DUMP_EXTENSIONS.contains(&extension) {
@@ -420,11 +422,14 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("dump was not discoverable: {name}"))?;
 
                 assert_eq!(parsed.extension(), name);
-                assert!(
-                    format!("{}.{name}", uuid::Uuid::nil())
-                        .parse::<ArchiveFormat>()
-                        .is_err()
-                );
+                if name != "zip" {
+                    assert!(
+                        format!("{}.{name}", uuid::Uuid::nil())
+                            .parse::<ArchiveFormat>()
+                            .is_err(),
+                        "{name}"
+                    );
+                }
             }
         }
 
@@ -437,7 +442,6 @@ mod tests {
             "",
             "sql.gz",
             "tar",
-            "zip",
             "7z",
             "gz",
             "part",
@@ -448,7 +452,7 @@ mod tests {
             assert!(validate_dump_extension(extension).is_err(), "{extension}");
         }
 
-        for file_name in ["unknown", "tar", "zip", "sql.part", "sql.s3.gz"] {
+        for file_name in ["unknown", "tar", "sql.part", "sql.s3.gz"] {
             assert!(
                 adapters::wings::WingsBackupFile::parse_dump(file_name).is_none(),
                 "{file_name}"
@@ -470,12 +474,12 @@ mod tests {
         ];
         assert_eq!(suffixes.len(), CompressionType::variants().len());
 
-        for base in ["sql", "archive", "rdb", "dump"] {
+        for base in DATABASE_DUMP_EXTENSIONS {
             for (suffix, compression) in suffixes {
                 let extension = format!("{base}{suffix}");
                 assert_eq!(
                     parse_dump_extension(&extension)?,
-                    (base, compression),
+                    (*base, compression),
                     "{extension}"
                 );
             }

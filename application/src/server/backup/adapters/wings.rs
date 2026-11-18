@@ -344,12 +344,15 @@ impl BackupStreamExt for WingsBackup {
         _state: &crate::routes::State,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<BackupStream, anyhow::Error> {
-        let WingsBackupFile::Dump {
-            extension,
-            compression,
-        } = &self.format
-        else {
-            return Err(anyhow::anyhow!("backup is not a database dump"));
+        let (extension, compression) = match &self.format {
+            WingsBackupFile::Dump {
+                extension,
+                compression,
+            } => (extension.as_str(), compression),
+            WingsBackupFile::Archive(ArchiveFormat::Zip) => ("zip", &CompressionType::None),
+            WingsBackupFile::Archive(_) => {
+                return Err(anyhow::anyhow!("backup is not a database dump"));
+            }
         };
 
         let file = tokio::fs::File::open(&self.path).await?;
