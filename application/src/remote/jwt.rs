@@ -179,7 +179,7 @@ pub struct JwtClient {
 }
 
 impl JwtClient {
-    pub fn new(config: &crate::config::InnerConfig) -> Self {
+    pub fn new(config: &crate::config::InnerConfig) -> Result<Self, jsonwebtoken::errors::Error> {
         let denied_jtokens = Arc::new(RwLock::new(HashMap::new()));
         let seen_jtoken_ids = Arc::new(RwLock::new(HashMap::new()));
         let revocations = Arc::new(RwLock::new(Revocations::default()));
@@ -217,8 +217,8 @@ impl JwtClient {
         validation.validate_aud = false;
         validation.required_spec_claims.clear();
 
-        Self {
-            decoding_key: DecodingKey::from_secret(config.token.as_bytes()),
+        Ok(Self {
+            decoding_key: DecodingKey::from_secret(config.token.as_bytes())?,
             validation,
             boot_time: chrono::Utc::now(),
             max_jwt_uses: config.api.max_jwt_uses,
@@ -227,7 +227,7 @@ impl JwtClient {
             seen_jtoken_ids,
             revocations,
             revocation_sender: tokio::sync::broadcast::channel(16).0,
-        }
+        })
     }
 
     #[inline]

@@ -1885,7 +1885,7 @@ impl Config {
             inner.system.disk_check_concurrency,
         ));
         let client = crate::remote::client::Client::new(&inner, ignore_certificate_errors);
-        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner)?;
 
         let config = Arc::new(Self {
             inner: ArcSwap::new(Arc::new(inner)),
@@ -1905,7 +1905,7 @@ impl Config {
     pub fn mock() -> Self {
         let inner = InnerConfig::default();
         let client = crate::remote::client::Client::new(&inner, true);
-        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner).expect("failed to create jwt client");
 
         Self {
             inner: ArcSwap::new(Arc::new(inner)),
