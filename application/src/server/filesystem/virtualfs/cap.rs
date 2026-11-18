@@ -3209,6 +3209,7 @@ mod tests {
     // VirtualCapFilesystem::async_quota_copy_from
     #[cfg(unix)]
     #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn quota_copy_from_refuses_denied_destinations_and_leaves_them_untouched() {
         with_one_blocking_worker(|| async {
             let mut fixture = ListingFixture::new(0).await?;
