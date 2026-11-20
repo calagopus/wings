@@ -942,6 +942,11 @@ impl BackupManager {
         Ok(None)
     }
 
+    pub async fn invalidate_cached_backup(&self, uuid: uuid::Uuid) {
+        self.cached_backups.invalidate(&uuid).await;
+        self.cached_backup_adapters.invalidate(&uuid).await;
+    }
+
     pub async fn invalidate_cached_browse(&self, uuid: uuid::Uuid) {
         if let Some(browse) = self.cached_browse_backups.remove(&uuid).await
             && let Err(err) = browse.close().await

@@ -29,12 +29,14 @@ use compact_str::CompactString;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::io::AsyncBufReadExt;
 
@@ -43,12 +45,44 @@ const BACKUP_UUID_TAG: &str = "backup-uuid";
 const KOPIA_IGNORE_BATCH: usize = 500;
 const MAX_TREE_DEPTH: usize = 1024;
 const KOPIA_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+/// How long a successful `repository status` or connect is trusted without checking again.
+const KOPIA_CONNECTED_TTL: Duration = Duration::from_secs(300);
+/// How long a snapshot listing answers lookups for the backups it contains.
+const KOPIA_CATALOG_TTL: Duration = Duration::from_secs(60);
+
+/// Every kopia process opens a repository server session, and each session makes the
+/// server load its whole manifest catalog, so connection checks and snapshot lookups
+/// are shared per repository.
+#[derive(Default)]
+struct KopiaRepositoryState {
+    connected: tokio::sync::Mutex<Option<([u8; 32], Instant)>>,
+    catalog: tokio::sync::Mutex<Option<KopiaCatalog>>,
+}
+
+struct KopiaCatalog {
+    listed_at: Instant,
+    manifests: HashMap<uuid::Uuid, Arc<KopiaManifest>>,
+}
+
+type KopiaRepositories = moka::future::Cache<String, Arc<KopiaRepositoryState>>;
+static KOPIA_REPOSITORIES: LazyLock<KopiaRepositories> =
+    LazyLock::new(|| moka::future::Cache::new(1024));
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KopiaManifest {
     id: String,
+    #[serde(default)]
+    source: KopiaSource,
     root_entry: KopiaRootEntry,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KopiaSource {
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +119,7 @@ pub struct KopiaBackup {
     uuid: uuid::Uuid,
     root_oid: String,
     manifest_id: String,
+    source_path: String,
     total_size: u64,
 
     config: Arc<crate::config::Config>,
@@ -259,11 +294,42 @@ impl KopiaBackup {
         Self::parse_human_bytes(rest.get(..end)?)
     }
 
+    async fn repository_state(remote: &KopiaBackupConfiguration) -> Arc<KopiaRepositoryState> {
+        KOPIA_REPOSITORIES
+            .get_with(Self::repository_slug(remote), async { Arc::default() })
+            .await
+    }
+
+    fn connection_key(remote: &KopiaBackupConfiguration) -> [u8; 32] {
+        let mut hasher = sha2::Sha256::new();
+        for part in [
+            remote.url.as_str(),
+            remote.username.as_str(),
+            remote.password.as_str(),
+            remote.fingerprint().unwrap_or_default(),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.finalize().into()
+    }
+
     async fn ensure_connected(
         config_file: &Path,
         cache_dir: &Path,
         remote: &KopiaBackupConfiguration,
     ) -> Result<(), anyhow::Error> {
+        let repository = Self::repository_state(remote).await;
+        let key = Self::connection_key(remote);
+
+        let mut connected = repository.connected.lock().await;
+        if connected.is_some_and(|(connected_key, connected_at)| {
+            connected_key == key && connected_at.elapsed() < KOPIA_CONNECTED_TTL
+        }) {
+            return Ok(());
+        }
+        *connected = None;
+
         let status = Self::get_tokio_command(config_file, remote)
             .arg("repository")
             .arg("status")
@@ -272,11 +338,17 @@ impl KopiaBackup {
             .status()
             .await;
 
-        if matches!(status, Ok(status) if status.success()) {
-            return Ok(());
+        if !matches!(status, Ok(status) if status.success()) {
+            Self::connect(config_file, cache_dir, remote).await?;
         }
 
-        Self::connect(config_file, cache_dir, remote).await
+        *connected = Some((key, Instant::now()));
+
+        Ok(())
+    }
+
+    async fn invalidate_connection(remote: &KopiaBackupConfiguration) {
+        *Self::repository_state(remote).await.connected.lock().await = None;
     }
 
     async fn connect(
@@ -327,32 +399,82 @@ impl KopiaBackup {
         Ok(())
     }
 
-    async fn find_snapshot(
+    async fn find_manifest(
         config_file: &Path,
         remote: &KopiaBackupConfiguration,
         uuid: uuid::Uuid,
-    ) -> Result<Option<KopiaManifest>, anyhow::Error> {
+    ) -> Result<Option<Arc<KopiaManifest>>, anyhow::Error> {
+        let requested_at = Instant::now();
+        let repository = Self::repository_state(remote).await;
+        let mut catalog = repository.catalog.lock().await;
+
+        if let Some(catalog) = &*catalog {
+            let manifest = catalog.manifests.get(&uuid);
+
+            if catalog.listed_at >= requested_at
+                || (manifest.is_some() && catalog.listed_at.elapsed() < KOPIA_CATALOG_TTL)
+            {
+                return Ok(manifest.cloned());
+            }
+        }
+
+        let listed_at = Instant::now();
+        let manifests = match Self::list_snapshots(config_file, remote).await {
+            Ok(manifests) => manifests,
+            Err(err) => {
+                *catalog = None;
+                drop(catalog);
+                Self::invalidate_connection(remote).await;
+
+                return Err(err);
+            }
+        };
+
+        let manifest = manifests.get(&uuid).cloned();
+        *catalog = Some(KopiaCatalog {
+            listed_at,
+            manifests,
+        });
+
+        Ok(manifest)
+    }
+
+    async fn forget_manifest(remote: &KopiaBackupConfiguration, uuid: uuid::Uuid) {
+        if let Some(catalog) = &mut *Self::repository_state(remote).await.catalog.lock().await {
+            catalog.manifests.remove(&uuid);
+        }
+    }
+
+    async fn list_snapshots(
+        config_file: &Path,
+        remote: &KopiaBackupConfiguration,
+    ) -> Result<HashMap<uuid::Uuid, Arc<KopiaManifest>>, anyhow::Error> {
         let output = Self::get_tokio_command(config_file, remote)
             .arg("snapshot")
             .arg("list")
             .arg("--json")
             .arg("--all")
-            .arg("--tags")
-            .arg(format!("{BACKUP_UUID_TAG}:{uuid}"))
-            .stderr(std::process::Stdio::null())
+            .arg("--no-retention")
             .output()
             .await?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!(
                 "failed to list Kopia snapshots: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
-        let mut manifests: Vec<KopiaManifest> = serde_json::from_slice(&output.stdout)?;
+        let manifests: Vec<KopiaManifest> = serde_json::from_slice(&output.stdout)?;
+        let tag = format!("tag:{BACKUP_UUID_TAG}");
 
-        Ok(manifests.pop())
+        Ok(manifests
+            .into_iter()
+            .filter_map(|manifest| {
+                let uuid = manifest.tags.get(&tag)?.parse().ok()?;
+                Some((uuid, Arc::new(manifest)))
+            })
+            .collect())
     }
 }
 
@@ -364,31 +486,25 @@ impl BackupFindExt for KopiaBackup {
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_kopia_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(err) => {
-                super::log_configuration_error("kopia", uuid, &err);
-                return Ok(None);
-            }
+            Err(err) if super::is_configuration_missing(&err) => return Ok(None),
+            Err(err) => return Err(err.context("failed to get kopia backup configuration")),
         };
 
         let config_file = Self::get_config_file_path(&state.config, &remote);
         let cache_dir = Self::get_cache_dir_path(&state.config, &remote);
 
-        if Self::ensure_connected(&config_file, &cache_dir, &remote)
-            .await
-            .is_err()
-        {
-            return Ok(None);
-        }
+        Self::ensure_connected(&config_file, &cache_dir, &remote).await?;
 
-        let manifest = match Self::find_snapshot(&config_file, &remote, uuid).await? {
+        let manifest = match Self::find_manifest(&config_file, &remote, uuid).await? {
             Some(manifest) => manifest,
             None => return Ok(None),
         };
 
         Ok(Some(Backup::Kopia(KopiaBackup {
             uuid,
-            root_oid: manifest.root_entry.obj,
-            manifest_id: manifest.id,
+            root_oid: manifest.root_entry.obj.clone(),
+            manifest_id: manifest.id.clone(),
+            source_path: manifest.source.path.clone(),
             total_size: manifest.root_entry.summ.size,
             config: Arc::clone(&state.config),
             config_file,
@@ -609,6 +725,7 @@ impl BackupCreateExt for KopiaBackup {
                     continue;
                 }
 
+                Self::invalidate_connection(&remote).await;
                 return Err(anyhow::anyhow!(
                     "failed to create Kopia snapshot: {}",
                     stderr
@@ -705,6 +822,7 @@ impl BackupStreamCreateExt for KopiaBackup {
                         continue;
                     }
 
+                    Self::invalidate_connection(&remote).await;
                     return Err(anyhow::anyhow!("failed to create Kopia snapshot: {}", stderr));
                 };
 
@@ -744,32 +862,8 @@ impl BackupStreamExt for KopiaBackup {
         let cache_dir = Self::get_cache_dir_path(&self.config, &self.remote);
         Self::ensure_connected(&self.config_file, &cache_dir, &self.remote).await?;
 
-        let output = Self::get_tokio_command(&self.config_file, &self.remote)
-            .arg("snapshot")
-            .arg("list")
-            .arg("--json")
-            .arg("--all")
-            .arg("--tags")
-            .arg(format!("{BACKUP_UUID_TAG}:{}", self.uuid))
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed to list Kopia snapshots: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let manifests: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-        let file_name = manifests
-            .iter()
-            .find(|manifest| {
-                manifest.get("id").and_then(|id| id.as_str()) == Some(&self.manifest_id)
-            })
-            .and_then(|manifest| manifest.get("source"))
-            .and_then(|source| source.get("path"))
-            .and_then(|path| path.as_str())
-            .and_then(|path| Path::new(path).file_name())
+        let file_name = Path::new(&self.source_path)
+            .file_name()
             .and_then(|name| name.to_str())
             .map(compact_str::CompactString::from)
             .ok_or_else(|| anyhow::anyhow!("kopia snapshot does not contain a database dump"))?;
@@ -969,9 +1063,13 @@ impl BackupExt for KopiaBackup {
             .arg(&self.manifest_id)
             .arg("--delete")
             .output()
-            .await?;
+            .await;
+        Self::forget_manifest(&self.remote, self.uuid).await;
+
+        let output = output?;
 
         if !output.status.success() {
+            Self::invalidate_connection(&self.remote).await;
             return Err(anyhow::anyhow!(
                 "failed to delete Kopia backup: {}",
                 String::from_utf8_lossy(&output.stderr)

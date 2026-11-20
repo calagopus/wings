@@ -26,15 +26,15 @@ pub use super::BackupAdapter;
 /// every path against every pattern, gets noticeably slow.
 const EXCLUSION_FRONTIER_WARN: usize = 20_000;
 
-fn log_configuration_error(adapter: &str, uuid: uuid::Uuid, err: &anyhow::Error) {
-    if err
-        .downcast_ref::<crate::remote::ApiError>()
-        .is_some_and(|err| err.status == reqwest::StatusCode::EXPECTATION_FAILED)
-    {
-        return;
-    }
-
-    tracing::warn!(backup = %uuid, "failed to get {} backup configuration: {:#}", adapter, err);
+/// Whether the panel answered that the backup is missing or not stored on this adapter.
+fn is_configuration_missing(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::remote::ApiError>()
+        .is_some_and(|err| {
+            matches!(
+                err.status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::EXPECTATION_FAILED
+            )
+        })
 }
 
 /// A path spelled as a literal pattern for an external engine's glob syntax.
@@ -262,17 +262,27 @@ impl BackupAdapter {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<(Self, Backup)>, anyhow::Error> {
+        let mut first_error = None;
+
         for adapter in Self::variants() {
             if *adapter == Self::S3 {
                 continue;
             }
 
-            if let Some(backup) = adapter.find(state, uuid).await? {
-                return Ok(Some((*adapter, backup)));
+            match adapter.find(state, uuid).await {
+                Ok(Some(backup)) => return Ok(Some((*adapter, backup))),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(backup = %uuid, "failed to search {} backups: {:#}", adapter.to_str(), err);
+                    first_error.get_or_insert(err);
+                }
             }
         }
 
-        Ok(None)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(None),
+        }
     }
 
     pub async fn create_from_stream(

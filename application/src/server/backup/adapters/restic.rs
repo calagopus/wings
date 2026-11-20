@@ -344,6 +344,7 @@ impl BackupFindExt for ResticBackup {
             })));
         }
 
+        let mut system_error = None;
         if tokio::fs::metadata(
             state
                 .config
@@ -353,129 +354,87 @@ impl BackupFindExt for ResticBackup {
         .is_ok()
         {
             let configuration = Arc::new(Self::system_configuration(&state.config));
-            let output = match Self::command(&state.config, &configuration)
-                .arg("--json")
-                .arg("--no-lock")
-                .arg("snapshots")
-                .output()
-                .await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    return Err(anyhow::anyhow!("failed to find restic backup: {:?}", err));
-                }
-            };
-
-            if output.status.success() {
-                let snapshots: Vec<ResticSnapshot> =
-                    serde_json::from_slice(&output.stdout).unwrap_or_default();
-
-                let mut backup = None;
-                let mut cache = RESTIC_BACKUP_CACHE.write().await;
-                for snapshot in snapshots {
-                    let snapshot_uuid = match snapshot.tags.first() {
-                        Some(tag) => match uuid::Uuid::parse_str(tag) {
-                            Ok(uuid) => uuid,
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    if snapshot_uuid == uuid {
-                        backup = Some(ResticBackup {
-                            uuid,
-                            short_id: snapshot.short_id.clone(),
-                            total_bytes_processed: snapshot.summary.total_bytes_processed,
-                            config: Arc::clone(&state.config),
-                            server_path: match snapshot.paths.first() {
-                                Some(path) => PathBuf::from(path),
-                                None => {
-                                    return Err(anyhow::anyhow!(
-                                        "no paths found in restic snapshot for uuid: {}",
-                                        uuid
-                                    ));
-                                }
-                            },
-                            configuration: Arc::clone(&configuration),
-                        });
-                    }
-
-                    cache.insert(snapshot_uuid, (snapshot, Arc::clone(&configuration)));
-                }
-                drop(cache);
-
-                if let Some(backup) = backup {
-                    return Ok(Some(Backup::Restic(backup)));
-                }
+            match find_in_repository(state, configuration, uuid).await {
+                Ok(Some(backup)) => return Ok(Some(Backup::Restic(backup))),
+                Ok(None) => {}
+                Err(err) => system_error = Some(err),
             }
         }
 
-        let configuration = state.config.client.backup_restic_configuration(uuid).await;
-        if let Err(err) = &configuration {
-            super::log_configuration_error("restic", uuid, err);
-        }
-
-        if let Ok(configuration) = configuration {
-            let output = match ResticBackup::command(&state.config, &configuration)
-                .arg("--json")
-                .arg("--no-lock")
-                .arg("snapshots")
-                .output()
-                .await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    return Err(anyhow::anyhow!("failed to find restic backup: {:?}", err));
-                }
-            };
-
-            if output.status.success() {
-                let snapshots: Vec<ResticSnapshot> =
-                    serde_json::from_slice(&output.stdout).unwrap_or_default();
-                let configuration = Arc::new(configuration.clone());
-
-                let mut backup = None;
-                let mut cache = RESTIC_BACKUP_CACHE.write().await;
-                for snapshot in snapshots {
-                    let snapshot_uuid = match snapshot.tags.first() {
-                        Some(tag) => match uuid::Uuid::parse_str(tag) {
-                            Ok(uuid) => uuid,
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    };
-
-                    if snapshot_uuid == uuid {
-                        backup = Some(ResticBackup {
-                            uuid,
-                            short_id: snapshot.short_id.clone(),
-                            total_bytes_processed: snapshot.summary.total_bytes_processed,
-                            config: Arc::clone(&state.config),
-                            server_path: match snapshot.paths.first() {
-                                Some(path) => PathBuf::from(path),
-                                None => {
-                                    return Err(anyhow::anyhow!(
-                                        "no paths found in restic snapshot for uuid: {}",
-                                        uuid
-                                    ));
-                                }
-                            },
-                            configuration: Arc::clone(&configuration),
-                        });
-                    }
-
-                    cache.insert(snapshot_uuid, (snapshot, Arc::clone(&configuration)));
-                }
-                drop(cache);
-
-                if let Some(backup) = backup {
-                    return Ok(Some(Backup::Restic(backup)));
-                }
+        let configuration = match state.config.client.backup_restic_configuration(uuid).await {
+            Ok(configuration) => Arc::new(configuration),
+            Err(err) if super::is_configuration_missing(&err) => {
+                return match system_error {
+                    Some(err) => Err(err),
+                    None => Ok(None),
+                };
             }
-        }
+            Err(err) => return Err(err.context("failed to get restic backup configuration")),
+        };
 
-        Ok(None)
+        Ok(find_in_repository(state, configuration, uuid)
+            .await?
+            .map(Backup::Restic))
     }
+}
+
+async fn find_in_repository(
+    state: &crate::routes::State,
+    configuration: Arc<ResticBackupConfiguration>,
+    uuid: uuid::Uuid,
+) -> Result<Option<ResticBackup>, anyhow::Error> {
+    let output = ResticBackup::command(&state.config, &configuration)
+        .arg("--json")
+        .arg("--no-lock")
+        .arg("snapshots")
+        .output()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to find restic backup: {:?}", err))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to list restic snapshots: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let snapshots: Vec<ResticSnapshot> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| anyhow::anyhow!("failed to parse restic snapshots: {}", err))?;
+
+    let mut backup = None;
+    let mut cache = RESTIC_BACKUP_CACHE.write().await;
+    for snapshot in snapshots {
+        let snapshot_uuid = match snapshot.tags.first() {
+            Some(tag) => match uuid::Uuid::parse_str(tag) {
+                Ok(uuid) => uuid,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+
+        if snapshot_uuid == uuid {
+            backup = Some(ResticBackup {
+                uuid,
+                short_id: snapshot.short_id.clone(),
+                total_bytes_processed: snapshot.summary.total_bytes_processed,
+                config: Arc::clone(&state.config),
+                server_path: match snapshot.paths.first() {
+                    Some(path) => PathBuf::from(path),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "no paths found in restic snapshot for uuid: {}",
+                            uuid
+                        ));
+                    }
+                },
+                configuration: Arc::clone(&configuration),
+            });
+        }
+
+        cache.insert(snapshot_uuid, (snapshot, Arc::clone(&configuration)));
+    }
+
+    Ok(backup)
 }
 
 #[async_trait::async_trait]

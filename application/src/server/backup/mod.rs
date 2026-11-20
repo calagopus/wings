@@ -297,7 +297,13 @@ impl Backup {
     }
 
     pub async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
-        self.inner().delete(state).await
+        let result = self.inner().delete(state).await;
+        state
+            .backup_manager
+            .invalidate_cached_backup(self.uuid())
+            .await;
+
+        result
     }
 
     async fn browse(

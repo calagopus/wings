@@ -105,9 +105,9 @@ impl BackupFindExt for PbsBackup {
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_pbs_configuration(uuid).await {
             Ok(remote) => remote,
+            Err(err) if super::is_configuration_missing(&err) => return Ok(None),
             Err(err) => {
-                super::log_configuration_error("pbs", uuid, &err);
-                return Ok(None);
+                return Err(err.context("failed to get proxmox backup server backup configuration"));
             }
         };
 
