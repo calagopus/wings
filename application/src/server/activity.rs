@@ -52,6 +52,8 @@ pub enum ActivityEvent {
     FileRename,
     #[serde(rename = "server:file.pull")]
     FilePull,
+    #[serde(rename = "server:file.patch")]
+    FilePatch,
     #[serde(rename = "server:file.trash")]
     FileTrash,
     #[serde(rename = "server:file.trash.purge")]

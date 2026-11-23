@@ -678,6 +678,9 @@ fn docker_log_config_config() -> BTreeMap<String, String> {
 fn limits_server_concurrent_pulls() -> usize {
     3
 }
+fn limits_file_patch_size() -> MiB {
+    64u64.into()
+}
 
 fn throttles_enabled() -> bool {
     true
@@ -1519,6 +1522,9 @@ nestify::nest! {
             #[serde(default)]
             /// 0 = unlimited, pulls count towards this too
             pub server_concurrent_operations: usize,
+            #[serde(default = "limits_file_patch_size")]
+            /// largest patch file, file being patched and patched result
+            pub file_patch_size: MiB,
         },
 
         #[serde(default)]

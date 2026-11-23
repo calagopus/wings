@@ -6,6 +6,7 @@ use crate::{
             RenameParents, RequestIgnored,
             archive::ArchiveFormat,
             cap::FileType,
+            patch::{Patch, PatchError},
             trash::TrashSource,
             virtualfs::{AsyncWritableFileStream, IsIgnoredFn},
         },
@@ -142,6 +143,10 @@ impl ScheduleBackupSelector {
             }),
         }
     }
+}
+
+fn patch_strip_default() -> usize {
+    1
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -328,6 +333,17 @@ pub enum ScheduleAction {
         root: ScheduleDynamicParameter,
         file: ScheduleDynamicParameter,
     },
+    PatchFiles {
+        ignore_failure: bool,
+
+        root: ScheduleDynamicParameter,
+        format: crate::server::filesystem::patch::PatchFormat,
+        patch: ScheduleDynamicParameter,
+        #[serde(default)]
+        file: Option<ScheduleDynamicParameter>,
+        #[serde(default = "patch_strip_default")]
+        strip: usize,
+    },
     PullFile {
         ignore_failure: bool,
         foreground: bool,
@@ -407,6 +423,7 @@ impl ScheduleAction {
             ScheduleAction::RenameFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CompressFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::DecompressFile { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::PatchFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::PullFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupVariable { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupCommand { ignore_failure, .. } => *ignore_failure,
@@ -1854,6 +1871,55 @@ impl ScheduleAction {
                     )
                     .await?;
                 }
+            }
+            ScheduleAction::PatchFiles {
+                root,
+                format,
+                patch,
+                file,
+                strip,
+                ..
+            } => {
+                let root = execution_context.resolve_required(root, "root")?;
+                let patch = execution_context.resolve_required(patch, "patch")?;
+                let file = match file {
+                    Some(file) => Some(execution_context.resolve_required(file, "file")?.as_str()),
+                    None => None,
+                };
+
+                let ignored = RequestIgnored::default();
+                let result = async {
+                    let contents =
+                        Patch::read_file(server, Path::new(root), Path::new(patch), &ignored)
+                            .await?;
+
+                    Patch::parse(*format, &contents, file, *strip)?
+                        .apply(server, Path::new(root), &ignored, None)
+                        .await
+                }
+                .await;
+
+                match result {
+                    Ok(_) => {}
+                    Err(PatchError::Internal(err)) => {
+                        tracing::error!(server = %server.uuid, "failed to patch files: {:#?}", err);
+                        return Err("failed to patch files".into());
+                    }
+                    Err(err) => return Err(err.to_string().into()),
+                }
+
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FilePatch,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": root,
+                        "patch": patch,
+                        "file": file,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::PullFile {
                 foreground,

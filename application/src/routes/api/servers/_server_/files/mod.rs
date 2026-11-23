@@ -28,6 +28,7 @@ mod lines;
 mod list;
 mod list_directory;
 mod operations;
+mod patch;
 mod pull;
 mod rename;
 mod revisions;
@@ -72,6 +73,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/copy-many", copy_many::router(state))
         .nest("/copy-remote", copy_remote::router(state))
         .nest("/write", write::router(state))
+        .nest("/patch", patch::router(state))
         .nest("/create-directory", create_directory::router(state))
         .nest("/create-symlink", create_symlink::router(state))
         .nest("/largest-directories", largest_directories::router(state))

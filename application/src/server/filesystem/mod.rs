@@ -35,6 +35,7 @@ pub mod inotify;
 pub mod limiter;
 pub mod listing;
 pub mod operations;
+pub mod patch;
 pub mod pull;
 pub mod sqlite;
 pub mod trash;

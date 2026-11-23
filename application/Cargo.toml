@@ -105,6 +105,8 @@ croner = { version = "4.0.0", features = ["serde"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 time = "0.3.55"
 semver = "1.0.28"
+diffy = "0.5.2"
+qbsdiff = "1.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
