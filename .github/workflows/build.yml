@@ -1,6 +1,7 @@
 name: Release Nightly
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
