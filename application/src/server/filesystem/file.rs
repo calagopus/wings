@@ -736,6 +736,7 @@ mod tests {
 
     // ServerFile::new
     #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn new_creates_missing_file() {
         crate::server::Server::with_mock(|server| async move {
             let root = server.filesystem.base_path.to_path_buf();
