@@ -112,7 +112,7 @@ mod get {
         }
 
         let file_read = filesystem.async_read_file(&path, None).await?;
-        let mut reader = BufReader::new(file_read.reader);
+        let mut reader = BufReader::with_capacity(crate::FILE_STREAM_BUFFER_SIZE, file_read.reader);
 
         let header = reader.fill_buf().await?;
         let (compression_type, archive_type) =

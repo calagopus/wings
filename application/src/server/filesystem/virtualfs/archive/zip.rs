@@ -92,14 +92,14 @@ pub struct VirtualZipArchive {
 impl VirtualZipArchive {
     pub fn new(
         server: crate::server::Server,
-        mut archive: zip::ZipArchive<MultiReader>,
+        archive: zip::ZipArchive<MultiReader>,
         archive_created: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let mut sizes = crate::server::filesystem::usage::DiskUsage::default();
         let mut indices = HashMap::with_capacity(archive.len());
 
         for i in 0..archive.len() {
-            let Ok(entry) = archive.by_index_raw(i) else {
+            let Ok(entry) = archive.by_index_data(i) else {
                 continue;
             };
             let Some(name) = entry.enclosed_name() else {
@@ -538,7 +538,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                 let path_len = path.components().count();
                 for i in 0..archive.len() {
-                    let entry = archive.by_index_raw(i)?;
+                    let entry = archive.by_index_data(i)?;
                     if entry.is_dir() {
                         continue;
                     }
@@ -554,6 +554,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         continue;
                     }
 
+                    let entry = archive.by_index_raw(i)?;
                     let file_type = Self::zip_entry_to_file_type(&entry);
                     let Some(filtered_name) = (is_ignored)(file_type, name).reachable(file_type)
                     else {

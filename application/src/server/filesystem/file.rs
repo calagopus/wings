@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub const ALLOCATION_THRESHOLD: i64 = 1024 * 1024; // 1 MiB
 
+type NoCheck = fn(&std::fs::File) -> Result<(), anyhow::Error>;
+
 pub struct ServerFile {
     server: crate::server::Server,
     parent: Vec<String>,
@@ -36,7 +38,7 @@ fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) ->
     false
 }
 
-/// Opens `path` with `options`, runs `check` on the opened file and only then
+/// Opens `path` with `options`, runs `check`, if any, on the opened file and only then
 /// truncates it when asked, so nothing is lost before the check passes. An empty
 /// file the open created is removed again when the check rejects it. Returns
 /// the file, its size before truncation and its metadata from before truncation.
@@ -45,16 +47,19 @@ fn open_and_check(
     path: &Path,
     mut options: cap_std::fs::OpenOptions,
     truncate: bool,
-    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+    check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
 ) -> Result<(std::fs::File, u64, Option<std::fs::Metadata>), anyhow::Error> {
     options.truncate(false);
 
-    let missing = server
-        .filesystem
-        .metadata(path)
-        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+    let missing = check.is_some()
+        && server
+            .filesystem
+            .metadata(path)
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
     let file = server.filesystem.open_with(path, options)?;
-    if let Err(err) = check(&file) {
+    if let Some(check) = check
+        && let Err(err) = check(&file)
+    {
         if missing {
             remove_created(server, &file);
         }
@@ -113,7 +118,7 @@ fn open_destination(
     server: &crate::server::Server,
     destination: &Path,
     permissions: Option<PortablePermissions>,
-    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+    check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
 ) -> Result<(std::fs::File, u64), anyhow::Error> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create(true);
@@ -152,7 +157,7 @@ impl ServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_checked(server, destination, permissions, modified, |_| Ok(()))
+        Self::new_checked(server, destination, permissions, modified, None::<NoCheck>)
     }
 
     /// Like [`Self::new`], but runs `check` on the opened file before it is
@@ -162,7 +167,7 @@ impl ServerFile {
         destination: &Path,
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
     ) -> Result<Self, anyhow::Error> {
         let (file, previous_size) = open_destination(&server, destination, permissions, check)?;
 
@@ -180,7 +185,7 @@ impl ServerFile {
         path: &Path,
         options: cap_std::fs::OpenOptions,
         truncate: bool,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
     ) -> Result<Self, anyhow::Error> {
         let (file, previous_size, _) = open_and_check(&server, path, options, truncate, check)?;
 
@@ -405,7 +410,7 @@ impl AsyncServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_checked(server, destination, permissions, modified, |_| Ok(())).await
+        Self::new_checked(server, destination, permissions, modified, None::<NoCheck>).await
     }
 
     /// Async counterpart of [`ServerFile::new_checked`].
@@ -414,7 +419,7 @@ impl AsyncServerFile {
         destination: &Path,
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static>,
     ) -> Result<Self, anyhow::Error> {
         let (file, previous_size) = tokio::task::spawn_blocking({
             let server = server.clone();
@@ -663,5 +668,82 @@ impl Drop for AsyncServerFile {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reject(_: &std::fs::File) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!("rejected"))
+    }
+
+    // ServerFile::new_checked
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_checked_rejection_removes_file_it_created() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("new.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert!(!root.join("new.txt").exists());
+        });
+    }
+
+    #[test]
+    fn new_checked_rejection_keeps_existing_content() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::write(root.join("old.txt"), b"content").unwrap();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("old.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"content");
+        });
+    }
+
+    #[test]
+    fn new_checked_rejection_keeps_existing_empty_file() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::write(root.join("empty.txt"), b"").unwrap();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("empty.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert!(root.join("empty.txt").exists());
+        });
+    }
+
+    // ServerFile::new
+    #[test]
+    fn new_creates_missing_file() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+
+            let file = ServerFile::new(server.clone(), Path::new("created.txt"), None, None);
+            assert!(file.is_ok());
+            drop(file);
+            assert!(root.join("created.txt").is_file());
+        });
     }
 }

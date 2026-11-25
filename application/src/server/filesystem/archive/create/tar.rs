@@ -5,13 +5,13 @@ use crate::{
         compression::{CompressionLevel, CompressionType, writer::CompressionWriter},
         fixed_reader::FixedReader,
     },
-    server::filesystem::{cap::CapFilesystem, virtualfs::IsIgnoredFn},
+    server::filesystem::{
+        cap::{CapFilesystem, WalkEntry},
+        virtualfs::IsIgnoredFn,
+    },
     utils::PortablePermissions,
 };
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::Path};
 
 pub struct CreateTarOptions {
     pub compression_type: CompressionType,
@@ -19,6 +19,7 @@ pub struct CreateTarOptions {
     pub threads: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_entry<W: Write>(
     archive: &mut tar::Builder<W>,
     filesystem: &CapFilesystem,
@@ -26,6 +27,7 @@ fn append_entry<W: Write>(
     relative: &Path,
     path: &Path,
     metadata: &cap_std::fs::Metadata,
+    open: impl FnOnce() -> Result<std::fs::File, std::io::Error>,
     buffer_size: usize,
 ) -> Result<(), anyhow::Error> {
     let mut header = tar::Header::new_gnu();
@@ -49,10 +51,11 @@ fn append_entry<W: Write>(
         archive.append_data(&mut header, relative, std::io::empty())?;
         progress.increment_bytes(metadata.len());
     } else if metadata.is_file() {
-        let file = filesystem.open(path)?;
+        let file = open()?;
         let reader = progress.counting_reader(file);
         let reader = FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
-        let reader = std::io::BufReader::with_capacity(buffer_size, reader);
+        let reader =
+            std::io::BufReader::with_capacity(buffer_size.min(metadata.len() as usize), reader);
 
         header.set_size(metadata.len());
         header.set_entry_type(tar::EntryType::Regular);
@@ -105,6 +108,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
                     relative,
                     path,
                     metadata,
+                    || filesystem.open(path),
                     crate::BUFFER_SIZE,
                 )
             },
@@ -122,12 +126,10 @@ pub async fn create_tar<W: Write + Send + 'static>(
 pub async fn create_tar_distributed<W: Write + Send + 'static>(
     filesystem: CapFilesystem,
     destination: W,
-    base: &Path,
-    sources: async_channel::Receiver<PathBuf>,
+    sources: async_channel::Receiver<WalkEntry>,
     progress: ArchiveProgress,
     options: CreateTarOptions,
 ) -> Result<W, anyhow::Error> {
-    let base = filesystem.relative_path(base);
     let (_guard, listener) = AbortGuard::new();
 
     tokio::task::spawn_blocking(move || {
@@ -140,13 +142,11 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
         let writer = AbortWriter::new(writer, listener);
         let mut archive = tar::Builder::new(writer);
 
-        while let Ok(relative) = sources.recv_blocking() {
-            let source = base.join(&relative);
-
-            let metadata = match filesystem.symlink_metadata(&source) {
+        while let Ok(entry) = sources.recv_blocking() {
+            let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(err) => {
-                    tracing::debug!(path = %source.display(), "skipping source while creating tar archive, failed to read metadata: {err:#}");
+                    tracing::debug!(path = %entry.path.display(), "skipping source while creating tar archive, failed to read metadata: {err:#}");
                     continue;
                 }
             };
@@ -155,9 +155,10 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
                 &mut archive,
                 &filesystem,
                 &progress,
-                &relative,
-                &source,
+                &entry.path,
+                &entry.path,
                 &metadata,
+                || entry.open(),
                 crate::TRANSFER_BUFFER_SIZE,
             )?;
         }

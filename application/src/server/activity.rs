@@ -206,7 +206,7 @@ fn merge_activities(activities: Vec<Activity>) -> Vec<Activity> {
     let mut file_upload_events: HashMap<UploadKey, (Activity, Vec<serde_json::Value>)> =
         HashMap::new();
 
-    for activity in activities {
+    for mut activity in activities {
         if activity.event.is_sftp_event()
             && let Some(metadata) = &activity.metadata
             && metadata.get("files").is_some()
@@ -220,19 +220,19 @@ fn merge_activities(activities: Vec<Activity>) -> Vec<Activity> {
                         .num_seconds()
                         .abs();
                     if dt <= 60 {
-                        files_acc.extend(extract_files(&activity));
+                        files_acc.extend(take_files(&mut activity));
                     } else {
                         let Some((mut base, files)) = sftp_events.remove(&key) else {
                             continue;
                         };
                         finalize_files(&mut base, files);
                         merged.push(base);
-                        let init = extract_files(&activity);
+                        let init = take_files(&mut activity);
                         sftp_events.insert(key, (activity, init));
                     }
                 }
                 None => {
-                    let init = extract_files(&activity);
+                    let init = take_files(&mut activity);
                     sftp_events.insert(key, (activity, init));
                 }
             }
@@ -253,19 +253,19 @@ fn merge_activities(activities: Vec<Activity>) -> Vec<Activity> {
                         .num_seconds()
                         .abs();
                     if dt <= 60 {
-                        files_acc.extend(extract_files(&activity));
+                        files_acc.extend(take_files(&mut activity));
                     } else {
                         let Some((mut base, files)) = file_upload_events.remove(&key) else {
                             continue;
                         };
                         finalize_files(&mut base, files);
                         merged.push(base);
-                        let init = extract_files(&activity);
+                        let init = take_files(&mut activity);
                         file_upload_events.insert(key, (activity, init));
                     }
                 }
                 None => {
-                    let init = extract_files(&activity);
+                    let init = take_files(&mut activity);
                     file_upload_events.insert(key, (activity, init));
                 }
             }
@@ -287,13 +287,13 @@ fn merge_activities(activities: Vec<Activity>) -> Vec<Activity> {
     merged
 }
 
-fn extract_files(activity: &Activity) -> Vec<serde_json::Value> {
+fn take_files(activity: &mut Activity) -> Vec<serde_json::Value> {
     activity
         .metadata
-        .as_ref()
-        .and_then(|m| m.get("files"))
-        .and_then(|f| f.as_array())
-        .map(|a| a.to_vec())
+        .as_mut()
+        .and_then(|m| m.get_mut("files"))
+        .and_then(|f| f.as_array_mut())
+        .map(std::mem::take)
         .unwrap_or_default()
 }
 

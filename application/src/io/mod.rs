@@ -172,6 +172,18 @@ pub fn copy_file_progress(
     Ok(total_copied)
 }
 
+/// `tokio::io::copy` with [`crate::FILE_STREAM_BUFFER_SIZE`] buffers on both ends, so a
+/// tokio file on either side does not cost one blocking-pool hop per 8 KiB or per network frame.
+pub async fn async_copy(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin + ?Sized),
+) -> std::io::Result<u64> {
+    let mut reader = tokio::io::BufReader::with_capacity(crate::FILE_STREAM_BUFFER_SIZE, reader);
+    let mut writer = tokio::io::BufWriter::with_capacity(crate::FILE_STREAM_BUFFER_SIZE, writer);
+
+    tokio::io::copy_buf(&mut reader, &mut writer).await
+}
+
 pub trait WriteSeek: Write + std::io::Seek {}
 impl<T: Write + std::io::Seek> WriteSeek for T {}
 pub trait AsyncWriteSeek: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin {}

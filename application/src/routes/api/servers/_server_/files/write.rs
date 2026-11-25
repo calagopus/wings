@@ -176,64 +176,57 @@ mod post {
         let file_size_cap = history.file_size_cap;
         drop(config_guard);
 
-        let mut file = filesystem.async_create_file(&path).await?;
+        let mut file = tokio::io::BufWriter::with_capacity(
+            crate::FILE_STREAM_BUFFER_SIZE,
+            filesystem.async_create_file(&path).await?,
+        );
         let mut stream = body.into_data_stream();
+        let mut after = track.then(Vec::new);
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| {
                 std::io::Error::other(format!("failed to read request body: {err}"))
             })?;
             file.write_all(&chunk).await?;
+
+            if let Some(buffer) = &mut after {
+                if buffer.len() as u64 + chunk.len() as u64 > file_size_cap {
+                    after = None;
+                } else {
+                    buffer.extend_from_slice(&chunk);
+                }
+            }
         }
 
         file.shutdown().await?;
 
         let mut revision_id = None;
 
-        if track {
-            match filesystem.async_read_file(&path, None).await {
-                Ok(mut handle) => match handle.read_to_end_capped(file_size_cap).await {
-                    Ok(Some(buf)) => match server
-                        .diff
-                        .record_edit(&diff_key, captured_before, buf, data.user)
-                        .await
-                    {
-                        Ok(id) => {
-                            if id != 0 {
-                                revision_id = Some(id);
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                server = %server.uuid,
-                                path = %diff_key,
-                                "diff: record_edit failed: {err:#}"
-                            );
-                        }
-                    },
-                    Ok(None) => {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            path = %diff_key,
-                            "diff: post-write content exceeds file_size_cap; not recorded"
-                        );
+        if let Some(after) = after {
+            match server
+                .diff
+                .record_edit(&diff_key, captured_before, after, data.user)
+                .await
+            {
+                Ok(id) => {
+                    if id != 0 {
+                        revision_id = Some(id);
                     }
-                    Err(err) => {
-                        tracing::debug!(
-                            server = %server.uuid,
-                            path = %diff_key,
-                            "diff: failed to read post-edit content: {err}"
-                        );
-                    }
-                },
+                }
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         server = %server.uuid,
                         path = %diff_key,
-                        "diff: failed to open post-edit file: {err}"
+                        "diff: record_edit failed: {err:#}"
                     );
                 }
             }
+        } else if track {
+            tracing::debug!(
+                server = %server.uuid,
+                path = %diff_key,
+                "diff: post-write content exceeds file_size_cap; not recorded"
+            );
         }
 
         ApiResponse::new_serialized(Response { revision_id }).ok()

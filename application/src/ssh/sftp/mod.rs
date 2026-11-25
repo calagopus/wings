@@ -1357,23 +1357,21 @@ impl russh_sftp::server::Handler for SftpSession {
                     &path,
                     open_options,
                     pflags.contains(OpenFlags::TRUNCATE),
-                    |file| {
+                    may_ignore.then_some(|file: &std::fs::File| {
                         #[cfg(target_os = "linux")]
-                        if may_ignore
-                            && Self::is_ignored_server(
-                                &server,
-                                user_uuid,
-                                &server.filesystem.opened_relative_path(file)?,
-                                FileType::File,
-                            )
-                        {
+                        if Self::is_ignored_server(
+                            &server,
+                            user_uuid,
+                            &server.filesystem.opened_relative_path(file)?,
+                            FileType::File,
+                        ) {
                             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
                         }
                         #[cfg(not(target_os = "linux"))]
                         let _ = file;
 
                         Ok(())
-                    },
+                    }),
                 )
                 .map_err(|_| StatusCode::Failure)?;
 

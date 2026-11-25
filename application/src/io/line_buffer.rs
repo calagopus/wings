@@ -20,11 +20,7 @@ impl LineBuffer {
     }
 
     pub fn next_line(&mut self) -> Option<&[u8]> {
-        let newline = self
-            .buffer
-            .get(self.line_start..)?
-            .iter()
-            .position(|&b| b == b'\n');
+        let newline = memchr::memchr(b'\n', self.buffer.get(self.line_start..)?);
         let available = self.buffer.len() - self.line_start;
 
         let (len, advance) = match newline {

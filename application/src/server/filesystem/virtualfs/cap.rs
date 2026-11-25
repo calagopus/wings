@@ -1661,7 +1661,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 &path,
                 None,
                 None,
-                |file| self.check_opened(&path, file),
+                self.link_filter()
+                    .is_some()
+                    .then_some(|file: &std::fs::File| self.check_opened(&path, file)),
             )?
             .ignorant_if(self.ignore_quota);
 
@@ -1686,7 +1688,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 &path,
                 permissions,
                 modified,
-                |file| self.check_opened(&path, file),
+                self.link_filter()
+                    .is_some()
+                    .then_some(|file: &std::fs::File| self.check_opened(&path, file)),
             )?
             .ignorant_if(self.ignore_quota);
 
@@ -1715,12 +1719,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 &path,
                 permissions,
                 None,
-                {
+                self.link_filter().is_some().then(|| {
                     let this = self.clone();
                     let path = path.clone();
 
-                    move |file| this.check_opened(&path, file)
-                },
+                    move |file: &std::fs::File| this.check_opened(&path, file)
+                }),
             )
             .await?
             .ignorant_if(self.ignore_quota);
@@ -1749,12 +1753,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 &path,
                 None,
                 None,
-                {
+                self.link_filter().is_some().then(|| {
                     let this = self.clone();
                     let path = path.clone();
 
-                    move |file| this.check_opened(&path, file)
-                },
+                    move |file: &std::fs::File| this.check_opened(&path, file)
+                }),
             )
             .await?
             .ignorant_if(self.ignore_quota);

@@ -126,7 +126,25 @@ impl AllowedMounts {
     }
 
     pub async fn from_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
-        Self(load_allowed_paths(entries, "allowed_mounts").await)
+        let entries = owned_entries(entries);
+
+        tokio::task::spawn_blocking(move || Self::from_entries_blocking(entries))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub fn load_blocking(config: &crate::config::Config) -> Self {
+        Self::from_entries_blocking(
+            config
+                .load()
+                .allowed_mounts
+                .iter()
+                .map(|entry| entry.as_str()),
+        )
+    }
+
+    pub fn from_entries_blocking<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
+        Self(load_allowed_paths(entries, "allowed_mounts"))
     }
 }
 
@@ -143,7 +161,17 @@ impl Mount {
         &self,
         allowed: &AllowedMounts,
     ) -> Result<PathBuf, anyhow::Error> {
-        resolve_allowed_path(&self.source, &self.target, &allowed.0, "allowed_mounts").await
+        let mount = self.clone();
+        let allowed = AllowedMounts(allowed.0.clone());
+
+        tokio::task::spawn_blocking(move || mount.resolve_allowed_source_blocking(&allowed)).await?
+    }
+
+    pub fn resolve_allowed_source_blocking(
+        &self,
+        allowed: &AllowedMounts,
+    ) -> Result<PathBuf, anyhow::Error> {
+        resolve_allowed_path(&self.source, &self.target, &allowed.0, "allowed_mounts")
     }
 }
 
@@ -172,7 +200,11 @@ impl AllowedDevices {
     }
 
     pub async fn from_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
-        Self(load_allowed_paths(entries, "allowed_devices").await)
+        let entries = owned_entries(entries);
+
+        tokio::task::spawn_blocking(move || Self(load_allowed_paths(entries, "allowed_devices")))
+            .await
+            .unwrap_or_default()
     }
 }
 
@@ -196,8 +228,15 @@ impl Device {
             ));
         }
 
-        let source =
-            resolve_allowed_path(&self.source, &self.target, &allowed.0, "allowed_devices").await?;
+        let source = {
+            let (source, target) = (self.source.clone(), self.target.clone());
+            let allowed = allowed.0.clone();
+
+            tokio::task::spawn_blocking(move || {
+                resolve_allowed_path(&source, &target, &allowed, "allowed_devices")
+            })
+            .await??
+        };
         let file_type = tokio::fs::metadata(&source).await?.file_type();
         if !file_type.is_char_device() && !file_type.is_block_device() {
             return Err(anyhow::anyhow!(
@@ -210,7 +249,14 @@ impl Device {
     }
 }
 
-async fn load_allowed_paths<E: AsRef<Path>>(
+fn owned_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Vec<PathBuf> {
+    entries
+        .into_iter()
+        .map(|entry| entry.as_ref().to_path_buf())
+        .collect()
+}
+
+fn load_allowed_paths<E: AsRef<Path>>(
     entries: impl IntoIterator<Item = E>,
     name: &str,
 ) -> Vec<PathBuf> {
@@ -220,7 +266,7 @@ async fn load_allowed_paths<E: AsRef<Path>>(
     for entry in entries {
         let entry = entry.as_ref();
 
-        match tokio::fs::canonicalize(entry).await {
+        match std::fs::canonicalize(entry) {
             Ok(path) => allowed.push(path),
             Err(err) => {
                 tracing::warn!(
@@ -236,7 +282,7 @@ async fn load_allowed_paths<E: AsRef<Path>>(
     allowed
 }
 
-async fn resolve_allowed_path(
+fn resolve_allowed_path(
     source: &str,
     target: &str,
     allowed: &[PathBuf],
@@ -258,8 +304,7 @@ async fn resolve_allowed_path(
         ));
     }
 
-    let resolved = tokio::fs::canonicalize(source)
-        .await
+    let resolved = std::fs::canonicalize(source)
         .with_context(|| format!("source {source} could not be resolved"))?;
 
     if !allowed.iter().any(|allowed| resolved.starts_with(allowed)) {

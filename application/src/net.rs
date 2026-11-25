@@ -292,9 +292,14 @@ impl CongestionControlProxy {
             return;
         }
 
-        tokio::io::copy_bidirectional(&mut client, &mut upstream)
-            .await
-            .ok();
+        tokio::io::copy_bidirectional_with_sizes(
+            &mut client,
+            &mut upstream,
+            crate::FILE_STREAM_BUFFER_SIZE,
+            crate::BUFFER_SIZE,
+        )
+        .await
+        .ok();
     }
 }
 

@@ -278,7 +278,10 @@ mod post {
             let lock = super::upload_lock((payload.server_uuid, part.clone()));
             let lock_guard = lock.lock_owned().await;
 
-            let mut writer = filesystem.async_create_file(&part).await?;
+            let mut writer = tokio::io::BufWriter::with_capacity(
+                crate::FILE_STREAM_BUFFER_SIZE,
+                filesystem.async_create_file(&part).await?,
+            );
 
             let guard = if filesystem.is_primary_server_fs() {
                 Some(
@@ -595,9 +598,12 @@ mod patch {
 
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).append(true).create(true);
-        let mut file = filesystem
-            .async_open_file_with_options(&part, options)
-            .await?;
+        let mut file = tokio::io::BufWriter::with_capacity(
+            crate::FILE_STREAM_BUFFER_SIZE,
+            filesystem
+                .async_open_file_with_options(&part, options)
+                .await?,
+        );
 
         let guard = if filesystem.is_primary_server_fs() {
             Some(

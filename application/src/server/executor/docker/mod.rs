@@ -1974,6 +1974,9 @@ impl DockerProcessHandle {
 
         let state_task = tokio::spawn(async move {
             const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+            let host_cpu_limit = std::thread::available_parallelism()
+                .map_or(1, |threads| threads.get()) as u32
+                * 100;
 
             struct CachedState {
                 status: Option<bollard::plugin::ContainerStateStatusEnum>,
@@ -2110,14 +2113,8 @@ impl DockerProcessHandle {
 
                             state_usage.send_modify(|usage| {
                                 usage.started_at = Some(started_instant);
-                                usage.cpu_limit_absolute = if limit > 0 {
-                                    limit
-                                } else {
-                                    std::thread::available_parallelism()
-                                        .map_or(1, |threads| threads.get())
-                                        as u32
-                                        * 100
-                                };
+                                usage.cpu_limit_absolute =
+                                    if limit > 0 { limit } else { host_cpu_limit };
                             });
                         }
                         super::ProcessStatus::Running

@@ -13,7 +13,6 @@ use sha2::Digest;
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -374,7 +373,7 @@ impl OutgoingServerTransfer {
             let (reader, mut writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
             fn get_tar_archive_task(
-                files_receiver: async_channel::Receiver<PathBuf>,
+                files_receiver: async_channel::Receiver<crate::server::filesystem::cap::WalkEntry>,
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
@@ -385,7 +384,6 @@ impl OutgoingServerTransfer {
                     let writer = crate::server::filesystem::archive::create::create_tar_distributed(
                         server.filesystem.clone(),
                         writer,
-                        Path::new(""),
                         files_receiver,
                         crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_archived, files_archived),
                         options,
@@ -399,7 +397,7 @@ impl OutgoingServerTransfer {
             }
 
             fn get_itaf_archive_task(
-                files_receiver: async_channel::Receiver<PathBuf>,
+                files_receiver: async_channel::Receiver<crate::server::filesystem::cap::WalkEntry>,
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
@@ -410,7 +408,6 @@ impl OutgoingServerTransfer {
                     let writer = crate::server::filesystem::archive::create::create_itaf_distributed(
                         server.filesystem.clone(),
                         writer,
-                        Path::new(""),
                         files_receiver,
                         crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_archived, files_archived),
                         options,
@@ -497,7 +494,7 @@ impl OutgoingServerTransfer {
                             }
                         };
 
-                        files_sender.send(entry.path).await?;
+                        files_sender.send(entry).await?;
                     }
 
                     Ok::<_, anyhow::Error>(())

@@ -335,7 +335,10 @@ impl Download {
                             lock: Some(lock),
                         };
 
-                        let mut writer = filesystem.async_create_file(&part).await?;
+                        let mut writer = tokio::io::BufWriter::with_capacity(
+                            crate::FILE_STREAM_BUFFER_SIZE,
+                            filesystem.async_create_file(&part).await?,
+                        );
 
                         let mut written = 0;
                         while let Some(chunk) =

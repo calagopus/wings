@@ -558,6 +558,12 @@ impl BackupCreateExt for ResticBackup {
                 .stderr(std::process::Stdio::piped())
                 .spawn()?;
 
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+            let stderr_task = super::spawn_stderr_capture(stderr, RESTIC_STDERR_CAPTURE_LIMIT);
+
             let mut line_reader = tokio::io::BufReader::new(child.take_stdout()?).lines();
 
             let mut snapshot_id = None;
@@ -600,15 +606,15 @@ impl BackupCreateExt for ResticBackup {
                 }
             }
 
-            let output = child.wait_with_output().await?;
+            let status = child.wait().await?;
+            let stderr = stderr_task.await.unwrap_or_default();
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            if !status.success() {
                 if !retried
                     && Self::recover_from_lock_error(
                         &server.app_state.config,
                         &configuration,
-                        output.status,
+                        status,
                         &stderr,
                     )
                     .await

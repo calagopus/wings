@@ -382,7 +382,7 @@ mod post {
                                                                 .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
                                                                 .await?;
 
-                                                            tokio::io::copy(&mut reader, &mut writer).await?;
+                                                            crate::io::async_copy(&mut reader, &mut writer).await?;
                                                             writer.shutdown().await?;
                                                         }
 

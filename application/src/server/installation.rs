@@ -725,7 +725,7 @@ impl ServerInstaller {
 
         match handle.logs(None).await {
             Ok(mut reader) => {
-                tokio::io::copy(&mut reader, &mut file).await?;
+                crate::io::async_copy(&mut reader, &mut file).await?;
             }
             Err(err) => {
                 tracing::warn!(

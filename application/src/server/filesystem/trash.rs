@@ -1306,15 +1306,17 @@ impl TrashManager {
 
     pub async fn ensure_not_full(&self, server: &crate::server::Server) -> bool {
         let mut purged = 0;
-        if is_full_at(server, self.projected_usage(server).await) {
+        let not_full = if is_full_at(server, self.projected_usage(server).await) {
             if self.is_empty().await {
                 return false;
             }
 
             purged += self.purge_oldest_while(server, PurgeUntil::NotFull).await;
-        }
 
-        let not_full = !is_full_at(server, self.projected_usage(server).await);
+            !is_full_at(server, self.projected_usage(server).await)
+        } else {
+            true
+        };
         if not_full {
             purged += self.purge_over_threshold(server).await;
         }

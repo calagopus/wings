@@ -307,7 +307,7 @@ impl BackupStreamCreateExt for WingsBackup {
 
         let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
-        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+        let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
 
         loop {
             match file.read(&mut buffer).await? {
@@ -487,7 +487,7 @@ impl BackupCreateExt for WingsBackup {
 
         let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
-        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+        let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
 
         loop {
             match file.read(&mut buffer).await? {

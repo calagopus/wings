@@ -213,7 +213,7 @@ impl S3Backup {
 
             let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
                 reader,
-                crate::BUFFER_SIZE,
+                crate::FILE_STREAM_BUFFER_SIZE,
             ));
 
             match client
@@ -267,7 +267,6 @@ impl S3Backup {
         mut reader: impl AsyncRead + Unpin,
         part_size: u64,
         initial_urls: Vec<String>,
-        total: Arc<AtomicU64>,
     ) -> Result<
         (
             String,
@@ -299,7 +298,7 @@ impl S3Backup {
             let mut url_queue: std::collections::VecDeque<String> =
                 initial_urls.into_iter().collect();
             let mut part_number = 1;
-            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+            let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
 
             let (_upload_proxy, upload_http) =
                 Self::upload_client(config, url_queue.front().map(String::as_str)).await;
@@ -322,7 +321,6 @@ impl S3Backup {
                     scratch.safe_write_all(&buffer, bytes_read).await?;
 
                     valid_len += bytes_read as u64;
-                    total.fetch_add(bytes_read as u64, Ordering::Relaxed);
                 }
 
                 scratch.flush().await?;
@@ -421,7 +419,7 @@ impl S3Backup {
             }
         };
 
-        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -522,7 +520,6 @@ impl S3Backup {
             archive_reader,
             part_size,
             initial_urls,
-            Arc::clone(&total),
         );
 
         let ((checksum, parts, size), total_files, _) =
@@ -562,12 +559,13 @@ impl S3Backup {
             .open(&file_name)
             .await?;
 
-        let (mut checksum_reader, checksum_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (mut checksum_reader, checksum_writer) =
+            crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let checksum_task = async {
             let mut hasher = sha2::Sha256::new();
 
-            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+            let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
             loop {
                 let bytes_read = checksum_reader.read(&mut buffer).await?;
                 if crate::unlikely(bytes_read == 0) {
@@ -576,7 +574,6 @@ impl S3Backup {
 
                 hasher.safe_update(&buffer, bytes_read)?;
                 file.safe_write_all(&buffer, bytes_read).await?;
-                total.fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
 
             Ok::<_, anyhow::Error>(hex::encode(hasher.finalize()))
@@ -728,7 +725,7 @@ impl S3Backup {
 
                 let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
                     reader,
-                    crate::BUFFER_SIZE,
+                    crate::FILE_STREAM_BUFFER_SIZE,
                 ));
 
                 match upload_http
@@ -914,14 +911,12 @@ impl BackupStreamCreateExt for S3Backup {
             Ok(())
         });
 
-        let total = Arc::new(AtomicU64::new(0));
         let upload_task = Self::upload_parts(
             &state.config,
             uuid,
             compressed_reader,
             part_size,
             initial_urls,
-            Arc::clone(&total),
         );
 
         let (upload_result, compress_result) = tokio::join!(upload_task, compress_task);

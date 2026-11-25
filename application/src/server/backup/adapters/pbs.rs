@@ -156,7 +156,7 @@ impl BackupCreateExt for PbsBackup {
         let group_lock = group_lock(&config, &backup_id);
         let _group_guard = group_lock.lock().await;
 
-        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -192,16 +192,19 @@ impl BackupCreateExt for PbsBackup {
 
             async move {
                 let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-                let writer = LimitedWriter::new_with_bytes_per_second(
-                    archive_writer.into_sync(),
-                    server
-                        .app_state
-                        .config
-                        .load()
-                        .system
-                        .backups
-                        .write_limit
-                        .as_bytes(),
+                let writer = std::io::BufWriter::with_capacity(
+                    crate::BUFFER_SIZE,
+                    LimitedWriter::new_with_bytes_per_second(
+                        archive_writer.into_sync(),
+                        server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .write_limit
+                            .as_bytes(),
+                    ),
                 );
 
                 let (writer, catalog) = crate::server::filesystem::archive::create::create_pxar(
@@ -217,7 +220,13 @@ impl BackupCreateExt for PbsBackup {
                 )
                 .await?;
 
-                writer.into_inner().into_inner().shutdown().await?;
+                writer
+                    .into_inner()
+                    .map_err(std::io::IntoInnerError::into_error)?
+                    .into_inner()
+                    .into_inner()
+                    .shutdown()
+                    .await?;
 
                 let _ = catalog_tx.send(catalog);
 
@@ -865,7 +874,7 @@ impl BackupExt for PbsBackup {
                         .await?;
 
                         if let Some(mut contents) = decoder.contents()? {
-                            tokio::io::copy(&mut contents, &mut writer).await?;
+                            crate::io::async_copy(&mut contents, &mut writer).await?;
                         }
                         writer.flush().await?;
 

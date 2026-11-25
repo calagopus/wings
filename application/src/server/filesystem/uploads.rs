@@ -442,7 +442,7 @@ pub async fn finalize_upload(
         let copied = async {
             let mut reader = filesystem.async_read_file(&part, None).await?.reader;
             let mut writer = filesystem.async_create_file(&path).await?;
-            tokio::io::copy(&mut reader, &mut writer).await?;
+            crate::io::async_copy(&mut reader, &mut writer).await?;
             writer.shutdown().await?;
 
             Ok::<_, anyhow::Error>(())

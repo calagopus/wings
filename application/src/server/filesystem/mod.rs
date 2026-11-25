@@ -313,6 +313,13 @@ pub const VIRTUAL_PATH_MESSAGE: &str = "path is a mount point or virtual directo
 pub const IGNORED_CONTENTS_MESSAGE: &str =
     "a directory contains files you cannot access, so it was left in place";
 
+struct MountMatch {
+    inner_path: PathBuf,
+    source_path: PathBuf,
+    read_only: bool,
+    target: PathBuf,
+}
+
 pub struct Filesystem {
     uuid: uuid::Uuid,
     app_state: crate::routes::State,
@@ -1165,50 +1172,33 @@ impl Filesystem {
             return (inner_path.to_path_buf(), archive_fs);
         }
 
-        let (mount_match, mount_infos) = {
+        let (mount_match, mounts, mut allowed) = {
             let server_config = server.configuration.read().await;
-            let allowed = if server_config.mounts.is_empty() {
-                crate::server::configuration::AllowedMounts::default()
+            if server_config.mounts.is_empty() {
+                (None, Vec::new(), None)
             } else {
-                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
-            };
+                let mounts = server_config.mounts.clone();
+                let config = Arc::clone(&server.app_state.config);
+                let path = path.clone();
 
-            let mut match_result = None;
-            let mut infos = Vec::new();
+                tokio::task::spawn_blocking(move || {
+                    let mut allowed = None;
+                    let mount_match = Self::match_mount(&config, &mounts, &path, &mut allowed);
 
-            for mount in &server_config.mounts {
-                let Some(relative_target) = mount.container_relative_target() else {
-                    continue;
-                };
-                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
-                    continue;
-                };
-
-                infos.push(virtualfs::mount::MountInfo {
-                    relative_target: PathBuf::from(relative_target),
-                });
-
-                let relative_target_path = Path::new(relative_target);
-                let depth = relative_target_path.components().count();
-                if match_result
-                    .as_ref()
-                    .is_none_or(|(_, _, _, matched_depth, _)| depth > *matched_depth)
-                    && let Ok(inner_path) = path.strip_prefix(relative_target_path)
-                {
-                    match_result = Some((
-                        inner_path.to_path_buf(),
-                        source_path,
-                        mount.read_only,
-                        depth,
-                        relative_target_path.to_path_buf(),
-                    ));
-                }
+                    (mount_match, mounts, allowed)
+                })
+                .await
+                .unwrap_or_default()
             }
-
-            (match_result, infos)
         };
 
-        if let Some((inner_path, source_path, read_only, _, target)) = mount_match {
+        if let Some(MountMatch {
+            inner_path,
+            source_path,
+            read_only,
+            target,
+        }) = mount_match
+        {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let fs = Self::mount_virtual_fs(server, cap_fs, read_only, &target, ignored);
@@ -1225,6 +1215,16 @@ impl Filesystem {
             }
         }
 
+        let mount_infos = if mounts.is_empty() {
+            Vec::new()
+        } else {
+            let config = Arc::clone(&server.app_state.config);
+
+            tokio::task::spawn_blocking(move || Self::mount_infos(&config, &mounts, &mut allowed))
+                .await
+                .unwrap_or_default()
+        };
+
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
@@ -1240,6 +1240,74 @@ impl Filesystem {
                 mounts: mount_infos,
             }),
         )
+    }
+
+    /// The deepest mount holding `path` whose source resolves inside `allowed_mounts`, the
+    /// first in config order on equal depth. `allowed` is loaded on first use. Blocking.
+    fn match_mount(
+        config: &crate::config::Config,
+        mounts: &[crate::server::configuration::Mount],
+        path: &Path,
+        allowed: &mut Option<crate::server::configuration::AllowedMounts>,
+    ) -> Option<MountMatch> {
+        let mut candidates: Vec<(usize, &crate::server::configuration::Mount, &Path)> = mounts
+            .iter()
+            .filter_map(|mount| {
+                let target = Path::new(mount.container_relative_target()?);
+
+                path.starts_with(target)
+                    .then(|| (target.components().count(), mount, target))
+            })
+            .collect();
+        candidates.sort_by_key(|(depth, _, _)| std::cmp::Reverse(*depth));
+
+        for (_, mount, target) in candidates {
+            let allowed = allowed.get_or_insert_with(|| {
+                crate::server::configuration::AllowedMounts::load_blocking(config)
+            });
+            let Ok(source_path) = mount.resolve_allowed_source_blocking(allowed) else {
+                continue;
+            };
+            let Ok(inner_path) = path.strip_prefix(target) else {
+                continue;
+            };
+
+            return Some(MountMatch {
+                inner_path: inner_path.to_path_buf(),
+                source_path,
+                read_only: mount.read_only,
+                target: target.to_path_buf(),
+            });
+        }
+
+        None
+    }
+
+    /// Every mount with a target inside the container root whose source resolves. Blocking.
+    fn mount_infos(
+        config: &crate::config::Config,
+        mounts: &[crate::server::configuration::Mount],
+        allowed: &mut Option<crate::server::configuration::AllowedMounts>,
+    ) -> Vec<virtualfs::mount::MountInfo> {
+        let mut infos = Vec::new();
+
+        for mount in mounts {
+            let Some(relative_target) = mount.container_relative_target() else {
+                continue;
+            };
+            let allowed = allowed.get_or_insert_with(|| {
+                crate::server::configuration::AllowedMounts::load_blocking(config)
+            });
+            if mount.resolve_allowed_source_blocking(allowed).is_err() {
+                continue;
+            }
+
+            infos.push(virtualfs::mount::MountInfo {
+                relative_target: PathBuf::from(relative_target),
+            });
+        }
+
+        infos
     }
 
     /// A mount source as a filesystem whose entries are judged by the denylist and
@@ -1284,46 +1352,28 @@ impl Filesystem {
 
         let mount_match = {
             let server_config = server.configuration.read().await;
-            let allowed = if server_config.mounts.is_empty() {
-                crate::server::configuration::AllowedMounts::default()
+            if server_config.mounts.is_empty() {
+                None
             } else {
-                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
-            };
+                let mounts = server_config.mounts.clone();
+                let config = Arc::clone(&server.app_state.config);
+                let path = path.clone();
 
-            let mut result: Option<(PathBuf, PathBuf, bool, usize, PathBuf)> = None;
-            for mount in &server_config.mounts {
-                let Some(relative_target) = mount.container_relative_target() else {
-                    continue;
-                };
-
-                let relative_target_path = Path::new(relative_target);
-                let depth = relative_target_path.components().count();
-                if !path.starts_with(relative_target_path)
-                    || result
-                        .as_ref()
-                        .is_some_and(|(_, _, _, matched_depth, _)| depth <= *matched_depth)
-                {
-                    continue;
-                }
-
-                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
-                    continue;
-                };
-
-                if let Ok(inner_path) = path.strip_prefix(relative_target_path) {
-                    result = Some((
-                        inner_path.to_path_buf(),
-                        source_path,
-                        mount.read_only,
-                        depth,
-                        relative_target_path.to_path_buf(),
-                    ));
-                }
+                tokio::task::spawn_blocking(move || {
+                    Self::match_mount(&config, &mounts, &path, &mut None)
+                })
+                .await
+                .unwrap_or_default()
             }
-            result
         };
 
-        if let Some((inner_path, source_path, read_only, _, target)) = mount_match {
+        if let Some(MountMatch {
+            inner_path,
+            source_path,
+            read_only,
+            target,
+        }) = mount_match
+        {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let fs =
@@ -1624,7 +1674,7 @@ impl Filesystem {
                         )
                         .await?;
 
-                    tokio::io::copy(&mut reader, &mut writer).await?;
+                    crate::io::async_copy(&mut reader, &mut writer).await?;
                     writer.shutdown().await?;
                 } else {
                     // Both sides may be the same file on one mount, which creating the
@@ -1640,7 +1690,7 @@ impl Filesystem {
                             )
                             .await?;
 
-                        tokio::io::copy(&mut reader, &mut writer).await?;
+                        crate::io::async_copy(&mut reader, &mut writer).await?;
                         writer.shutdown().await?;
 
                         destination_filesystem
@@ -1737,7 +1787,7 @@ impl Filesystem {
                                     )
                                     .await?;
 
-                                tokio::io::copy(&mut reader, &mut writer).await?;
+                                crate::io::async_copy(&mut reader, &mut writer).await?;
                                 writer.shutdown().await?;
                             } else {
                                 destination_filesystem
@@ -4068,6 +4118,166 @@ mod tests {
             assert!(holds(&["mods/dest/secret.key"], &["dest"]).await);
             assert!(!holds(&["mods/other/secret.key"], &["dest"]).await);
             assert!(!holds(&[], &["dest"]).await);
+        });
+    }
+
+    fn allow_sources(server: &crate::server::Server) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        std::fs::create_dir_all(root.path().join("b")).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        server
+            .app_state
+            .config
+            .mutate_in_place_for_testing()
+            .allowed_mounts = vec![canonical.to_string_lossy().into()];
+
+        (root, canonical.join("a"), canonical.join("b"))
+    }
+
+    fn sourced_mount(
+        target: &str,
+        source: &Path,
+        read_only: bool,
+    ) -> crate::server::configuration::Mount {
+        crate::server::configuration::Mount {
+            default: false,
+            target: target.into(),
+            source: source.to_string_lossy().into(),
+            read_only,
+        }
+    }
+
+    // Filesystem::match_mount
+    #[test]
+    fn match_mount_prefers_deepest_regardless_of_order() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let shallow = sourced_mount("/home/container/mods", &a, false);
+            let deep = sourced_mount("/home/container/mods/deep", &b, false);
+
+            for mounts in [
+                [shallow.clone(), deep.clone()],
+                [deep.clone(), shallow.clone()],
+            ] {
+                let found = Filesystem::match_mount(
+                    &server.app_state.config,
+                    &mounts,
+                    Path::new("mods/deep/x.jar"),
+                    &mut None,
+                )
+                .unwrap();
+                assert_eq!(found.target, Path::new("mods/deep"));
+                assert_eq!(found.inner_path, Path::new("x.jar"));
+                assert_eq!(found.source_path, b);
+            }
+        });
+    }
+
+    #[test]
+    fn match_mount_takes_first_in_config_order_on_equal_depth() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let mounts = [
+                sourced_mount("/home/container/mods", &b, false),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods/x.jar"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.source_path, b);
+        });
+    }
+
+    #[test]
+    fn match_mount_falls_back_when_deeper_source_is_unresolvable() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [
+                mount("/home/container/mods/deep"),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods/deep/x.jar"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.target, Path::new("mods"));
+            assert_eq!(found.inner_path, Path::new("deep/x.jar"));
+            assert_eq!(found.source_path, a);
+        });
+    }
+
+    #[test]
+    fn match_mount_outside_mounts_is_none_and_skips_loading_allowed() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [sourced_mount("/home/container/mods", &a, false)];
+
+            let mut allowed = None;
+            for path in ["plugins/x.jar", "modsX/a", ""] {
+                assert!(
+                    Filesystem::match_mount(
+                        &server.app_state.config,
+                        &mounts,
+                        Path::new(path),
+                        &mut allowed,
+                    )
+                    .is_none(),
+                    "{path}"
+                );
+            }
+            assert!(allowed.is_none());
+        });
+    }
+
+    #[test]
+    fn match_mount_on_target_itself_has_empty_inner_path_and_keeps_read_only() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [sourced_mount("/home/container/mods", &a, true)];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.inner_path, Path::new(""));
+            assert_eq!(found.target, Path::new("mods"));
+            assert!(found.read_only);
+        });
+    }
+
+    // Filesystem::mount_infos
+    #[test]
+    fn mount_infos_keeps_config_order_and_omits_invalid_mounts() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let mounts = [
+                sourced_mount("/home/container/plugins", &b, false),
+                mount("/home/container/unresolvable"),
+                sourced_mount("/srv/outside", &a, false),
+                sourced_mount("/home/container", &a, false),
+                sourced_mount("/home/containerX/mods", &a, false),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let targets: Vec<PathBuf> =
+                Filesystem::mount_infos(&server.app_state.config, &mounts, &mut None)
+                    .into_iter()
+                    .map(|info| info.relative_target)
+                    .collect();
+            assert_eq!(targets, [PathBuf::from("plugins"), PathBuf::from("mods")]);
         });
     }
 }

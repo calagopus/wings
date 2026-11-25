@@ -781,7 +781,7 @@ impl BackupStreamCreateExt for KopiaBackup {
             async {
                 let mut reader = source.await?;
                 let mut file = tokio::fs::File::create(&staged_file).await?;
-                tokio::io::copy(&mut reader, &mut file).await?;
+                crate::io::async_copy(&mut reader, &mut file).await?;
                 file.sync_all().await?;
                 drop(file);
 
