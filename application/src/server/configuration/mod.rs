@@ -400,6 +400,15 @@ nestify::nest! {
             pub id: uuid::Uuid,
             #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
             pub file_denylist: Vec<compact_str::CompactString>,
+
+            #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
+            #[schema(inline)]
+            pub crash_detection: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde, Clone)] #[serde(default)] pub struct ServerConfigurationEggCrashDetection {
+                pub enabled: Option<bool>,
+                pub detect_clean_exit_as_crash: Option<bool>,
+                pub timeout: Option<u64>,
+                pub clean_exit_codes: Option<Vec<i32>>,
+            },
         },
 
         #[schema(inline)]
@@ -509,6 +518,39 @@ impl ServerConfigurationFeatures {
     }
 }
 
+pub struct CrashDetection {
+    pub enabled: bool,
+    pub detect_clean_exit_as_crash: bool,
+    pub timeout: u64,
+    pub clean_exit_codes: Vec<i32>,
+}
+
+impl CrashDetection {
+    pub fn is_clean_exit(&self, exit_code: i32, oom_killed: bool) -> bool {
+        !oom_killed && self.clean_exit_codes.contains(&exit_code)
+    }
+}
+
+impl ServerConfigurationEgg {
+    pub fn crash_detection(&self, config: &crate::config::Config) -> CrashDetection {
+        let config = config.load();
+        let node = &config.system.crash_detection;
+        let egg = &self.crash_detection;
+
+        CrashDetection {
+            enabled: node.enabled && egg.enabled.unwrap_or(true),
+            detect_clean_exit_as_crash: egg
+                .detect_clean_exit_as_crash
+                .unwrap_or(node.detect_clean_exit_as_crash),
+            timeout: egg.timeout.unwrap_or(node.timeout),
+            clean_exit_codes: egg
+                .clean_exit_codes
+                .clone()
+                .unwrap_or_else(|| node.clean_exit_codes.clone()),
+        }
+    }
+}
+
 impl ServerConfigurationBuild {
     pub fn has_pending_restart(&self, other: &Self) -> bool {
         self.memory_limit != other.memory_limit
@@ -561,6 +603,7 @@ impl ServerConfiguration {
             egg: ServerConfigurationEgg {
                 id: uuid::Uuid::new_v4(),
                 file_denylist: Vec::new(),
+                crash_detection: ServerConfigurationEggCrashDetection::default(),
             },
             container: ServerConfigurationContainer {
                 image: "example/image:latest".into(),
@@ -1307,5 +1350,129 @@ mod tests {
 
             assert_eq!(allowed.0, vec![allowed_root.canonicalize().unwrap()]);
         });
+    }
+
+    fn egg_crash_detection(
+        crash_detection: ServerConfigurationEggCrashDetection,
+    ) -> ServerConfigurationEgg {
+        let mut egg = ServerConfiguration::mock(uuid::Uuid::new_v4()).egg;
+        egg.crash_detection = crash_detection;
+        egg
+    }
+
+    // ServerConfigurationEgg::crash_detection
+    #[test]
+    fn egg_crash_detection_inherits_unset_fields_from_the_node() {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+        let node = &mut config.mutate_in_place_for_testing().system.crash_detection;
+        node.detect_clean_exit_as_crash = false;
+        node.timeout = 17;
+        node.clean_exit_codes = vec![0, 143];
+
+        let effective = egg_crash_detection(ServerConfigurationEggCrashDetection::default())
+            .crash_detection(&config);
+        assert!(effective.enabled);
+        assert!(!effective.detect_clean_exit_as_crash);
+        assert_eq!(effective.timeout, 17);
+        assert_eq!(effective.clean_exit_codes, vec![0, 143]);
+    }
+
+    #[test]
+    fn egg_crash_detection_overrides_win_over_the_node() {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+        let node = &mut config.mutate_in_place_for_testing().system.crash_detection;
+        node.detect_clean_exit_as_crash = true;
+        node.timeout = 60;
+        node.clean_exit_codes = vec![0];
+
+        let effective = egg_crash_detection(ServerConfigurationEggCrashDetection {
+            enabled: None,
+            detect_clean_exit_as_crash: Some(false),
+            timeout: Some(5),
+            clean_exit_codes: Some(vec![1, 130]),
+        })
+        .crash_detection(&config);
+        assert!(effective.enabled);
+        assert!(!effective.detect_clean_exit_as_crash);
+        assert_eq!(effective.timeout, 5);
+        assert_eq!(effective.clean_exit_codes, vec![1, 130]);
+    }
+
+    #[test]
+    fn egg_crash_detection_can_disable_but_never_enable() {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+        for (node_enabled, egg_enabled, expected) in [
+            (true, Some(false), false),
+            (true, Some(true), true),
+            (false, Some(true), false),
+            (false, None, false),
+        ] {
+            config
+                .mutate_in_place_for_testing()
+                .system
+                .crash_detection
+                .enabled = node_enabled;
+            let effective = egg_crash_detection(ServerConfigurationEggCrashDetection {
+                enabled: egg_enabled,
+                ..Default::default()
+            })
+            .crash_detection(&config);
+            assert_eq!(
+                effective.enabled, expected,
+                "node {node_enabled}, egg {egg_enabled:?}"
+            );
+        }
+    }
+
+    // ServerConfigurationEggCrashDetection
+    #[test]
+    fn egg_crash_detection_deserializes_missing_null_and_malformed_as_unset() {
+        let mut value = serde_json::to_value(ServerConfiguration::mock(uuid::Uuid::new_v4()))
+            .expect("configuration should serialize");
+        for crash_detection in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("garbage")),
+            Some(serde_json::json!({ "timeout": "soon" })),
+        ] {
+            let egg = value["egg"]
+                .as_object_mut()
+                .expect("egg should be an object");
+            match &crash_detection {
+                Some(crash_detection) => {
+                    egg.insert("crash_detection".into(), crash_detection.clone());
+                }
+                None => {
+                    egg.remove("crash_detection");
+                }
+            }
+
+            let configuration: ServerConfiguration =
+                serde_json::from_value(value.clone()).expect("configuration should deserialize");
+            let parsed = configuration.egg.crash_detection;
+            assert!(
+                parsed.enabled.is_none()
+                    && parsed.detect_clean_exit_as_crash.is_none()
+                    && parsed.timeout.is_none()
+                    && parsed.clean_exit_codes.is_none(),
+                "{crash_detection:?}"
+            );
+        }
+    }
+
+    // CrashDetection::is_clean_exit
+    #[test]
+    fn is_clean_exit_requires_a_listed_code_and_no_oom_kill() {
+        let crash_detection = CrashDetection {
+            enabled: true,
+            detect_clean_exit_as_crash: true,
+            timeout: 60,
+            clean_exit_codes: vec![0, 143],
+        };
+        assert!(crash_detection.is_clean_exit(0, false));
+        assert!(crash_detection.is_clean_exit(143, false));
+        assert!(!crash_detection.is_clean_exit(1, false));
+        assert!(!crash_detection.is_clean_exit(0, true));
+        assert!(!crash_detection.is_clean_exit(143, true));
     }
 }

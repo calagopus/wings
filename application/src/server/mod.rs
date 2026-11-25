@@ -605,6 +605,13 @@ impl Server {
                         executor::ProcessStatus::Stopped { exit_code, oom_killed } => {
                             server.state.set_state(state::ServerState::Offline).await;
 
+                            let crash_detection = server
+                                .configuration
+                                .read()
+                                .await
+                                .egg
+                                .crash_detection(&server.app_state.config);
+
                             tracing::info!(
                                 server = %server.uuid,
                                 restarting = %server.restarting.load(Ordering::SeqCst),
@@ -663,7 +670,7 @@ impl Server {
 
                                     server.destroy_container().await;
                                 }
-                            } else if server.app_state.config.load().system.crash_detection.enabled
+                            } else if crash_detection.enabled
                                 && !server
                                     .crash_handled
                                     .load(Ordering::SeqCst)
@@ -672,14 +679,8 @@ impl Server {
                                     .crash_handled
                                     .store(true, Ordering::SeqCst);
 
-                                if exit_code == 0
-                                    && !oom_killed
-                                    && !server.app_state
-                                        .config
-                                        .load()
-                                        .system
-                                        .crash_detection
-                                        .detect_clean_exit_as_crash
+                                if crash_detection.is_clean_exit(exit_code, oom_killed)
+                                    && !crash_detection.detect_clean_exit_as_crash
                                 {
                                     tracing::debug!(
                                         server = %server.uuid,
@@ -748,18 +749,18 @@ impl Server {
                                 let mut last_crash_lock = server.last_crash.lock().await;
                                 if let Some(last_crash) = *last_crash_lock {
                                     if last_crash.elapsed().as_secs()
-                                        < server.app_state.config.load().system.crash_detection.timeout
+                                        < crash_detection.timeout
                                     {
                                         tracing::debug!(
                                             server = %server.uuid,
                                             "last crash was less than {} seconds ago, aborting automatic restart",
-                                            server.app_state.config.load().system.crash_detection.timeout
+                                            crash_detection.timeout
                                         );
 
                                         server.log_daemon_with_prelude(
                                             &format!(
                                                 "Aborting automatic restart, last crash occurred less than {} seconds ago.",
-                                                server.app_state.config.load().system.crash_detection.timeout
+                                                crash_detection.timeout
                                             ),
                                         );
                                         if server.app_state.config.load().docker.delete_container_on_stop {
@@ -784,7 +785,7 @@ impl Server {
                                         tracing::debug!(
                                             server = %server.uuid,
                                             "last crash was more than {} seconds ago, restarting server",
-                                            server.app_state.config.load().system.crash_detection.timeout
+                                            crash_detection.timeout
                                         );
 
                                         last_crash_lock.replace(std::time::Instant::now());

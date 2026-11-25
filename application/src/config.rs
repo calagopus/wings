@@ -319,6 +319,9 @@ fn system_crash_detection_detect_clean_exit_as_crash() -> bool {
 fn system_crash_detection_timeout() -> u64 {
     60
 }
+fn system_crash_detection_clean_exit_codes() -> Vec<i32> {
+    vec![0]
+}
 
 fn system_file_history_enabled() -> bool {
     true
@@ -1072,6 +1075,8 @@ nestify::nest! {
                 pub detect_clean_exit_as_crash: bool,
                 #[serde(default = "system_crash_detection_timeout")]
                 pub timeout: u64,
+                #[serde(default = "system_crash_detection_clean_exit_codes")]
+                pub clean_exit_codes: Vec<i32>,
             },
 
             #[serde(default)]
