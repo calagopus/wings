@@ -166,5 +166,8 @@ pub trait ServerExecutor: Send + Sync {
         ips: &[IpAddr],
     ) -> Result<HashMap<IpAddr, Vec<UsedPort>>, anyhow::Error>;
 
-    fn bandwidth(&self) -> Option<&super::bandwidth::Bandwidth>;
+    fn bandwidth_enabled(&self) -> bool;
+
+    /// Whether bandwidth limits can currently be applied.
+    async fn bandwidth_ready(&self) -> Result<(), anyhow::Error>;
 }

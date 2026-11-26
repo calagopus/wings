@@ -73,17 +73,24 @@ pub(super) struct InstanceState {
     pub started_at: Option<String>,
 }
 
+impl InstanceState {
+    /// The state reported for an instance that no longer exists.
+    pub(super) fn stopped() -> Self {
+        Self {
+            status: "Stopped".into(),
+            pid: 0,
+            cpu: BTreeMap::new(),
+            memory: BTreeMap::new(),
+            network: BTreeMap::new(),
+            started_at: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(super) struct NetworkState {
     #[serde(default)]
-    pub addresses: Vec<NetworkAddress>,
-    #[serde(default)]
     pub counters: NetworkCounters,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(super) struct NetworkAddress {
-    pub address: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -169,7 +169,7 @@ fn nofile_ceiling(requested: u64) -> u64 {
     requested
 }
 
-fn convert_ulimits(
+pub(crate) fn convert_ulimits(
     config: &crate::config::Config,
 ) -> Option<Vec<bollard::models::ResourcesUlimits>> {
     static WARNED_CLAMP: OnceLock<()> = OnceLock::new();
@@ -212,7 +212,7 @@ fn convert_ulimits(
     )
 }
 
-fn convert_sysctls(
+pub(crate) fn convert_sysctls(
     config: &crate::config::Config,
     network_mode: &str,
 ) -> Option<HashMap<String, String>> {
@@ -714,7 +714,10 @@ impl crate::server::configuration::ServerConfiguration {
         }
     }
 
-    fn installer_resources(&self, config: &crate::config::Config) -> bollard::models::Resources {
+    pub(crate) fn installer_resources(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::Resources {
         let mut resources = self.convert_container_resources(config);
 
         let config = config.load();
@@ -763,7 +766,7 @@ impl crate::server::configuration::ServerConfiguration {
 }
 
 /// An empty read-only mount hiding the host-side trash directory from the container.
-const TRASH_TMPFS_OPTIONS: &str = "ro,nosuid,nodev,noexec,size=4k";
+pub(crate) const TRASH_TMPFS_OPTIONS: &str = "ro,nosuid,nodev,noexec,size=4k";
 
 const TRANSIENT_JSON_ATTEMPTS: u32 = 4;
 const TRANSIENT_JSON_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
@@ -3747,8 +3750,12 @@ impl super::ServerExecutor for DockerExecutor {
             .collect())
     }
 
-    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
-        Some(&self.bandwidth)
+    fn bandwidth_enabled(&self) -> bool {
+        self.bandwidth.enabled()
+    }
+
+    async fn bandwidth_ready(&self) -> Result<(), anyhow::Error> {
+        self.bandwidth.ready().await
     }
 }
 

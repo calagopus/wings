@@ -39,22 +39,15 @@ mod get {
         (status = OK, body = inline(Response)),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let (enabled, result) = match state.executor.bandwidth() {
-            Some(bandwidth) => (
-                bandwidth.enabled(),
-                match tokio::time::timeout(std::time::Duration::from_secs(2), bandwidth.ready())
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!("bandwidth readiness check timed out")),
-                },
-            ),
-            None => (
-                false,
-                Err(anyhow::anyhow!(
-                    "bandwidth limits are not supported by this server executor"
-                )),
-            ),
+        let enabled = state.executor.bandwidth_enabled();
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.executor.bandwidth_ready(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("bandwidth readiness check timed out")),
         };
 
         ApiResponse::new_serialized(Response {

@@ -6545,7 +6545,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-test",
- "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml_edit",
  "tower-http 0.7.1",

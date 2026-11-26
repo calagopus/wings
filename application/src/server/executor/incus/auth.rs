@@ -2,21 +2,29 @@ use anyhow::{Context, bail, ensure};
 use base64::Engine;
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+use tokio::io::AsyncWriteExt;
 
 pub(super) struct PullEnvironment {
     _directory: tempfile::TempDir,
+    /// The Incus client to run.
+    pub incus: String,
     pub environment: BTreeMap<String, String>,
 }
+
+/// The packaged client binary, whose wrapper script would put its own skopeo ahead of ours.
+const PACKAGED_CLIENT: &str = "/opt/incus/bin/incus";
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn executable(path: &str) -> anyhow::Result<PathBuf> {
+/// Finds the configured skopeo, falling back to the copy shipped with Incus packages.
+pub(super) fn executable(path: &str) -> anyhow::Result<PathBuf> {
+    let name = path;
     let path = Path::new(path);
     if path.components().count() > 1 || path.is_absolute() {
         return std::fs::canonicalize(path).context("resolving configured Skopeo executable");
@@ -30,6 +38,12 @@ fn executable(path: &str) -> anyhow::Result<PathBuf> {
             return Ok(std::fs::canonicalize(candidate)?);
         }
     }
+    if name == "skopeo" {
+        let packaged = Path::new("/opt/incus/bin/skopeo");
+        if packaged.is_file() {
+            return Ok(packaged.into());
+        }
+    }
     bail!("configured Skopeo executable was not found in PATH")
 }
 
@@ -37,8 +51,9 @@ impl PullEnvironment {
     pub async fn new(
         root: &Path,
         cfg: &crate::config::IncusRuntime,
-        registries: &HashMap<String, crate::config::DockerRegistryConfiguration>,
+        credentials: Option<(String, String)>,
         registry: &str,
+        layout: &Path,
     ) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir_in(root)?;
         let mut environment = BTreeMap::from([
@@ -54,29 +69,25 @@ impl PullEnvironment {
             serde_saphyr::to_string(&client_config)?,
         )
         .await?;
-        let credentials = registries.get(registry).or_else(|| {
-            (registry == "docker.io")
-                .then(|| registries.get("https://index.docker.io/v1/"))
-                .flatten()
-        });
-        if let Some(credentials) = credentials {
+        if let Some((username, password)) = credentials {
             ensure!(
-                !credentials.username.contains(':'),
+                !username.contains(':'),
                 "registry username must not contain a colon"
             );
-            let auth = base64::engine::general_purpose::STANDARD
-                .encode(format!("{}:{}", credentials.username, credentials.password));
+            let auth =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
             let auth_file = directory.path().join("auth.json");
-            let file = std::fs::OpenOptions::new()
+            let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&auth_file)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            tokio::fs::write(
-                &auth_file,
-                serde_json::to_vec(&json!({"auths": {registry: {"auth": auth}}}))?,
-            )
+                .mode(0o600)
+                .open(&auth_file)
+                .await?;
+            file.write_all(&serde_json::to_vec(
+                &json!({"auths": {registry: {"auth": auth}}}),
+            )?)
             .await?;
+            file.flush().await?;
             environment.insert("REGISTRY_AUTH_FILE".into(), auth_file.display().to_string());
         }
         let binary = executable(&cfg.skopeo_path)?;
@@ -97,22 +108,31 @@ impl PullEnvironment {
                 script.push_str(&format!("export {key}={}\n", quote(&value)));
             }
         }
+        // Copy the layers Wings has already downloaded instead of fetching them again.
+        script.push_str(&format!(
+            "layout={}\ncopying=\nfor argument in \"$@\"; do\n  shift\n  case \"$argument\" in\n    copy) copying=1 ;;\n    docker://*) [ -n \"$copying\" ] && argument=\"dir:$layout\" ;;\n  esac\n  set -- \"$@\" \"$argument\"\ndone\n",
+            quote(&layout.display().to_string())
+        ));
         script.push_str(&format!(
             "exec {} \"$@\"\n",
             quote(&binary.display().to_string())
         ));
         tokio::fs::write(&wrapper, script).await?;
         tokio::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).await?;
+        let mut path = directory.path().display().to_string();
+        let mut incus = cfg.incus_path.clone();
+        if incus == "incus" && Path::new(PACKAGED_CLIENT).exists() {
+            incus = PACKAGED_CLIENT.into();
+            path.push_str(":/opt/incus/bin");
+            environment.insert("LD_LIBRARY_PATH".into(), "/opt/incus/lib/".into());
+        }
         environment.insert(
             "PATH".into(),
-            format!(
-                "{}:{}",
-                directory.path().display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
+            format!("{path}:{}", std::env::var("PATH").unwrap_or_default()),
         );
         Ok(Self {
             _directory: directory,
+            incus,
             environment,
         })
     }

@@ -1,17 +1,41 @@
 use super::{
-    Devices, IncusExecutor, Instance, InstanceState, image, network, process, storage::Storage,
+    IncusExecutor, Instance, InstanceState,
+    configuration::{self, BlueprintOptions, Role},
+    image, network, process,
+    storage::Storage,
 };
 use crate::server::executor::{ProcessHandle, StatusReceiver};
-use crate::server::{Server, installation::InstallationScript};
+use crate::server::{Server, firewall::sets::FirewallFileAccess, installation::InstallationScript};
 use anyhow::{Context, ensure};
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
+
+/// What a new instance is for.
+pub(super) struct Launch {
+    role: Role,
+    /// Replaces the image's own command.
+    command: Option<Vec<String>>,
+    environment: HashMap<compact_str::CompactString, Value>,
+    /// A host directory of helper files and where it is mounted.
+    staging: Option<(PathBuf, &'static str)>,
+}
+
+impl Launch {
+    pub(super) fn server() -> Self {
+        Self {
+            role: Role::Server,
+            command: None,
+            environment: HashMap::new(),
+            staging: None,
+        }
+    }
+}
 
 impl IncusExecutor {
     pub(super) async fn create(
@@ -19,14 +43,10 @@ impl IncusExecutor {
         server: &Server,
         name: &str,
         image: &image::Image,
-        command: Option<Vec<String>>,
-        installer: bool,
-        extra_env: &HashMap<compact_str::CompactString, Value>,
+        launch: Launch,
     ) -> anyhow::Result<()> {
-        let _guard = self.provisioning.lock().await;
-        let cfg = server.configuration.read().await;
-        Self::validate_server(&cfg)?;
-        let runtime = self.config.load().runtime.incus.clone();
+        let _guard = self.locks.lock(server.uuid).await;
+        let role = launch.role;
         if let Some(existing) = self
             .client
             .optional::<Instance>(&Self::instance_path(name))
@@ -39,195 +59,167 @@ impl IncusExecutor {
             );
             self.remove_instance(name).await?;
         }
-        let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
-        let address = self.network.allocate(&instances).await?;
+        let data = self.prepare_data_mount(server).await?;
+        ensure!(
+            data.is_absolute() && data.is_dir(),
+            "Wings server directory must be initialized before creating an Incus instance"
+        );
+        server.filesystem.ensure_trash_directory().await;
+
+        let cfg = server.configuration.read().await;
+        let mut blueprint = configuration::blueprint(
+            &self.config,
+            server,
+            &cfg,
+            BlueprintOptions {
+                role,
+                image,
+                command: launch.command,
+                extra_env: &launch.environment,
+                swap_sizes: self.swap_sizes(),
+            },
+        )
+        .await?;
+        let published = if role == Role::Server {
+            self.network.publish_map(&cfg)?
+        } else {
+            BTreeMap::new()
+        };
+        // Held until the instance exists, so no other instance can be given the same address.
+        let address = self.network.reserve().await?;
+        let runtime = self.config.load().runtime.incus.clone();
         let control = Storage::control_name(name);
         self.storage
             .ensure_volume(&control, 16 * 1024 * 1024)
             .await?;
-        let mut config = self.process_config(&cfg, image, installer, command)?;
-        config.extend(BTreeMap::from([
+
+        blueprint.config.extend(address.instance_config());
+        blueprint.config.extend(BTreeMap::from([
             ("user.wings.owner".into(), self.owner.clone()),
             ("user.wings.server".into(), server.uuid.to_string()),
-            ("user.wings.ip".into(), address.to_string()),
             ("user.wings.digest".into(), image.digest.clone()),
-            (
-                "user.wings.image-env".into(),
-                serde_json::to_string(&image.environment)?,
-            ),
-            (
-                "user.wings.allocations".into(),
-                serde_json::to_string(&network::allocations(&cfg)?)?,
-            ),
+            (network::JOURNAL.into(), serde_json::to_string(&published)?),
         ]));
-        for (key, value) in extra_env {
-            config.insert(
-                format!("environment.{key}"),
-                value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), str::to_owned),
+        if role == Role::Server
+            && let Some(source) = network::forced_source(&cfg)?
+        {
+            blueprint
+                .config
+                .insert(network::SOURCE_NAT.into(), source.to_string());
+        }
+
+        let bandwidth = (role == Role::Server).then_some(cfg.build.bandwidth);
+        blueprint.devices.insert(
+            "root".into(),
+            BTreeMap::from([
+                ("type".into(), "disk".into()),
+                ("path".into(), "/".into()),
+                ("pool".into(), runtime.storage_pool.clone()),
+                ("size".into(), runtime.root_disk_size),
+            ]),
+        );
+        blueprint
+            .devices
+            .insert("eth0".into(), self.network.nic(&address, bandwidth));
+        blueprint.devices.insert(
+            "data".into(),
+            BTreeMap::from([
+                ("type".into(), "disk".into()),
+                (
+                    "source".into(),
+                    data.to_str()
+                        .context("Incus data path is not UTF-8")?
+                        .into(),
+                ),
+                ("path".into(), role.home().into()),
+            ]),
+        );
+        blueprint.devices.insert(
+            "control".into(),
+            BTreeMap::from([
+                ("type".into(), "disk".into()),
+                ("pool".into(), runtime.storage_pool),
+                ("source".into(), control.clone()),
+                ("path".into(), "/opt/wings-control".into()),
+            ]),
+        );
+        if let Some((source, target)) = &launch.staging {
+            blueprint.devices.insert(
+                "staging".into(),
+                BTreeMap::from([
+                    ("type".into(), "disk".into()),
+                    ("source".into(), source.display().to_string()),
+                    ("path".into(), (*target).into()),
+                    ("shift".into(), "true".into()),
+                ]),
             );
         }
-        let data_source = self.prepare_data_mount(server).await?;
-        ensure!(
-            data_source.is_absolute() && data_source.is_dir(),
-            "Wings server directory must be initialized before creating an Incus instance"
-        );
-        let mut devices = Devices::from([
-            (
-                "root".into(),
-                BTreeMap::from([
-                    ("type".into(), "disk".into()),
-                    ("path".into(), "/".into()),
-                    ("pool".into(), runtime.storage_pool.clone()),
-                    ("size".into(), runtime.root_disk_size),
-                ]),
-            ),
-            (
-                "eth0".into(),
-                BTreeMap::from([
-                    ("type".into(), "nic".into()),
-                    ("network".into(), runtime.network),
-                    ("name".into(), "eth0".into()),
-                    ("ipv4.address".into(), address.to_string()),
-                    ("security.mac_filtering".into(), "true".into()),
-                    ("security.ipv4_filtering".into(), "true".into()),
-                    ("security.port_isolation".into(), "true".into()),
-                ]),
-            ),
-            (
-                "data".into(),
-                BTreeMap::from([
-                    ("type".into(), "disk".into()),
-                    (
-                        "source".into(),
-                        data_source
-                            .to_str()
-                            .context("Incus data path is not UTF-8")?
-                            .into(),
-                    ),
-                    (
-                        "path".into(),
-                        if installer {
-                            "/mnt/server"
-                        } else {
-                            "/home/container"
-                        }
-                        .into(),
-                    ),
-                ]),
-            ),
-            (
-                "control".into(),
-                BTreeMap::from([
-                    ("type".into(), "disk".into()),
-                    ("pool".into(), runtime.storage_pool),
-                    ("source".into(), control.clone()),
-                    ("path".into(), "/opt/wings-control".into()),
-                ]),
-            ),
-        ]);
-        if !installer {
-            cfg.ensure_vmounts(&self.config).await?;
-            for (index, mount) in cfg
-                .mounts(&self.config, &server.filesystem)
-                .await
-                .into_iter()
-                .filter(|mount| mount.target != "/home/container")
-                .enumerate()
-            {
-                let source = Path::new(mount.source.as_str());
-                ensure!(
-                    source.is_absolute() && source.exists(),
-                    "Incus mount source is missing"
-                );
-                let target = if mount.target == "/etc/hosts" {
-                    config.insert(
-                        "raw.lxc".into(),
-                        "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n"
-                            .into(),
-                    );
-                    "/opt/wings-private-hosts"
-                } else {
-                    mount.target.as_str()
-                };
-                devices.insert(
-                    format!("mount-{index}"),
-                    BTreeMap::from([
-                        ("type".into(), "disk".into()),
-                        ("source".into(), mount.source.to_string()),
-                        ("path".into(), target.to_string()),
-                        ("readonly".into(), mount.read_only.to_string()),
-                    ]),
-                );
-            }
-        }
+        blueprint
+            .devices
+            .extend(self.network.proxy_devices(&address, &published)?);
+
         let body = json!({
             "name": name,
             "type": "container",
             "profiles": [],
             "source": {"type": "image", "fingerprint": image.fingerprint},
-            "config": config,
-            "devices": devices,
+            "config": blueprint.config,
+            "devices": blueprint.devices,
         });
-        self.client
-            .mutate(Method::POST, "/1.0/instances", body)
-            .await?;
-        let (mut instance, etag) = self.instance_with_etag(name).await?;
-        let uid: u32 = instance
-            .config
-            .get("oci.uid")
-            .context("Incus did not resolve the OCI UID")?
-            .parse()?;
-        let gid: u32 = instance
-            .config
-            .get("oci.gid")
-            .context("Incus did not resolve the OCI GID")?
-            .parse()?;
-        instance.config.insert(
-            "raw.idmap".into(),
-            format!(
-                "uid {} {uid}\ngid {} {gid}",
-                self.config.load().system.user.uid,
-                self.config.load().system.user.gid
-            ),
-        );
-        self.update_instance(&instance, etag.as_deref()).await?;
-        self.client
-            .directory(
-                &self.storage.file_path(&control, "process"),
-                uid,
-                gid,
-                "0700",
-            )
-            .await?;
-        self.client
-            .write_file(
-                &self.storage.file_path(&control, "process/launch"),
-                instance
-                    .config
-                    .get("user.wings.launch")
-                    .context("OCI launch script missing")?
-                    .as_bytes()
-                    .to_vec(),
-                uid,
-                gid,
-                "0600",
-            )
-            .await?;
-        self.client
-            .write_file(
-                &self.storage.file_path(&control, "process/exit"),
-                Vec::new(),
-                uid,
-                gid,
-                "0600",
-            )
-            .await?;
-        drop(cfg);
-        drop(_guard);
-        if !installer {
-            self.sync_server(server, name).await?;
+        let created = async {
+            self.client
+                .mutate(Method::POST, "/1.0/instances", body)
+                .await?;
+            let launch_script = blueprint
+                .config
+                .get("user.wings.launch")
+                .context("OCI launch script missing")?;
+            let (uid, gid) = (blueprint.uid, blueprint.gid);
+            self.client
+                .directory(
+                    &self.storage.file_path(&control, "process"),
+                    uid,
+                    gid,
+                    "0700",
+                )
+                .await?;
+            for (file, content) in [
+                ("process/launch", launch_script.as_bytes().to_vec()),
+                ("process/exit", Vec::new()),
+            ] {
+                self.client
+                    .write_file(
+                        &self.storage.file_path(&control, file),
+                        content,
+                        uid,
+                        gid,
+                        "0600",
+                    )
+                    .await?;
+            }
+            if role == Role::Server {
+                let instance = self.instance(name).await?;
+                let mut spec = super::firewall_spec(&cfg, &instance)?;
+                spec.files = Some(FirewallFileAccess {
+                    filesystem: (*server.filesystem).clone(),
+                    notifier: Some(server.filesystem.server_notifier().clone()),
+                    server: Some(Arc::downgrade(server)),
+                });
+                if let Err(err) = self.firewall.sync(&spec).await {
+                    if !spec.rules.is_empty() {
+                        return Err(err.context("failed to apply firewall rules"));
+                    }
+                    tracing::warn!(server = %server.uuid, "failed to clear firewall rules: {err:#}");
+                }
+            }
+            self.network.refresh_nat().await
+        }
+        .await;
+        if let Err(err) = created {
+            if let Err(cleanup) = self.remove_instance(name).await {
+                tracing::warn!(instance = %name, "could not remove a half-created instance: {cleanup:#}");
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -320,16 +312,20 @@ impl IncusExecutor {
             .context("preparing Incus helper data permissions")?;
         let image = self
             .images
-            .ensure(&script.container_image, server, installation)
+            // Script containers pull quietly, as with docker.
+            .ensure(&script.container_image, server, !installation)
             .await?;
-        let name = if installation {
-            format!("wgi-{}", server.uuid)
+        let (role, name) = if installation {
+            (Role::Installer, format!("wgi-{}", server.uuid))
         } else {
             let identity = uuid::Uuid::new_v4().simple().to_string();
-            format!(
-                "wgx-{}-{}",
-                server.uuid,
-                identity.get(..16).context("helper ID")?
+            (
+                Role::Script,
+                format!(
+                    "wgx-{}-{}",
+                    server.uuid,
+                    identity.get(..16).context("helper ID")?
+                ),
             )
         };
         let staging = if installation {
@@ -337,63 +333,56 @@ impl IncusExecutor {
         } else {
             self.state_root().join("scripts").join(&name)
         };
-        tokio::fs::create_dir_all(&staging).await?;
-        if installation {
-            for filename in [
-                crate::server::installation::INSTALL_STATUS_FILE_NAME,
-                crate::server::installation::INSTALL_PROGRESS_FILE_NAME,
-            ] {
-                tokio::fs::write(staging.join(filename), []).await?;
-            }
-        }
         let (target, filename) = if installation {
             ("/mnt/install", "install.sh")
         } else {
             ("/mnt/script", "script.sh")
         };
-        let mut env = script.environment.clone();
+        tokio::fs::create_dir_all(&staging).await?;
+        let mut environment = script.environment.clone();
         if installation {
-            env.insert(
-                "INSTALL_STATUS_FILE".into(),
-                Value::String(format!(
-                    "{target}/{}",
-                    crate::server::installation::INSTALL_STATUS_FILE_NAME
-                )),
-            );
-            env.insert(
-                "INSTALL_PROGRESS_FILE".into(),
-                Value::String(format!(
-                    "{target}/{}",
-                    crate::server::installation::INSTALL_PROGRESS_FILE_NAME
-                )),
-            );
+            for (variable, file) in [
+                (
+                    "INSTALL_STATUS_FILE",
+                    crate::server::installation::INSTALL_STATUS_FILE_NAME,
+                ),
+                (
+                    "INSTALL_PROGRESS_FILE",
+                    crate::server::installation::INSTALL_PROGRESS_FILE_NAME,
+                ),
+            ] {
+                tokio::fs::write(staging.join(file), []).await?;
+                environment.insert(variable.into(), Value::String(format!("{target}/{file}")));
+            }
         }
-        self.create(
-            server,
-            &name,
-            &image,
-            Some(vec![
-                script.entrypoint.to_string(),
-                format!("{target}/{filename}"),
-            ]),
-            true,
-            &env,
-        )
-        .await?;
-        let (mut instance, etag) = self.instance_with_etag(&name).await?;
-        instance.devices.insert(
-            "staging".into(),
-            BTreeMap::from([
-                ("type".into(), "disk".into()),
-                ("source".into(), staging.display().to_string()),
-                ("path".into(), target.into()),
-                ("shift".into(), "true".into()),
-            ]),
-        );
-        self.update_instance(&instance, etag.as_deref()).await?;
         tokio::fs::write(staging.join(filename), script.script.replace("\r\n", "\n")).await?;
-        let (handle, status_rx) =
-            process::Handle::connect(self.clone(), server, name.clone(), false, false).await?;
-        Ok((name, handle, status_rx))
+        let launched = async {
+            self.create(
+                server,
+                &name,
+                &image,
+                Launch {
+                    role,
+                    command: Some(vec![
+                        script.entrypoint.to_string(),
+                        format!("{target}/{filename}"),
+                    ]),
+                    environment,
+                    staging: Some((staging.clone(), target)),
+                },
+            )
+            .await?;
+            process::Handle::connect(self.clone(), server, name.clone(), false).await
+        }
+        .await;
+        match launched {
+            Ok((handle, status_rx)) => Ok((name, handle, status_rx)),
+            Err(err) => {
+                if let Err(cleanup) = self.remove_instance(&name).await {
+                    tracing::warn!(instance = %name, "could not remove a failed helper instance: {cleanup:#}");
+                }
+                Err(err)
+            }
+        }
     }
 }

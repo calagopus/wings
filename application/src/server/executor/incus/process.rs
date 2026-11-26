@@ -1,10 +1,18 @@
 use super::super::{ProcessHandle, ProcessStatus, StatusReceiver};
-use super::{IncusExecutor, InstanceState, client::segment, storage::Storage};
+use super::{
+    IncusExecutor, InstanceState,
+    boost::Cpu,
+    client::{self, segment},
+    configuration::Role,
+    console,
+    storage::Storage,
+    terminal::Terminal,
+};
+use crate::io::line_buffer::LineBuffer;
+use crate::server::executor::docker::cgroup;
 use anyhow::{Context, ensure};
-use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Weak,
@@ -12,23 +20,36 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{broadcast, mpsc},
-};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{broadcast, mpsc, watch};
 
+/// Runs inside the instance around the game process, because Incus reports neither the exit code
+/// nor out-of-memory kills of an application container.
+///
+/// A shell starts background commands with SIGINT and SIGQUIT ignored, which would silently break
+/// those stop signals. GNU `env` can restore them; without it the game runs in the foreground.
 pub(super) const SUPERVISOR: &str = concat!(
-    "rm -f /opt/wings-control/process/exit; exec 3<&0; ",
-    r#""$@" <&3 3<&- & child=$!; exec 3<&-; "#,
-    r#"printf '%s\n' "$child" > /opt/wings-control/process/pid; "#,
+    "dir=/opt/wings-control/process; rm -f $dir/exit; ",
+    "if env --default-signal=INT,QUIT true >/dev/null 2>&1; then ",
+    "exec 3<&0; ",
+    r#"env --default-signal=INT,QUIT "$@" <&3 3<&- & child=$!; exec 3<&-; "#,
+    r#"printf '%s\n' "$child" > $dir/pid; "#,
     r#"trap 'kill -TERM "$child" 2>/dev/null' TERM; "#,
     r#"trap 'kill -INT "$child" 2>/dev/null' INT; "#,
     r#"trap 'kill -QUIT "$child" 2>/dev/null' QUIT; "#,
     r#"while :; do wait "$child"; code=$?; kill -0 "$child" 2>/dev/null || break; done; "#,
-    r#"printf '%s\n' "$code" > /opt/wings-control/process/exit.tmp; "#,
-    r#"mv /opt/wings-control/process/exit.tmp /opt/wings-control/process/exit; exit "$code""#,
+    "else ",
+    "trap : INT QUIT TERM; ",
+    r#"/bin/sh -c 'echo $$ > /opt/wings-control/process/pid; exec "$@"' wings-child "$@"; code=$?; "#,
+    "fi; ",
+    "oom=0; if [ -r /sys/fs/cgroup/memory.events ]; then ",
+    r#"while read -r key value; do [ "$key" = oom_kill ] && oom=$value; done < /sys/fs/cgroup/memory.events; "#,
+    "fi; ",
+    r#"printf '%s %s\n' "$code" "$oom" > $dir/exit.tmp; mv $dir/exit.tmp $dir/exit; exit "$code""#,
 );
+
+const TAIL_INTERVAL: Duration = Duration::from_millis(50);
+const STATE_INTERVAL: Duration = Duration::from_millis(250);
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) fn encode_argv(args: &[String]) -> anyhow::Result<String> {
     ensure!(
@@ -42,15 +63,20 @@ pub(super) fn encode_argv(args: &[String]) -> anyhow::Result<String> {
         .join(" "))
 }
 
-pub(super) fn launch_script(args: &[String]) -> anyhow::Result<String> {
-    let script = format!(
-        "#!/bin/sh\nexec </dev/console >/dev/console 2>&1\nexec {}\n",
-        encode_argv(args)?
-    );
+/// The instance's entrypoint script. With `terminal` the process talks to the console directly;
+/// without it, as for docker script containers, it writes into a pipe and gets no input.
+pub(super) fn launch_script(args: &[String], terminal: bool) -> anyhow::Result<String> {
+    let command = encode_argv(args)?;
+    let script = if terminal {
+        format!("#!/bin/sh\nexec </dev/console >/dev/console 2>&1\nexec {command}\n")
+    } else {
+        format!("#!/bin/sh\nexec </dev/null >/dev/console 2>&1\n{command} 2>&1 | cat\n")
+    };
     ensure!(script.len() <= 262144, "OCI launch script exceeds 256 KiB");
     Ok(script)
 }
 
+/// A console terminal sends a carriage return for the enter key.
 fn console_input(data: &[u8]) -> Vec<u8> {
     let mut input = Vec::with_capacity(data.len());
     let mut previous = None;
@@ -67,22 +93,70 @@ fn console_input(data: &[u8]) -> Vec<u8> {
     input
 }
 
+/// The exit code and whether the kernel killed anything for running out of memory.
+fn parse_exit(data: &str) -> Option<(i32, bool)> {
+    let mut fields = data.split_whitespace();
+    let code = fields.next()?.parse().ok()?;
+    let oom = fields
+        .next()
+        .and_then(|count| count.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((code, oom > 0))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Phase {
+    /// Created but not yet seen running.
+    Created,
+    Running {
+        pid: u32,
+    },
+    Stopped,
+}
+
+/// What the handle and its background tasks share.
+pub(super) struct Shared {
+    pub executor: IncusExecutor,
+    pub name: String,
+    pub server: Weak<crate::server::InnerServer>,
+    pub started: AtomicBool,
+    pub phase: watch::Sender<Phase>,
+    pub cpu: Cpu,
+}
+
+impl Shared {
+    pub(super) fn pid(&self) -> Option<u32> {
+        match *self.phase.borrow() {
+            Phase::Running { pid } => Some(pid),
+            _ => None,
+        }
+    }
+}
+
 pub(super) struct Handle {
-    name: String,
-    executor: IncusExecutor,
-    server: Weak<crate::server::InnerServer>,
-    started: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    role: Role,
     stdin: mpsc::Sender<Vec<u8>>,
     lines: broadcast::Sender<Arc<compact_str::CompactString>>,
     limited: broadcast::Sender<Arc<compact_str::CompactString>>,
-    log_path: PathBuf,
+    log: PathBuf,
+    detached: watch::Sender<bool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        // The output pump is not aborted: it delivers the last output first, and for script
+        // instances it outlives the handle, which callers drop as soon as the script starts.
+        let _ = self.detached.send(true);
         for task in &self.tasks {
             task.abort();
+        }
+        if self.role == Role::Server
+            && let Some(server) = self.shared.server.upgrade()
+        {
+            use crate::server::resources::ResourceUsageWatchExt;
+            server.resource_usage.wipe(server.state.get_state());
         }
     }
 }
@@ -93,307 +167,407 @@ impl Handle {
         server: &crate::server::Server,
         name: String,
         attached: bool,
-        runtime: bool,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        let (stdin, stdin_rx) = mpsc::channel(150);
+        let role = Role::of(&name);
         let capacity = executor.config.load().system.websocket_log_count.max(1);
+        let (stdin, stdin_rx) = mpsc::channel(150);
         let (lines, _) = broadcast::channel(capacity * 2);
         let (limited, _) = broadcast::channel(capacity);
         let (status, status_rx) = mpsc::channel(8);
-        let started = Arc::new(AtomicBool::new(attached));
-        let log_path = executor
-            .state_root()
-            .join("logs")
-            .join(format!("{name}.log"));
-        tokio::fs::create_dir_all(log_path.parent().context("log directory missing")?).await?;
-        if !attached {
-            tokio::fs::write(&log_path, []).await?;
+        let (detached, detached_rx) = watch::channel(false);
+        let log = executor.console_log_path(&name);
+        let tail = if attached {
+            console::Tail::from_end(log.clone()).await
+        } else {
+            console::clear(&log)
+                .await
+                .context("removing earlier console output")?;
+            console::Tail::from_start(log.clone())
+        };
+        if role == Role::Server {
+            use crate::server::resources::ResourceUsageWatchExt;
+            let disk = server.filesystem.limiter_usage().await;
+            server.resource_usage.wipe(server.state.get_state());
+            server.resource_usage.publish_disk_usage(disk);
         }
-        let weak = Arc::downgrade(server);
-        let console = tokio::spawn(console_task(
-            executor.clone(),
-            name.clone(),
-            stdin_rx,
-            lines.clone(),
-            limited.clone(),
-            log_path.clone(),
-        ));
-        let monitor = tokio::spawn(monitor_task(
-            executor.clone(),
-            name.clone(),
-            Arc::clone(&started),
-            status,
-            weak.clone(),
-            runtime,
-        ));
+        let shared = Arc::new(Shared {
+            executor,
+            name,
+            server: Arc::downgrade(server),
+            started: AtomicBool::new(attached),
+            phase: watch::channel(Phase::Created).0,
+            cpu: Cpu::default(),
+        });
+
+        tokio::spawn(
+            Pump {
+                shared: Arc::clone(&shared),
+                role,
+                tail,
+                output: Output {
+                    config: Arc::clone(&shared.executor.config),
+                    server: Arc::downgrade(server),
+                    buffer: LineBuffer::new(),
+                    lines: lines.clone(),
+                    limited: limited.clone(),
+                    count: 0,
+                    since: Instant::now(),
+                },
+                status,
+                detached: detached_rx,
+            }
+            .run(),
+        );
+
+        let mut tasks = Vec::new();
+        if role == Role::Server {
+            tasks.push(tokio::spawn(input_task(Arc::clone(&shared), stdin_rx)));
+            tasks.push(tokio::spawn(super::stats::run(Arc::clone(&shared))));
+        }
+
         Ok((
             Arc::new(Self {
-                name,
-                executor,
-                server: weak,
-                started,
+                shared,
+                role,
                 stdin,
                 lines,
                 limited,
-                log_path,
-                tasks: vec![console, monitor],
+                log,
+                detached,
+                tasks,
             }),
             status_rx,
         ))
     }
-}
 
-async fn console_task(
-    executor: IncusExecutor,
-    name: String,
-    mut stdin: mpsc::Receiver<Vec<u8>>,
-    lines: broadcast::Sender<Arc<compact_str::CompactString>>,
-    limited: broadcast::Sender<Arc<compact_str::CompactString>>,
-    path: PathBuf,
-) {
-    let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
-    let mut line_count = 0;
-    let mut interval = Instant::now();
-    let mut initial_replay = true;
-    let mut emit = |chunk: &[u8]| {
-        line_buffer.extend(chunk);
-        while let Some(bytes) = line_buffer.next_line() {
-            let line = Arc::new(compact_str::CompactString::from_utf8_lossy(bytes));
-            let _ = lines.send(Arc::clone(&line));
-            let cfg = executor.config.load();
-            if interval.elapsed() >= Duration::from_millis(cfg.throttles.line_reset_interval) {
-                interval = Instant::now();
-                line_count = 0;
+    /// Delivers a signal to the game process, leaving the instance to stop once it exits.
+    async fn signal(&self, signal: &str) -> anyhow::Result<()> {
+        let shared = &self.shared;
+        let path = shared
+            .executor
+            .storage
+            .file_path(&Storage::control_name(&shared.name), "process/pid");
+        // The supervisor records the PID moments after the instance starts.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pid = loop {
+            let state = shared.executor.instance_state(&shared.name).await?;
+            if state.status == "Stopped" {
+                return Ok(());
             }
-            line_count += 1;
-            if !cfg.throttles.enabled || line_count <= cfg.throttles.lines {
-                let _ = limited.send(line);
-            }
-        }
-        line_buffer.compact();
-    };
-    loop {
-        let connection = async {
-            let (operation, fds) = executor.client.console(&name).await?;
-            let data_secret = fds
-                .get("0")
-                .and_then(Value::as_str)
-                .context("console data descriptor missing")?;
-            let control_secret = fds
-                .get("control")
-                .and_then(Value::as_str)
-                .context("console control descriptor missing")?;
-            let mut control = executor
+            let pid = shared
+                .executor
                 .client
-                .websocket(&operation, control_secret)
-                .await?;
-            let data = executor.client.websocket(&operation, data_secret).await?;
-            control
-                .send(Message::Text(
-                    json!({
-                        "command": "window-resize", "args": {"width": "120", "height": "40"}
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await?;
-            Ok::<_, anyhow::Error>((data, control))
-        }
-        .await;
-        match connection {
-            Ok((mut data, mut control)) => {
-                tracing::debug!(instance = %name, "Incus console websockets connected");
-                let input_ready = tokio::time::sleep(Duration::from_secs(5));
-                tokio::pin!(input_ready);
-                let mut accept_input = false;
-                let Ok(mut log) = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .await
-                else {
-                    tracing::error!(instance = %name, "could not open Incus console log");
-                    return;
-                };
-                if initial_replay {
-                    if let Ok(Ok(buffer)) = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        executor.client.console_buffer(&name),
-                    )
-                    .await
-                    {
-                        let _ = log.write_all(&buffer).await;
-                        emit(&buffer);
-                    }
-                    initial_replay = false;
-                }
-                tracing::debug!(instance = %name, "Incus console input/output loop ready");
-                loop {
-                    tokio::select! {
-                        () = &mut input_ready, if !accept_input => {
-                            accept_input = true;
-                        }
-                        command = stdin.recv(), if accept_input => {
-                            let Some(command) = command else { return; };
-                            if data.send(Message::Binary(command.into())).await.is_err() { break; }
-                            tracing::debug!(instance = %name, "Incus console input frame sent");
-                        }
-                        message = data.next() => {
-                            let chunk = match message {
-                                Some(Ok(Message::Binary(data))) => data,
-                                Some(Ok(Message::Text(data))) => data.as_bytes().to_vec().into(),
-                                Some(Ok(Message::Ping(ping))) => {
-                                    if data.send(Message::Pong(ping)).await.is_err() { break; }
-                                    continue;
-                                }
-                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                                _ => continue,
-                            };
-                            if log.metadata().await.is_ok_and(|meta| meta.len() > 10 * 1024 * 1024)
-                                && let Err(error) = log.set_len(0).await
-                            {
-                                tracing::warn!(instance = %name, %error, "could not truncate Incus console log");
-                            }
-                            if let Err(error) = log.write_all(&chunk).await {
-                                tracing::warn!(instance = %name, %error, "could not write Incus console log");
-                            }
-                            emit(&chunk);
-                        }
-                        message = control.next() => {
-                            match message {
-                                Some(Ok(Message::Ping(data))) => {
-                                    if control.send(Message::Pong(data)).await.is_err() { break; }
-                                }
-                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+                .read_file(&path)
+                .await
+                .ok()
+                .and_then(|data| String::from_utf8(data).ok())
+                .and_then(|data| data.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 1);
+            if let Some(pid) = pid {
+                break pid;
             }
-            Err(err) if super::client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
-                return;
-            }
-            Err(err) => {
-                tracing::debug!(instance = %name, error = %err, "Incus console not yet available; retrying");
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+            ensure!(
+                Instant::now() < deadline,
+                "the process has not reported its PID, kill the server instead"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let result = shared
+            .executor
+            .client
+            .mutate(
+                reqwest::Method::POST,
+                &format!("/1.0/instances/{}/exec", segment(&shared.name)),
+                json!({
+                    "command": ["/bin/sh", "-c", format!("kill -s {signal} {pid}")],
+                    "wait-for-websocket": false,
+                    "interactive": false,
+                    "user": 0,
+                    "group": 0,
+                }),
+            )
+            .await?;
+        ensure!(
+            result.pointer("/metadata/return").and_then(Value::as_i64) == Some(0),
+            "SIG{signal} could not be delivered to the process"
+        );
+        Ok(())
     }
 }
 
-async fn monitor_task(
-    executor: IncusExecutor,
-    name: String,
-    started: Arc<AtomicBool>,
-    status: mpsc::Sender<ProcessStatus>,
+struct Output {
+    config: Arc<crate::config::Config>,
     server: Weak<crate::server::InnerServer>,
-    runtime: bool,
-) {
-    let mut previous = String::new();
-    let mut running_announced = false;
-    let mut cpu = None::<(u64, Instant)>;
-    loop {
-        let start_acknowledged = started.load(Ordering::SeqCst);
-        let state = executor
-            .client
-            .get::<InstanceState>(&format!("/1.0/instances/{}/state", segment(&name)))
-            .await;
-        match state {
-            Ok(state) => {
-                if runtime && let Some(server) = server.upgrade() {
-                    let now = Instant::now();
-                    let cpu_usage = state.cpu.get("usage").copied().unwrap_or(0);
-                    let percent = cpu.map_or(0.0, |(before, time)| {
-                        cpu_usage.saturating_sub(before) as f64
-                            / now.duration_since(time).as_nanos().max(1) as f64
-                            * 100.0
-                    });
-                    cpu = Some((cpu_usage, now));
-                    let build = server.configuration.read().await;
-                    server.resource_usage.send_modify(|usage| {
-                        usage.memory_bytes = state.memory.get("usage").copied().unwrap_or(0);
-                        usage.memory_limit_bytes = state.memory.get("total").copied().unwrap_or(0);
-                        usage.cpu_absolute = percent;
-                        usage.cpu_limit_absolute = if build.build.cpu_limit > 0 {
-                            build.build.cpu_limit as u32
-                        } else {
-                            std::thread::available_parallelism()
-                                .map_or(100, |threads| threads.get() as u32 * 100)
-                        };
-                        usage.uptime = state
-                            .started_at
-                            .as_ref()
-                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                            .map_or(0, |time| {
-                                if matches!(state.status.as_str(), "Running" | "Frozen") {
-                                    chrono::Utc::now()
-                                        .signed_duration_since(time)
-                                        .num_milliseconds()
-                                        .max(0) as u64
-                                } else {
-                                    0
-                                }
-                            });
-                        let counters = state.network.get("eth0").map(|nic| &nic.counters);
-                        usage.network.rx_bytes =
-                            counters.map_or(0, |counters| counters.bytes_received);
-                        usage.network.tx_bytes = counters.map_or(0, |counters| counters.bytes_sent);
-                        usage.network.rx_packets =
-                            counters.map_or(0, |counters| counters.packets_received);
-                        usage.network.tx_packets =
-                            counters.map_or(0, |counters| counters.packets_sent);
-                    });
+    buffer: LineBuffer,
+    lines: broadcast::Sender<Arc<compact_str::CompactString>>,
+    limited: broadcast::Sender<Arc<compact_str::CompactString>>,
+    count: u64,
+    since: Instant,
+}
+
+impl Output {
+    fn push(&mut self, data: &[u8]) {
+        self.buffer.extend(data);
+        while let Some(line) = self.buffer.next_line() {
+            let line = Arc::new(compact_str::CompactString::from_utf8_lossy(line));
+            Self::emit(
+                &self.config,
+                &self.server,
+                &mut self.count,
+                &mut self.since,
+                &self.limited,
+                &line,
+            );
+            let _ = self.lines.send(line);
+        }
+        self.buffer.compact();
+    }
+
+    fn flush(&mut self) {
+        if let Some(line) = self.buffer.flush() {
+            let line = Arc::new(compact_str::CompactString::from_utf8_lossy(line));
+            let _ = self.limited.send(Arc::clone(&line));
+            let _ = self.lines.send(line);
+        }
+        self.buffer = LineBuffer::new();
+    }
+
+    /// Forwards a line to the throttled stream, applying the same limit as the docker runtime.
+    fn emit(
+        config: &crate::config::Config,
+        server: &Weak<crate::server::InnerServer>,
+        count: &mut u64,
+        since: &mut Instant,
+        limited: &broadcast::Sender<Arc<compact_str::CompactString>>,
+        line: &Arc<compact_str::CompactString>,
+    ) {
+        let config = config.load();
+        let interval = config.throttles.line_reset_interval;
+        *count += 1;
+        if config.throttles.enabled && interval > 0 && *count >= config.throttles.lines {
+            if since.elapsed() < Duration::from_millis(interval) {
+                if *count == config.throttles.lines
+                    && let Some(server) = server.upgrade()
+                {
+                    server.log_daemon_with_prelude(
+                        "Server is outputting console data too quickly -- throttling...",
+                    );
                 }
-                if state.status != previous {
-                    match state.status.as_str() {
-                        "Running" => {
-                            running_announced = true;
-                            if status.send(ProcessStatus::Running).await.is_err() {
-                                return;
-                            }
-                        }
-                        "Frozen" if status.send(ProcessStatus::Paused).await.is_err() => return,
-                        _ => {}
-                    }
-                    previous = state.status.clone();
-                }
-                if state.status == "Stopped" && start_acknowledged {
-                    if !running_announced && status.send(ProcessStatus::Running).await.is_err() {
-                        return;
-                    }
-                    let exit = executor
-                        .client
-                        .read_file(
-                            &executor
-                                .storage
-                                .file_path(&Storage::control_name(&name), "process/exit"),
-                        )
-                        .await;
-                    let code = exit
-                        .ok()
-                        .and_then(|data| String::from_utf8(data).ok())
-                        .and_then(|s| s.trim().parse::<i32>().ok())
-                        .unwrap_or(-1);
-                    if name.starts_with("wgx-")
-                        && let Err(error) = executor.remove_instance(&name).await
-                    {
-                        tracing::warn!(instance = %name, %error, "could not clean up Incus script instance");
-                    }
-                    let _ = status
-                        .send(ProcessStatus::Stopped {
-                            exit_code: code,
-                            oom_killed: false,
-                        })
-                        .await;
+                return;
+            }
+            *count = 0;
+            *since = Instant::now();
+        }
+        let _ = limited.send(Arc::clone(line));
+    }
+}
+
+struct Pump {
+    shared: Arc<Shared>,
+    role: Role,
+    tail: console::Tail,
+    output: Output,
+    status: mpsc::Sender<ProcessStatus>,
+    detached: watch::Receiver<bool>,
+}
+
+impl Pump {
+    /// Reads everything currently in the log.
+    async fn drain(&mut self) {
+        loop {
+            match self.tail.next().await {
+                Ok(Some(data)) => self.output.push(&data),
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(instance = %self.shared.name, "could not read console output: {err}");
                     return;
                 }
             }
-            Err(err) => {
-                tracing::warn!(instance = %name, error = %err, "could not read Incus process state")
+        }
+    }
+
+    async fn run(mut self) {
+        let mut tick = tokio::time::interval(TAIL_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_state = Instant::now();
+        let mut next_status = Instant::now();
+        let mut previous = String::new();
+        let mut seen_running = false;
+        let mut oom_events = None::<PathBuf>;
+        let mut oom_seen = false;
+        let mut failures = 0u64;
+
+        loop {
+            tick.tick().await;
+            match self.tail.next().await {
+                Ok(Some(data)) => self.output.push(&data),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(instance = %self.shared.name, "could not read console output: {err}");
+                }
+            }
+            if let Some(path) = &oom_events
+                && !oom_seen
+            {
+                oom_seen = tokio::fs::read_to_string(path).await.is_ok_and(|events| {
+                    cgroup::StatFiles::parse_keyed(&events, "oom_kill").unwrap_or(0) > 0
+                });
+            }
+            let detached = *self.detached.borrow();
+            if detached && self.role != Role::Script {
+                self.drain().await;
+                return;
+            }
+            if Instant::now() < next_state {
+                continue;
+            }
+            next_state = Instant::now() + STATE_INTERVAL;
+
+            let started = self.shared.started.load(Ordering::SeqCst);
+            let state = match self.shared.executor.instance_state(&self.shared.name).await {
+                Ok(state) => state,
+                Err(err) if client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
+                    if started || seen_running {
+                        InstanceState::stopped()
+                    } else if detached {
+                        return;
+                    } else {
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    // Incus briefly cannot report on an instance that is starting or stopping.
+                    failures += 1;
+                    if failures.is_multiple_of(40) {
+                        tracing::warn!(instance = %self.shared.name, "could not read Incus process state: {err:#}");
+                    }
+                    continue;
+                }
+            };
+            failures = 0;
+
+            match state.status.as_str() {
+                "Running" | "Frozen" if state.pid > 0 => {
+                    if !seen_running || self.shared.pid() != Some(state.pid) {
+                        oom_events =
+                            cgroup::StatFiles::resolve(i64::from(state.pid)).and_then(|files| {
+                                Some(files.memory_current.parent()?.join("memory.events"))
+                            });
+                        self.shared
+                            .phase
+                            .send_replace(Phase::Running { pid: state.pid });
+                    }
+                    seen_running = true;
+                    if self.role == Role::Server {
+                        super::stats::publish_started(&self.shared, &state).await;
+                    }
+                    if state.status != previous || Instant::now() >= next_status {
+                        next_status = Instant::now() + STATUS_INTERVAL;
+                        let status = if state.status == "Frozen" {
+                            ProcessStatus::Paused
+                        } else {
+                            ProcessStatus::Running
+                        };
+                        previous = state.status.clone();
+                        // Script callers do not listen for statuses.
+                        let _ = self.status.send(status).await;
+                    }
+                }
+                "Stopped" if started || seen_running => {
+                    self.finish(seen_running, oom_seen).await;
+                    return;
+                }
+                "Stopped" if detached => return,
+                _ => {}
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    async fn finish(mut self, seen_running: bool, oom_seen: bool) {
+        self.drain().await;
+        self.output.flush();
+        let executor = self.shared.executor.clone();
+        let name = self.shared.name.clone();
+        let exit = executor
+            .client
+            .read_file(
+                &executor
+                    .storage
+                    .file_path(&Storage::control_name(&name), "process/exit"),
+            )
+            .await
+            .ok()
+            .and_then(|data| parse_exit(&String::from_utf8_lossy(&data)));
+        // Without a record the supervisor was killed along with the process.
+        let (exit_code, oom_recorded) = exit.unwrap_or((137, false));
+        if self.role == Role::Server
+            && let Some(server) = self.shared.server.upgrade()
+        {
+            server
+                .resource_usage
+                .send_if_modified(|usage| usage.started_at.take().is_some());
+        }
+        self.shared.phase.send_replace(Phase::Stopped);
+        if self.role == Role::Script
+            && let Err(error) = executor.remove_instance(&name).await
+        {
+            tracing::warn!(instance = %name, "could not clean up Incus script instance: {error:#}");
+        }
+        if !seen_running {
+            let _ = self.status.send(ProcessStatus::Running).await;
+        }
+        let _ = self
+            .status
+            .send(ProcessStatus::Stopped {
+                exit_code,
+                oom_killed: oom_recorded || oom_seen,
+            })
+            .await;
+    }
+}
+
+/// Types console input into the instance as it arrives.
+async fn input_task(shared: Arc<Shared>, mut stdin: mpsc::Receiver<Vec<u8>>) {
+    let mut phase = shared.phase.subscribe();
+    let mut open: Option<(u32, Arc<Terminal>)> = None;
+    while let Some(input) = stdin.recv().await {
+        // Input sent while the instance starts waits for it, and input for a stopped one is lost.
+        let pid = match phase
+            .wait_for(|phase| !matches!(phase, Phase::Created))
+            .await
+            .map(|phase| *phase)
+        {
+            Ok(Phase::Running { pid }) => pid,
+            _ => return,
+        };
+        let cached = open.take().filter(|(of, _)| *of == pid);
+        let name = shared.name.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let terminal = match cached {
+                Some((_, terminal)) => terminal,
+                None => Arc::new(Terminal::open(pid, &name)?),
+            };
+            terminal.write(&input)?;
+            anyhow::Ok(terminal)
+        })
+        .await;
+        match written {
+            Ok(Ok(terminal)) => open = Some((pid, terminal)),
+            // The instance stopped while the input was queued.
+            Ok(Err(_))
+                if tokio::fs::metadata(format!("/proc/{pid}/root/dev/console"))
+                    .await
+                    .is_err() => {}
+            Ok(Err(err)) => {
+                tracing::warn!(instance = %shared.name, "could not send console input: {err:#}");
+                if let Some(server) = shared.server.upgrade() {
+                    server.log_daemon_error(&format!("could not send console input: {err:#}"));
+                }
+            }
+            Err(err) => {
+                tracing::error!(instance = %shared.name, "console input task failed: {err}");
+            }
+        }
     }
 }
 
@@ -403,25 +577,24 @@ impl ProcessHandle for Handle {
         &self,
         lines: Option<usize>,
     ) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        let mut data = console::history(&self.log).await?;
         if let Some(lines) = lines {
-            let data = tokio::fs::read(&self.log_path).await?;
-            let text = String::from_utf8_lossy(&data);
-            let mut selected = text.lines().rev().take(lines).collect::<Vec<_>>();
-            selected.reverse();
-            Ok(Box::new(std::io::Cursor::new(
-                selected.join("\n").into_bytes(),
-            )))
-        } else {
-            Ok(Box::new(tokio::fs::File::open(&self.log_path).await?))
+            data = console::last_lines(&data, lines).to_vec();
         }
+        Ok(Box::new(std::io::Cursor::new(data)))
     }
 
     async fn send_stdin(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        ensure!(self.role == Role::Server, "this process takes no input");
         ensure!(data.len() <= 65536, "console input exceeds 64 KiB");
+        ensure!(
+            *self.shared.phase.borrow() != Phase::Stopped,
+            "the server is not running"
+        );
         self.stdin
-            .send(console_input(&data))
+            .send_timeout(console_input(&data), Duration::from_secs(5))
             .await
-            .context("Incus console closed")
+            .map_err(|_| anyhow::anyhow!("the server console is not accepting input"))
     }
 
     async fn subscribe_stdout_lines(
@@ -437,99 +610,122 @@ impl ProcessHandle for Handle {
     }
 
     async fn sync_configuration(&self) -> anyhow::Result<()> {
-        if self.name.starts_with("wgs-")
-            && let Some(server) = self.server.upgrade()
+        if self.role == Role::Server
+            && let Some(server) = self.shared.server.upgrade()
         {
-            self.executor.sync_server(&server, &self.name).await?;
+            let _guard = self.shared.cpu.lock.lock().await;
+            self.shared.cpu.clear_burst(self.shared.pid());
+            self.shared
+                .executor
+                .sync_server(&server, &self.shared.name)
+                .await?;
+            self.shared
+                .cpu
+                .apply_burst(&self.shared.executor.config, self.shared.pid());
         }
         Ok(())
     }
 
     async fn start(&self) -> anyhow::Result<()> {
-        self.executor
+        let shared = &self.shared;
+        // Held until the instance runs, so a server starting alongside cannot take its ports.
+        let _ports = match self.role {
+            Role::Server => Some(shared.executor.claim_ports(&shared.name).await?),
+            Role::Installer | Role::Script => None,
+        };
+        if let Err(err) = shared
+            .executor
             .client
-            .state(&self.name, "start", false)
-            .await?;
-        self.started.store(true, Ordering::SeqCst);
-        if self.name.starts_with("wgs-")
-            && let Err(err) = self.executor.publish(&self.name).await
+            .state(&shared.name, "start", false)
+            .await
         {
-            if let Some(server) = self.server.upgrade() {
-                let _ = self
-                    .executor
-                    .network
-                    .sync(server.uuid, "", &BTreeMap::new())
-                    .await;
-            }
-            let _ = self.executor.client.state(&self.name, "stop", true).await;
-            return Err(err);
+            return Err(err.context(shared.executor.start_failure_detail(&shared.name).await));
+        }
+        shared.started.store(true, Ordering::SeqCst);
+        if self.role == Role::Server
+            && let Some(server) = shared.server.upgrade()
+        {
+            super::boost::on_start(shared, &server).await;
         }
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        if self.name.starts_with("wgs-")
-            && let Some(server) = self.server.upgrade()
-        {
-            let config = server.process_configuration.read().await;
-            match config.stop.r#type.as_str() {
-                "command" => {
-                    let mut command = config
-                        .stop
-                        .value
-                        .as_deref()
-                        .unwrap_or_default()
-                        .as_bytes()
-                        .to_vec();
-                    command.push(b'\n');
-                    return self.send_stdin(command).await;
-                }
-                "signal" => {
-                    let signal = match config.stop.value.as_deref() {
-                        Some("SIGINT" | "C") => "INT",
-                        Some("SIGQUIT") => "QUIT",
-                        Some("SIGTERM") => "TERM",
-                        _ => return self.kill().await,
-                    };
-                    let pid = self
-                        .executor
-                        .client
-                        .read_file(
-                            &self
-                                .executor
-                                .storage
-                                .file_path(&Storage::control_name(&self.name), "process/pid"),
-                        )
-                        .await?;
-                    let pid: u32 = std::str::from_utf8(&pid)?.trim().parse()?;
-                    ensure!(pid > 1, "invalid game process PID");
-                    let body = json!({
-                        "command": ["/bin/sh", "-c", format!("kill -s {signal} {pid}")],
-                        "wait-for-websocket": false,
-                        "interactive": false,
-                    });
-                    let result = self
-                        .executor
-                        .client
-                        .mutate(
-                            reqwest::Method::POST,
-                            &format!("/1.0/instances/{}/exec", segment(&self.name)),
-                            body,
-                        )
-                        .await?;
-                    ensure!(
-                        result.pointer("/metadata/return").and_then(Value::as_i64) == Some(0),
-                        "Incus stop signal was not delivered"
-                    );
-                    return Ok(());
-                }
-                _ => {}
+        let stop = match self.shared.server.upgrade() {
+            Some(server) if self.role == Role::Server => {
+                let config = server.process_configuration.read().await;
+                Some((config.stop.r#type.clone(), config.stop.value.clone()))
             }
+            _ => None,
+        };
+        match stop.as_ref().map(|(kind, value)| (kind.as_str(), value)) {
+            Some(("command", value)) => {
+                let mut command = value.as_deref().unwrap_or_default().as_bytes().to_vec();
+                command.push(b'\n');
+                self.send_stdin(command).await
+            }
+            Some(("signal", value)) => match value.as_deref().map(str::to_uppercase).as_deref() {
+                Some("SIGABRT") => self.signal("ABRT").await,
+                Some("SIGINT" | "C") => self.signal("INT").await,
+                Some("SIGTERM") => self.signal("TERM").await,
+                Some("SIGQUIT") => self.signal("QUIT").await,
+                _ => self.kill().await,
+            },
+            _ => self.signal("TERM").await,
         }
-        self.executor.client.state(&self.name, "stop", false).await
     }
 
     async fn kill(&self) -> anyhow::Result<()> {
-        self.executor.client.state(&self.name, "stop", true).await
+        self.shared.executor.force_stop(&self.shared.name).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_records_carry_the_code_and_oom_flag() {
+        assert_eq!(parse_exit("0 0\n"), Some((0, false)));
+        assert_eq!(parse_exit("137 2\n"), Some((137, true)));
+        assert_eq!(parse_exit(""), None);
+    }
+
+    #[test]
+    fn console_input_uses_terminal_line_endings() {
+        assert_eq!(console_input(b"stop\n"), b"stop\r");
+        assert_eq!(console_input(b"a\r\nb\n"), b"a\rb\r");
+    }
+
+    fn run_supervisor(script: &str) -> (i32, String) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().to_str().expect("utf8 path");
+        let supervisor = SUPERVISOR.replace("/opt/wings-control", root);
+        std::fs::create_dir(directory.path().join("process")).expect("process directory");
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &supervisor,
+                "wings-supervisor",
+                "/bin/sh",
+                "-c",
+                script,
+            ])
+            .status()
+            .expect("supervisor should run");
+        let exit =
+            std::fs::read_to_string(directory.path().join("process/exit")).expect("exit record");
+        (status.code().unwrap_or(-1), exit)
+    }
+
+    #[test]
+    fn supervisor_records_the_exit_code_and_leaves_signals_deliverable() {
+        let (code, record) = run_supervisor("exit 7");
+        assert_eq!(code, 7);
+        assert_eq!(parse_exit(&record).map(|(code, _)| code), Some(7));
+
+        // SIGINT must terminate a child that installs no handler of its own.
+        let (code, _) = run_supervisor("kill -INT $$; exit 0");
+        assert_eq!(code, 130);
     }
 }

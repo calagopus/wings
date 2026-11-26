@@ -121,6 +121,65 @@ impl Seccomp {
         self
     }
 
+    /// Renders the profile in liblxc's version 2 format, for a container whose capability
+    /// bounding set is `capabilities` on the architecture `arch` (docker naming, e.g. `amd64`).
+    #[cfg(target_os = "linux")]
+    pub fn to_lxc(&self, capabilities: &[&str], arch: &str) -> String {
+        let has = |name: &compact_str::CompactString| capabilities.contains(&name.as_str());
+        let mut result = format!("2\nallowlist errno {}\n[all]\n", self.default_errno_ret);
+
+        for rule in &self.syscalls {
+            let included = (rule.includes.caps.is_empty() || rule.includes.caps.iter().any(has))
+                && (rule.includes.arches.is_empty()
+                    || rule.includes.arches.iter().any(|a| a == arch));
+            if !included
+                || rule.excludes.caps.iter().any(has)
+                || rule.excludes.arches.iter().any(|a| a == arch)
+            {
+                continue;
+            }
+
+            let action = match rule.action {
+                Action::Allow => compact_str::CompactString::const_new("allow"),
+                Action::Errno => compact_str::format_compact!("errno {}", rule.errno_ret),
+                // The base profile only allows or denies with an error number.
+                _ => continue,
+            };
+            let conditions: String = rule
+                .args
+                .iter()
+                .flatten()
+                .map(|arg| {
+                    let op = match arg.op {
+                        Operator::NotEqual => "SCMP_CMP_NE",
+                        Operator::LessThan => "SCMP_CMP_LT",
+                        Operator::LessThanEqual => "SCMP_CMP_LE",
+                        Operator::Equal => "SCMP_CMP_EQ",
+                        Operator::GreaterThan => "SCMP_CMP_GE",
+                        Operator::GreaterThanEqual => "SCMP_CMP_GT",
+                        Operator::MaskedEqual => "SCMP_CMP_MASKED_EQ",
+                    };
+                    match arg.op {
+                        Operator::MaskedEqual => {
+                            format!(" [{},{},{op},{}]", arg.index, arg.value, arg.value_two)
+                        }
+                        _ => format!(" [{},{},{op}]", arg.index, arg.value),
+                    }
+                })
+                .collect();
+
+            for name in &rule.names {
+                result.push_str(name);
+                result.push(' ');
+                result.push_str(&action);
+                result.push_str(&conditions);
+                result.push('\n');
+            }
+        }
+
+        result
+    }
+
     pub fn to_string(&self) -> Result<String, serde_json::Error> {
         let mut string = Vec::new();
         string.reserve_exact(8 + RAW_BASE_SECCOMP.len());

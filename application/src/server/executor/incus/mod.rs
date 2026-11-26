@@ -1,12 +1,19 @@
 mod auth;
+mod boost;
 mod client;
 mod configuration;
+mod console;
 mod image;
 mod instance;
 mod network;
 mod process;
+mod progress;
 mod provision;
+mod registry;
+mod seccomp;
+mod stats;
 mod storage;
+mod terminal;
 
 use super::{ProcessHandle, ProcessStatus, ServerExecutor, StatusReceiver, UsedPort};
 use crate::{
@@ -15,6 +22,7 @@ use crate::{
     server::{
         InnerServer, Server,
         configuration::ServerConfiguration,
+        executor::docker::cgroup::StatsSampler,
         filesystem::cap::CapFilesystem,
         firewall::{
             FirewallBackend, FirewallBackendKind, FirewallBinding, FirewallServerSpec,
@@ -26,20 +34,23 @@ use crate::{
         installation::InstallationScript,
     },
 };
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use client::{Client, segment};
+use configuration::Role;
 use instance::{Devices, Instance, InstanceState};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, OnceLock, atomic::Ordering},
     time::Duration,
 };
 use storage::Storage;
 
+/// Incus could not be asked about an instance that may well be running, so Wings must not go on to
+/// replace it.
 #[derive(Debug)]
 pub(crate) struct RecoveryError(anyhow::Error);
 impl std::fmt::Display for RecoveryError {
@@ -61,9 +72,14 @@ pub struct IncusExecutor {
     network: Arc<network::Network>,
     storage: Arc<Storage>,
     firewall: Arc<dyn FirewallBackend>,
-    provisioning: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes changes to one server's instances without holding up other servers.
+    locks: Arc<crate::utils::KeyedLocks<uuid::Uuid>>,
+    stats_sampler: Arc<StatsSampler>,
+    /// Whether this Incus release accepts a swap limit as a size rather than on or off.
+    swap_sizes: Arc<OnceLock<bool>>,
     owner: String,
 }
+
 impl IncusExecutor {
     pub fn new(config: Arc<Config>) -> anyhow::Result<Self> {
         let settings = config.load();
@@ -78,15 +94,9 @@ impl IncusExecutor {
                     SourceFileLimits::from_config(&config),
                 ))
             }
-            _ => anyhow::bail!(
-                "Incus requires the host nftables firewall backend or explicitly disabled policy"
-            ),
+            _ => bail!("Incus requires the nftables firewall backend or a disabled firewall"),
         };
-        let network = Arc::new(network::Network::new(
-            client.clone(),
-            &settings.runtime.incus,
-            settings.uuid,
-        ));
+        let network = Arc::new(network::Network::new(client.clone(), Arc::clone(&config)));
         drop(settings);
         Ok(Self {
             images: Arc::new(image::Images::new(Arc::clone(&config), client.clone())),
@@ -95,21 +105,47 @@ impl IncusExecutor {
             config,
             client,
             firewall,
+            locks: Arc::new(crate::utils::KeyedLocks::new()),
+            stats_sampler: Arc::new(StatsSampler::default()),
+            swap_sizes: Arc::new(OnceLock::new()),
             owner,
-            provisioning: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
+
     pub fn state_root(&self) -> PathBuf {
         self.config
             .resolve_as_path(|cfg| &cfg.system.root_directory)
             .join("incus")
     }
+
     fn name(uuid: uuid::Uuid) -> String {
         format!("wgs-{uuid}")
     }
+
     fn instance_path(name: &str) -> String {
         format!("/1.0/instances/{}", segment(name))
     }
+
+    /// Where Incus writes an instance's log files on this host.
+    fn log_directory(&self, name: &str) -> PathBuf {
+        let config = self.config.load();
+        let runtime = &config.runtime.incus;
+        let directory = PathBuf::from(&runtime.log_directory);
+        if runtime.project == "default" {
+            directory.join(name)
+        } else {
+            directory.join(format!("{}_{name}", runtime.project))
+        }
+    }
+
+    fn console_log_path(&self, name: &str) -> PathBuf {
+        self.log_directory(name).join("console.log")
+    }
+
+    fn swap_sizes(&self) -> bool {
+        self.swap_sizes.get().copied().unwrap_or(false)
+    }
+
     fn check_owner(&self, instance: &Instance) -> anyhow::Result<()> {
         ensure!(
             instance.config.get("user.wings.owner") == Some(&self.owner),
@@ -118,6 +154,7 @@ impl IncusExecutor {
         );
         Ok(())
     }
+
     async fn instance(&self, name: &str) -> anyhow::Result<Instance> {
         Ok(self.instance_with_etag(name).await?.0)
     }
@@ -131,19 +168,118 @@ impl IncusExecutor {
         Ok((instance, etag))
     }
 
-    async fn update_instance(&self, instance: &Instance, etag: Option<&str>) -> anyhow::Result<()> {
-        self.check_owner(instance)?;
+    async fn instance_state(&self, name: &str) -> anyhow::Result<InstanceState> {
         self.client
-            .request(
-                Method::PUT,
-                &Self::instance_path(&instance.name),
-                Some(&instance.update_body()),
-                etag,
-                true,
-            )
-            .await?;
-        Ok(())
+            .get(&format!("{}/state", Self::instance_path(name)))
+            .await
     }
+
+    /// Applies `change` to an instance, retrying if something else modified it meanwhile.
+    async fn modify_instance(
+        &self,
+        name: &str,
+        change: impl Fn(&mut Instance),
+    ) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds);
+        loop {
+            let (mut instance, etag) = self.instance_with_etag(name).await?;
+            let before = instance.update_body();
+            change(&mut instance);
+            let body = instance.update_body();
+            if body == before {
+                return Ok(());
+            }
+            let result = self
+                .client
+                .request(
+                    Method::PUT,
+                    &Self::instance_path(name),
+                    Some(&body),
+                    etag.as_deref(),
+                    true,
+                )
+                .await;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(err)
+                    if (client::is_status(&err, StatusCode::PRECONDITION_FAILED)
+                        || client::is_busy(&err))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Changes only the CPU time limit, given as quota and period in microseconds.
+    async fn set_cpu_allowance(&self, name: &str, quota: Option<(i64, i64)>) -> anyhow::Result<()> {
+        let allowance = configuration::limit_config(
+            &bollard::models::Resources {
+                cpu_quota: quota.map(|(quota, _)| quota),
+                cpu_period: quota.map(|(_, period)| period),
+                ..Default::default()
+            },
+            false,
+        )
+        .remove("limits.cpu.allowance");
+        self.modify_instance(name, |instance| match &allowance {
+            Some(allowance) => {
+                instance
+                    .config
+                    .insert("limits.cpu.allowance".into(), allowance.clone());
+            }
+            None => {
+                instance.config.remove("limits.cpu.allowance");
+            }
+        })
+        .await
+    }
+
+    /// Kills an instance. One that is already gone or stopped is not an error.
+    async fn force_stop(&self, name: &str) -> anyhow::Result<()> {
+        let Err(error) = self.client.state(name, "stop", true).await else {
+            return Ok(());
+        };
+        if client::is_status(&error, StatusCode::NOT_FOUND) {
+            return Ok(());
+        }
+        match self.instance_state(name).await {
+            Ok(state) if state.status == "Stopped" => Ok(()),
+            _ => Err(error),
+        }
+    }
+
+    /// The reason liblxc gave for the last failed start, for the error message.
+    async fn start_failure_detail(&self, name: &str) -> String {
+        let log = tokio::fs::read_to_string(self.log_directory(name).join("lxc.log"))
+            .await
+            .unwrap_or_default();
+        let reasons: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains(" ERROR "))
+            .filter_map(|line| line.splitn(3, " - ").nth(2))
+            .take(3)
+            .collect();
+        if reasons.is_empty() {
+            "Incus could not start the instance".into()
+        } else {
+            format!(
+                "Incus could not start the instance ({})",
+                reasons.join("; ")
+            )
+        }
+    }
+
+    /// Claims a server's published ports ahead of starting it.
+    async fn claim_ports(&self, name: &str) -> anyhow::Result<network::Claim> {
+        let instance = self.instance(name).await?;
+        let published = network::published(&instance)?;
+        self.network.claim(name, &published).await
+    }
+
     pub async fn remove_instance(&self, name: &str) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds);
@@ -153,25 +289,19 @@ impl IncusExecutor {
             .await?
         {
             self.check_owner(&instance)?;
-            if instance.status != "Stopped" {
-                self.client.state(name, "stop", true).await?;
+            let result = async {
+                if instance.status != "Stopped" {
+                    self.force_stop(name).await?;
+                }
+                self.client
+                    .mutate(Method::DELETE, &Self::instance_path(name), json!({}))
+                    .await
             }
-            match self
-                .client
-                .mutate(Method::DELETE, &Self::instance_path(name), json!({}))
-                .await
-            {
+            .await;
+            match result {
                 Ok(_) => break,
-                Err(error) if client::is_status(&error, reqwest::StatusCode::NOT_FOUND) => break,
-                Err(error)
-                    if error
-                        .downcast_ref::<client::ApiError>()
-                        .is_some_and(|error| {
-                            error.status == reqwest::StatusCode::BAD_REQUEST
-                                && error.message == "Instance is running"
-                        })
-                        && tokio::time::Instant::now() < deadline =>
-                {
+                Err(error) if client::is_status(&error, StatusCode::NOT_FOUND) => break,
+                Err(error) if client::is_busy(&error) && tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(error) => return Err(error),
@@ -180,101 +310,59 @@ impl IncusExecutor {
         self.storage
             .delete_volume(&Storage::control_name(name))
             .await?;
-        if name.starts_with("wgx-") {
-            let staging = self.state_root().join("scripts").join(name);
-            if tokio::fs::try_exists(&staging).await? {
-                tokio::fs::remove_dir_all(staging).await?;
+        // A server keeps its last output, helpers leave nothing behind.
+        let role = Role::of(name);
+        if role != Role::Server {
+            let mut directories = vec![self.log_directory(name)];
+            if role == Role::Script {
+                directories.push(self.state_root().join("scripts").join(name));
+            }
+            for directory in directories {
+                match tokio::fs::remove_dir_all(&directory).await {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())
     }
+
+    /// Brings an existing instance up to date with the settings that apply without a restart.
     async fn sync_server(&self, server: &Arc<InnerServer>, name: &str) -> anyhow::Result<()> {
-        let _guard = self.provisioning.lock().await;
-        let cfg = server.configuration.read().await;
-        Self::validate_server(&cfg)?;
-        let (mut instance, etag) = self.instance_with_etag(name).await?;
-        let image_environment: BTreeMap<String, String> = serde_json::from_str(
-            instance
-                .config
-                .get("user.wings.image-env")
-                .context("OCI environment metadata missing; recreate this stopped instance")?,
-        )?;
-        instance
-            .config
-            .retain(|key, _| !key.starts_with("environment.") && !key.starts_with("limits."));
-        for (key, value) in image_environment {
-            instance.config.insert(format!("environment.{key}"), value);
-        }
-        instance.config.extend(self.resources(&cfg, false)?);
-        for entry in cfg.environment(&self.config) {
-            let (key, value) = entry.split_once('=').context("invalid environment")?;
-            instance
-                .config
-                .insert(format!("environment.{key}"), value.into());
-        }
-        instance.config.insert(
-            "user.wings.allocations".into(),
-            serde_json::to_string(&network::allocations(&cfg)?)?,
-        );
-        let ip: IpAddr = instance
-            .config
-            .get("user.wings.ip")
-            .context("instance address missing")?
-            .parse()?;
-        let mut spec = firewall_spec(&cfg, ip)?;
+        let _guard = self.locks.lock(server.uuid).await;
+        let instance = self.instance(name).await?;
+        let (resources, bandwidth, mut spec) = {
+            let cfg = server.configuration.read().await;
+            (
+                configuration::resources(&self.config, &cfg, Role::Server),
+                cfg.build.bandwidth,
+                firewall_spec(&cfg, &instance)?,
+            )
+        };
         spec.files = Some(FirewallFileAccess {
             filesystem: (*server.filesystem).clone(),
             notifier: Some(server.filesystem.server_notifier().clone()),
             server: Some(Arc::downgrade(server)),
         });
-        self.firewall.sync(&spec).await?;
-        self.update_instance(&instance, etag.as_deref()).await?;
-        if instance.status == "Running" {
-            self.publish(name).await?;
+        if let Err(err) = self.firewall.sync(&spec).await {
+            tracing::error!(server = %server.uuid, "failed to sync firewall rules: {err:#}");
         }
-        Ok(())
-    }
-    async fn publish(&self, name: &str) -> anyhow::Result<()> {
-        let instance = self.instance(name).await?;
-        let uuid: uuid::Uuid = instance
-            .config
-            .get("user.wings.server")
-            .context("instance server missing")?
-            .parse()?;
-        let ip = instance
-            .config
-            .get("user.wings.ip")
-            .context("instance address missing")?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let state: InstanceState = self
-                .client
-                .get(&format!("{}/state", Self::instance_path(name)))
-                .await?;
-            if state
-                .network
-                .get("eth0")
-                .is_some_and(|nic| nic.addresses.iter().any(|address| &address.address == ip))
-            {
-                break;
+        let limits = configuration::limit_config(&resources, self.swap_sizes());
+        let shaping = self.network.bandwidth_config(bandwidth);
+        self.modify_instance(name, |instance| {
+            for key in configuration::LIVE_LIMITS {
+                instance.config.remove(key);
             }
-            ensure!(
-                state.status == "Running",
-                "OCI process exited before network publication"
-            );
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "Incus instance did not acquire its reserved address"
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        let desired: BTreeMap<IpAddr, BTreeSet<u16>> = serde_json::from_str(
-            instance
-                .config
-                .get("user.wings.allocations")
-                .context("allocation journal missing")?,
-        )?;
-        self.network.sync(uuid, ip, &desired).await
+            instance.config.extend(limits.clone());
+            if let Some(device) = instance.devices.get_mut("eth0") {
+                device.remove("limits.ingress");
+                device.remove("limits.egress");
+                device.extend(shaping.clone());
+            }
+        })
+        .await
     }
 }
 
@@ -282,21 +370,20 @@ pub fn verify_version(version: &str, extensions: &[String]) -> anyhow::Result<()
     let release = version
         .split_once('-')
         .map_or(version, |(release, _)| release);
-    let mut parts = release.split('.');
+    let mut parts = release
+        .split('.')
+        .map(|part| part.parse::<u64>().ok().context("unreadable Incus version"));
+    let major = parts.next().context("Incus version missing")??;
+    let minor = parts.next().context("Incus minor version missing")??;
+    let patch = parts.next().transpose()?.unwrap_or(0);
     ensure!(
-        parts.next() == Some("7") && parts.next() == Some("0"),
-        "Incus 7.0 LTS is required; daemon reports {version}"
-    );
-    let patch = parts.next().and_then(|patch| patch.parse::<u64>().ok());
-    ensure!(
-        patch.is_some_and(|patch| patch >= 1) && parts.next().is_none(),
-        "Incus 7.0.1 or a newer 7.0 LTS maintenance release is required; daemon reports {version}"
+        major == 7 && (minor > 0 || patch >= 1),
+        "Incus 7.0.1 or a newer 7.x release is required; daemon reports {version}"
     );
     for required in [
         "instance_oci",
         "instance_oci_entrypoint",
         "oci_network_config",
-        "network_forward",
         "proxy_nat",
         "file_storage_volume",
     ] {
@@ -341,14 +428,15 @@ async fn wait_for_script(
     }
 }
 
+/// The firewall policy of a server: its rules, applied to what its instance publishes.
 fn firewall_spec(
     config: &ServerConfiguration,
-    private: IpAddr,
+    instance: &Instance,
 ) -> anyhow::Result<FirewallServerSpec> {
-    let mappings = network::allocations(config)?;
+    let published = network::published(instance)?;
     Ok(FirewallServerSpec {
         server: config.uuid,
-        bindings: mappings
+        bindings: published
             .iter()
             .flat_map(|(ip, ports)| {
                 ports.iter().map(|port| FirewallBinding {
@@ -357,14 +445,14 @@ fn firewall_spec(
                 })
             })
             .collect(),
-        container_ports: mappings
+        container_ports: published
             .values()
             .flatten()
             .copied()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
-        container_ips: vec![private],
+        container_ips: network::addresses(instance)?,
         rules: config.firewall.clone(),
         files: None,
     })
@@ -373,10 +461,11 @@ fn firewall_spec(
 #[async_trait::async_trait]
 impl ServerExecutor for IncusExecutor {
     async fn boot(&self) -> anyhow::Result<()> {
-        let runtime = self.config.load().runtime.incus.clone();
+        let config = self.config.load();
+        let runtime = config.runtime.incus.clone();
         ensure!(
             rustix::process::geteuid().as_raw() == 0,
-            "the current Incus OCI importer requires a root Wings service"
+            "the Incus runtime requires Wings to run as root"
         );
         ensure!(
             runtime.network.len() <= 15
@@ -388,16 +477,11 @@ impl ServerExecutor for IncusExecutor {
             "invalid Incus bridge name"
         );
         ensure!(
-            !self.config.load().docker.startup_boost.enabled
-                && !self.config.load().docker.runtime_boost.enabled,
-            "Incus CPU boosts are not implemented; disable node CPU boosts"
+            config.system.user.uid != 0 && config.system.user.gid != 0,
+            "Incus requires a non-root Wings data UID/GID"
         );
         ensure!(
-            self.config.load().system.user.uid != 0 && self.config.load().system.user.gid != 0,
-            "Incus requires a non-root Wings data UID/GID for the host bind mount"
-        );
-        ensure!(
-            !self.config.load().uuid.is_nil(),
+            !config.uuid.is_nil(),
             "Incus requires a persistent non-nil Wings node UUID"
         );
         ensure!(
@@ -411,8 +495,20 @@ impl ServerExecutor for IncusExecutor {
             "use a dedicated Incus project"
         );
         ensure!(
-            !self.config.load().system.user.rootless.enabled,
+            !config.system.user.rootless.enabled,
             "Docker rootless settings do not apply to Incus"
+        );
+        ensure!(
+            config.docker.network.mode != "host"
+                && !config.docker.network.mode.starts_with("container:"),
+            "the Incus runtime does not support docker.network.mode {}",
+            config.docker.network.mode
+        );
+        drop(config);
+        ensure!(
+            tokio::fs::try_exists(&runtime.log_directory).await?,
+            "Incus log directory {} does not exist, set runtime.incus.log_directory",
+            runtime.log_directory
         );
         let (server, _) = self
             .client
@@ -429,6 +525,11 @@ impl ServerExecutor for IncusExecutor {
                 .context("Incus extensions missing")?,
         )?;
         verify_version(version, &extensions)?;
+        let _ = self.swap_sizes.set(
+            extensions
+                .iter()
+                .any(|extension| extension == "instance_memory_swap_bytes"),
+        );
         match self
             .client
             .request(
@@ -446,7 +547,8 @@ impl ServerExecutor for IncusExecutor {
                         .pointer("/config/user.wings.owner")
                         .and_then(Value::as_str)
                         == Some(&self.owner),
-                    "refusing unmanaged Incus project"
+                    "Incus project {} belongs to something else, set runtime.incus.project",
+                    runtime.project
                 );
                 ensure!(
                     project
@@ -499,42 +601,64 @@ impl ServerExecutor for IncusExecutor {
             .to_string();
         let image = self.images.ensure(&source, server, false).await?;
         let name = Self::name(server.uuid);
-        self.create(server, &name, &image, None, false, &HashMap::new())
+        self.create(server, &name, &image, provision::Launch::server())
             .await?;
-        process::Handle::connect(self.clone(), server, name, false, true).await
+        process::Handle::connect(self.clone(), server, name, false).await
     }
+
     async fn attach_server_process(
         &self,
         server: &Server,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         let name = Self::name(server.uuid);
-        let instance = self
-            .client
-            .optional::<Instance>(&Self::instance_path(&name))
-            .await
-            .map_err(RecoveryError)?
-            .context("Incus server does not exist")?;
+        let path = Self::instance_path(&name);
+        let mut attempts = 0u32;
+        let instance = loop {
+            attempts += 1;
+            match self.client.optional::<Instance>(&path).await {
+                Ok(instance) => break instance,
+                Err(_) if attempts < 5 => tokio::time::sleep(Duration::from_secs(1)).await,
+                Err(err) => return Err(RecoveryError(err).into()),
+            }
+        }
+        .context("Incus server does not exist")?;
         ensure!(
             instance.status == "Running" || instance.status == "Frozen",
             "Incus server is not running"
         );
-        async {
-            self.verify_data_mount(server, &instance).await?;
-            self.sync_server(server, &name).await?;
-            process::Handle::connect(self.clone(), server, name, true, true).await
+        self.check_owner(&instance)?;
+        // The game is running: take control of it, and report whatever could not be restored.
+        if let Err(err) = self.verify_data_mount(server, &instance).await {
+            tracing::error!(server = %server.uuid, "{err:#}");
+            server.log_daemon_error(&format!("{err:#}"));
         }
-        .await
-        .map_err(|error| RecoveryError(error).into())
+        if let Err(err) = self.sync_server(server, &name).await {
+            tracing::error!(server = %server.uuid, "failed to reapply server settings: {err:#}");
+        }
+        process::Handle::connect(self.clone(), server, name, true).await
     }
+
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
-        let _guard = self.provisioning.lock().await;
-        self.remove_instance(&Self::name(server.uuid)).await?;
-        if server.suspended.load(Ordering::SeqCst) {
+        let destroying = server.destroying.load(Ordering::SeqCst);
+        let name = Self::name(server.uuid);
+        {
+            let _guard = self.locks.lock(server.uuid).await;
+            if let Err(err) = self.firewall.clear(server.uuid).await {
+                tracing::warn!(server = %server.uuid, "failed to clear firewall rules: {err:#}");
+            }
+            self.remove_instance(&name).await?;
+        }
+        if destroying || server.suspended.load(Ordering::SeqCst) {
             self.cleanup_owned_helpers(server.uuid).await?;
         }
-        self.firewall.clear(server.uuid).await?;
-        Ok(())
+        if destroying {
+            for name in [name, format!("wgi-{}", server.uuid)] {
+                let _ = tokio::fs::remove_dir_all(self.log_directory(&name)).await;
+            }
+        }
+        self.network.refresh_nat().await
     }
+
     async fn setup_installation_process(
         &self,
         server: &Server,
@@ -548,10 +672,17 @@ impl ServerExecutor for IncusExecutor {
         server: &Server,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         let name = format!("wgi-{}", server.uuid);
-        self.instance(&name).await?;
-        self.prepare_data_mount(server).await?;
-        process::Handle::connect(self.clone(), server, name, true, false).await
+        let instance = self.instance(&name).await?;
+        ensure!(
+            instance.status == "Running" || instance.status == "Frozen",
+            "Incus installation is not running"
+        );
+        if let Err(err) = self.prepare_data_mount(server).await {
+            tracing::warn!(server = %server.uuid, "failed to restore the data mount: {err:#}");
+        }
+        process::Handle::connect(self.clone(), server, name, true).await
     }
+
     async fn cleanup_installation_process(&self, server: &Server) -> anyhow::Result<()> {
         self.remove_instance(&format!("wgi-{}", server.uuid)).await
     }
@@ -566,17 +697,15 @@ impl ServerExecutor for IncusExecutor {
         let executor = self.clone();
         let supervised = Arc::clone(&handle);
 
-        // Script callers drop both the handle and the receiver right after starting, and dropping
-        // the handle stops its console and monitor tasks, so this task keeps them until the end.
+        // Script callers drop both the handle and the receiver right after starting, so this task
+        // watches for the end, and removes a script that never started or ran too long.
         tokio::spawn(async move {
             if !wait_for_script(statuses, forward, SCRIPT_START_DEADLINE, timeout).await {
                 tracing::warn!(instance = %name, "Incus script did not finish in time, removing it");
                 if let Err(error) = executor.remove_instance(&name).await {
-                    tracing::warn!(instance = %name, %error, "could not remove Incus script instance");
+                    tracing::warn!(instance = %name, "could not remove Incus script instance: {error:#}");
                 }
             }
-            // Give the console task time to forward the last output.
-            tokio::time::sleep(Duration::from_secs(1)).await;
             drop(supervised);
         });
 
@@ -587,19 +716,21 @@ impl ServerExecutor for IncusExecutor {
         server: &Server,
         port: u16,
     ) -> anyhow::Result<Option<SocketAddr>> {
-        let instance = self.instance(&Self::name(server.uuid)).await?;
-        ensure!(
-            instance.status == "Running",
-            "Incus target instance is not running"
-        );
-        Ok(Some(SocketAddr::new(
-            instance
-                .config
-                .get("user.wings.ip")
-                .context("instance address missing")?
-                .parse()?,
-            port,
-        )))
+        let name = Self::name(server.uuid);
+        let Some(instance) = self
+            .client
+            .optional::<Instance>(&Self::instance_path(&name))
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.check_owner(&instance)?;
+        if instance.status != "Running" {
+            return Ok(None);
+        }
+        Ok(network::addresses(&instance)?
+            .first()
+            .map(|ip| SocketAddr::new(*ip, port)))
     }
     async fn resolve_published_address(&self, _server: &Server) -> Option<IpAddr> {
         None
@@ -613,11 +744,19 @@ impl ServerExecutor for IncusExecutor {
     async fn used_ports(&self, ips: &[IpAddr]) -> anyhow::Result<HashMap<IpAddr, Vec<UsedPort>>> {
         self.network.used_ports(ips).await
     }
-    // Bandwidth shaping is implemented only for Docker containers (it works on their
-    // network namespaces), so Incus instances run without per-server bandwidth limits.
-    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
-        None
+    // Incus shapes traffic itself, on the instance's network device.
+    fn bandwidth_enabled(&self) -> bool {
+        self.network.bandwidth_enabled()
     }
+
+    async fn bandwidth_ready(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.network.bandwidth_enabled(),
+            "docker.bandwidth.backend is disabled"
+        );
+        Ok(())
+    }
+
     async fn reconcile_firewall(&self, servers: &[RawServer]) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
         let servers: HashMap<_, _> = servers
@@ -629,42 +768,47 @@ impl ServerExecutor for IncusExecutor {
             if instance.config.get("user.wings.owner") != Some(&self.owner) {
                 continue;
             }
-            let Some(uuid) = instance
+            let Some(settings) = instance
                 .config
                 .get("user.wings.server")
                 .and_then(|uuid| uuid.parse::<uuid::Uuid>().ok())
+                .filter(|uuid| instance.name == Self::name(*uuid))
+                .and_then(|uuid| servers.get(&uuid))
             else {
                 continue;
             };
-            if instance.name != Self::name(uuid) {
-                continue;
-            }
-            let Some(settings) = servers.get(&uuid) else {
-                self.network.sync(uuid, "", &BTreeMap::new()).await?;
-                continue;
+            // One unreadable instance must not leave every other server without its rules.
+            let mut spec = match firewall_spec(settings, &instance) {
+                Ok(spec) => spec,
+                Err(err) => {
+                    tracing::error!(
+                        server = %settings.uuid,
+                        "failed to build firewall rules: {err:#}"
+                    );
+                    continue;
+                }
             };
-            let ip: IpAddr = instance
-                .config
-                .get("user.wings.ip")
-                .context("instance address missing")?
-                .parse()?;
-            if matches!(instance.status.as_str(), "Running" | "Frozen") {
-                let desired = network::allocations(settings)?;
-                self.network.sync(uuid, &ip.to_string(), &desired).await?;
-            }
-            let mut spec = firewall_spec(settings, ip)?;
             if spec.references_files() {
-                spec.files = Some(FirewallFileAccess {
-                    filesystem: CapFilesystem::new(&self.config.data_path(uuid)).await?,
-                    notifier: None,
-                    server: None,
-                });
+                match CapFilesystem::new(&self.config.data_path(settings.uuid)).await {
+                    Ok(filesystem) => {
+                        spec.files = Some(FirewallFileAccess {
+                            filesystem,
+                            notifier: None,
+                            server: None,
+                        });
+                    }
+                    Err(err) => tracing::warn!(
+                        server = %settings.uuid,
+                        "failed to open the server directory for its firewall source files: {err}"
+                    ),
+                }
             }
             specs.push(spec);
         }
         self.firewall.reconcile(&specs).await
     }
 }
+
 impl IncusExecutor {
     async fn cleanup_owned_helpers(&self, uuid: uuid::Uuid) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;

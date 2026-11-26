@@ -1,14 +1,13 @@
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, bail, ensure};
 use futures::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(super) struct Client {
     http: reqwest::Client,
-    pub socket: PathBuf,
     pub project: String,
     timeout: Duration,
 }
@@ -53,6 +52,13 @@ pub(super) fn segment(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
+/// Whether Incus refused because another operation on the instance is still finishing.
+pub(super) fn is_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ApiError>().is_some_and(|error| {
+        error.message == "Instance is running" || error.message.contains("Instance is busy")
+    })
+}
+
 pub(super) fn is_status(error: &anyhow::Error, status: StatusCode) -> bool {
     error
         .downcast_ref::<ApiError>()
@@ -69,7 +75,6 @@ impl Client {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(timeout)
                 .build()?,
-            socket: config.socket.clone().into(),
             project: config.project.clone(),
             timeout,
         })
@@ -216,14 +221,23 @@ impl Client {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if code != 200 {
-            bail!(
-                "Incus operation failed or timed out: {}",
-                envelope
-                    .metadata
-                    .get("err")
-                    .and_then(Value::as_str)
-                    .unwrap_or("no final result")
-            );
+            let message = envelope
+                .metadata
+                .get("err")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // 103 means the operation is still running after the wait timed out.
+            if code == 103 {
+                bail!(
+                    "Incus operation did not finish within {} seconds",
+                    self.timeout.as_secs()
+                );
+            }
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: message.into(),
+            }
+            .into());
         }
         Ok(envelope.metadata)
     }
@@ -244,60 +258,8 @@ impl Client {
         Ok(())
     }
 
-    pub(super) async fn console(&self, name: &str) -> anyhow::Result<(String, Value)> {
-        let response = self
-            .http
-            .post(self.url(&format!("/1.0/instances/{}/console", segment(name)), true)?)
-            .json(&json!({"type": "console", "width": 120, "height": 40}))
-            .send()
-            .await?;
-        let (envelope, _) = Self::decode(response).await?;
-        ensure!(
-            envelope.kind == ResponseType::Async,
-            "invalid Incus console response"
-        );
-        Self::validate_operation(&envelope.operation)?;
-        let fds = envelope
-            .metadata
-            .get("metadata")
-            .and_then(|m| m.get("fds"))
-            .cloned()
-            .context("missing console descriptors")?;
-        Ok((envelope.operation, fds))
-    }
-
-    pub(super) async fn websocket(
-        &self,
-        operation: &str,
-        secret: &str,
-    ) -> anyhow::Result<tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>> {
-        Self::validate_operation(operation)?;
-        let mut url = self.url(&format!("{operation}/websocket"), true)?;
-        url.set_scheme("ws")
-            .map_err(|_| anyhow!("invalid websocket URL"))?;
-        url.query_pairs_mut().append_pair("secret", secret);
-        tokio::time::timeout(self.timeout, async {
-            let stream = tokio::net::UnixStream::connect(&self.socket).await?;
-            anyhow::Ok(
-                tokio_tungstenite::client_async(url.as_str(), stream)
-                    .await?
-                    .0,
-            )
-        })
-        .await
-        .context("connecting to Incus console timed out")?
-    }
-
     pub(super) async fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
         self.read_bytes(path, 4096).await
-    }
-
-    pub(super) async fn console_buffer(&self, name: &str) -> anyhow::Result<Vec<u8>> {
-        self.read_bytes(
-            &format!("/1.0/instances/{}/console", segment(name)),
-            1024 * 1024,
-        )
-        .await
     }
 
     async fn read_bytes(&self, path: &str, limit: usize) -> anyhow::Result<Vec<u8>> {

@@ -27,9 +27,8 @@ mod get {
             .ok();
         }
 
-        let ips =
-            crate::utils::assignable_host_ips(state.config.load().docker.network.name.clone())
-                .await?;
+        let bridge = state.config.load().server_bridge_name();
+        let ips = crate::utils::assignable_host_ips(bridge).await?;
 
         ApiResponse::new_serialized(Response { ips }).ok()
     }

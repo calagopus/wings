@@ -359,4 +359,4 @@ ignore_panel_wings_upgrades: false
 
 ## Experimental Incus runtime
 
-An Incus 7.0 LTS executor is available for development and disposable-node testing. See [configuration, limitations, and validation](docs/incus.md) before enabling it. Docker remains the default.
+Servers can run on Incus 7.0.1 or newer instead of Docker. It is experimental: read [requirements, configuration and limitations](docs/incus.md) before enabling it. Docker remains the default.

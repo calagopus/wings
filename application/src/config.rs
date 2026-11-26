@@ -813,6 +813,11 @@ pub struct IncusRuntime {
     pub storage_config: BTreeMap<String, String>,
     pub network: String,
     pub ipv4_address: String,
+    /// The bridge's IPv6 address, used when `docker.network.interfaces.v6.enabled` is set.
+    /// Empty disables IPv6.
+    pub ipv6_address: String,
+    /// Where Incus keeps instance logs on this host.
+    pub log_directory: String,
     #[schema(value_type = Vec<String>)]
     pub listen_addresses: Vec<std::net::IpAddr>,
     pub incus_path: String,
@@ -834,6 +839,8 @@ impl Default for IncusRuntime {
             storage_config: BTreeMap::new(),
             network: "wingsbr0".into(),
             ipv4_address: "10.76.0.1/16".into(),
+            ipv6_address: "fd76:c0a1:7761::1/64".into(),
+            log_directory: "/var/log/incus".into(),
             listen_addresses: Vec::new(),
             incus_path: "incus".into(),
             skopeo_path: "skopeo".into(),
@@ -1740,6 +1747,16 @@ impl DockerOverhead {
         let multiplier = self.get_multiplier(memory);
 
         MiB((memory.as_mib() as f64 * multiplier) as u64)
+    }
+}
+
+impl InnerConfig {
+    /// The name of the host interface servers are attached to, which no allocation can use.
+    pub fn server_bridge_name(&self) -> String {
+        match self.runtime.backend {
+            RuntimeBackend::Docker => self.docker.network.name.clone(),
+            RuntimeBackend::Incus => self.runtime.incus.network.clone(),
+        }
     }
 }
 
