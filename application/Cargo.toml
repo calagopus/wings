@@ -59,7 +59,7 @@ dialoguer = { version = "0.12.0", default-features = false }
 sysinfo = { version = "0.40.0", default-features = false, features = ["disk", "network", "system", "user"] }
 crc32fast = { workspace = true }
 cap-std = "4.0.0"
-rustix = { version = "1.0.7", features = ["fs", "process", "net", "thread"] }
+rustix = { version = "1.0.7", features = ["event", "fs", "process", "net", "termios", "thread"] }
 cidr = { version = "0.3.1", features = ["serde"] }
 hickory-resolver = { workspace = true }
 constant_time_eq = "0.6.0"
@@ -109,6 +109,7 @@ diffy = "0.5.2"
 qbsdiff = "1.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+tundra-node = { git = "https://github.com/Luxxy-GF/tundra", rev = "f045f5861da0cf9d3df5d3e11b0b384af325147a" }
 landlock = "0.4.7"
 tikv-jemallocator = "0.6.0"
 ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }

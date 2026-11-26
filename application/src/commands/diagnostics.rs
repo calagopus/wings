@@ -57,11 +57,23 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     Err(_) => Default::default(),
                 };
 
+                let incus_version = match config.runtime.backend {
+                    crate::config::RuntimeBackend::Incus => Some(
+                        crate::utils::incus_version(&config.runtime.incus.socket)
+                            .await
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                    crate::config::RuntimeBackend::Docker => None,
+                };
+
                 let mut output = String::with_capacity(1024);
                 writeln!(output, "wings-rs - diagnostics report")?;
 
                 write_header(&mut output, "versions")?;
                 write_line(&mut output, "wings-rs", &crate::full_version())?;
+                if let Some(incus_version) = &incus_version {
+                    write_line(&mut output, "incus", incus_version)?;
+                }
                 write_line(
                     &mut output,
                     "docker",

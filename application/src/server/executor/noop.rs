@@ -98,7 +98,13 @@ impl ServerExecutor for NoopExecutor {
         Ok(ips.iter().map(|ip| (*ip, Vec::new())).collect())
     }
 
-    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
-        None
+    fn bandwidth_enabled(&self) -> bool {
+        false
+    }
+
+    async fn bandwidth_ready(&self) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "bandwidth limits are not supported by this server executor"
+        ))
     }
 }

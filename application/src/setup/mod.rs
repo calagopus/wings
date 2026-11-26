@@ -117,6 +117,7 @@ struct ProbeResponse {
     api_port: u16,
     sftp_port: u16,
     docker: ProbeDocker,
+    incus: ProbeDocker,
 }
 
 async fn probe_docker(socket: &str) -> ProbeDocker {
@@ -134,6 +135,15 @@ async fn probe_docker(socket: &str) -> ProbeDocker {
             .and_then(|version| version.version),
         Err(_) => None,
     };
+
+    ProbeDocker {
+        available: version.is_some(),
+        version,
+    }
+}
+
+async fn probe_incus(socket: &str) -> ProbeDocker {
+    let version = crate::utils::incus_version(socket).await;
 
     ProbeDocker {
         available: version.is_some(),
@@ -195,7 +205,7 @@ async fn probe(
     let ips = if container {
         BTreeSet::new()
     } else {
-        crate::utils::assignable_host_ips(state.config.docker.network.name.clone())
+        crate::utils::assignable_host_ips(state.config.server_bridge_name())
             .await
             .unwrap_or_default()
     };
@@ -211,6 +221,7 @@ async fn probe(
         api_port: state.config.api.port,
         sftp_port: state.config.system.sftp.bind_port,
         docker: probe_docker(&state.config.docker.socket).await,
+        incus: probe_incus(&state.config.runtime.incus.socket).await,
     })
     .ok()
 }

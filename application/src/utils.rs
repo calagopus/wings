@@ -31,12 +31,44 @@ pub async fn assignable_host_ips(
             name != docker_network_name.as_bytes()
                 && !name.starts_with(b"docker")
                 && !name.starts_with(b"br-")
+                && !name.starts_with(b"incusbr")
+                && !name.starts_with(b"lxdbr")
                 && !name.starts_with(b"veth")
         })
         .flat_map(|(_, data)| data.ip_networks())
         .map(|network| network.addr)
         .filter(is_assignable_ip)
         .collect())
+}
+
+/// The version of the Incus daemon listening on `socket`, if one is.
+pub async fn incus_version(socket: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let response: serde_json::Value = reqwest::Client::builder()
+            .unix_socket(socket)
+            .timeout(std::time::Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .ok()?
+            .get("http://localhost/1.0")
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+
+        response
+            .pointer("/metadata/environment/server_version")?
+            .as_str()
+            .map(str::to_owned)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        None
+    }
 }
 
 pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {

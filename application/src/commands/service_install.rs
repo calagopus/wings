@@ -44,13 +44,18 @@ fn lxcfs_args() -> String {
     )
 }
 
-fn generate_systemd_service(binary_path: &Path) -> String {
+fn generate_systemd_service(binary_path: &Path, incus: bool) -> String {
+    // Incus keeps instances running while its daemon restarts, so Wings is not part of it.
+    let dependencies = if incus {
+        "After=incus.service network-online.target\nWants=incus.service network-online.target"
+    } else {
+        "After=docker.service\nRequires=docker.service\nPartOf=docker.service"
+    };
+
     format!(
         r#"[Unit]
 Description=Calagopus Wings Daemon
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
+{dependencies}
 
 [Service]
 User=root
@@ -94,7 +99,9 @@ WantedBy=multi-user.target
     )
 }
 
-fn generate_openrc_service(binary_path: &Path) -> String {
+fn generate_openrc_service(binary_path: &Path, incus: bool) -> String {
+    let runtime = if incus { "incusd" } else { "docker" };
+
     format!(
         r#"#!/sbin/openrc-run
 
@@ -110,7 +117,7 @@ respawn_max=30
 respawn_period=180
 
 depend() {{
-    need net docker
+    need net {runtime}
 }}
 "#,
         binary_path.display()
@@ -297,6 +304,9 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
 
                 let awaiting_pairing = config.is_none() && crate::config::Config::find().is_none();
                 let start = config.is_some() || awaiting_pairing;
+                let uses_incus = config.as_ref().is_some_and(|config| {
+                    config.load().runtime.backend == crate::config::RuntimeBackend::Incus
+                });
 
                 let mut init_system = args.init.clone();
                 if init_system == InitSystem::Auto {
@@ -329,7 +339,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             return Ok(1);
                         }
 
-                        let service_content = generate_systemd_service(&binary);
+                        let service_content = generate_systemd_service(&binary, uses_incus);
 
                         match tokio::fs::write(service_path, service_content).await {
                             Ok(_) => {
@@ -387,7 +397,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             return Ok(1);
                         }
 
-                        let service_content = generate_openrc_service(&binary);
+                        let service_content = generate_openrc_service(&binary, uses_incus);
 
                         match tokio::fs::write(service_path, service_content).await {
                             Ok(_) => {

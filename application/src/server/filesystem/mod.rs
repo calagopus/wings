@@ -1422,7 +1422,9 @@ impl Filesystem {
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
-        fs.ignore_quota = true;
+        // Transfers skip disk quota checks on Docker only; on Incus they stay subject to the limit.
+        fs.ignore_quota =
+            server.app_state.config.load().runtime.backend != crate::config::RuntimeBackend::Incus;
 
         Arc::new(fs)
     }

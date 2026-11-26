@@ -1147,6 +1147,13 @@ impl Server {
                 });
             }
             Err(err) => {
+                #[cfg(target_os = "linux")]
+                if err
+                    .downcast_ref::<executor::incus::RecoveryError>()
+                    .is_some()
+                {
+                    return Err(err);
+                }
                 tracing::debug!(server = %self.uuid, "no running container to attach to: {}", err);
             }
         }
