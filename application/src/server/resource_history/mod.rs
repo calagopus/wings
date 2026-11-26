@@ -61,6 +61,9 @@ pub struct HistoryPoint {
     pub disk_bytes: Option<u64>,
     pub network_rx_bytes: Option<u64>,
     pub network_tx_bytes: Option<u64>,
+    /// Bytes read from disk within this point, `None` when not tracked for all of it.
+    pub disk_read_bytes: Option<u64>,
+    pub disk_write_bytes: Option<u64>,
 }
 
 /// Configured limits, excluding memory overhead and CPU boosts, `0` is unlimited.
@@ -150,6 +153,8 @@ impl History {
                         disk_bytes: None,
                         network_rx_bytes: None,
                         network_tx_bytes: None,
+                        disk_read_bytes: None,
+                        disk_write_bytes: None,
                     };
                 }
 
@@ -171,6 +176,9 @@ impl History {
                     disk_bytes: disk.map(|d| d.max(0) as u64 * 1024),
                     network_rx_bytes: Some(row.rx.max(0.0).round() as u64),
                     network_tx_bytes: Some(row.tx.max(0.0).round() as u64),
+                    disk_read_bytes: (!row.disk_io_unknown).then(|| row.rd.max(0.0).round() as u64),
+                    disk_write_bytes: (!row.disk_io_unknown)
+                        .then(|| row.wr.max(0.0).round() as u64),
                 }
             })
             .collect();
@@ -591,6 +599,9 @@ mod tests {
                         mem_max: 1536.0,
                         rx: 5.0,
                         tx: 6.0,
+                        rd: 8.0,
+                        wr: 9.0,
+                        disk_io_unknown: false,
                     },
                 ),
                 (
@@ -619,6 +630,8 @@ mod tests {
             disk_bytes: None,
             network_rx_bytes: None,
             network_tx_bytes: None,
+            disk_read_bytes: None,
+            disk_write_bytes: None,
         };
 
         assert_eq!(history.resolution, 10);
@@ -645,12 +658,16 @@ mod tests {
                     disk_bytes: Some(100 * 1024),
                     network_rx_bytes: Some(5),
                     network_tx_bytes: Some(6),
+                    disk_read_bytes: Some(8),
+                    disk_write_bytes: Some(9),
                 },
                 HistoryPoint {
                     sampled_seconds: Some(0),
                     disk_bytes: Some(100 * 1024),
                     network_rx_bytes: Some(0),
                     network_tx_bytes: Some(0),
+                    disk_read_bytes: Some(0),
+                    disk_write_bytes: Some(0),
                     ..unknown(20)
                 },
                 HistoryPoint {
@@ -658,6 +675,8 @@ mod tests {
                     disk_bytes: Some(50 * 1024),
                     network_rx_bytes: Some(7),
                     network_tx_bytes: Some(0),
+                    disk_read_bytes: Some(0),
+                    disk_write_bytes: Some(0),
                     ..unknown(30)
                 },
             ]

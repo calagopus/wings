@@ -20,6 +20,14 @@ nestify::nest! {
             pub tx_packets: u64,
         },
 
+        #[schema(inline)]
+        pub disk: #[derive(ToSchema, Default, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)] pub struct ResourceUsageDisk {
+            pub read_bytes: u64,
+            pub read_ops: u64,
+            pub write_bytes: u64,
+            pub write_ops: u64,
+        },
+
         pub cpu_absolute: f64,
         pub cpu_limit_absolute: u32,
 

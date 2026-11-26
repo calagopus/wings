@@ -1873,6 +1873,33 @@ impl DockerProcessHandle {
 
                                 totals
                             }),
+                            disk: stats.blkio_stats.as_ref().and_then(|blkio| {
+                                let sum =
+                                    |entries: &[bollard::models::ContainerBlkioStatEntry],
+                                     op: &str| {
+                                        entries
+                                            .iter()
+                                            .filter(|entry| {
+                                                entry.op.as_deref().is_some_and(|entry_op| {
+                                                    entry_op.eq_ignore_ascii_case(op)
+                                                })
+                                            })
+                                            .fold(0u64, |total, entry| {
+                                                total.saturating_add(entry.value.unwrap_or(0))
+                                            })
+                                    };
+
+                                let bytes = blkio.io_service_bytes_recursive.as_deref()?;
+                                let ops =
+                                    blkio.io_serviced_recursive.as_deref().unwrap_or_default();
+
+                                Some((
+                                    sum(bytes, "read"),
+                                    sum(ops, "read"),
+                                    sum(bytes, "write"),
+                                    sum(ops, "write"),
+                                ))
+                            }),
                             cpu_total_ns: stats
                                 .cpu_stats
                                 .as_ref()
@@ -1911,6 +1938,13 @@ impl DockerProcessHandle {
                         usage.network.rx_packets = rx_packets;
                         usage.network.tx_bytes = tx_bytes;
                         usage.network.tx_packets = tx_packets;
+                    }
+
+                    if let Some((read_bytes, read_ops, write_bytes, write_ops)) = sample.disk {
+                        usage.disk.read_bytes = read_bytes;
+                        usage.disk.read_ops = read_ops;
+                        usage.disk.write_bytes = write_bytes;
+                        usage.disk.write_ops = write_ops;
                     }
 
                     usage.cpu_absolute = cpu_absolute;

@@ -86,13 +86,26 @@ pub struct StoredTier {
 /// Bucket totals attributed to one point, buckets straddling points are split by overlap.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct PointRow {
+    /// Running seconds sampled.
     pub n: f64,
+    /// Sum of cpu usage per running second, hundredths of a percent.
     pub cpu_sum: f64,
+    /// Peak cpu usage, hundredths of a percent.
     pub cpu_max: f64,
+    /// Sum of memory usage per running second, KiB.
     pub mem_sum: f64,
+    /// Peak memory usage, KiB.
     pub mem_max: f64,
+    /// Network bytes received.
     pub rx: f64,
+    /// Network bytes sent.
     pub tx: f64,
+    /// Disk bytes read.
+    pub rd: f64,
+    /// Disk bytes written.
+    pub wr: f64,
+    /// Set when a bucket of this point predates disk io tracking.
+    pub disk_io_unknown: bool,
 }
 
 #[derive(Default)]
@@ -131,10 +144,53 @@ impl Storage {
                 disk    INTEGER NOT NULL,
                 rx      INTEGER NOT NULL,
                 tx      INTEGER NOT NULL,
+                rd      INTEGER,
+                wr      INTEGER,
                 PRIMARY KEY (server, b)
             ) WITHOUT ROWID;",
             Self::samples_table(schema, step)
         ))
+    }
+
+    fn has_disk_io_columns(conn: &Connection, schema: &str, step: u64) -> rusqlite::Result<bool> {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info('samples_{step}', '{schema}') WHERE name IN ('rd', 'wr')"
+            ),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|count| count == 2)
+    }
+
+    fn migrate_disk_io_columns(conn: &Connection) -> rusqlite::Result<()> {
+        let steps = conn
+            .prepare(
+                "SELECT CAST(substr(name, 9) AS INTEGER) FROM sqlite_master
+                WHERE type = 'table' AND name GLOB 'samples_[0-9]*'",
+            )?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for step in steps {
+            let table = Self::samples_table("main", step as u64);
+            let mut columns = conn.prepare(&format!(
+                "SELECT name FROM pragma_table_info('samples_{step}', 'main')"
+            ))?;
+            let columns = columns
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            for column in ["rd", "wr"] {
+                if !columns.iter().any(|c| c == column) {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} INTEGER;"
+                    ))?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Fills `dst_step` buckets missing in `dst` from `src`, whose step must divide `dst_step`.
@@ -154,6 +210,12 @@ impl Storage {
             Some((from, to)) => (format!("WHERE server = {from}"), to.to_string()),
             None => (String::new(), "a.server".to_string()),
         };
+        let disk_io = if Self::has_disk_io_columns(tx, src_schema, src_step)? {
+            "CASE WHEN COUNT(s.rd) = COUNT(*) THEN SUM(s.rd) END AS rd,
+            CASE WHEN COUNT(s.wr) = COUNT(*) THEN SUM(s.wr) END AS wr"
+        } else {
+            "NULL AS rd, NULL AS wr"
+        };
 
         // the WHERE keeps sqlite from parsing ON CONFLICT as a join constraint
         tx.execute(
@@ -163,13 +225,13 @@ impl Storage {
                     SELECT s.server AS server, s.b / {k} AS nb, SUM(s.n) AS n,
                         SUM(s.cpu_sum) AS cpu_sum, MAX(s.cpu_max) AS cpu_max,
                         SUM(s.mem_sum) AS mem_sum, MAX(s.mem_max) AS mem_max,
-                        SUM(s.rx) AS rx, SUM(s.tx) AS tx, MAX(s.b) AS lb
+                        SUM(s.rx) AS rx, SUM(s.tx) AS tx, {disk_io}, MAX(s.b) AS lb
                     FROM {src} s JOIN m ON m.server = s.server
                     WHERE (s.b / {k}) * {k} >= m.mb
                     GROUP BY s.server, nb
                 )
-                INSERT INTO {dst} (server, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx)
-                SELECT {server}, a.nb, a.n, a.cpu_sum, a.cpu_max, a.mem_sum, a.mem_max, s.disk, a.rx, a.tx
+                INSERT INTO {dst} (server, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx, rd, wr)
+                SELECT {server}, a.nb, a.n, a.cpu_sum, a.cpu_max, a.mem_sum, a.mem_max, s.disk, a.rx, a.tx, a.rd, a.wr
                 FROM a JOIN {src} s ON s.server = a.server AND s.b = a.lb
                 WHERE true
                 ON CONFLICT DO NOTHING"
@@ -220,6 +282,7 @@ impl Storage {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate_disk_io_columns(&conn)?;
         conn.pragma_update(None, "user_version", FORMAT_VERSION)?;
 
         Ok(Self {
@@ -392,8 +455,8 @@ impl Storage {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => e.insert(tx.prepare_cached(
                         &format!(
-                            "INSERT INTO {} (server, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                            "INSERT INTO {} (server, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx, rd, wr)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                             ON CONFLICT (server, b) DO UPDATE SET
                                 n = n + excluded.n,
                                 cpu_sum = cpu_sum + excluded.cpu_sum,
@@ -402,7 +465,9 @@ impl Storage {
                                 mem_max = max(mem_max, excluded.mem_max),
                                 disk = excluded.disk,
                                 rx = rx + excluded.rx,
-                                tx = tx + excluded.tx",
+                                tx = tx + excluded.tx,
+                                rd = rd + excluded.rd,
+                                wr = wr + excluded.wr",
                             Self::samples_table("main", row.step)
                         ),
                     )?),
@@ -417,9 +482,11 @@ impl Storage {
                     disk,
                     rx,
                     tx,
+                    rd,
+                    wr,
                 } = row.bucket;
                 stmt.execute(params![
-                    id, row.b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx
+                    id, row.b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx, rd, wr
                 ])?;
             }
 
@@ -613,7 +680,7 @@ impl Storage {
             |t: i64| (((t - start) as i128 * points as i128 / span) as usize).min(points - 1);
         let mut rows = HashMap::<usize, PointRow>::new();
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT b, n, cpu_sum, cpu_max, mem_sum, mem_max, rx, tx
+            "SELECT b, n, cpu_sum, cpu_max, mem_sum, mem_max, rx, tx, rd, wr
             FROM {table} WHERE server = ?1 AND b >= ?2 AND b < ?3"
         ))?;
         let mut q = stmt.query(params![id, b0, b1])?;
@@ -635,6 +702,10 @@ impl Storage {
                 field(6)?,
                 field(7)?,
             );
+            let (rd, wr) = (
+                r.get::<_, Option<i64>>(8)?.map(|v| v as f64),
+                r.get::<_, Option<i64>>(9)?.map(|v| v as f64),
+            );
 
             let first = index_of(since).saturating_sub(1);
             let last = (index_of(until - 1) + 1).min(points - 1);
@@ -654,6 +725,13 @@ impl Storage {
                 row.mem_max = row.mem_max.max(mem_max);
                 row.rx += rx * share;
                 row.tx += tx * share;
+                match rd.zip(wr) {
+                    Some((rd, wr)) => {
+                        row.rd += rd * share;
+                        row.wr += wr * share;
+                    }
+                    None => row.disk_io_unknown = true,
+                }
             }
         }
 
@@ -766,7 +844,8 @@ impl Storage {
             for tier in &tiers {
                 self.conn.execute(
                     &format!(
-                        "INSERT INTO {} SELECT 1, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx
+                        "INSERT INTO {} (server, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx, rd, wr)
+                        SELECT 1, b, n, cpu_sum, cpu_max, mem_sum, mem_max, disk, rx, tx, rd, wr
                         FROM {} WHERE server = ?1",
                         Self::samples_table("export", tier.step),
                         Self::samples_table("main", tier.step)
@@ -891,6 +970,8 @@ mod tests {
             disk: b * 10,
             rx: b,
             tx: 1,
+            rd: b,
+            wr: 1,
         }
     }
 
@@ -919,6 +1000,9 @@ mod tests {
             mem_max: *bs.end() as f64,
             rx: total,
             tx: n,
+            rd: total,
+            wr: n,
+            disk_io_unknown: false,
         }
     }
 
@@ -939,7 +1023,92 @@ mod tests {
             .unwrap();
     }
 
+    fn old_db(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("old.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE samples_10 (
+                server  INTEGER NOT NULL,
+                b       INTEGER NOT NULL,
+                n       INTEGER NOT NULL,
+                cpu_sum INTEGER NOT NULL,
+                cpu_max INTEGER NOT NULL,
+                mem_sum INTEGER NOT NULL,
+                mem_max INTEGER NOT NULL,
+                disk    INTEGER NOT NULL,
+                rx      INTEGER NOT NULL,
+                tx      INTEGER NOT NULL,
+                PRIMARY KEY (server, b)
+            ) WITHOUT ROWID;
+            INSERT INTO tiers (step, retention, retired) VALUES (10, 0, 0);
+            INSERT INTO samples_10 VALUES (1, 0, 1, 0, 0, 0, 0, 0, 5, 1);
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO servers (id, uuid) VALUES (1, ?1)",
+            params![A.as_bytes()],
+        )
+        .unwrap();
+        path
+    }
+
+    fn drop_disk_io_columns(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        let tables = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'samples_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!tables.is_empty());
+        for table in tables {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} DROP COLUMN rd; ALTER TABLE {table} DROP COLUMN wr;"
+            ))
+            .unwrap();
+        }
+    }
+
     // Storage
+    #[test]
+    fn open_migrates_old_schema_with_existing_buckets_unknown_and_new_ones_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = old_db(dir.path());
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage.reconcile(&[tier(10, 0)]).unwrap();
+        write_samples(&mut storage, A, 10, 1..=1);
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        let raw = storage.query(A, 0, 20, 2).unwrap().unwrap();
+        let old = raw.rows[&0];
+        assert!(old.disk_io_unknown);
+        assert_eq!(old.rx, 5.0);
+        assert_eq!(raw.rows.get(&1), Some(&sum(1..=1)));
+    }
+
+    #[test]
+    fn merging_into_pre_upgrade_bucket_keeps_disk_io_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&old_db(dir.path())).unwrap();
+        storage.reconcile(&[tier(10, 0)]).unwrap();
+        storage
+            .write(vec![entry(A, vec![row(10, 0, sample(3))], None)])
+            .unwrap();
+
+        let raw = storage.query(A, 0, 10, 1).unwrap().unwrap();
+        let merged = raw.rows[&0];
+        assert!(merged.disk_io_unknown);
+        assert_eq!(merged.n, 2.0);
+        assert_eq!(merged.rx, 8.0);
+    }
+
     #[test]
     fn writes_to_same_bucket_merge_additively() {
         let (_dir, mut storage) = open(&[tier(10, 0)]);
@@ -952,6 +1121,8 @@ mod tests {
             disk: 5,
             rx: 1,
             tx: 2,
+            rd: 1,
+            wr: 2,
         };
         let second = Bucket {
             n: 1,
@@ -962,6 +1133,8 @@ mod tests {
             disk: 7,
             rx: 3,
             tx: 4,
+            rd: 3,
+            wr: 4,
         };
         storage
             .write(vec![entry(A, vec![row(10, 0, first)], None)])
@@ -981,6 +1154,9 @@ mod tests {
                 mem_max: 8.0,
                 rx: 4.0,
                 tx: 6.0,
+                rd: 4.0,
+                wr: 6.0,
+                disk_io_unknown: false,
             })
         );
         assert_eq!(raw.disks.get(&0), Some(&7));
@@ -1013,6 +1189,9 @@ mod tests {
                 mem_max: 2.0,
                 rx: 2.0,
                 tx: 2.0,
+                rd: 2.0,
+                wr: 2.0,
+                disk_io_unknown: false,
             })
         );
         assert_eq!(
@@ -1025,6 +1204,9 @@ mod tests {
                 mem_max: 4.0,
                 rx: 6.0,
                 tx: 2.0,
+                rd: 6.0,
+                wr: 2.0,
+                disk_io_unknown: false,
             })
         );
         assert_eq!(raw.disks, HashMap::from([(0, 20), (1, 40)]));
@@ -1218,6 +1400,41 @@ mod tests {
         assert_eq!(raw.rows.get(&1), Some(&sum(6..=11)));
         assert_eq!(raw.disks, HashMap::from([(0, 50), (1, 110)]));
         assert_eq!(target.latest_limits(A).unwrap(), Some(limits(5)));
+    }
+
+    #[test]
+    fn export_import_round_trips_disk_io() {
+        let (dir, mut source) = open(&[tier(10, 0)]);
+        write_samples(&mut source, A, 10, 0..=5);
+        let path = dir.path().join("export.db");
+        assert!(source.export(A, &path).unwrap());
+
+        let (_target_dir, mut target) = open(&[tier(10, 0)]);
+        target.import(A, &path).unwrap();
+
+        let raw = target.query(A, 0, 60, 6).unwrap().unwrap();
+        for b in 0..=5 {
+            assert_eq!(raw.rows.get(&(b as usize)), Some(&sum(b..=b)));
+        }
+    }
+
+    #[test]
+    fn import_of_export_without_disk_io_columns_marks_disk_io_unknown() {
+        let (dir, mut source) = open(&[tier(10, 0)]);
+        write_samples(&mut source, A, 10, 0..=5);
+        let path = dir.path().join("export.db");
+        assert!(source.export(A, &path).unwrap());
+        drop_disk_io_columns(&path);
+
+        let (_target_dir, mut target) = open(&[tier(10, 0)]);
+        target.import(A, &path).unwrap();
+
+        let raw = target.query(A, 0, 60, 6).unwrap().unwrap();
+        for b in 0..=5 {
+            let point = raw.rows[&(b as usize)];
+            assert!(point.disk_io_unknown, "point {b}: {point:?}");
+            assert_eq!(point.rx, b as f64, "point {b}: {point:?}");
+        }
     }
 
     #[test]

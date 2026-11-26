@@ -96,6 +96,15 @@ impl SshCliCommand for StatsCommand {
             "    Sent: {}",
             human_bytes::human_bytes(resource_usage.network.tx_bytes as f64)
         ));
+        out.push("  Disk IO:".into());
+        out.push(format!(
+            "    Read: {}",
+            human_bytes::human_bytes(resource_usage.disk.read_bytes as f64)
+        ));
+        out.push(format!(
+            "    Written: {}",
+            human_bytes::human_bytes(resource_usage.disk.write_bytes as f64)
+        ));
 
         true
     }

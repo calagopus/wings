@@ -1,5 +1,6 @@
 use crate::io::abort::{AbortGuard, AbortListener};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -232,6 +233,7 @@ pub struct StatSample {
     pub memory_bytes: u64,
     pub memory_limit_bytes: u64,
     pub network: Option<(u64, u64, u64, u64)>,
+    pub disk: Option<(u64, u64, u64, u64)>,
     pub cpu_total_ns: u64,
     pub at: std::time::Instant,
 }
@@ -242,6 +244,7 @@ pub struct StatFiles {
     pub memory_stat: PathBuf,
     pub memory_max: PathBuf,
     pub net_dev: PathBuf,
+    pub io_stat: PathBuf,
 }
 
 impl StatFiles {
@@ -260,11 +263,36 @@ impl StatFiles {
             memory_current: dir.join("memory.current"),
             memory_stat: dir.join("memory.stat"),
             memory_max: dir.join("memory.max"),
+            io_stat: dir.join("io.stat"),
             net_dev: PathBuf::from(format!("/proc/{pid}/net/dev")),
         })
     }
 
-    fn read_sample(&self, host_memory: &mut u64) -> Result<StatSample, std::io::Error> {
+    /// Whether a block device or one of its partitions sits below another one (dm, md),
+    /// its IO is already counted above it.
+    fn is_stacked_device(device: &str) -> bool {
+        let has_holders = |dir: &Path| {
+            std::fs::read_dir(dir.join("holders")).is_ok_and(|mut holders| holders.next().is_some())
+        };
+
+        let dir = PathBuf::from(format!("/sys/dev/block/{device}"));
+        if has_holders(&dir) {
+            return true;
+        }
+
+        std::fs::read_dir(&dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.join("partition").exists() && has_holders(&path)
+            })
+        })
+    }
+
+    fn read_sample(
+        &self,
+        host_memory: &mut u64,
+        stacked_devices: &mut HashMap<String, bool>,
+    ) -> Result<StatSample, std::io::Error> {
         let at = std::time::Instant::now();
 
         let cpu_stat = std::fs::read_to_string(&self.cpu_stat)?;
@@ -272,6 +300,7 @@ impl StatFiles {
         let memory_stat = std::fs::read_to_string(&self.memory_stat)?;
         let memory_max = std::fs::read_to_string(&self.memory_max)?;
         let net_dev = std::fs::read_to_string(&self.net_dev);
+        let io_stat = std::fs::read_to_string(&self.io_stat);
 
         let mut memory_bytes = memory_current.trim().parse::<u64>().unwrap_or(0);
         if let Some(inactive_file) = Self::parse_keyed(&memory_stat, "inactive_file")
@@ -306,6 +335,13 @@ impl StatFiles {
             memory_bytes,
             memory_limit_bytes,
             network: net_dev.ok().as_deref().and_then(Self::parse_net_dev),
+            disk: io_stat.ok().map(|io_stat| {
+                Self::parse_io_stat(&io_stat, |device| {
+                    !*stacked_devices
+                        .entry(device.to_string())
+                        .or_insert_with(|| Self::is_stacked_device(device))
+                })
+            }),
             cpu_total_ns: Self::parse_keyed(&cpu_stat, "usage_usec").unwrap_or(0) * 1000,
             at,
         })
@@ -360,6 +396,44 @@ impl StatFiles {
 
         totals
     }
+
+    /// Sums `(rbytes, rios, wbytes, wios)` over the devices `counted` accepts.
+    pub fn parse_io_stat(
+        contents: &str,
+        mut counted: impl FnMut(&str) -> bool,
+    ) -> (u64, u64, u64, u64) {
+        let mut totals = (0u64, 0u64, 0u64, 0u64);
+
+        for line in contents.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(device) = fields.next() else {
+                continue;
+            };
+            if !counted(device) {
+                continue;
+            }
+
+            for field in fields {
+                let Some((key, value)) = field.split_once('=') else {
+                    continue;
+                };
+                let Ok(value) = value.parse::<u64>() else {
+                    continue;
+                };
+
+                let total = match key {
+                    "rbytes" => &mut totals.0,
+                    "rios" => &mut totals.1,
+                    "wbytes" => &mut totals.2,
+                    "wios" => &mut totals.3,
+                    _ => continue,
+                };
+                *total = total.saturating_add(value);
+            }
+        }
+
+        totals
+    }
 }
 
 pub type SampleReceiver = tokio::sync::mpsc::Receiver<Result<StatSample, std::io::Error>>;
@@ -410,6 +484,7 @@ impl StatsSampler {
 
         let mut entries = Vec::new();
         let mut host_memory = 0;
+        let mut stacked_devices = HashMap::new();
         let mut next_tick = crate::utils::next_aligned_instant(PERIOD);
 
         while !listener.is_aborted() {
@@ -428,9 +503,11 @@ impl StatsSampler {
                 }
 
                 !matches!(
-                    entry
-                        .samples
-                        .try_send(entry.files.read_sample(&mut host_memory)),
+                    entry.samples.try_send(
+                        entry
+                            .files
+                            .read_sample(&mut host_memory, &mut stacked_devices)
+                    ),
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
                 )
             });
@@ -716,5 +793,45 @@ mod tests {
             StatFiles::parse_net_dev("h1\nh2\n    lo:    1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n"),
             None
         );
+    }
+
+    // StatFiles::parse_io_stat
+
+    #[test]
+    fn parse_io_stat_sums_every_counted_device() {
+        let io_stat = "8:0 rbytes=1000 wbytes=2000 rios=10 wios=20 dbytes=0 dios=0\n\
+             259:0 rbytes=300 wbytes=400 rios=3 wios=4 dbytes=0 dios=0\n";
+
+        assert_eq!(
+            StatFiles::parse_io_stat(io_stat, |_| true),
+            (1300, 13, 2400, 24)
+        );
+    }
+
+    #[test]
+    fn parse_io_stat_skips_devices_the_predicate_rejects() {
+        let io_stat = "259:0 rbytes=1000 wbytes=2000 rios=10 wios=20 dbytes=0 dios=0\n\
+             253:0 rbytes=1000 wbytes=2000 rios=10 wios=20 dbytes=0 dios=0\n";
+
+        assert_eq!(
+            StatFiles::parse_io_stat(io_stat, |device| device != "253:0"),
+            (1000, 10, 2000, 20)
+        );
+    }
+
+    #[test]
+    fn parse_io_stat_ignores_discards_and_unknown_keys() {
+        let io_stat = "8:0 rbytes=1000 wbytes=2000 rios=10 wios=20 dbytes=9000 dios=90 \
+             cost.vrate=100.00 cost.usage=5000 cost.wait=7 cost.indebt=0 cost.indelay=0\n";
+
+        assert_eq!(
+            StatFiles::parse_io_stat(io_stat, |_| true),
+            (1000, 10, 2000, 20)
+        );
+    }
+
+    #[test]
+    fn parse_io_stat_is_zero_for_empty_input() {
+        assert_eq!(StatFiles::parse_io_stat("", |_| true), (0, 0, 0, 0));
     }
 }

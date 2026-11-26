@@ -10,6 +10,8 @@ pub struct Bucket {
     pub disk: i64,
     pub rx: i64,
     pub tx: i64,
+    pub rd: i64,
+    pub wr: i64,
 }
 
 impl Bucket {
@@ -24,15 +26,17 @@ impl Bucket {
         self.disk = sample.disk;
         self.rx += sample.rx;
         self.tx += sample.tx;
+        self.rd += sample.rd;
+        self.wr += sample.wr;
     }
 
     fn is_idle(&self) -> bool {
-        self.n == 0 && self.rx == 0 && self.tx == 0
+        self.n == 0 && self.rx == 0 && self.tx == 0 && self.rd == 0 && self.wr == 0
     }
 }
 
 /// One second of usage, cpu in hundredths of a percent, memory and disk in KiB,
-/// network as bytes since the previous sample.
+/// network and disk io as bytes since the previous sample.
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     running: bool,
@@ -41,6 +45,8 @@ struct Sample {
     disk: i64,
     rx: i64,
     tx: i64,
+    rd: i64,
+    wr: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,7 @@ struct TierTrack {
 pub struct ServerTrack {
     tiers: Vec<TierTrack>,
     network: Option<(u64, u64)>,
+    disk_io: Option<(u64, u64)>,
     limits: Option<Limits>,
     pending_limits: Option<(i64, Limits)>,
     span: Option<Span>,
@@ -95,6 +102,7 @@ impl ServerTrack {
                 })
                 .collect(),
             network: None,
+            disk_io: None,
             limits,
             pending_limits: None,
             span,
@@ -160,6 +168,14 @@ impl ServerTrack {
             ),
             None => (0, 0),
         };
+        let disk_io = (usage.disk.read_bytes, usage.disk.write_bytes);
+        let (rd, wr) = match self.disk_io.replace(disk_io) {
+            Some((rd, wr)) => (
+                Self::counter_delta(rd, disk_io.0),
+                Self::counter_delta(wr, disk_io.1),
+            ),
+            None => (0, 0),
+        };
 
         let sample = Sample {
             running,
@@ -168,6 +184,8 @@ impl ServerTrack {
             disk: (usage.disk_bytes >> 10) as i64,
             rx,
             tx,
+            rd,
+            wr,
         };
 
         for tier in &mut self.tiers {
@@ -213,7 +231,7 @@ impl ServerTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::resources::ResourceUsageNetwork;
+    use crate::server::resources::{ResourceUsageDisk, ResourceUsageNetwork};
 
     fn usage(
         state: ServerState,
@@ -369,6 +387,29 @@ mod tests {
             LIMITS,
         );
         assert_eq!(find(&track.drain().0, 10, 3).unwrap().rx, 100);
+    }
+
+    #[test]
+    fn disk_io_only_bucket_with_unchanged_disk_is_drained() {
+        let io = |read_bytes, write_bytes| ResourceUsage {
+            disk: ResourceUsageDisk {
+                read_bytes,
+                write_bytes,
+                ..Default::default()
+            },
+            ..usage(ServerState::Offline, 0.0, 0, 4096, 0, 0)
+        };
+        let mut track = ServerTrack::new(&[10], None, None);
+        track.push(0, &io(100, 10), LIMITS);
+        track.drain();
+
+        track.push(10, &io(100, 10), LIMITS);
+        assert!(track.drain().0.is_empty());
+
+        track.push(20, &io(300, 50), LIMITS);
+        let bucket = find(&track.drain().0, 10, 2).unwrap();
+        assert_eq!(bucket.rd, 200);
+        assert_eq!(bucket.wr, 40);
     }
 
     #[test]
