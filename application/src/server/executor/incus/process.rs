@@ -11,6 +11,11 @@ use super::{
 use crate::io::line_buffer::LineBuffer;
 use crate::server::executor::docker::cgroup;
 use anyhow::{Context, ensure};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec},
+    fd::OwnedFd,
+    process::{Pid, PidfdFlags},
+};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -48,8 +53,29 @@ pub(super) const SUPERVISOR: &str = concat!(
 );
 
 const TAIL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often output is looked for just after input, so that replies appear at once.
+const REPLY_INTERVAL: Duration = Duration::from_millis(2);
+const REPLY_WINDOW: Duration = Duration::from_millis(100);
 const STATE_INTERVAL: Duration = Duration::from_millis(250);
+/// Asking Incus for an instance's state is expensive for it, so a process that is seen to be
+/// alive is only asked about this often, to notice changes such as a freeze.
+const WATCHED_STATE_INTERVAL: Duration = Duration::from_secs(5);
+const STOPPING_STATE_INTERVAL: Duration = Duration::from_millis(50);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// The number of lines forwarded before listeners are given a chance to take them.
+const PACE_LINES: usize = 64;
+const PACE_PAUSE: Duration = Duration::from_millis(1);
+
+/// A handle on the instance's first process, which becomes readable once it has exited.
+fn watch_process(pid: u32) -> Option<OwnedFd> {
+    let pid = Pid::from_raw(i32::try_from(pid).ok()?)?;
+    rustix::process::pidfd_open(pid, PidfdFlags::empty()).ok()
+}
+
+fn has_exited(process: &OwnedFd) -> bool {
+    let mut ready = [PollFd::new(process, PollFlags::IN)];
+    rustix::event::poll(&mut ready, Some(&Timespec::default())).is_ok_and(|count| count > 0)
+}
 
 pub(super) fn encode_argv(args: &[String]) -> anyhow::Result<String> {
     ensure!(
@@ -122,6 +148,11 @@ pub(super) struct Shared {
     pub started: AtomicBool,
     pub phase: watch::Sender<Phase>,
     pub cpu: Cpu,
+    /// Held while the instance starts: Incus reports it as stopped until the start has finished,
+    /// even though its process is already running, so a kill in between would be lost.
+    pub starting: tokio::sync::Mutex<()>,
+    /// Signalled after console input has been typed.
+    pub typed: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -197,6 +228,8 @@ impl Handle {
             started: AtomicBool::new(attached),
             phase: watch::channel(Phase::Created).0,
             cpu: Cpu::default(),
+            starting: tokio::sync::Mutex::new(()),
+            typed: tokio::sync::Notify::new(),
         });
 
         tokio::spawn(
@@ -306,8 +339,14 @@ struct Output {
 }
 
 impl Output {
-    fn push(&mut self, data: &[u8]) {
+    /// Whether a listener has not yet taken the last batch of lines.
+    fn backlogged(&self) -> bool {
+        self.lines.len() >= PACE_LINES || self.limited.len() >= PACE_LINES
+    }
+
+    async fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
+        let mut sent = 0usize;
         while let Some(line) = self.buffer.next_line() {
             let line = Arc::new(compact_str::CompactString::from_utf8_lossy(line));
             Self::emit(
@@ -319,6 +358,15 @@ impl Output {
                 &line,
             );
             let _ = self.lines.send(line);
+            // A burst is read from the log all at once. Listeners keep only a few hundred lines,
+            // so pass it on at a rate they can follow, as reading from docker's stream does.
+            sent += 1;
+            if sent.is_multiple_of(PACE_LINES) {
+                tokio::task::yield_now().await;
+                if self.backlogged() {
+                    tokio::time::sleep(PACE_PAUSE).await;
+                }
+            }
         }
         self.buffer.compact();
     }
@@ -376,7 +424,7 @@ impl Pump {
     async fn drain(&mut self) {
         loop {
             match self.tail.next().await {
-                Ok(Some(data)) => self.output.push(&data),
+                Ok(Some(data)) => self.output.push(&data).await,
                 Ok(None) => return,
                 Err(err) => {
                     tracing::warn!(instance = %self.shared.name, "could not read console output: {err}");
@@ -386,26 +434,59 @@ impl Pump {
         }
     }
 
+    /// Reports the process as running, or paused, to whoever follows its status.
+    async fn report(&self, state: &InstanceState) {
+        if self.role == Role::Server {
+            super::stats::publish_started(&self.shared, state).await;
+        }
+        let status = if state.status == "Frozen" {
+            ProcessStatus::Paused
+        } else {
+            ProcessStatus::Running
+        };
+        // Script callers do not listen for statuses.
+        let _ = self.status.send(status).await;
+    }
+
     async fn run(mut self) {
-        let mut tick = tokio::time::interval(TAIL_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut more_output = false;
+        let mut reply_until = Instant::now();
+        // The running process and a handle on it, and one already seen to have exited.
+        let mut process = None::<(u32, OwnedFd)>;
+        let mut exited = None::<u32>;
+        let mut running = None::<InstanceState>;
         let mut next_state = Instant::now();
         let mut next_status = Instant::now();
-        let mut previous = String::new();
         let mut seen_running = false;
         let mut oom_events = None::<PathBuf>;
         let mut oom_seen = false;
         let mut failures = 0u64;
 
         loop {
-            tick.tick().await;
-            match self.tail.next().await {
-                Ok(Some(data)) => self.output.push(&data),
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::debug!(instance = %self.shared.name, "could not read console output: {err}");
+            if !more_output {
+                let interval = if Instant::now() < reply_until {
+                    REPLY_INTERVAL
+                } else {
+                    TAIL_INTERVAL
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = self.shared.typed.notified() => {
+                        reply_until = Instant::now() + REPLY_WINDOW;
+                    }
                 }
             }
+            more_output = match self.tail.next().await {
+                Ok(Some(data)) => {
+                    self.output.push(&data).await;
+                    true
+                }
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::debug!(instance = %self.shared.name, "could not read console output: {err}");
+                    false
+                }
+            };
             if let Some(path) = &oom_events
                 && !oom_seen
             {
@@ -418,10 +499,29 @@ impl Pump {
                 self.drain().await;
                 return;
             }
+            if let Some((pid, handle)) = &process
+                && has_exited(handle)
+            {
+                exited = Some(*pid);
+                process = None;
+                running = None;
+                next_state = Instant::now();
+            }
+            if let Some(state) = &running
+                && Instant::now() >= next_status
+            {
+                next_status = Instant::now() + STATUS_INTERVAL;
+                self.report(state).await;
+            }
             if Instant::now() < next_state {
                 continue;
             }
-            next_state = Instant::now() + STATE_INTERVAL;
+            next_state = Instant::now()
+                + if exited.is_some() {
+                    STOPPING_STATE_INTERVAL
+                } else {
+                    STATE_INTERVAL
+                };
 
             let started = self.shared.started.load(Ordering::SeqCst);
             let state = match self.shared.executor.instance_state(&self.shared.name).await {
@@ -447,6 +547,8 @@ impl Pump {
             failures = 0;
 
             match state.status.as_str() {
+                // Incus still calls it running while it tears the instance down.
+                "Running" | "Frozen" if Some(state.pid) == exited => {}
                 "Running" | "Frozen" if state.pid > 0 => {
                     if !seen_running || self.shared.pid() != Some(state.pid) {
                         oom_events =
@@ -458,20 +560,21 @@ impl Pump {
                             .send_replace(Phase::Running { pid: state.pid });
                     }
                     seen_running = true;
-                    if self.role == Role::Server {
-                        super::stats::publish_started(&self.shared, &state).await;
+                    exited = None;
+                    if process.as_ref().is_none_or(|(pid, _)| *pid != state.pid) {
+                        process = watch_process(state.pid).map(|handle| (state.pid, handle));
                     }
-                    if state.status != previous || Instant::now() >= next_status {
+                    if process.is_some() {
+                        next_state = Instant::now() + WATCHED_STATE_INTERVAL;
+                    }
+                    if running
+                        .as_ref()
+                        .is_none_or(|previous| previous.status != state.status)
+                    {
                         next_status = Instant::now() + STATUS_INTERVAL;
-                        let status = if state.status == "Frozen" {
-                            ProcessStatus::Paused
-                        } else {
-                            ProcessStatus::Running
-                        };
-                        previous = state.status.clone();
-                        // Script callers do not listen for statuses.
-                        let _ = self.status.send(status).await;
+                        self.report(&state).await;
                     }
+                    running = Some(state);
                 }
                 "Stopped" if started || seen_running => {
                     self.finish(seen_running, oom_seen).await;
@@ -513,7 +616,9 @@ impl Pump {
         {
             tracing::warn!(instance = %name, "could not clean up Incus script instance: {error:#}");
         }
-        if !seen_running {
+        // Installers wait to see their process run. A server must not: after a kill it is
+        // already offline, and a late report would show it as running again.
+        if !seen_running && self.role != Role::Server {
             let _ = self.status.send(ProcessStatus::Running).await;
         }
         let _ = self
@@ -551,6 +656,7 @@ async fn input_task(shared: Arc<Shared>, mut stdin: mpsc::Receiver<Vec<u8>>) {
             anyhow::Ok(terminal)
         })
         .await;
+        shared.typed.notify_one();
         match written {
             Ok(Ok(terminal)) => open = Some((pid, terminal)),
             // The instance stopped while the input was queued.
@@ -628,6 +734,7 @@ impl ProcessHandle for Handle {
 
     async fn start(&self) -> anyhow::Result<()> {
         let shared = &self.shared;
+        let _starting = shared.starting.lock().await;
         // Held until the instance runs, so a server starting alongside cannot take its ports.
         let _ports = match self.role {
             Role::Server => Some(shared.executor.claim_ports(&shared.name).await?),
@@ -676,6 +783,7 @@ impl ProcessHandle for Handle {
     }
 
     async fn kill(&self) -> anyhow::Result<()> {
+        let _starting = self.shared.starting.lock().await;
         self.shared.executor.force_stop(&self.shared.name).await
     }
 }
@@ -689,6 +797,19 @@ mod tests {
         assert_eq!(parse_exit("0 0\n"), Some((0, false)));
         assert_eq!(parse_exit("137 2\n"), Some((137, true)));
         assert_eq!(parse_exit(""), None);
+    }
+
+    #[test]
+    fn an_exited_process_is_noticed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("child process");
+        let handle = watch_process(child.id()).expect("process handle");
+        assert!(!has_exited(&handle));
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert!(has_exited(&handle));
     }
 
     #[test]
