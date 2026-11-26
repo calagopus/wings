@@ -95,6 +95,16 @@ jobs:
         env:
           CARGO_BUILD_WARNINGS: allow
 
+      - name: Download fusequota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release view --repo calagopus/fusequota --json tagName -q .tagName)
+          mkdir -p .fusequota
+          gh release download "$TAG" --repo calagopus/fusequota --pattern "fusequota-${{ matrix.build }}" --output .fusequota/fusequota
+          echo "FUSEQUOTA_RELEASE=$TAG" >> "$GITHUB_ENV"
+          echo "FUSEQUOTA_BINARY_PATH=$GITHUB_WORKSPACE/.fusequota/fusequota" >> "$GITHUB_ENV"
+
       - name: Run cargo test
         run: cross test --release --target ${{ matrix.target }}
         env:
