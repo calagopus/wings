@@ -273,7 +273,7 @@ docker:
     duration: 300
 
   # server UUIDs that won't receive the no-new-privileges security option (allowing to run sudo, etc.)
-  no_new_privileges_whitelist: []
+  container_no_new_privileges_whitelist: []
 
   installer_limits:
     # how long in seconds to wait until an install container is considered failed, 0 means no limit

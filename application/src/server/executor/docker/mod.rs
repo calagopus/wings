@@ -746,7 +746,7 @@ impl crate::server::configuration::ServerConfiguration {
         let mut security_opt = Vec::new();
         if !config
             .docker
-            .no_new_privileges_whitelist
+            .container_no_new_privileges_whitelist
             .contains(&self.uuid)
         {
             security_opt.push("no-new-privileges".to_string());
