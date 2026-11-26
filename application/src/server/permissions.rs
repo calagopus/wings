@@ -133,28 +133,77 @@ impl IgnoredFiles {
     }
 }
 
-type UserPermissions = (Permissions, IgnoredFiles, std::time::Instant);
+struct UserPermissions {
+    permissions: Permissions,
+    ignored_files: IgnoredFiles,
+    last_access: std::time::Instant,
+    /// Panel time, in unix milliseconds, at which these permissions were evaluated.
+    as_of: i64,
+}
 
-/// When permissions for a user last came fresh from the panel, as unix timestamps.
-#[derive(Default, Clone, Copy)]
-struct PanelStamps {
-    pushed: Option<i64>,
-    fetched: Option<i64>,
+struct Inner {
+    users: HashMap<uuid::Uuid, UserPermissions>,
+    /// Panel times, in unix milliseconds, at or before which anything evaluated for a user
+    /// is outdated.
+    invalidated: HashMap<uuid::Uuid, i64>,
+    invalidated_all: i64,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            users: HashMap::new(),
+            invalidated: HashMap::new(),
+            invalidated_all: i64::MIN,
+        }
+    }
+}
+
+impl Inner {
+    fn invalidated_at(&self, user_uuid: uuid::Uuid) -> i64 {
+        self.invalidated
+            .get(&user_uuid)
+            .copied()
+            .unwrap_or(i64::MIN)
+            .max(self.invalidated_all)
+    }
+
+    fn invalidate(&mut self, user_uuid: uuid::Uuid, as_of: i64) {
+        let invalidated = self.invalidated.entry(user_uuid).or_insert(as_of);
+        *invalidated = (*invalidated).max(as_of);
+    }
 }
 
 /// Outcome of [`UserPermissionsMap::set_token_permissions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenVerdict {
     Applied,
-    /// The token predates a fetch at an SSH login, which is kept as the fresher state.
+    /// The token predates the permissions already held, which are kept as the fresher state.
     Kept,
-    /// The token predates a panel push and must not be accepted.
+    /// The token predates an invalidation by the panel and must not be accepted.
     Stale,
 }
 
+/// Outcome of [`UserPermissionsMap::set_fetched_permissions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchVerdict {
+    Applied,
+    /// Permissions evaluated after this fetch are already held.
+    Superseded,
+    /// The fetch predates an invalidation by the panel and must not be used.
+    Outdated,
+}
+
+#[inline]
+pub fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// The permissions wings holds for users of one server. These are always the full grants of
+/// the account, never the narrowed list of a scoped credential, which stays with the
+/// connection that presented it.
 pub struct UserPermissionsMap {
-    map: Arc<Mutex<HashMap<uuid::Uuid, UserPermissions>>>,
-    stamps: Arc<Mutex<HashMap<uuid::Uuid, PanelStamps>>>,
+    inner: Arc<Mutex<Inner>>,
     removal_sender: tokio::sync::broadcast::Sender<uuid::Uuid>,
     _removal_receiver: tokio::sync::broadcast::Receiver<uuid::Uuid>,
 
@@ -163,32 +212,37 @@ pub struct UserPermissionsMap {
 
 impl Default for UserPermissionsMap {
     fn default() -> Self {
-        let map = Arc::new(Mutex::new(HashMap::new()));
-        let stamps = Arc::new(Mutex::new(HashMap::new()));
+        let inner = Arc::new(Mutex::new(Inner::default()));
         let (tx, rx) = tokio::sync::broadcast::channel(32);
 
         Self {
-            map: Arc::clone(&map),
-            stamps: Arc::clone(&stamps),
-            removal_sender: tx,
+            inner: Arc::clone(&inner),
+            removal_sender: tx.clone(),
             _removal_receiver: rx,
             task: tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
-                    let now = chrono::Utc::now().timestamp();
-                    stamps
-                        .lock()
-                        .retain(|_, &mut PanelStamps { pushed, fetched }| {
-                            pushed
-                                .max(fetched)
-                                .is_some_and(|stamp| now - stamp < 60 * 60 * 24)
-                        });
+                    let now = now_millis();
+                    let mut inner = inner.lock();
+                    inner
+                        .invalidated
+                        .retain(|_, &mut stamp| now - stamp < 1000 * 60 * 60 * 24);
 
-                    let mut map = map.lock();
-                    map.retain(|_, (_, _, last_access)| {
-                        last_access.elapsed().as_secs() < 60 * 60 * 24
+                    let mut expired = Vec::new();
+                    inner.users.retain(|&user_uuid, user| {
+                        let keep = user.last_access.elapsed().as_secs() < 60 * 60 * 24;
+                        if !keep {
+                            expired.push(user_uuid);
+                        }
+
+                        keep
                     });
+                    drop(inner);
+
+                    for user_uuid in expired {
+                        tx.send(user_uuid).ok();
+                    }
                 }
             }),
         }
@@ -199,7 +253,7 @@ impl UserPermissionsMap {
     pub async fn wait_for_removal(&self, user_uuid: uuid::Uuid) {
         let mut receiver = self.removal_sender.subscribe();
 
-        while self.map.lock().contains_key(&user_uuid) {
+        while self.inner.lock().users.contains_key(&user_uuid) {
             match receiver.recv().await {
                 Ok(uuid) if uuid == user_uuid => break,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -213,11 +267,11 @@ impl UserPermissionsMap {
         user_uuid: uuid::Uuid,
         f: impl FnOnce(&Permissions, &IgnoredFiles) -> T,
     ) -> Option<T> {
-        let mut map = self.map.lock();
-        let (permissions, ignored, last_access) = map.get_mut(&user_uuid)?;
-        *last_access = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+        let user = inner.users.get_mut(&user_uuid)?;
+        user.last_access = std::time::Instant::now();
 
-        Some(f(permissions, ignored))
+        Some(f(&user.permissions, &user.ignored_files))
     }
 
     pub fn has_user(&self, user_uuid: uuid::Uuid) -> bool {
@@ -243,11 +297,25 @@ impl UserPermissionsMap {
         .unwrap_or(default)
     }
 
+    pub fn permissions(&self, user_uuid: uuid::Uuid) -> Option<Vec<Permission>> {
+        self.with_user(user_uuid, |permissions, _| {
+            permissions.iter().copied().collect()
+        })
+    }
+
     pub fn has_ignored_files(&self, user_uuid: uuid::Uuid) -> bool {
         self.with_user(user_uuid, |_, ignored| {
             !matches!(ignored, IgnoredFiles::Unrestricted)
         })
         .unwrap_or(false)
+    }
+
+    pub fn ignored_list(&self, user_uuid: uuid::Uuid) -> Option<IgnoreList> {
+        self.with_user(user_uuid, |_, ignored| match ignored {
+            IgnoredFiles::Matcher(list) => Some(list.clone()),
+            IgnoredFiles::Unrestricted | IgnoredFiles::Unusable => None,
+        })
+        .flatten()
     }
 
     pub fn is_ignored(
@@ -299,39 +367,51 @@ impl UserPermissionsMap {
             .unwrap_or(false)
     }
 
-    /// Applies permissions pushed by the panel, and records the push so that tokens
-    /// issued before it are refused by [`Self::set_token_permissions`].
+    /// Applies permissions pushed by the panel through the legacy push routes, which carry no
+    /// panel time, so wings' own clock stands in. Anything issued before the push is outdated.
     pub fn set_pushed_permissions(
         &self,
         user_uuid: uuid::Uuid,
         permissions: Permissions,
         ignored_files: Option<&[impl AsRef<str>]>,
     ) {
-        let mut stamps = self.stamps.lock();
-        let pushed = &mut stamps.entry(user_uuid).or_default().pushed;
-        *pushed = (*pushed).max(Some(chrono::Utc::now().timestamp()));
+        let now = now_millis();
 
-        self.apply_permissions(user_uuid, permissions, ignored_files);
+        let mut inner = self.inner.lock();
+        inner.invalidate(user_uuid, now);
+        self.apply_permissions(&mut inner, user_uuid, permissions, ignored_files, now);
     }
 
-    /// Applies permissions fetched from the panel at an SSH login. Unlike a push, a fetch
-    /// does not mean the panel changed anything, so tokens issued before it are still
-    /// accepted, they just cannot overwrite these fresher permissions.
+    /// Applies permissions the panel evaluated at `as_of`, unless permissions evaluated later
+    /// are already held or the panel invalidated the user after `as_of`.
     pub fn set_fetched_permissions(
         &self,
         user_uuid: uuid::Uuid,
         permissions: Permissions,
         ignored_files: Option<&[impl AsRef<str>]>,
-    ) {
-        let mut stamps = self.stamps.lock();
-        let fetched = &mut stamps.entry(user_uuid).or_default().fetched;
-        *fetched = (*fetched).max(Some(chrono::Utc::now().timestamp()));
+        as_of: i64,
+    ) -> FetchVerdict {
+        let mut inner = self.inner.lock();
 
-        self.apply_permissions(user_uuid, permissions, ignored_files);
+        if as_of <= inner.invalidated_at(user_uuid) {
+            return FetchVerdict::Outdated;
+        }
+
+        if inner
+            .users
+            .get(&user_uuid)
+            .is_some_and(|user| user.as_of > as_of)
+        {
+            return FetchVerdict::Superseded;
+        }
+
+        self.apply_permissions(&mut inner, user_uuid, permissions, ignored_files, as_of);
+
+        FetchVerdict::Applied
     }
 
-    /// Applies the permissions carried by a token unless a panel push or SSH fetch since
-    /// `issued_at` supersedes them.
+    /// Applies the full permissions carried by a token issued at `issued_at` (unix seconds)
+    /// unless the panel invalidated the user since, or fresher permissions are held.
     pub fn set_token_permissions(
         &self,
         user_uuid: uuid::Uuid,
@@ -339,61 +419,108 @@ impl UserPermissionsMap {
         permissions: Permissions,
         ignored_files: Option<&[impl AsRef<str>]>,
     ) -> TokenVerdict {
-        let stamps = self.stamps.lock();
-        let PanelStamps { pushed, fetched } = stamps.get(&user_uuid).copied().unwrap_or_default();
-        let issued_at = issued_at.unwrap_or(i64::MIN);
+        let issued_at = issued_at.map_or(i64::MIN, |issued_at| issued_at.saturating_mul(1000));
 
-        if pushed.is_some_and(|pushed| issued_at <= pushed) {
+        let mut inner = self.inner.lock();
+
+        if issued_at <= inner.invalidated_at(user_uuid) {
             return TokenVerdict::Stale;
         }
 
-        if fetched.is_some_and(|fetched| issued_at <= fetched)
-            && self.map.lock().contains_key(&user_uuid)
+        if inner
+            .users
+            .get(&user_uuid)
+            .is_some_and(|user| user.as_of >= issued_at)
         {
             return TokenVerdict::Kept;
         }
 
-        self.apply_permissions(user_uuid, permissions, ignored_files);
+        self.apply_permissions(&mut inner, user_uuid, permissions, ignored_files, issued_at);
 
         TokenVerdict::Applied
     }
 
+    /// Marks everything evaluated for the user at or before `as_of` as outdated, the held
+    /// permissions stay in effect until fresh ones replace them. Returns whether any are held.
+    pub fn invalidate(&self, user_uuid: uuid::Uuid, as_of: i64) -> bool {
+        let mut inner = self.inner.lock();
+        inner.invalidate(user_uuid, as_of);
+
+        inner.users.contains_key(&user_uuid)
+    }
+
+    /// Like [`Self::invalidate`] for every user, returns the users whose permissions are held.
+    pub fn invalidate_all(&self, as_of: i64) -> Vec<uuid::Uuid> {
+        let mut inner = self.inner.lock();
+        inner.invalidated_all = inner.invalidated_all.max(as_of);
+
+        inner.users.keys().copied().collect()
+    }
+
+    /// Drops the user's permissions, ending their sessions, unless permissions evaluated
+    /// after `as_of` are held.
+    pub fn revoke(&self, user_uuid: uuid::Uuid, as_of: i64) {
+        let mut inner = self.inner.lock();
+        inner.invalidate(user_uuid, as_of);
+
+        if inner
+            .users
+            .get(&user_uuid)
+            .is_some_and(|user| user.as_of <= as_of)
+        {
+            inner.users.remove(&user_uuid);
+            drop(inner);
+
+            self.removal_sender.send(user_uuid).ok();
+        }
+    }
+
     fn apply_permissions(
         &self,
+        inner: &mut Inner,
         user_uuid: uuid::Uuid,
         permissions: Permissions,
         ignored_files: Option<&[impl AsRef<str>]>,
+        as_of: i64,
     ) {
         if permissions.is_empty() {
-            self.map.lock().remove(&user_uuid);
-            self.removal_sender.send(user_uuid).ok();
+            if inner.users.remove(&user_uuid).is_some() {
+                self.removal_sender.send(user_uuid).ok();
+            }
+
             return;
         }
 
         let ignored_files = ignored_files.map(IgnoredFiles::compile);
 
-        let mut map = self.map.lock();
-        if let Some((current_permissions, current_ignored, _)) = map.get_mut(&user_uuid) {
-            *current_permissions = permissions;
+        if let Some(user) = inner.users.get_mut(&user_uuid) {
+            user.permissions = permissions;
+            user.as_of = as_of;
             if let Some(ignored_files) = ignored_files {
-                *current_ignored = ignored_files;
+                user.ignored_files = ignored_files;
             }
         } else {
-            map.insert(
+            inner.users.insert(
                 user_uuid,
-                (
+                UserPermissions {
                     permissions,
-                    ignored_files.unwrap_or(IgnoredFiles::Unrestricted),
-                    std::time::Instant::now(),
-                ),
+                    ignored_files: ignored_files.unwrap_or(IgnoredFiles::Unrestricted),
+                    last_access: std::time::Instant::now(),
+                    as_of,
+                },
             );
         }
     }
 
     pub fn clear_permissions(&self) {
-        let mut map = self.map.lock();
-        for user_uuid in map.keys().copied().collect::<Vec<_>>() {
-            map.remove(&user_uuid);
+        let removed: Vec<_> = self
+            .inner
+            .lock()
+            .users
+            .drain()
+            .map(|(user_uuid, _)| user_uuid)
+            .collect();
+        for user_uuid in removed {
             self.removal_sender.send(user_uuid).ok();
         }
     }
@@ -422,13 +549,8 @@ impl Permissions {
 
     #[inline]
     pub fn has_permission(&self, permission: Permission) -> bool {
-        if (self.0.contains(&Permission::All) && !permission.is_admin())
+        (self.0.contains(&Permission::All) && !permission.is_admin())
             || self.0.contains(&permission)
-        {
-            return true;
-        }
-
-        false
     }
 
     #[inline]
@@ -527,6 +649,14 @@ mod tests {
         Permission::FileArchive,
         Permission::FileSftp,
     ];
+
+    fn read() -> Permissions {
+        Permissions::from_list(&[Permission::FileRead])
+    }
+
+    fn delete() -> Permissions {
+        Permissions::from_list(&[Permission::FileDelete])
+    }
 
     // Permission
 
@@ -801,6 +931,36 @@ mod tests {
     }
 
     #[test]
+    fn map_ignored_list_only_for_a_usable_matcher() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let (matcher, unrestricted, unusable) = (
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+            );
+            let ignored: &[&str] = &["plugins/Vault/config.yml"];
+            let broken: &[&str] = &["[abc", "*.log"];
+            permissions.set_pushed_permissions(matcher, read(), Some(ignored));
+            permissions.grant(unrestricted, &[Permission::FileRead]);
+            permissions.set_pushed_permissions(unusable, read(), Some(broken));
+
+            let list = permissions.ignored_list(matcher).unwrap();
+            assert!(list.is_ignored(
+                std::path::Path::new("plugins/Vault/config.yml"),
+                FileType::File
+            ));
+            assert!(!list.is_ignored(
+                std::path::Path::new("plugins/Vault/other.yml"),
+                FileType::File
+            ));
+            assert!(permissions.ignored_list(unrestricted).is_none());
+            assert!(permissions.ignored_list(unusable).is_none());
+            assert!(permissions.ignored_list(uuid::Uuid::new_v4()).is_none());
+        });
+    }
+
+    #[test]
     fn map_wait_for_removal_resolves_when_cleared() {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
@@ -962,13 +1122,7 @@ mod tests {
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
             );
-            let pushed = permissions
-                .stamps
-                .lock()
-                .get(&user)
-                .unwrap()
-                .pushed
-                .unwrap();
+            let pushed = permissions.inner.lock().invalidated[&user].div_euclid(1000);
 
             for issued_at in [Some(pushed), None] {
                 assert_eq!(
@@ -995,6 +1149,7 @@ mod tests {
                 user,
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
+                now_millis(),
             );
 
             let iat = chrono::Utc::now().timestamp() - 100;
@@ -1017,18 +1172,14 @@ mod tests {
         tokio_test::block_on(async {
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
+            let fetched = now_millis();
             permissions.set_fetched_permissions(
                 user,
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
+                fetched,
             );
-            let fetched = permissions
-                .stamps
-                .lock()
-                .get(&user)
-                .unwrap()
-                .fetched
-                .unwrap();
+            let fetched = fetched.div_euclid(1000);
 
             assert_eq!(
                 permissions.set_token_permissions(
@@ -1046,7 +1197,7 @@ mod tests {
                     Permissions::from_list(&[Permission::FileRead, Permission::FileDelete]),
                     None::<&[&str]>
                 ),
-                TokenVerdict::Kept
+                TokenVerdict::Stale
             );
             assert!(!permissions.has_permission(user, Permission::FileDelete));
         });
@@ -1061,6 +1212,7 @@ mod tests {
                 user,
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
+                now_millis(),
             );
 
             let iat = chrono::Utc::now().timestamp() + 2;
@@ -1086,6 +1238,7 @@ mod tests {
                 user,
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
+                now_millis(),
             );
             permissions.set_pushed_permissions(
                 user,
@@ -1116,6 +1269,7 @@ mod tests {
                 user,
                 Permissions::from_list(&[Permission::FileRead]),
                 None::<&[&str]>,
+                now_millis(),
             );
             permissions.set_pushed_permissions(user, Permissions::default(), Some(&[] as &[&str]));
 
@@ -1131,6 +1285,281 @@ mod tests {
             );
             assert!(!permissions.has_user(user));
             assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_fetch_at_or_before_invalidation_is_outdated() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.invalidate(user, t);
+
+            for as_of in [t - 1, t] {
+                assert_eq!(
+                    permissions.set_fetched_permissions(user, read(), None::<&[&str]>, as_of),
+                    FetchVerdict::Outdated
+                );
+                assert!(!permissions.has_user(user));
+            }
+            assert_eq!(
+                permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t + 1),
+                FetchVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_outdated_fetch_does_not_change_held_permissions() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t);
+            permissions.invalidate(user, t + 10);
+
+            assert_eq!(
+                permissions.set_fetched_permissions(user, delete(), None::<&[&str]>, t + 10),
+                FetchVerdict::Outdated
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_invalidate_all_outdates_fetches_and_tokens_for_unheld_users() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let fetched = uuid::Uuid::new_v4();
+            let tokened = uuid::Uuid::new_v4();
+            let t = now_millis();
+            assert!(permissions.invalidate_all(t).is_empty());
+
+            assert_eq!(
+                permissions.set_fetched_permissions(fetched, read(), None::<&[&str]>, t),
+                FetchVerdict::Outdated
+            );
+            assert_eq!(
+                permissions.set_token_permissions(
+                    tokened,
+                    Some(t.div_euclid(1000)),
+                    read(),
+                    None::<&[&str]>
+                ),
+                TokenVerdict::Stale
+            );
+            assert!(!permissions.has_user(fetched));
+            assert!(!permissions.has_user(tokened));
+
+            assert_eq!(
+                permissions.set_fetched_permissions(fetched, read(), None::<&[&str]>, t + 1),
+                FetchVerdict::Applied
+            );
+        });
+    }
+
+    #[test]
+    fn map_token_issued_at_or_before_invalidation_is_stale() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let iat = chrono::Utc::now().timestamp() - 100;
+            permissions.set_token_permissions(user, Some(iat - 10), read(), None::<&[&str]>);
+            // mid-second, so the token from that same second predates it
+            permissions.invalidate(user, iat * 1000 + 500);
+
+            for issued_at in [iat - 1, iat] {
+                assert_eq!(
+                    permissions.set_token_permissions(
+                        user,
+                        Some(issued_at),
+                        delete(),
+                        None::<&[&str]>
+                    ),
+                    TokenVerdict::Stale
+                );
+            }
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+
+            assert_eq!(
+                permissions.set_token_permissions(user, Some(iat + 1), delete(), None::<&[&str]>),
+                TokenVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_older_fetch_is_superseded_and_newer_replaces() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let t = now_millis();
+            assert_eq!(
+                permissions.set_fetched_permissions(user, delete(), None::<&[&str]>, t + 10),
+                FetchVerdict::Applied
+            );
+
+            assert_eq!(
+                permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t),
+                FetchVerdict::Superseded
+            );
+            assert!(permissions.has_permission(user, Permission::FileDelete));
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+
+            assert_eq!(
+                permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t + 20),
+                FetchVerdict::Applied
+            );
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.has_permission(user, Permission::FileDelete));
+        });
+    }
+
+    #[test]
+    fn map_fetch_older_than_token_is_superseded() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let iat = chrono::Utc::now().timestamp() - 100;
+            permissions.set_token_permissions(user, Some(iat), delete(), None::<&[&str]>);
+
+            assert_eq!(
+                permissions.set_fetched_permissions(
+                    user,
+                    read(),
+                    None::<&[&str]>,
+                    (iat - 1) * 1000
+                ),
+                FetchVerdict::Superseded
+            );
+            assert!(permissions.has_permission(user, Permission::FileDelete));
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_invalidate_keeps_permissions_without_removal() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_fetched_permissions(user, read(), None::<&[&str]>, now_millis());
+
+            let removed = tokio::time::timeout(Duration::from_millis(200), async {
+                let removal = permissions.wait_for_removal(user);
+                let trigger = async {
+                    tokio::task::yield_now().await;
+                    assert!(permissions.invalidate(user, now_millis()));
+                };
+                tokio::join!(removal, trigger);
+            })
+            .await;
+
+            assert!(removed.is_err(), "invalidate broadcast a removal");
+            assert!(permissions.has_permission(user, Permission::FileRead));
+            assert!(!permissions.invalidate(uuid::Uuid::new_v4(), now_millis()));
+        });
+    }
+
+    #[test]
+    fn map_invalidate_all_reports_exactly_held_users() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let a = uuid::Uuid::new_v4();
+            let b = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.set_fetched_permissions(a, read(), None::<&[&str]>, t);
+            permissions.set_fetched_permissions(b, read(), None::<&[&str]>, t);
+            // invalidated but never held
+            permissions.invalidate(uuid::Uuid::new_v4(), t);
+
+            let mut held = permissions.invalidate_all(t + 1);
+            held.sort();
+            let mut expected = vec![a, b];
+            expected.sort();
+            assert_eq!(held, expected);
+            assert!(permissions.has_permission(a, Permission::FileRead));
+            assert!(permissions.has_permission(b, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_revoke_removes_user_and_wakes_waiter() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t);
+
+            let done = tokio::time::timeout(Duration::from_secs(2), async {
+                let removal = permissions.wait_for_removal(user);
+                let trigger = async {
+                    tokio::task::yield_now().await;
+                    permissions.revoke(user, t + 1);
+                };
+                tokio::join!(removal, trigger);
+            })
+            .await;
+
+            assert!(done.is_ok(), "wait_for_removal did not resolve on revoke");
+            assert!(!permissions.has_user(user));
+        });
+    }
+
+    #[test]
+    fn map_revoke_older_than_held_permissions_keeps_them() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.set_fetched_permissions(user, read(), None::<&[&str]>, t + 10);
+
+            permissions.revoke(user, t);
+            assert!(permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_revoke_without_held_user_makes_older_token_stale() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let iat = chrono::Utc::now().timestamp() - 100;
+            permissions.revoke(user, iat * 1000);
+
+            assert_eq!(
+                permissions.set_token_permissions(user, Some(iat), read(), None::<&[&str]>),
+                TokenVerdict::Stale
+            );
+            assert!(!permissions.has_user(user));
+        });
+    }
+
+    #[test]
+    fn map_older_invalidation_does_not_reopen_window() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            let other = uuid::Uuid::new_v4();
+            let t = now_millis();
+            permissions.invalidate(user, t + 10_000);
+            permissions.invalidate(user, t);
+            permissions.revoke(user, t);
+            permissions.invalidate_all(t + 10_000);
+            permissions.invalidate_all(t);
+
+            for target in [user, other] {
+                assert_eq!(
+                    permissions.set_fetched_permissions(target, read(), None::<&[&str]>, t + 5_000),
+                    FetchVerdict::Outdated
+                );
+            }
+            assert!(!permissions.has_user(user));
+            assert!(!permissions.has_user(other));
         });
     }
 }

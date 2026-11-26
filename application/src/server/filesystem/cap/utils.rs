@@ -66,6 +66,18 @@ impl From<std::fs::FileType> for FileType {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<rustix::fs::FileType> for FileType {
+    fn from(ft: rustix::fs::FileType) -> Self {
+        match ft {
+            rustix::fs::FileType::RegularFile => FileType::File,
+            rustix::fs::FileType::Directory => FileType::Dir,
+            rustix::fs::FileType::Symlink => FileType::Symlink,
+            _ => FileType::Unknown,
+        }
+    }
+}
+
 pub struct AsyncReadDir(
     pub Option<cap_std::fs::ReadDir>,
     pub Option<VecDeque<std::io::Result<cap_std::fs::DirEntry>>>,
@@ -113,6 +125,13 @@ impl AsyncReadDir {
 /// A directory opened once for a listing
 pub struct ListingDir(pub(super) cap_std::fs::Dir);
 
+#[cfg(unix)]
+impl std::os::fd::AsFd for ListingDir {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 impl ListingDir {
     /// Visits every entry except `.` and `..` in enumeration order. An
     /// enumeration error ends the walk and is returned.
@@ -136,10 +155,15 @@ impl ListingDir {
 
                 let name = String::from_utf8_lossy(name).into_owned();
                 let file_type = match entry.file_type() {
-                    rustix::fs::FileType::RegularFile => FileType::File,
-                    rustix::fs::FileType::Directory => FileType::Dir,
-                    rustix::fs::FileType::Symlink => FileType::Symlink,
-                    _ => FileType::Unknown,
+                    rustix::fs::FileType::Unknown => rustix::fs::statat(
+                        self.0.as_fd(),
+                        entry.file_name(),
+                        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_or(FileType::Unknown, |stat| {
+                        rustix::fs::FileType::from_raw_mode(stat.st_mode).into()
+                    }),
+                    file_type => file_type.into(),
                 };
 
                 visit(file_type, name)?;
@@ -271,6 +295,7 @@ pub struct AsyncWalkDir {
     stack: Vec<(PathBuf, AsyncReadDir, bool)>,
     is_ignored: IsIgnoredFn,
     reversed: bool,
+    inline_dirs: bool,
 }
 
 impl AsyncWalkDir {
@@ -285,11 +310,21 @@ impl AsyncWalkDir {
             stack: vec![(path, read_dir, true)],
             is_ignored: IsIgnoredFn::default(),
             reversed: false,
+            inline_dirs: false,
         })
     }
 
     pub fn with_is_ignored(mut self, is_ignored: IsIgnoredFn) -> Self {
         self.is_ignored = is_ignored;
+        self
+    }
+
+    /// Multithreaded walks run directory callbacks on the walking task before any
+    /// of the directory's descendants are dispatched, so a callback that creates
+    /// the directory has finished before its children's callbacks start. Ignored
+    /// for reversed walks.
+    pub fn with_inline_dirs(mut self) -> Self {
+        self.inline_dirs = true;
         self
     }
 
@@ -381,6 +416,19 @@ impl AsyncWalkDir {
                     break;
                 }
             };
+
+            if self.inline_dirs && !self.reversed && entry.file_type.is_dir() {
+                let Ok(_permit) = semaphore.acquire().await else {
+                    break;
+                };
+
+                if let Err(err) = func(entry).await {
+                    error.fail(err);
+                    break;
+                }
+
+                continue;
+            }
 
             let directory = self.reversed && entry.file_type.is_dir();
             if self.reversed {

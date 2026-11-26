@@ -1,4 +1,5 @@
 use crate::{
+    io::compression::CompressionType,
     remote::backups::RawServerBackup,
     response::ApiResponse,
     server::filesystem::{
@@ -55,8 +56,11 @@ impl BackupStream {
 }
 
 pub type DumpReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+pub type DumpSource = futures::future::BoxFuture<'static, Result<DumpReader, anyhow::Error>>;
 
-const DATABASE_DUMP_EXTENSIONS: &[&str] = &["sql", "archive", "rdb", "dump"];
+/// `zip` doubles as a file backup archive name, an uncompressed `{uuid}.zip` is
+/// found as a zip archive and only read as a dump by the database paths
+const DATABASE_DUMP_EXTENSIONS: &[&str] = &["sql", "archive", "rdb", "dump", "zip"];
 
 pub fn validate_dump_extension(extension: &str) -> Result<(), anyhow::Error> {
     if DATABASE_DUMP_EXTENSIONS.contains(&extension) {
@@ -64,6 +68,20 @@ pub fn validate_dump_extension(extension: &str) -> Result<(), anyhow::Error> {
     } else {
         Err(anyhow::anyhow!("unsupported database dump extension"))
     }
+}
+
+/// Splits a dump extension such as `sql.gz` into its base extension and the
+/// compression the dump source already applied.
+pub fn parse_dump_extension(extension: &str) -> Result<(&str, CompressionType), anyhow::Error> {
+    let compression = CompressionType::from_file_name(extension);
+    let base = extension
+        .strip_suffix(adapters::wings::WingsBackupFile::compression_suffix(
+            compression,
+        ))
+        .unwrap_or(extension);
+    validate_dump_extension(base)?;
+
+    Ok((base, compression))
 }
 
 /// Dispatch surface of a backup instance; lets [`Backup`] forward to whichever adapter it holds.
@@ -145,12 +163,13 @@ macro_rules! backup_adapters {
                 state: &crate::routes::State,
                 uuid: uuid::Uuid,
                 extension: &str,
-                reader: DumpReader,
+                compression: CompressionType,
+                source: DumpSource,
             ) -> Result<RawServerBackup, anyhow::Error> {
                 match self {
                     $(Self::$variant => {
                         <$backup as BackupStreamCreateExt>::create_from_stream(
-                            state, uuid, extension, reader,
+                            state, uuid, extension, compression, source,
                         )
                         .await
                     })*
@@ -278,7 +297,13 @@ impl Backup {
     }
 
     pub async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
-        self.inner().delete(state).await
+        let result = self.inner().delete(state).await;
+        state
+            .backup_manager
+            .invalidate_cached_backup(self.uuid())
+            .await;
+
+        result
     }
 
     async fn browse(
@@ -291,7 +316,6 @@ impl Backup {
 
 #[async_trait::async_trait]
 pub trait BackupFindExt {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error>;
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
@@ -312,11 +336,15 @@ pub trait BackupCreateExt {
 
 #[async_trait::async_trait]
 pub trait BackupStreamCreateExt {
+    /// `compression` is the compression the dump `source` yields is already encoded with.
+    /// The source opens the dump stream when awaited, so adapters await it only once their
+    /// setup is done: an opened stream left unread can be cut by the panel or a proxy.
     async fn create_from_stream(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
-        reader: DumpReader,
+        compression: CompressionType,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error>;
 }
 
@@ -400,11 +428,14 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("dump was not discoverable: {name}"))?;
 
                 assert_eq!(parsed.extension(), name);
-                assert!(
-                    format!("{}.{name}", uuid::Uuid::nil())
-                        .parse::<ArchiveFormat>()
-                        .is_err()
-                );
+                if name != "zip" {
+                    assert!(
+                        format!("{}.{name}", uuid::Uuid::nil())
+                            .parse::<ArchiveFormat>()
+                            .is_err(),
+                        "{name}"
+                    );
+                }
             }
         }
 
@@ -417,7 +448,6 @@ mod tests {
             "",
             "sql.gz",
             "tar",
-            "zip",
             "7z",
             "gz",
             "part",
@@ -428,11 +458,46 @@ mod tests {
             assert!(validate_dump_extension(extension).is_err(), "{extension}");
         }
 
-        for file_name in ["unknown", "tar", "zip", "sql.part", "sql.s3.gz"] {
+        for file_name in ["unknown", "tar", "sql.part", "sql.s3.gz"] {
             assert!(
                 adapters::wings::WingsBackupFile::parse_dump(file_name).is_none(),
                 "{file_name}"
             );
+        }
+    }
+
+    // parse_dump_extension
+    #[test]
+    fn parse_dump_extension_splits_every_base_and_compression() -> Result<(), anyhow::Error> {
+        let suffixes = [
+            ("", CompressionType::None),
+            (".gz", CompressionType::Gz),
+            (".xz", CompressionType::Xz),
+            (".lz", CompressionType::Lzip),
+            (".bz2", CompressionType::Bz2),
+            (".lz4", CompressionType::Lz4),
+            (".zst", CompressionType::Zstd),
+        ];
+        assert_eq!(suffixes.len(), CompressionType::variants().len());
+
+        for base in DATABASE_DUMP_EXTENSIONS {
+            for (suffix, compression) in suffixes {
+                let extension = format!("{base}{suffix}");
+                assert_eq!(
+                    parse_dump_extension(&extension)?,
+                    (*base, compression),
+                    "{extension}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_dump_extension_rejects_unknown_and_unsafe() {
+        for extension in ["", "gz", "sql.gz.gz", "tar.gz", "sql.part", "../sql.gz"] {
+            assert!(parse_dump_extension(extension).is_err(), "{extension}");
         }
     }
 

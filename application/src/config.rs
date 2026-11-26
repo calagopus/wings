@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufWriter, IsTerminal},
     path::{Path, PathBuf},
@@ -117,7 +117,7 @@ fn api_file_fingerprint_threads() -> usize {
     4
 }
 fn api_upload_limit() -> MiB {
-    100u64.into()
+    0u64.into()
 }
 fn api_max_jwt_uses() -> usize {
     5
@@ -324,7 +324,7 @@ fn system_file_history_enabled() -> bool {
     true
 }
 fn system_file_history_zstd_level() -> i32 {
-    19
+    9
 }
 fn system_file_history_anchor_interval() -> u64 {
     4
@@ -343,6 +343,58 @@ fn system_file_history_per_server_disk_budget() -> u64 {
 }
 fn system_file_history_maintenance_interval() -> u64 {
     3600
+}
+
+fn system_crash_history_enabled() -> bool {
+    true
+}
+fn system_crash_history_lines() -> usize {
+    2000
+}
+fn system_crash_history_record_size_cap() -> u64 {
+    512 * 1024
+}
+fn system_crash_history_zstd_level() -> i32 {
+    3
+}
+fn system_crash_history_max_records() -> u64 {
+    10
+}
+fn system_crash_history_max_age() -> u64 {
+    30 * 24 * 60 * 60
+}
+fn system_crash_history_per_server_disk_budget() -> u64 {
+    2 * 1024 * 1024
+}
+fn system_crash_history_capture_timeout() -> u64 {
+    5
+}
+
+fn system_resource_history_enabled() -> bool {
+    true
+}
+fn system_resource_history_flush_interval() -> u64 {
+    10
+}
+fn system_resource_history_tiers() -> Vec<ResourceHistoryTier> {
+    vec![
+        ResourceHistoryTier {
+            step: 1,
+            retention: 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 10,
+            retention: 7 * 24 * 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 60,
+            retention: 365 * 24 * 60 * 60,
+        },
+        ResourceHistoryTier {
+            step: 10 * 60,
+            retention: 0,
+        },
+    ]
 }
 
 fn system_file_collaboration_enabled() -> bool {
@@ -416,6 +468,9 @@ fn system_backup_s3_retry_limit() -> u64 {
 fn system_backup_ddup_bak_create_threads() -> usize {
     4
 }
+fn system_backup_ddup_bak_restore_threads() -> usize {
+    4
+}
 
 fn system_backup_restic_repository() -> SystemPath {
     #[cfg(unix)]
@@ -439,6 +494,13 @@ fn system_backup_restic_password_file() -> SystemPath {
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
     60
+}
+
+fn system_backup_kopia_restore_threads() -> usize {
+    8
+}
+fn system_backup_kopia_retry_limit() -> u64 {
+    3
 }
 
 fn system_backup_btrfs_restore_threads() -> usize {
@@ -616,6 +678,9 @@ fn docker_log_config_config() -> BTreeMap<String, String> {
 fn limits_server_concurrent_pulls() -> usize {
     3
 }
+fn limits_file_patch_size() -> MiB {
+    64u64.into()
+}
 
 fn throttles_enabled() -> bool {
     true
@@ -641,7 +706,7 @@ fn tundra_image() -> String {
     "debian:trixie-slim".to_string()
 }
 fn tundra_source_image() -> String {
-    "ghcr.io/calagopus/tundra:latest".to_string()
+    "calagopus/tundra:latest".to_string()
 }
 fn tundra_metrics_port() -> u16 {
     7101
@@ -779,6 +844,14 @@ impl Default for IncusRuntime {
             root_disk_size: "10GiB".into(),
         }
     }
+}
+
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResourceHistoryTier {
+    /// Width of one bucket in seconds.
+    pub step: u64,
+    /// How long buckets are kept in seconds, `0` keeps them forever.
+    pub retention: u64,
 }
 
 nestify::nest! {
@@ -1089,6 +1162,41 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
+            pub crash_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemCrashHistory {
+                #[serde(default = "system_crash_history_enabled")]
+                pub enabled: bool,
+
+                #[serde(default = "system_crash_history_lines")]
+                pub lines: usize,
+                #[serde(default = "system_crash_history_record_size_cap")]
+                pub record_size_cap: u64,
+                #[serde(default = "system_crash_history_zstd_level")]
+                pub zstd_level: i32,
+
+                #[serde(default = "system_crash_history_max_records")]
+                pub max_records: u64,
+                #[serde(default = "system_crash_history_max_age")]
+                pub max_age: u64,
+                #[serde(default = "system_crash_history_per_server_disk_budget")]
+                pub per_server_disk_budget: u64,
+
+                #[serde(default = "system_crash_history_capture_timeout")]
+                pub capture_timeout: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub resource_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemResourceHistory {
+                #[serde(default = "system_resource_history_enabled")]
+                pub enabled: bool,
+                #[serde(default = "system_resource_history_flush_interval")]
+                pub flush_interval: u64,
+                #[serde(default = "system_resource_history_tiers")]
+                pub tiers: Vec<ResourceHistoryTier>,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
             pub file_collaboration: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemFileCollaboration {
                 #[serde(default = "system_file_collaboration_enabled")]
                 pub enabled: bool,
@@ -1175,6 +1283,8 @@ nestify::nest! {
                 pub ddup_bak: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsDdupBak {
                     #[serde(default = "system_backup_ddup_bak_create_threads")]
                     pub create_threads: usize,
+                    #[serde(default = "system_backup_ddup_bak_restore_threads")]
+                    pub restore_threads: usize,
 
                     #[serde(default)]
                     pub compression_format: #[derive(ToSchema, Clone, Copy, Deserialize, Serialize, Default)] #[serde(rename_all = "snake_case")] pub enum SystemBackupsDdupBakCompressionFormat {
@@ -1198,6 +1308,16 @@ nestify::nest! {
                     pub retry_lock_seconds: u64,
                     #[serde(default)]
                     pub environment: BTreeMap<String, String>,
+                },
+                #[serde(default)]
+                #[schema(inline)]
+                pub kopia: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsKopia {
+                    #[serde(default)]
+                    pub create_threads: usize,
+                    #[serde(default = "system_backup_kopia_restore_threads")]
+                    pub restore_threads: usize,
+                    #[serde(default = "system_backup_kopia_retry_limit")]
+                    pub retry_limit: u64,
                 },
                 #[serde(default)]
                 #[schema(inline)]
@@ -1303,6 +1423,17 @@ nestify::nest! {
                 pub source_file_max_entries: u64,
                 #[serde(default = "docker_firewall_source_file_max_bytes")]
                 pub source_file_max_bytes: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub bandwidth: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerBandwidth {
+                #[serde(default)]
+                pub backend: crate::server::bandwidth::BandwidthBackendKind,
+                /// replaced by `backend`, only read to migrate older configs
+                #[serde(default, skip_serializing)]
+                #[schema(ignore)]
+                pub enabled: Option<bool>,
             },
 
             #[serde(default)]
@@ -1429,6 +1560,8 @@ nestify::nest! {
 
             #[serde(default)]
             pub userns_mode: String,
+            #[serde(default)]
+            pub mount_options: Vec<String>,
 
             #[serde(default)]
             #[schema(inline)]
@@ -1449,6 +1582,9 @@ nestify::nest! {
             #[serde(default)]
             /// 0 = unlimited, pulls count towards this too
             pub server_concurrent_operations: usize,
+            #[serde(default = "limits_file_patch_size")]
+            /// largest patch file, file being patched and patched result
+            pub file_patch_size: MiB,
         },
 
         #[serde(default)]
@@ -1516,6 +1652,53 @@ nestify::nest! {
     }
 }
 
+impl SystemCrashHistory {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        let max = crate::server::crash_history::MAX_RECORD_SIZE;
+        if self.record_size_cap > max {
+            return Err(anyhow::anyhow!(
+                "system.crash_history.record_size_cap may be at most {max} bytes"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl SystemResourceHistory {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        let max_tiers = crate::server::resource_history::MAX_TIERS;
+        if self.tiers.len() > max_tiers {
+            return Err(anyhow::anyhow!(
+                "system.resource_history.tiers may contain at most {max_tiers} tiers"
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        for tier in &self.tiers {
+            if tier.step == 0 {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers step must be at least 1 second"
+                ));
+            }
+            if tier.retention != 0 && tier.retention < tier.step {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers retention of the {}s tier must be 0 or at least its step",
+                    tier.step
+                ));
+            }
+            if !seen.insert(tier.step) {
+                return Err(anyhow::anyhow!(
+                    "system.resource_history.tiers contains the {}s step more than once",
+                    tier.step
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Docker {
     /// The configured CFS period in microseconds, clamped to what the kernel accepts.
     pub fn cpu_period_us(&self) -> i64 {
@@ -1577,6 +1760,7 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.passwd.directory",
     "system.backups.restic.repository",
     "system.backups.restic.password_file",
+    "system.backups.restic.environment",
     "system.backups.mounting.path",
     "system.username",
     "system.user",
@@ -1612,6 +1796,8 @@ type ReloadHandle =
 
 const LOG_CHANNEL_LINES: usize = 4096;
 const LEGACY_LIMITS_WARNING: &str = "migrated api.server_remote_download_limit to limits.server_concurrent_pulls, the old key is no longer used";
+const LEGACY_BANDWIDTH_WARNING: &str =
+    "migrated docker.bandwidth.enabled to docker.bandwidth.backend, the old key is no longer used";
 
 fn log_filter(debug: bool) -> Targets {
     let crate_level = if debug {
@@ -1670,12 +1856,13 @@ impl Config {
     ) -> Result<(Arc<Self>, ConfigGuard), anyhow::Error> {
         let file = File::open(path).context(format!("failed to open config file {path}"))?;
         let reader = std::io::BufReader::new(file);
-        let mut inner: InnerConfig = serde_norway::from_reader(reader)
+        let mut inner: InnerConfig = serde_saphyr::from_reader(reader)
             .context(format!("failed to parse config file {path}"))?;
 
         #[cfg(unix)]
         let migrated_tmp_directory = Self::migrate_tmp_directory(&mut inner);
         let migrated_legacy_limits = Self::migrate_legacy_limits(&mut inner);
+        let migrated_legacy_bandwidth = Self::migrate_legacy_bandwidth(&mut inner);
         let (mut inner, env_overrides) = crate::env_overrides::apply_to_config(inner)?;
 
         Self::ensure_directories(&inner)?;
@@ -1749,6 +1936,9 @@ impl Config {
         if migrated_legacy_limits {
             tracing::warn!("{LEGACY_LIMITS_WARNING}");
         }
+        if migrated_legacy_bandwidth {
+            tracing::warn!("{LEGACY_BANDWIDTH_WARNING}");
+        }
 
         for applied in &env_overrides.applied {
             tracing::info!("applied environment override {applied}");
@@ -1761,7 +1951,7 @@ impl Config {
             inner.system.disk_check_concurrency,
         ));
         let client = crate::remote::client::Client::new(&inner, ignore_certificate_errors);
-        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner)?;
 
         let config = Arc::new(Self {
             inner: ArcSwap::new(Arc::new(inner)),
@@ -1779,9 +1969,10 @@ impl Config {
 
     #[cfg(test)]
     pub fn mock() -> Self {
-        let inner = InnerConfig::default();
+        let mut inner = InnerConfig::default();
+        inner.token = "test-token".into();
         let client = crate::remote::client::Client::new(&inner, true);
-        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner).expect("failed to create jwt client");
 
         Self {
             inner: ArcSwap::new(Arc::new(inner)),
@@ -1802,6 +1993,9 @@ impl Config {
     pub fn replace(&self, mut new: InnerConfig) -> Result<(), anyhow::Error> {
         if Self::migrate_legacy_limits(&mut new) {
             tracing::warn!("{LEGACY_LIMITS_WARNING}");
+        }
+        if Self::migrate_legacy_bandwidth(&mut new) {
+            tracing::warn!("{LEGACY_BANDWIDTH_WARNING}");
         }
         let (new, _) = crate::env_overrides::apply_to_config(new)?;
         Self::validate_inner(&new)?;
@@ -1856,8 +2050,8 @@ impl Config {
         let file = opts
             .open(path)
             .context(format!("failed to create config file {path}"))?;
-        let writer = std::io::BufWriter::new(file);
-        serde_norway::to_writer(writer, inner)
+        let mut writer = std::io::BufWriter::new(file);
+        serde_saphyr::to_io_writer(&mut writer, inner)
             .context(format!("failed to write config file {path}"))?;
         Ok(())
     }
@@ -1983,6 +2177,9 @@ impl Config {
             ));
         }
 
+        cfg.system.crash_history.validate()?;
+        cfg.system.resource_history.validate()?;
+
         if cfg.remote.is_empty() {
             return Err(anyhow::anyhow!(
                 "invalid remote configuration, cannot connect to panel without a remote"
@@ -2061,6 +2258,20 @@ impl Config {
         true
     }
 
+    /// Moves `docker.bandwidth.enabled` into `docker.bandwidth.backend`, where `false` became
+    /// the `disabled` backend and `true` is the `auto` default.
+    fn migrate_legacy_bandwidth(cfg: &mut InnerConfig) -> bool {
+        let Some(enabled) = cfg.docker.bandwidth.enabled.take() else {
+            return false;
+        };
+
+        if !enabled {
+            cfg.docker.bandwidth.backend = crate::server::bandwidth::BandwidthBackendKind::Disabled;
+        }
+
+        true
+    }
+
     fn ensure_directories(cfg: &InnerConfig) -> std::io::Result<()> {
         let directories = vec![
             &cfg.system.root_directory,
@@ -2132,12 +2343,12 @@ impl Config {
             return Ok(());
         }
 
-        let users = sysinfo::Users::new_with_refreshed_list();
+        let users = sysinfo::Users::new_with_refreshed_list()?;
 
         if cfg.system.user.rootless.enabled
             && let Ok(current_pid) = sysinfo::get_current_pid()
         {
-            let mut sys = sysinfo::System::new_all();
+            let mut sys = sysinfo::System::new_all()?;
             sys.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[current_pid]),
                 false,
@@ -2169,7 +2380,7 @@ impl Config {
         }
 
         let mut found_user = false;
-        for user in users.list() {
+        for user in users.iter() {
             if user.name() == cfg.system.username {
                 cfg.system.user.uid = **user.id();
                 cfg.system.user.gid = *user.group_id();
@@ -2228,13 +2439,9 @@ impl Config {
             );
         }
 
-        let users = sysinfo::Users::new_with_refreshed_list();
+        let users = sysinfo::Users::new_with_refreshed_list()?;
 
-        let Some(user) = users
-            .list()
-            .iter()
-            .find(|u| u.name() == cfg.system.username)
-        else {
+        let Some(user) = users.iter().find(|u| u.name() == cfg.system.username) else {
             return Err(anyhow::anyhow!(
                 "failed to find user {} after creating it",
                 cfg.system.username
@@ -2383,6 +2590,72 @@ impl Config {
         path(&cfg).as_path(&cfg)
     }
 
+    pub async fn create_docker_network(
+        client: &bollard::Docker,
+        cfg: &InnerConfig,
+    ) -> Result<(), bollard::errors::Error> {
+        let mut ipam_config = Vec::new();
+
+        if cfg.docker.network.interfaces.v4.enabled {
+            ipam_config.push(bollard::models::IpamConfig {
+                subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
+                gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
+                ..Default::default()
+            });
+        }
+        if cfg.docker.network.interfaces.v6.enabled {
+            ipam_config.push(bollard::models::IpamConfig {
+                subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
+                gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
+                ..Default::default()
+            });
+        }
+
+        client
+            .create_network(bollard::plugin::NetworkCreateRequest {
+                name: cfg.docker.network.name.to_string(),
+                driver: Some(cfg.docker.network.driver.to_string()),
+                enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
+                enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
+                internal: Some(cfg.docker.network.is_internal),
+                ipam: Some(bollard::models::Ipam {
+                    config: Some(ipam_config),
+                    ..Default::default()
+                }),
+                options: Some(HashMap::from([
+                    ("encryption".to_string(), "false".to_string()),
+                    (
+                        "com.docker.network.bridge.default_bridge".to_string(),
+                        "false".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.enable_icc".to_string(),
+                        cfg.docker.network.enable_icc.to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.enable_ip_masquerade".to_string(),
+                        "true".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.host_binding_ipv4".to_string(),
+                        "0.0.0.0".to_string(),
+                    ),
+                    (
+                        "com.docker.network.bridge.name".to_string(),
+                        cfg.docker.network.name.to_string(),
+                    ),
+                    (
+                        "com.docker.network.driver.mtu".to_string(),
+                        cfg.docker.network.network_mtu.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn ensure_docker_network(
         &self,
         client: &bollard::Docker,
@@ -2391,72 +2664,6 @@ impl Config {
         let network = client.inspect_network(&network_name, None).await;
 
         if network.is_err() {
-            async fn create_network(
-                client: &bollard::Docker,
-                cfg: &InnerConfig,
-            ) -> Result<(), bollard::errors::Error> {
-                let mut ipam_config = Vec::new();
-
-                if cfg.docker.network.interfaces.v4.enabled {
-                    ipam_config.push(bollard::models::IpamConfig {
-                        subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
-                        gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
-                        ..Default::default()
-                    });
-                }
-                if cfg.docker.network.interfaces.v6.enabled {
-                    ipam_config.push(bollard::models::IpamConfig {
-                        subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
-                        gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
-                        ..Default::default()
-                    });
-                }
-
-                client
-                    .create_network(bollard::plugin::NetworkCreateRequest {
-                        name: cfg.docker.network.name.to_string(),
-                        driver: Some(cfg.docker.network.driver.to_string()),
-                        enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
-                        enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
-                        internal: Some(cfg.docker.network.is_internal),
-                        ipam: Some(bollard::models::Ipam {
-                            config: Some(ipam_config),
-                            ..Default::default()
-                        }),
-                        options: Some(HashMap::from([
-                            ("encryption".to_string(), "false".to_string()),
-                            (
-                                "com.docker.network.bridge.default_bridge".to_string(),
-                                "false".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.enable_icc".to_string(),
-                                cfg.docker.network.enable_icc.to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.enable_ip_masquerade".to_string(),
-                                "true".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.host_binding_ipv4".to_string(),
-                                "0.0.0.0".to_string(),
-                            ),
-                            (
-                                "com.docker.network.bridge.name".to_string(),
-                                cfg.docker.network.name.to_string(),
-                            ),
-                            (
-                                "com.docker.network.driver.mtu".to_string(),
-                                cfg.docker.network.network_mtu.to_string(),
-                            ),
-                        ])),
-                        ..Default::default()
-                    })
-                    .await?;
-
-                Ok(())
-            }
-
             if !self.load().docker.network.interfaces.v4.enabled
                 && !self.load().docker.network.interfaces.v6.enabled
             {
@@ -2466,7 +2673,7 @@ impl Config {
                 ));
             }
 
-            let initial_result = create_network(client, &self.load()).await;
+            let initial_result = Self::create_docker_network(client, &self.load()).await;
             match initial_result {
                 Ok(_) => {
                     tracing::info!("created docker network {}", self.load().docker.network.name);
@@ -2533,7 +2740,7 @@ impl Config {
                                 increment_ip_or_cidr(&m.docker.network.interfaces.v6.gateway);
                         }
 
-                        if let Err(err) = create_network(client, &self.load()).await {
+                        if let Err(err) = Self::create_docker_network(client, &self.load()).await {
                             tracing::warn!("failed to create docker network, trying again...");
                             tracing::error!("failed to create docker network: {:?}", err);
                         } else {
@@ -2595,7 +2802,19 @@ mod tests {
     use super::*;
 
     fn from_yaml(yaml: &str) -> InnerConfig {
-        serde_norway::from_str(yaml).expect("failed to parse config")
+        serde_saphyr::from_str(yaml).expect("failed to parse config")
+    }
+
+    fn history_with(tiers: &[ResourceHistoryTier]) -> Result<(), anyhow::Error> {
+        SystemResourceHistory {
+            tiers: tiers.to_vec(),
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    fn tier(step: u64, retention: u64) -> ResourceHistoryTier {
+        ResourceHistoryTier { step, retention }
     }
 
     #[test]
@@ -2632,6 +2851,29 @@ mod tests {
         assert_eq!(config.docker.lxcfs.directory.0, "/var/lib/lxcfs");
     }
 
+    // FORBIDDEN_PATHS
+    #[test]
+    fn restic_environment_cannot_be_changed_by_panel_patches_but_retry_lock_seconds_can() {
+        let config = from_yaml(
+            "system:\n  backups:\n    restic:\n      environment:\n        AWS_REGION: us-east-1\n",
+        );
+        let mut doc = serde_json::to_value(config).expect("config should serialize");
+        let mut patch = serde_json::json!({
+            "system": { "backups": { "restic": {
+                "environment": { "LD_PRELOAD": "/tmp/evil.so" },
+                "retry_lock_seconds": 99
+            } } }
+        });
+        crate::utils::strip_paths(&mut patch, FORBIDDEN_PATHS);
+        json_patch::merge(&mut doc, &patch);
+        let config: InnerConfig = serde_json::from_value(doc).expect("config should deserialize");
+        assert_eq!(
+            config.system.backups.restic.environment,
+            BTreeMap::from([("AWS_REGION".to_string(), "us-east-1".to_string())])
+        );
+        assert_eq!(config.system.backups.restic.retry_lock_seconds, 99);
+    }
+
     #[test]
     fn s3_streaming_defaults_to_true_and_can_be_disabled() {
         assert!(from_yaml("{}").system.backups.s3.streaming);
@@ -2657,7 +2899,7 @@ mod tests {
         assert!(!Config::migrate_legacy_limits(&mut cfg));
         assert_eq!(cfg.limits.server_concurrent_pulls, 7);
 
-        let yaml = serde_norway::to_string(&cfg).expect("config should round trip");
+        let yaml = serde_saphyr::to_string(&cfg).expect("config should round trip");
         assert!(!yaml.contains("server_remote_download_limit"));
         let reparsed = from_yaml(&yaml);
         assert_eq!(reparsed.limits.server_concurrent_pulls, 7);
@@ -2696,5 +2938,35 @@ mod tests {
 
         assert!(Config::migrate_legacy_limits(&mut cfg));
         assert_eq!(cfg.limits.server_concurrent_pulls, 5);
+    }
+
+    // SystemResourceHistory
+    #[test]
+    fn validate_accepts_valid_lists() {
+        assert!(history_with(&[]).is_ok());
+        assert!(history_with(&[tier(10, 10), tier(60, 0), tier(600, 86400)]).is_ok());
+        assert!(
+            history_with(
+                &(1..=crate::server::resource_history::MAX_TIERS as u64)
+                    .map(|s| tier(s, 0))
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_lists() {
+        assert!(
+            history_with(
+                &(1..=crate::server::resource_history::MAX_TIERS as u64 + 1)
+                    .map(|s| tier(s, 0))
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+        assert!(history_with(&[tier(0, 0)]).is_err());
+        assert!(history_with(&[tier(60, 59)]).is_err());
+        assert!(history_with(&[tier(10, 0), tier(60, 0), tier(10, 100)]).is_err());
     }
 }

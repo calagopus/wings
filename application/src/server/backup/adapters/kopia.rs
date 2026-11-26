@@ -10,7 +10,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -25,17 +25,18 @@ use crate::{
     },
     utils::{CmpExt, PortablePermissions},
 };
-use chrono::{Datelike, Timelike};
 use compact_str::CompactString;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::io::AsyncBufReadExt;
 
@@ -43,12 +44,45 @@ const BACKUP_UUID_TAG: &str = "backup-uuid";
 /// Ignore rules per `policy set` call, well under the argument length limit.
 const KOPIA_IGNORE_BATCH: usize = 500;
 const MAX_TREE_DEPTH: usize = 1024;
+const KOPIA_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+/// How long a successful `repository status` or connect is trusted without checking again.
+const KOPIA_CONNECTED_TTL: Duration = Duration::from_secs(300);
+/// How long a snapshot listing answers lookups for the backups it contains.
+const KOPIA_CATALOG_TTL: Duration = Duration::from_secs(60);
+
+/// Every kopia process opens a repository server session, and each session makes the
+/// server load its whole manifest catalog, so connection checks and snapshot lookups
+/// are shared per repository.
+#[derive(Default)]
+struct KopiaRepositoryState {
+    connected: tokio::sync::Mutex<Option<([u8; 32], Instant)>>,
+    catalog: tokio::sync::Mutex<Option<KopiaCatalog>>,
+}
+
+struct KopiaCatalog {
+    listed_at: Instant,
+    manifests: HashMap<uuid::Uuid, Arc<KopiaManifest>>,
+}
+
+type KopiaRepositories = moka::future::Cache<String, Arc<KopiaRepositoryState>>;
+static KOPIA_REPOSITORIES: LazyLock<KopiaRepositories> =
+    LazyLock::new(|| moka::future::Cache::new(1024));
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KopiaManifest {
     id: String,
+    #[serde(default)]
+    source: KopiaSource,
     root_entry: KopiaRootEntry,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KopiaSource {
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +92,18 @@ struct KopiaRootEntry {
     obj: String,
     #[serde(default)]
     summ: KopiaSummary,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KopiaPolicy {
+    #[serde(default)]
+    files: KopiaFilesPolicy,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KopiaFilesPolicy {
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +119,7 @@ pub struct KopiaBackup {
     uuid: uuid::Uuid,
     root_oid: String,
     manifest_id: String,
+    source_path: String,
     total_size: u64,
 
     config: Arc<crate::config::Config>,
@@ -115,15 +162,74 @@ impl KopiaBackup {
         Self::get_kopia_state_path(config).join(format!("{}.cache", Self::repository_slug(remote)))
     }
 
-    async fn apply_policy(mut policy: tokio::process::Command, uuid: uuid::Uuid) {
-        if let Ok(output) = policy.output().await
-            && !output.status.success()
-        {
-            tracing::warn!(
+    fn is_transient_error(stderr: &str) -> bool {
+        stderr.contains("policy not found") || stderr.contains("connection refused")
+    }
+
+    async fn retry_delay(attempt: u64) {
+        let jitter = rand::random::<f32>() * 0.3;
+        tokio::time::sleep(std::time::Duration::from_secs_f32(
+            attempt.pow(2) as f32 * (1.0 + jitter),
+        ))
+        .await;
+    }
+
+    async fn defined_ignore_rules(
+        config_file: &Path,
+        remote: &KopiaBackupConfiguration,
+        source_path: &Path,
+    ) -> Option<Vec<String>> {
+        let output = Self::get_tokio_command(config_file, remote)
+            .arg("policy")
+            .arg("export")
+            .arg(source_path)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let policies: std::collections::HashMap<String, KopiaPolicy> =
+            serde_json::from_slice(&output.stdout).ok()?;
+
+        Some(policies.into_values().next()?.files.ignore)
+    }
+
+    async fn apply_policy(
+        config: &crate::config::Config,
+        mut policy: tokio::process::Command,
+        uuid: uuid::Uuid,
+    ) -> Result<(), anyhow::Error> {
+        let retry_limit = config.load().system.backups.kopia.retry_limit;
+        let mut attempt = 0;
+
+        loop {
+            let output = policy.output().await?;
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if attempt < retry_limit && Self::is_transient_error(&stderr) {
+                attempt += 1;
+                tracing::warn!(
+                    "retrying ignore policy for Kopia backup {} after transient error (attempt {}): {}",
+                    uuid,
+                    attempt,
+                    stderr.trim()
+                );
+                Self::retry_delay(attempt).await;
+                continue;
+            }
+
+            return Err(anyhow::anyhow!(
                 "failed to apply ignore policy for Kopia backup {}: {}",
                 uuid,
-                String::from_utf8_lossy(&output.stderr)
-            );
+                stderr
+            ));
         }
     }
 
@@ -188,11 +294,42 @@ impl KopiaBackup {
         Self::parse_human_bytes(rest.get(..end)?)
     }
 
+    async fn repository_state(remote: &KopiaBackupConfiguration) -> Arc<KopiaRepositoryState> {
+        KOPIA_REPOSITORIES
+            .get_with(Self::repository_slug(remote), async { Arc::default() })
+            .await
+    }
+
+    fn connection_key(remote: &KopiaBackupConfiguration) -> [u8; 32] {
+        let mut hasher = sha2::Sha256::new();
+        for part in [
+            remote.url.as_str(),
+            remote.username.as_str(),
+            remote.password.as_str(),
+            remote.fingerprint().unwrap_or_default(),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.finalize().into()
+    }
+
     async fn ensure_connected(
         config_file: &Path,
         cache_dir: &Path,
         remote: &KopiaBackupConfiguration,
     ) -> Result<(), anyhow::Error> {
+        let repository = Self::repository_state(remote).await;
+        let key = Self::connection_key(remote);
+
+        let mut connected = repository.connected.lock().await;
+        if connected.is_some_and(|(connected_key, connected_at)| {
+            connected_key == key && connected_at.elapsed() < KOPIA_CONNECTED_TTL
+        }) {
+            return Ok(());
+        }
+        *connected = None;
+
         let status = Self::get_tokio_command(config_file, remote)
             .arg("repository")
             .arg("status")
@@ -201,11 +338,17 @@ impl KopiaBackup {
             .status()
             .await;
 
-        if matches!(status, Ok(status) if status.success()) {
-            return Ok(());
+        if !matches!(status, Ok(status) if status.success()) {
+            Self::connect(config_file, cache_dir, remote).await?;
         }
 
-        Self::connect(config_file, cache_dir, remote).await
+        *connected = Some((key, Instant::now()));
+
+        Ok(())
+    }
+
+    async fn invalidate_connection(remote: &KopiaBackupConfiguration) {
+        *Self::repository_state(remote).await.connected.lock().await = None;
     }
 
     async fn connect(
@@ -256,87 +399,112 @@ impl KopiaBackup {
         Ok(())
     }
 
-    async fn find_snapshot(
+    async fn find_manifest(
         config_file: &Path,
         remote: &KopiaBackupConfiguration,
         uuid: uuid::Uuid,
-    ) -> Result<Option<KopiaManifest>, anyhow::Error> {
+    ) -> Result<Option<Arc<KopiaManifest>>, anyhow::Error> {
+        let requested_at = Instant::now();
+        let repository = Self::repository_state(remote).await;
+        let mut catalog = repository.catalog.lock().await;
+
+        if let Some(catalog) = &*catalog {
+            let manifest = catalog.manifests.get(&uuid);
+
+            if catalog.listed_at >= requested_at
+                || (manifest.is_some() && catalog.listed_at.elapsed() < KOPIA_CATALOG_TTL)
+            {
+                return Ok(manifest.cloned());
+            }
+        }
+
+        let listed_at = Instant::now();
+        let manifests = match Self::list_snapshots(config_file, remote).await {
+            Ok(manifests) => manifests,
+            Err(err) => {
+                *catalog = None;
+                drop(catalog);
+                Self::invalidate_connection(remote).await;
+
+                return Err(err);
+            }
+        };
+
+        let manifest = manifests.get(&uuid).cloned();
+        *catalog = Some(KopiaCatalog {
+            listed_at,
+            manifests,
+        });
+
+        Ok(manifest)
+    }
+
+    async fn forget_manifest(remote: &KopiaBackupConfiguration, uuid: uuid::Uuid) {
+        if let Some(catalog) = &mut *Self::repository_state(remote).await.catalog.lock().await {
+            catalog.manifests.remove(&uuid);
+        }
+    }
+
+    async fn list_snapshots(
+        config_file: &Path,
+        remote: &KopiaBackupConfiguration,
+    ) -> Result<HashMap<uuid::Uuid, Arc<KopiaManifest>>, anyhow::Error> {
         let output = Self::get_tokio_command(config_file, remote)
             .arg("snapshot")
             .arg("list")
             .arg("--json")
             .arg("--all")
-            .arg("--tags")
-            .arg(format!("{BACKUP_UUID_TAG}:{uuid}"))
-            .stderr(std::process::Stdio::null())
+            .arg("--no-retention")
             .output()
             .await?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!(
                 "failed to list Kopia snapshots: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
-        let mut manifests: Vec<KopiaManifest> = serde_json::from_slice(&output.stdout)?;
+        let manifests: Vec<KopiaManifest> = serde_json::from_slice(&output.stdout)?;
+        let tag = format!("tag:{BACKUP_UUID_TAG}");
 
-        Ok(manifests.pop())
+        Ok(manifests
+            .into_iter()
+            .filter_map(|manifest| {
+                let uuid = manifest.tags.get(&tag)?.parse().ok()?;
+                Some((uuid, Arc::new(manifest)))
+            })
+            .collect())
     }
 }
 
 #[async_trait::async_trait]
 impl BackupFindExt for KopiaBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let remote = match state.config.client.backup_kopia_configuration(uuid).await {
-            Ok(remote) => remote,
-            Err(_) => return Ok(false),
-        };
-
-        let config_file = Self::get_config_file_path(&state.config, &remote);
-        let cache_dir = Self::get_cache_dir_path(&state.config, &remote);
-
-        if Self::ensure_connected(&config_file, &cache_dir, &remote)
-            .await
-            .is_err()
-        {
-            return Ok(false);
-        }
-
-        Ok(Self::find_snapshot(&config_file, &remote, uuid)
-            .await
-            .unwrap_or(None)
-            .is_some())
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_kopia_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(_) => return Ok(None),
+            Err(err) if super::is_configuration_missing(&err) => return Ok(None),
+            Err(err) => return Err(err.context("failed to get kopia backup configuration")),
         };
 
         let config_file = Self::get_config_file_path(&state.config, &remote);
         let cache_dir = Self::get_cache_dir_path(&state.config, &remote);
 
-        if Self::ensure_connected(&config_file, &cache_dir, &remote)
-            .await
-            .is_err()
-        {
-            return Ok(None);
-        }
+        Self::ensure_connected(&config_file, &cache_dir, &remote).await?;
 
-        let manifest = match Self::find_snapshot(&config_file, &remote, uuid).await? {
+        let manifest = match Self::find_manifest(&config_file, &remote, uuid).await? {
             Some(manifest) => manifest,
             None => return Ok(None),
         };
 
         Ok(Some(Backup::Kopia(KopiaBackup {
             uuid,
-            root_oid: manifest.root_entry.obj,
-            manifest_id: manifest.id,
+            root_oid: manifest.root_entry.obj.clone(),
+            manifest_id: manifest.id.clone(),
+            source_path: manifest.source.path.clone(),
             total_size: manifest.root_entry.summ.size,
             config: Arc::clone(&state.config),
             config_file,
@@ -399,7 +567,7 @@ impl BackupCreateExt for KopiaBackup {
 
         // kopia has no re-includes, so a list that needs them is handed the exact
         // entries to leave out instead, anchored at the snapshot root
-        let ignore_lines: Vec<String> = if ignore.has_reincludes() {
+        let mut ignore_lines: Vec<String> = if ignore.has_reincludes() {
             let filesystem = server.filesystem.clone();
             let ignore = ignore.clone();
             let frontier =
@@ -422,23 +590,33 @@ impl BackupCreateExt for KopiaBackup {
             ignore_raw.lines().map(str::to_string).collect()
         };
 
-        // the policy keeps the previous backup's rules, and clearing does not combine
-        // with adding in one call
-        let mut policy = Self::get_tokio_command(&config_file, &remote);
-        policy
-            .arg("policy")
-            .arg("set")
-            .arg(&source_path)
-            .arg("--clear-ignore");
-        Self::apply_policy(policy, uuid).await;
+        ignore_lines.sort_unstable();
+        ignore_lines.dedup();
 
-        for batch in ignore_lines.chunks(KOPIA_IGNORE_BATCH) {
+        // every `policy set` replaces the manifest, racing concurrent snapshots on the repository
+        if Self::defined_ignore_rules(&config_file, &remote, &source_path)
+            .await
+            .as_ref()
+            != Some(&ignore_lines)
+        {
+            // the policy keeps the previous backup's rules, and clearing does not combine
+            // with adding in one call
             let mut policy = Self::get_tokio_command(&config_file, &remote);
-            policy.arg("policy").arg("set").arg(&source_path);
-            for line in batch {
-                policy.arg("--add-ignore").arg(line);
+            policy
+                .arg("policy")
+                .arg("set")
+                .arg(&source_path)
+                .arg("--clear-ignore");
+            Self::apply_policy(&server.app_state.config, policy, uuid).await?;
+
+            for batch in ignore_lines.chunks(KOPIA_IGNORE_BATCH) {
+                let mut policy = Self::get_tokio_command(&config_file, &remote);
+                policy.arg("policy").arg("set").arg(&source_path);
+                for line in batch {
+                    policy.arg(format!("--add-ignore={line}"));
+                }
+                Self::apply_policy(&server.app_state.config, policy, uuid).await?;
             }
-            Self::apply_policy(policy, uuid).await;
         }
 
         let mut command = Self::get_tokio_command(&config_file, &remote);
@@ -455,6 +633,18 @@ impl BackupCreateExt for KopiaBackup {
             .arg("--description")
             .arg(format!("wings backup {uuid}"));
 
+        let create_threads = server
+            .app_state
+            .config
+            .load()
+            .system
+            .backups
+            .kopia
+            .create_threads;
+        if create_threads > 0 {
+            command.arg(format!("--parallel={create_threads}"));
+        }
+
         command
             .arg("--tags")
             .arg(format!("{BACKUP_UUID_TAG}:{uuid}"));
@@ -462,45 +652,90 @@ impl BackupCreateExt for KopiaBackup {
             command.arg("--tags").arg(format!("{key}:{value}"));
         }
 
-        let mut child = command
+        command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
 
-        let progress_task = {
-            let progress = progress.clone();
-            let stderr = child.stderr.take();
+        let retry_limit = server
+            .app_state
+            .config
+            .load()
+            .system
+            .backups
+            .kopia
+            .retry_limit;
+        let snapshot_task = async {
+            let mut attempt = 0;
 
-            async move {
-                let Some(stderr) = stderr else {
-                    return;
+            loop {
+                let mut child = command.spawn()?;
+
+                let progress_task = {
+                    let progress = progress.clone();
+                    let stderr = child.stderr.take();
+
+                    async move {
+                        let mut captured = Vec::new();
+                        let Some(stderr) = stderr else {
+                            return captured;
+                        };
+
+                        let mut segments = tokio::io::BufReader::new(stderr).split(b'\r');
+                        while let Ok(Some(segment)) = segments.next_segment().await {
+                            let line = String::from_utf8_lossy(&segment);
+
+                            let hashed = Self::extract_parenthesised_bytes(&line, "hashed ");
+                            let cached = Self::extract_parenthesised_bytes(&line, "cached ");
+                            let uploaded = Self::extract_labelled_bytes(&line, "uploaded ", ",");
+
+                            progress.store_bytes(
+                                (hashed.unwrap_or(0) + cached.unwrap_or(0))
+                                    .max(uploaded.unwrap_or(0)),
+                            );
+
+                            captured.extend_from_slice(&segment);
+                            captured.push(b'\n');
+                            if captured.len() > KOPIA_STDERR_CAPTURE_LIMIT {
+                                captured.drain(..captured.len() - KOPIA_STDERR_CAPTURE_LIMIT);
+                            }
+                        }
+
+                        captured
+                    }
                 };
 
-                let mut segments = tokio::io::BufReader::new(stderr).split(b'\r');
-                while let Ok(Some(segment)) = segments.next_segment().await {
-                    let line = String::from_utf8_lossy(&segment);
-
-                    let hashed = Self::extract_parenthesised_bytes(&line, "hashed ");
-                    let cached = Self::extract_parenthesised_bytes(&line, "cached ");
-                    let uploaded = Self::extract_labelled_bytes(&line, "uploaded ", ",");
-
-                    progress.store_bytes(
-                        (hashed.unwrap_or(0) + cached.unwrap_or(0)).max(uploaded.unwrap_or(0)),
-                    );
+                let (output, stderr) = tokio::join!(child.wait_with_output(), progress_task);
+                let output = output?;
+                if output.status.success() {
+                    return Ok::<_, anyhow::Error>(output);
                 }
+
+                let stderr = String::from_utf8_lossy(&stderr);
+                if attempt < retry_limit && Self::is_transient_error(&stderr) {
+                    attempt += 1;
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "retrying Kopia snapshot for backup {} after transient error (attempt {}): {}",
+                        uuid,
+                        attempt,
+                        stderr.trim()
+                    );
+                    progress.store_bytes(0);
+                    Self::retry_delay(attempt).await;
+                    continue;
+                }
+
+                Self::invalidate_connection(&remote).await;
+                return Err(anyhow::anyhow!(
+                    "failed to create Kopia snapshot: {}",
+                    stderr
+                ));
             }
         };
 
-        let (output, _, total_result) =
-            tokio::join!(child.wait_with_output(), progress_task, total_task);
+        let (output, total_result) = tokio::join!(snapshot_task, total_task);
         total_result?;
         let output = output?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed to create Kopia snapshot: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
 
         let manifest: KopiaManifest = serde_json::from_slice(&output.stdout)?;
         let summary = &manifest.root_entry.summ;
@@ -529,7 +764,8 @@ impl BackupStreamCreateExt for KopiaBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
-        mut reader: DumpReader,
+        _compression: crate::io::compression::CompressionType,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_kopia_configuration(uuid).await?;
 
@@ -543,13 +779,14 @@ impl BackupStreamCreateExt for KopiaBackup {
 
         let result =
             async {
+                let mut reader = source.await?;
                 let mut file = tokio::fs::File::create(&staged_file).await?;
-                tokio::io::copy(&mut reader, &mut file).await?;
+                crate::io::async_copy(&mut reader, &mut file).await?;
                 file.sync_all().await?;
                 drop(file);
 
-                let output =
-                    Self::get_tokio_command(&config_file, &remote)
+                let mut command = Self::get_tokio_command(&config_file, &remote);
+                command
                         .arg("snapshot")
                         .arg("create")
                         .arg(&staged_file)
@@ -562,16 +799,32 @@ impl BackupStreamCreateExt for KopiaBackup {
                             ["--tags".to_string(), format!("{key}:{value}")]
                         }))
                         .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output()
-                        .await?;
+                        .stderr(std::process::Stdio::piped());
 
-                if !output.status.success() {
-                    return Err(anyhow::anyhow!(
-                        "failed to create Kopia snapshot: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
+                let retry_limit = state.config.load().system.backups.kopia.retry_limit;
+                let mut attempt = 0;
+                let output = loop {
+                    let output = command.output().await?;
+                    if output.status.success() {
+                        break output;
+                    }
+
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if attempt < retry_limit && Self::is_transient_error(&stderr) {
+                        attempt += 1;
+                        tracing::warn!(
+                            "retrying Kopia snapshot for database backup {} after transient error (attempt {}): {}",
+                            uuid,
+                            attempt,
+                            stderr.trim()
+                        );
+                        Self::retry_delay(attempt).await;
+                        continue;
+                    }
+
+                    Self::invalidate_connection(&remote).await;
+                    return Err(anyhow::anyhow!("failed to create Kopia snapshot: {}", stderr));
+                };
 
                 let manifest: KopiaManifest = serde_json::from_slice(&output.stdout)?;
                 let size = tokio::fs::metadata(&staged_file).await?.len();
@@ -609,32 +862,8 @@ impl BackupStreamExt for KopiaBackup {
         let cache_dir = Self::get_cache_dir_path(&self.config, &self.remote);
         Self::ensure_connected(&self.config_file, &cache_dir, &self.remote).await?;
 
-        let output = Self::get_tokio_command(&self.config_file, &self.remote)
-            .arg("snapshot")
-            .arg("list")
-            .arg("--json")
-            .arg("--all")
-            .arg("--tags")
-            .arg(format!("{BACKUP_UUID_TAG}:{}", self.uuid))
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed to list Kopia snapshots: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let manifests: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-        let file_name = manifests
-            .iter()
-            .find(|manifest| {
-                manifest.get("id").and_then(|id| id.as_str()) == Some(&self.manifest_id)
-            })
-            .and_then(|manifest| manifest.get("source"))
-            .and_then(|source| source.get("path"))
-            .and_then(|path| path.as_str())
-            .and_then(|path| Path::new(path).file_name())
+        let file_name = Path::new(&self.source_path)
+            .file_name()
             .and_then(|name| name.to_str())
             .map(compact_str::CompactString::from)
             .ok_or_else(|| anyhow::anyhow!("kopia snapshot does not contain a database dump"))?;
@@ -709,7 +938,7 @@ impl BackupExt for KopiaBackup {
                         let mode = header.mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
                         let size = header.size().unwrap_or(0);
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -718,16 +947,10 @@ impl BackupExt for KopiaBackup {
                                 .large_file(size >= u32::MAX as u64);
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match header.entry_type() {
@@ -803,49 +1026,34 @@ impl BackupExt for KopiaBackup {
     ) -> Result<(), anyhow::Error> {
         total.store(self.total_size, Ordering::Relaxed);
 
-        let mut child = Self::get_tokio_command(&self.config_file, &self.remote)
-            .arg("--progress")
-            .arg("--progress-update-interval")
-            .arg("1s")
+        let mut command = Self::get_tokio_command(&self.config_file, &self.remote);
+        command
             .arg("restore")
             .arg(&self.root_oid)
-            .arg(&server.filesystem.base_path)
-            .arg("--overwrite-files")
-            .arg("--overwrite-directories")
-            .arg("--overwrite-symlinks")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .arg("/dev/stdout")
+            .arg("--mode")
+            .arg("tar")
+            .arg(format!(
+                "--parallel={}",
+                server
+                    .app_state
+                    .config
+                    .load()
+                    .system
+                    .backups
+                    .kopia
+                    .restore_threads
+            ));
 
-        if let Some(stderr) = child.stderr.take() {
-            let mut segments = tokio::io::BufReader::new(stderr).split(b'\r');
-            while let Ok(Some(segment)) = segments.next_segment().await {
-                let line = compact_str::CompactString::from_utf8_lossy(segment.trim_ascii());
-                if line.is_empty() {
-                    continue;
-                }
-
-                let Some(restored) = Self::extract_parenthesised_bytes(&line, "Processed ") else {
-                    continue;
-                };
-
-                progress.store_bytes(restored);
-                if let Some(enqueued) = Self::extract_parenthesised_bytes(&line, " of ") {
-                    total.store(enqueued, Ordering::Relaxed);
-                }
-                server.log_daemon(line);
-            }
-        }
-
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("failed to restore Kopia backup"));
-        }
-
-        progress.store_bytes(total.load(Ordering::Relaxed));
-        server.filesystem.rerun_disk_checker();
-
-        Ok(())
+        super::restore_tar_command(
+            server,
+            "Kopia",
+            command,
+            progress,
+            total,
+            KOPIA_STDERR_CAPTURE_LIMIT,
+        )
+        .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
@@ -855,9 +1063,13 @@ impl BackupExt for KopiaBackup {
             .arg(&self.manifest_id)
             .arg("--delete")
             .output()
-            .await?;
+            .await;
+        Self::forget_manifest(&self.remote, self.uuid).await;
+
+        let output = output?;
 
         if !output.status.success() {
+            Self::invalidate_connection(&self.remote).await;
             return Err(anyhow::anyhow!(
                 "failed to delete Kopia backup: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -1906,7 +2118,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                                 .unwrap_or(if file_type.is_dir() { 0o755 } else { 0o644 });
                         let size = header.size().unwrap_or(0);
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -1916,16 +2128,10 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
 
                         if let Ok(mtime) = header.mtime()
                             && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
-                            options =
-                                options.last_modified_time(zip::DateTime::from_date_and_time(
-                                    mtime.year() as u16,
-                                    mtime.month() as u8,
-                                    mtime.day() as u8,
-                                    mtime.hour() as u8,
-                                    mtime.minute() as u8,
-                                    mtime.second() as u8,
-                                )?);
+                            options = options.last_modified_time(mtime);
                         }
 
                         match file_type {

@@ -193,24 +193,14 @@ impl DiffManager {
                     } else {
                         let prev_content = storage.reconstruct(prev.id)?;
 
-                        let delta_bytes = storage.try_encode_delta(&prev_content, &after)?;
-                        let snapshot_estimate = zstd::encode_all(&after[..], storage.zstd_level())
-                            .map(|v| v.len())
-                            .unwrap_or(usize::MAX);
-
-                        if delta_bytes.len() * 10 >= snapshot_estimate * 9 {
-                            storage.insert_snapshot(file_id, user, &after, now_ms)?
-                        } else {
-                            storage.insert_delta(
-                                file_id,
-                                prev.id,
-                                prev.chain_id,
-                                &prev_content,
-                                user,
-                                &after,
-                                now_ms,
-                            )?
-                        }
+                        storage.insert_successor(
+                            file_id,
+                            &prev,
+                            &prev_content,
+                            user,
+                            &after,
+                            now_ms,
+                        )?
                     }
                 }
             };
@@ -219,18 +209,20 @@ impl DiffManager {
             storage.prune_old_chains(file_id, keep_chains)?;
 
             while storage.file_payload_bytes(file_id)? > per_file_budget {
-                let freed = storage.drop_oldest_chain(file_id, protected_chain, keep_chains)?;
+                let freed = storage.drop_oldest_chain(file_id, protected_chain, 1)?;
                 if freed == 0 {
                     break;
                 }
             }
 
             let server_protect = protected_chain.map(|cid| (file_id, cid));
-            while storage.total_payload_bytes()? > per_server_budget {
+            let mut total = storage.total_payload_bytes()?;
+            while total > per_server_budget {
                 let freed = storage.drop_globally_oldest_chain(server_protect)?;
                 if freed == 0 {
                     break;
                 }
+                total = total.saturating_sub(freed);
             }
 
             tracing::debug!(server = %server, path = %path, "recorded file edit");

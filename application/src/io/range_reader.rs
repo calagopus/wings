@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, ReadBuf};
 
-fn resolve_range(range: (Bound<u64>, Bound<u64>), len: u64) -> io::Result<(u64, u64)> {
+pub fn resolve_range(range: (Bound<u64>, Bound<u64>), len: u64) -> io::Result<(u64, u64)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid range specified");
 
     let last = len.checked_sub(1).ok_or_else(invalid)?;
@@ -32,6 +32,24 @@ fn resolve_range(range: (Bound<u64>, Bound<u64>), len: u64) -> io::Result<(u64, 
     Ok((start, end))
 }
 
+/// A byte range that resolves to inclusive `(start, end)` offsets against a known length,
+/// or `None` when it cannot be satisfied.
+pub trait ResolveRange {
+    fn resolve(&self, len: u64) -> Option<(u64, u64)>;
+}
+
+impl ResolveRange for (Bound<u64>, Bound<u64>) {
+    fn resolve(&self, len: u64) -> Option<(u64, u64)> {
+        resolve_range(*self, len).ok()
+    }
+}
+
+fn resolve_or_invalid(range: &impl ResolveRange, len: u64) -> io::Result<(u64, u64)> {
+    range
+        .resolve(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid range specified"))
+}
+
 pub struct RangeReader<R> {
     inner: R,
     start: u64,
@@ -40,12 +58,8 @@ pub struct RangeReader<R> {
 }
 
 impl<R: Read + Seek> RangeReader<R> {
-    pub fn new(
-        mut inner: R,
-        range: impl Into<(Bound<u64>, Bound<u64>)>,
-        len: u64,
-    ) -> io::Result<Self> {
-        let (start, end) = resolve_range(range.into(), len)?;
+    pub fn new(mut inner: R, range: impl ResolveRange, len: u64) -> io::Result<Self> {
+        let (start, end) = resolve_or_invalid(&range, len)?;
 
         inner.seek(SeekFrom::Start(start))?;
 
@@ -86,12 +100,8 @@ pub struct AsyncRangeReader<R> {
 }
 
 impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRangeReader<R> {
-    pub async fn new(
-        mut inner: R,
-        range: impl Into<(Bound<u64>, Bound<u64>)>,
-        len: u64,
-    ) -> io::Result<Self> {
-        let (start, end) = resolve_range(range.into(), len)?;
+    pub async fn new(mut inner: R, range: impl ResolveRange, len: u64) -> io::Result<Self> {
+        let (start, end) = resolve_or_invalid(&range, len)?;
 
         inner.seek(SeekFrom::Start(start)).await?;
 

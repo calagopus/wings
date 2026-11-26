@@ -12,5 +12,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/broadcast", broadcast::router(state))
         .nest("/permissions", permissions::router(state))
         .route("/query", any(crate::server::tunnel::handle_ws))
+        .route("/socket", any(crate::server::tunnel::unix::handle_ws))
         .with_state(state.clone())
 }

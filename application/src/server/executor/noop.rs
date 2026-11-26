@@ -64,6 +64,7 @@ impl ServerExecutor for NoopExecutor {
         &self,
         _server: &crate::server::Server,
         _script: &crate::server::installation::InstallationScript,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error> {
         Self::unsupported()
     }
@@ -95,5 +96,9 @@ impl ServerExecutor for NoopExecutor {
     ) -> Result<std::collections::HashMap<std::net::IpAddr, Vec<super::UsedPort>>, anyhow::Error>
     {
         Ok(ips.iter().map(|ip| (*ip, Vec::new())).collect())
+    }
+
+    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
+        None
     }
 }

@@ -17,6 +17,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FUSEQUOTA_RELEASE");
     println!("cargo:rerun-if-env-changed=FUSEQUOTA_BINARY_PATH");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_PROVIDER");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=WINGS_UPGRADE_API_URL");
 
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string());
@@ -29,6 +32,7 @@ fn main() {
     handle_git_info();
     handle_fusequota(&target_arch, &target_os);
     handle_seccomp();
+    handle_upgrade_source();
 }
 
 #[allow(clippy::panic)]
@@ -92,24 +96,26 @@ fn handle_fusequota(target_arch: &str, target_os: &str) {
         && target_os == "linux"
         && let Some((tag, url)) = fetch_release_metadata(target_arch)
         && (tag != existing_version || release_env.starts_with("latest"))
-        && let Ok(mut resp) = ureq::get(url).call()
-        && resp.status().is_success()
+        && let Some(compressed_data) = with_retry("fusequota download", || {
+            println!(
+                "cargo:warning=Downloading and compressing fusequota version {tag} for {target_arch} from GitHub..."
+            );
+
+            let mut resp = ureq::get(&url).call().map_err(|err| err.to_string())?;
+            let compressed_data =
+                zstd::encode_all(resp.body_mut().as_reader(), 22).map_err(|err| err.to_string())?;
+
+            println!(
+                "cargo:warning=Compressed binary size: {} bytes -> {} bytes",
+                resp.headers()
+                    .get("Content-Length")
+                    .map_or("?", |v| v.to_str().unwrap_or("?")),
+                compressed_data.len()
+            );
+
+            Ok(compressed_data)
+        })
     {
-        println!(
-            "cargo:warning=Downloading and compressing fusequota version {tag} for {target_arch} from GitHub..."
-        );
-
-        let compressed_data = zstd::encode_all(resp.body_mut().as_reader(), 22)
-            .expect("Failed to compress binary with zstd");
-
-        println!(
-            "cargo:warning=Compressed binary size: {} bytes -> {} bytes",
-            resp.headers()
-                .get("Content-Length")
-                .map_or("?", |v| v.to_str().unwrap_or("?")),
-            compressed_data.len()
-        );
-
         let mut file = File::create(&bin_path).expect("Failed to create bin");
         file.write_all(&compressed_data)
             .expect("Failed to write compressed bin");
@@ -138,11 +144,14 @@ fn handle_fusequota(target_arch: &str, target_os: &str) {
 }
 
 fn fetch_release_metadata(arch: &str) -> Option<(String, String)> {
-    let mut resp = ureq::get("https://api.github.com/repos/calagopus/fusequota/releases/latest")
-        .header("User-Agent", "rust-build-script")
-        .call()
-        .ok()?;
-    let release: GithubRelease = serde_json::from_reader(resp.body_mut().as_reader()).ok()?;
+    let release: GithubRelease = with_retry("fusequota release lookup", || {
+        let mut resp =
+            ureq::get("https://api.github.com/repos/calagopus/fusequota/releases/latest")
+                .header("User-Agent", "rust-build-script")
+                .call()
+                .map_err(|err| err.to_string())?;
+        serde_json::from_reader(resp.body_mut().as_reader()).map_err(|err| err.to_string())
+    })?;
 
     let release_arch = match arch {
         "powerpc64" => "ppc64le",
@@ -156,6 +165,24 @@ fn fetch_release_metadata(arch: &str) -> Option<(String, String)> {
         .find(|a| a.name == expected_name)?;
 
     Some((release.tag_name, asset.browser_download_url))
+}
+
+fn with_retry<T>(what: &str, mut f: impl FnMut() -> Result<T, String>) -> Option<T> {
+    const ATTEMPTS: u32 = 5;
+
+    for attempt in 1..=ATTEMPTS {
+        match f() {
+            Ok(value) => return Some(value),
+            Err(err) => {
+                println!("cargo:warning={what} failed (attempt {attempt}/{ATTEMPTS}): {err}");
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_secs(2u64.pow(attempt)));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn handle_git_info() {
@@ -205,4 +232,37 @@ fn handle_seccomp() {
         let seccomp_min = serde_json::to_string(&val).expect("Failed to serialize");
         std::fs::write("seccomp.min.json", seccomp_min).expect("Failed to write seccomp.min.json");
     }
+}
+
+#[allow(clippy::panic)]
+fn handle_upgrade_source() {
+    let read = |name: &str, default: &str| {
+        let value = std::env::var(name).unwrap_or_default();
+        if value.is_empty() {
+            default.to_string()
+        } else {
+            value
+        }
+    };
+
+    let provider = read("WINGS_UPGRADE_PROVIDER", "github");
+    let repository = read("WINGS_UPGRADE_REPOSITORY", "calagopus/wings");
+    let api_url = read("WINGS_UPGRADE_API_URL", "https://api.github.com");
+
+    if !matches!(provider.as_str(), "github") {
+        panic!("unsupported WINGS_UPGRADE_PROVIDER {provider:?}, expected one of: github");
+    }
+    if repository.split('/').count() != 2 || repository.split('/').any(str::is_empty) {
+        panic!("WINGS_UPGRADE_REPOSITORY {repository:?} must be in the form owner/repo");
+    }
+    if !api_url.starts_with("https://") && !api_url.starts_with("http://") {
+        panic!("WINGS_UPGRADE_API_URL {api_url:?} must be an http(s) url");
+    }
+
+    println!("cargo:rustc-env=WINGS_UPGRADE_PROVIDER={provider}");
+    println!("cargo:rustc-env=WINGS_UPGRADE_REPOSITORY={repository}");
+    println!(
+        "cargo:rustc-env=WINGS_UPGRADE_API_URL={}",
+        api_url.trim_end_matches('/')
+    );
 }

@@ -11,7 +11,11 @@ use crate::{
 use russh_sftp::protocol::{Status, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::{io::SeekFrom, path::PathBuf, sync::Arc};
+use std::{
+    io::SeekFrom,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::bytes::BufMut;
 
@@ -20,6 +24,39 @@ fn map_ser_err(err: impl Into<russh_sftp::client::error::Error>) -> StatusCode {
     tracing::error!("russh serialization error: {}", err);
 
     StatusCode::Failure
+}
+
+type DiskSpaceCache = moka::future::Cache<PathBuf, (u64, u64)>;
+static DISK_SPACE: LazyLock<DiskSpaceCache> = LazyLock::new(|| {
+    moka::future::CacheBuilder::new(1024)
+        .time_to_live(std::time::Duration::from_secs(30))
+        .build()
+});
+
+async fn disk_space(base_path: PathBuf) -> Result<(u64, u64), StatusCode> {
+    DISK_SPACE
+        .try_get_with(base_path.clone(), async move {
+            tokio::task::spawn_blocking(move || {
+                let disks = sysinfo::Disks::new_with_refreshed_list().map_err(|_| ())?;
+
+                let mut path = base_path;
+                let disk = loop {
+                    if let Some(disk) = disks.iter().find(|d| d.mount_point() == path) {
+                        break disk;
+                    }
+
+                    if !path.pop() {
+                        break disks.first().ok_or(())?;
+                    }
+                };
+
+                Ok((disk.total_space(), disk.available_space()))
+            })
+            .await
+            .map_err(|_| ())?
+        })
+        .await
+        .map_err(|_: Arc<()>| StatusCode::Failure)
 }
 
 pub async fn handle_extended(
@@ -411,15 +448,40 @@ pub async fn handle_extended(
                 }
             }
 
+            let check = {
+                let server = sftp_session.server.clone();
+                let user_uuid = sftp_session.user_uuid;
+
+                move |file: &std::fs::File| {
+                    #[cfg(target_os = "linux")]
+                    if super::SftpSession::is_ignored_server(
+                        &server,
+                        user_uuid,
+                        &server.filesystem.opened_relative_path(file)?,
+                        FileType::File,
+                    ) {
+                        return Err(anyhow::anyhow!(std::io::Error::from(
+                            std::io::ErrorKind::NotFound
+                        )));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = (file, &server, user_uuid);
+
+                    Ok(())
+                }
+            };
+
             sftp_session
                 .server
                 .filesystem
-                .async_quota_copy(
+                .async_quota_copy_checked(
                     &source_path,
                     &destination_path,
                     &sftp_session.server,
                     None,
                     None,
+                    None,
+                    check,
                 )
                 .await
                 .map_err(|_| StatusCode::NoSuchFile)?;
@@ -453,31 +515,7 @@ pub async fn handle_extended(
             }
 
             let (total_space, available_space) = match sftp_session.server.filesystem.disk_limit() {
-                0 => {
-                    let disks = sysinfo::Disks::new();
-
-                    let mut path = sftp_session.server.filesystem.base_path.clone();
-                    let disk;
-                    loop {
-                        if let Some(d) = disks.iter().find(|d| d.mount_point() == path) {
-                            disk = d;
-                            break;
-                        }
-
-                        if !path.pop() {
-                            disk = match disks.first() {
-                                Some(d) => d,
-                                None => return Err(StatusCode::Failure),
-                            };
-                            break;
-                        }
-                    }
-
-                    let total_space = disk.total_space();
-                    let free_space = disk.available_space();
-
-                    (total_space, free_space)
-                }
+                0 => disk_space(sftp_session.server.filesystem.base_path.clone()).await?,
                 total => (
                     total as u64,
                     (total as u64)
@@ -548,31 +586,7 @@ pub async fn handle_extended(
             }
 
             let (total_space, free_space) = match sftp_session.server.filesystem.disk_limit() {
-                0 => {
-                    let disks = sysinfo::Disks::new();
-
-                    let mut path = sftp_session.server.filesystem.base_path.clone();
-                    let disk;
-                    loop {
-                        if let Some(d) = disks.iter().find(|d| d.mount_point() == path) {
-                            disk = d;
-                            break;
-                        }
-
-                        if !path.pop() {
-                            disk = match disks.first() {
-                                Some(d) => d,
-                                None => return Err(StatusCode::Failure),
-                            };
-                            break;
-                        }
-                    }
-
-                    let total_space = disk.total_space();
-                    let free_space = disk.available_space();
-
-                    (total_space, free_space)
-                }
+                0 => disk_space(sftp_session.server.filesystem.base_path.clone()).await?,
                 total => (
                     total as u64,
                     (total as u64)
@@ -897,8 +911,23 @@ pub async fn handle_extended(
                 || sftp_session
                     .async_is_ignored(&new_path, old_metadata.file_type().into())
                     .await
+                || (old_metadata.is_dir()
+                    && sftp_session
+                        .async_contains_ignored(&old_path, &[&old_path, &new_path])
+                        .await)
             {
                 return Err(StatusCode::Failure);
+            }
+
+            if !sftp_session.has_permission(Permission::FileDelete)
+                && sftp_session
+                    .server
+                    .filesystem
+                    .async_symlink_metadata(&new_path)
+                    .await
+                    .is_ok()
+            {
+                return Err(StatusCode::PermissionDenied);
             }
 
             let activity = Activity {

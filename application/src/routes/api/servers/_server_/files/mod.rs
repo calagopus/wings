@@ -1,4 +1,13 @@
 use super::State;
+use crate::{
+    response::{ApiResponse, ApiResponseResult},
+    server::{
+        Server,
+        filesystem::{IGNORED_CONTENTS_MESSAGE, VIRTUAL_PATH_MESSAGE},
+    },
+};
+use axum::http::StatusCode;
+use std::path::{Path, PathBuf};
 use utoipa_axum::router::OpenApiRouter;
 
 mod chmod;
@@ -13,18 +22,45 @@ mod decompress;
 mod delete;
 mod directory_sizes;
 mod fingerprints;
+mod ignore_matches;
 mod largest_directories;
 mod lines;
 mod list;
 mod list_directory;
 mod operations;
+mod patch;
 mod pull;
 mod rename;
 mod revisions;
 mod search;
 mod sqlite_query;
 mod stat;
+mod trash;
 mod write;
+
+async fn reject_protected(server: &Server, path: &Path) -> Result<(), ApiResponse> {
+    if server.filesystem.async_is_protected_path(path).await {
+        return Err(
+            ApiResponse::error(VIRTUAL_PATH_MESSAGE).with_status(StatusCode::EXPECTATION_FAILED)
+        );
+    }
+
+    Ok(())
+}
+
+async fn reject_any_protected(server: &Server, paths: &[PathBuf]) -> Result<(), ApiResponse> {
+    for path in paths {
+        reject_protected(server, path).await?;
+    }
+
+    Ok(())
+}
+
+fn ignored_contents_error() -> ApiResponseResult {
+    ApiResponse::error(IGNORED_CONTENTS_MESSAGE)
+        .with_status(StatusCode::EXPECTATION_FAILED)
+        .ok()
+}
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
@@ -37,6 +73,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/copy-many", copy_many::router(state))
         .nest("/copy-remote", copy_remote::router(state))
         .nest("/write", write::router(state))
+        .nest("/patch", patch::router(state))
         .nest("/create-directory", create_directory::router(state))
         .nest("/create-symlink", create_symlink::router(state))
         .nest("/largest-directories", largest_directories::router(state))
@@ -44,6 +81,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/directory-sizes", directory_sizes::router(state))
         .nest("/chmod", chmod::router(state))
         .nest("/search", search::router(state))
+        .nest("/ignore-matches", ignore_matches::router(state))
         .nest("/sqlite-query", sqlite_query::router(state))
         .nest("/stat", stat::router(state))
         .nest("/fingerprints", fingerprints::router(state))
@@ -52,5 +90,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/decompress", decompress::router(state))
         .nest("/operations", operations::router(state))
         .nest("/revisions", revisions::router(state))
+        .nest("/trash", trash::router(state))
         .with_state(state.clone())
 }

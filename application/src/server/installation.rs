@@ -299,6 +299,17 @@ impl ServerInstaller {
         self.abort_notify.notify_one();
     }
 
+    async fn fail_installing(&self, err: &anyhow::Error) -> Result<(), anyhow::Error> {
+        let reason = compact_str::format_compact!("{err:#}");
+
+        self.server.log_daemon_install(compact_str::format_compact!(
+            "Installation failed: {reason}"
+        ));
+        *self.failure_reason.lock().await = Some(reason);
+
+        self.unset_installing(false).await
+    }
+
     pub async fn unset_installing(&self, successful: bool) -> Result<(), anyhow::Error> {
         self.server.set_installing(false).await;
         self.server.installer.write().await.take();
@@ -412,7 +423,7 @@ impl ServerInstaller {
                 {
                     Ok(container_script) => Arc::new(container_script),
                     Err(err) => {
-                        self.unset_installing(false).await?;
+                        self.fail_installing(&err).await?;
                         return Err(err);
                     }
                 };
@@ -424,10 +435,10 @@ impl ServerInstaller {
                             .replace(Arc::clone(&container_script));
                     }
                     None => {
-                        self.unset_installing(false).await?;
-                        return Err(anyhow::anyhow!(
-                            "unable to get mutable reference to server installer"
-                        ));
+                        let err =
+                            anyhow::anyhow!("unable to get mutable reference to server installer");
+                        self.fail_installing(&err).await?;
+                        return Err(err);
                     }
                 }
 
@@ -450,7 +461,7 @@ impl ServerInstaller {
 
             async move {
                 let run = async || {
-                    let (handle, mut status_rx) = match installer
+                    let (handle, status_rx) = match installer
                         .server
                         .app_state
                         .executor
@@ -460,134 +471,28 @@ impl ServerInstaller {
                     {
                         Ok(r) => r,
                         Err(err) => {
-                            installer.unset_installing(false).await?;
+                            installer.fail_installing(&err).await?;
                             return Err(err);
                         }
                     };
 
                     *installer.process_handle.lock().await = Some(Arc::clone(&handle));
 
-                    let mut stdout_rx = match handle
+                    let stdout_rx = match handle
                         .subscribe_stdout_lines_ratelimited()
                         .await
                         .context("Failed to subscribe to stdout")
                     {
                         Ok(rx) => rx,
                         Err(err) => {
-                            installer.unset_installing(false).await?;
+                            installer.fail_installing(&err).await?;
                             return Err(err);
                         }
                     };
 
-                    tokio::select! {
-                        result = tokio::time::timeout(
-                            if installer
-                                .server
-                                .app_state
-                                .config
-                                .load()
-                                .docker
-                                .installer_limits
-                                .timeout
-                                > 0
-                            {
-                                std::time::Duration::from_secs(
-                                    installer
-                                        .server
-                                        .app_state
-                                        .config
-                                        .load()
-                                        .docker
-                                        .installer_limits
-                                        .timeout,
-                                )
-                            } else {
-                                std::time::Duration::MAX
-                            },
-                            {
-                                let installer = Arc::clone(&installer);
-
-                                async move {
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    handle.start().await.context("Failed to start installation container")?;
-
-                                    let mut progress_tick = Self::install_progress_interval();
-                                    let mut seen_running = false;
-                                    let mut stdout_open = true;
-                                    loop {
-                                        tokio::select! {
-                                            _ = progress_tick.tick() => {
-                                                installer.send_install_progress().await;
-                                            }
-                                            result = stdout_rx.recv(), if stdout_open => {
-                                                match result {
-                                                    Ok(line) => {
-                                                        installer
-                                                            .server
-                                                            .websocket
-                                                            .send(
-                                                                super::websocket::WebsocketMessage::builder(
-                                                                    super::websocket::WebsocketEvent::ServerInstallOutput,
-                                                                )
-                                                                .arg(line.to_compact_string())
-                                                                .build(),
-                                                            )
-                                                            .ok();
-                                                    }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_open = false,
-                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                                }
-                                            }
-                                            result = status_rx.recv() => {
-                                                match result {
-                                                    Some(super::executor::ProcessStatus::Running) => {
-                                                        seen_running = true;
-                                                    }
-                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running || !stdout_open => {
-                                                        tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
-
-                                                        installer.evaluate_install_result(exit_code, oom_killed).await;
-                                                        break;
-                                                    }
-                                                    None => break,
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Ok::<_, anyhow::Error>(())
-                                }
-                            }
-                        ) => match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "failed to start installation container: {}",
-                                    err
-                                ));
-                            }
-                            Err(err) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "timeout while waiting for installation: {:#?}",
-                                    err
-                                ));
-                            }
-                        },
-                        _ = installer.abort_notify.notified() => {
-                            tracing::info!(
-                                server = %installer.server.uuid,
-                                "installation script aborted"
-                            );
-                        }
-                    }
-
-                    let successful = installer.failure_reason.lock().await.is_none();
-                    installer.unset_installing(successful).await?;
-
-                    Ok(())
+                    installer
+                        .supervise(handle, stdout_rx, status_rx, true)
+                        .await
                 };
 
                 if let Err(err) = run().await {
@@ -612,7 +517,7 @@ impl ServerInstaller {
             .build(),
         )?;
 
-        let (handle, mut status_rx) = match self
+        let (handle, status_rx) = match self
             .server
             .app_state
             .executor
@@ -629,14 +534,14 @@ impl ServerInstaller {
 
         *self.process_handle.lock().await = Some(Arc::clone(&handle));
 
-        let mut stdout_rx = match handle
+        let stdout_rx = match handle
             .subscribe_stdout_lines_ratelimited()
             .await
             .context("Failed to subscribe to stdout")
         {
             Ok(rx) => rx,
             Err(err) => {
-                self.unset_installing(false).await?;
+                self.fail_installing(&err).await?;
                 return Err(err);
             }
         };
@@ -645,116 +550,10 @@ impl ServerInstaller {
             let installer = Arc::clone(self);
 
             async move {
-                let run = async || {
-                    tokio::select! {
-                        result = tokio::time::timeout(
-                            if installer
-                                .server
-                                .app_state
-                                .config
-                                .load()
-                                .docker
-                                .installer_limits
-                                .timeout
-                                > 0
-                            {
-                                std::time::Duration::from_secs(
-                                    installer
-                                        .server
-                                        .app_state
-                                        .config
-                                        .load()
-                                        .docker
-                                        .installer_limits
-                                        .timeout,
-                                )
-                            } else {
-                                std::time::Duration::MAX
-                            },
-                            {
-                                let installer = Arc::clone(&installer);
-
-                                async move {
-                                    let mut progress_tick = Self::install_progress_interval();
-                                    let mut stdout_open = true;
-
-                                    loop {
-                                        tokio::select! {
-                                            _ = progress_tick.tick() => {
-                                                installer.send_install_progress().await;
-                                            }
-                                            result = stdout_rx.recv(), if stdout_open => {
-                                                match result {
-                                                    Ok(line) => {
-                                                    installer
-                                                        .server
-                                                        .websocket
-                                                        .send(
-                                                            super::websocket::WebsocketMessage::builder(
-                                                                super::websocket::WebsocketEvent::ServerInstallOutput,
-                                                            )
-                                                            .arg(line.to_compact_string())
-                                                            .build(),
-                                                        )
-                                                        .ok();
-                                                    }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_open = false,
-                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                                }
-                                            }
-                                            result = status_rx.recv() => {
-                                                match result {
-                                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) => {
-                                                        tracing::info!(server = ?installer.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
-
-                                                        installer.evaluate_install_result(exit_code, oom_killed).await;
-                                                        break;
-                                                    }
-                                                    None => {
-                                                        tracing::info!(server = ?installer.server.uuid, "ending server installation process by container exit");
-                                                        break;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Ok::<_, anyhow::Error>(())
-                                }
-                            }
-                        ) => match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "failed during installation container streaming: {}",
-                                    err
-                                ));
-                            }
-                            Err(err) => {
-                                installer.unset_installing(false).await?;
-                                return Err(anyhow::anyhow!(
-                                    "timeout while waiting for installation: {:#?}",
-                                    err
-                                ));
-                            }
-                        },
-                        _ = installer.abort_notify.notified() => {
-                            tracing::info!(
-                                server = %installer.server.uuid,
-                                "installation script aborted"
-                            );
-                        }
-                    }
-
-                    let successful = installer.failure_reason.lock().await.is_none();
-                    installer.unset_installing(successful).await?;
-
-                    Ok(())
-                };
-
-                if let Err(err) = run().await {
+                if let Err(err) = installer
+                    .supervise(handle, stdout_rx, status_rx, false)
+                    .await
+                {
                     tracing::error!(
                         server = %installer.server.uuid,
                         "generic installation script error: {:#?}",
@@ -763,6 +562,121 @@ impl ServerInstaller {
                 }
             }
         });
+
+        Ok(())
+    }
+
+    async fn supervise(
+        self: &Arc<Self>,
+        handle: Arc<dyn super::executor::ProcessHandle>,
+        mut stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
+        mut status_rx: tokio::sync::mpsc::Receiver<super::executor::ProcessStatus>,
+        start: bool,
+    ) -> Result<(), anyhow::Error> {
+        let timeout = self
+            .server
+            .app_state
+            .config
+            .load()
+            .docker
+            .installer_limits
+            .timeout;
+
+        tokio::select! {
+            result = tokio::time::timeout(
+                if timeout > 0 {
+                    std::time::Duration::from_secs(timeout)
+                } else {
+                    std::time::Duration::MAX
+                },
+                async move {
+                    if start {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        handle.start().await.context("Failed to start installation container")?;
+                    }
+
+                    let mut progress_tick = Self::install_progress_interval();
+                    let mut seen_running = !start;
+                    let mut stdout_open = true;
+                    loop {
+                        tokio::select! {
+                            _ = progress_tick.tick() => {
+                                self.send_install_progress().await;
+                            }
+                            result = stdout_rx.recv(), if stdout_open => {
+                                match result {
+                                    Ok(line) => {
+                                        self
+                                            .server
+                                            .websocket
+                                            .send(
+                                                super::websocket::WebsocketMessage::builder(
+                                                    super::websocket::WebsocketEvent::ServerInstallOutput,
+                                                )
+                                                .arg(line.to_compact_string())
+                                                .build(),
+                                            )
+                                            .ok();
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_open = false,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                }
+                            }
+                            result = status_rx.recv() => {
+                                match result {
+                                    Some(super::executor::ProcessStatus::Running) => {
+                                        seen_running = true;
+                                    }
+                                    Some(super::executor::ProcessStatus::Stopped { exit_code, oom_killed }) if seen_running || !stdout_open => {
+                                        tracing::info!(server = ?self.server.uuid, exit_code, oom_killed, "ending server installation process by container exit");
+
+                                        self.evaluate_install_result(exit_code, oom_killed).await;
+                                        break;
+                                    }
+                                    None => {
+                                        if !start {
+                                            tracing::info!(server = ?self.server.uuid, "ending server installation process by container exit");
+                                        }
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    Ok::<_, anyhow::Error>(())
+                }
+            ) => match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let err = if start {
+                        anyhow::anyhow!("failed to start installation container: {:#}", err)
+                    } else {
+                        anyhow::anyhow!("failed during installation container streaming: {:#}", err)
+                    };
+                    self.fail_installing(&err).await?;
+                    return Err(err);
+                }
+                Err(err) => {
+                    let err = anyhow::anyhow!(
+                        "timeout while waiting for installation: {:#}",
+                        err
+                    );
+                    self.fail_installing(&err).await?;
+                    return Err(err);
+                }
+            },
+            _ = self.abort_notify.notified() => {
+                tracing::info!(
+                    server = %self.server.uuid,
+                    "installation script aborted"
+                );
+            }
+        }
+
+        let successful = self.failure_reason.lock().await.is_none();
+        self.unset_installing(successful).await?;
 
         Ok(())
     }
@@ -821,7 +735,7 @@ impl ServerInstaller {
 
         match handle.logs(None).await {
             Ok(mut reader) => {
-                tokio::io::copy(&mut reader, &mut file).await?;
+                crate::io::async_copy(&mut reader, &mut file).await?;
             }
             Err(err) => {
                 tracing::warn!(

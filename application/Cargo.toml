@@ -1,12 +1,12 @@
 [package]
 name = "wings-rs"
 rust-version = { workspace = true }
-version = "1.2.4"
+version = "1.3.0"
 edition = "2024"
 
 [dependencies]
 tempfile = "3.27.0"
-unrar = { path = "../unrar-rs" }
+unrar = { package = "unrar-ng", git = "https://github.com/0x7d8/unrar.rs.git" }
 pbs-client = { path = "../pbs-client" }
 tundra-common = { git = "https://github.com/calagopus/tundra.git" }
 tracing = { version = "0.1.41", features = ["max_level_debug"] }
@@ -14,7 +14,7 @@ tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 tracing-appender = "0.2.3"
 anyhow = "1.0.98"
 axum = { version = "0.8.1", features = ["http2", "ws", "multipart"] }
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum-server = { version = "0.9.0", features = ["tls-rustls"] }
 axum-extra = { version = "0.12.1", features = ["query"] }
 tower-http = { version = "0.7.0", features = ["catch-panic"] }
 bollard = "0.21.0"
@@ -27,29 +27,29 @@ url = { workspace = true }
 tokio = { workspace = true }
 chrono = { version = "0.4.40", features = ["serde"] }
 colored = "3.0.0"
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 nestify = "0.3.3"
 rayon = "1.10.0"
-serde_norway = "0.9.42"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize", "serialize"] }
 serde_default = "0.2.0"
 tokio-tungstenite = "0.29.0"
 tokio-util = { version = "0.7.15", features = ["io-util"] }
 uuid = { workspace = true }
 rand = "0.10.0"
 tar = { workspace = true }
-zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-ng", "zstd", "lzma", "xz"] }
-sevenz-rust2 = { version = "0.23.0", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
+zip = { version = "9.0.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-ng", "zstd", "lzma", "xz"] }
+sevenz-rust2 = { version = "0.25.0", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
 flate2 = { version = "1.1.1", default-features = false, features = ["zlib-ng"] }
 sha2 = { workspace = true }
 hmac = "0.13.0"
-ddup-bak = "0.11.0"
+ddup-bak = "0.12.0"
 infer = "0.22.0"
 rustls = { workspace = true }
 bytes = { workspace = true }
 ignore = "0.4.23"
 sha1 = "0.11.0"
 futures = { workspace = true }
-russh = "0.63.1"
+russh = "0.65.0"
 russh-sftp = "3.0.0"
 md5 = "0.8.0"
 human_bytes = "0.4.3"
@@ -57,10 +57,10 @@ nu-ansi-term = "0.50.3"
 clap = { version = "4.5.37", features = ["derive", "string"] }
 clap_complete = "4.6.7"
 dialoguer = { version = "0.12.0", default-features = false }
-sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "network", "system", "user"] }
+sysinfo = { version = "0.40.0", default-features = false, features = ["disk", "network", "system", "user"] }
 crc32fast = { workspace = true }
 cap-std = "4.0.0"
-rustix = { version = "1.0.7", features = ["fs", "process", "net"] }
+rustix = { version = "1.0.7", features = ["fs", "process", "net", "thread"] }
 cidr = { version = "0.3.1", features = ["serde"] }
 hickory-resolver = { workspace = true }
 constant_time_eq = "0.6.0"
@@ -68,7 +68,7 @@ new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
 chrono-tz = "0.10.4"
 gzp = { version = "2.0.0", default-features = false, features = ["deflate_zlib_ng"] }
-lzma-rust2 = { version = "0.21.0", features = ["optimization"] }
+lzma-rust2 = { version = "0.25.0", features = ["optimization"] }
 bzip2 = "0.6.0"
 zstd = { workspace = true }
 base64 = "0.23.0"
@@ -93,24 +93,33 @@ mime = "0.3.17"
 sntpc-net-tokio = "1.0.1"
 sntpc = { version = "0.11.0", features = ["std"] }
 hex = { workspace = true }
-json-patch = "4.2.0"
-itaf = "0.3.0"
+json-patch = "5.0.0"
+itaf = "0.4.0"
 arc-swap = "1.9.1"
-rusqlite = { version = "0.40.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
 blake3 = "1.8.5"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 toml_edit = "0.25.12"
 ini-roundtrip = "0.2.1"
 yrs = "0.28.0"
 croner = { version = "4.0.0", features = ["serde"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 time = "0.3.55"
+semver = "1.0.28"
+diffy = "0.5.2"
+qbsdiff = "1.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tundra-node = { git = "https://github.com/Luxxy-GF/tundra", rev = "f045f5861da0cf9d3df5d3e11b0b384af325147a" }
+landlock = "0.4.7"
 tikv-jemallocator = "0.6.0"
 ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26.4"
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.34.0"
+
+[target.'cfg(windows)'.dependencies]
+self-replace = "1.5.0"
 
 [target.'cfg(target_arch = "riscv64gc")'.dependencies]
 libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues

@@ -162,8 +162,8 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
-                            tracing::debug!("failed to read directory entry while creating pxar archive: {err:#}");
-                            break;
+                            tracing::warn!("failed to read directory entry while creating pxar archive: {err:#}");
+                            continue;
                         }
                     };
 

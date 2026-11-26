@@ -1,11 +1,7 @@
 use crate::{
     io::{
         SafeAsyncWriteExt, SafeDigestExt, SafeSliceMutExt,
-        compression::{
-            CompressionType,
-            reader::{AsyncCompressionReader, CompressionReader},
-            writer::CompressionWriter,
-        },
+        compression::{CompressionType, reader::AsyncCompressionReader, writer::CompressionWriter},
         limited_reader::{AsyncLimitedReader, LimitedReader},
         limited_writer::LimitedWriter,
     },
@@ -13,21 +9,19 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
-            archive::{Archive, ArchiveFormat, StreamableArchiveFormat},
+            archive::{Archive, ArchiveFormat, ExtractOptions, StreamableArchiveFormat},
             virtualfs::{ByteRange, VirtualReadableFilesystem},
         },
     },
-    utils::PortablePermissions,
 };
 use compact_str::ToCompactString;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -56,16 +50,30 @@ fn get_client(config: &Arc<crate::config::Config>) -> Arc<reqwest::Client> {
         .clone()
 }
 
+static DOWNLOAD_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+
+/// Restores read at the pace of the import, which can stall for minutes, so downloads carry
+/// no total timeout.
+fn get_download_client(config: &Arc<crate::config::Config>) -> Arc<reqwest::Client> {
+    DOWNLOAD_CLIENT
+        .get_or_init(|| {
+            Arc::new(
+                reqwest::ClientBuilder::new()
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
+                    .tls_danger_accept_invalid_certs(config.ignore_certificate_errors)
+                    .build()
+                    .expect("failed to build HTTP client"),
+            )
+        })
+        .clone()
+}
+
 pub struct S3Backup {
     uuid: uuid::Uuid,
 }
 
 impl S3Backup {
-    /// A client for uploads to the given presigned URL's host, routed through
-    /// the congestion control proxy when one could be started - backup uploads
-    /// are long-haul flows where loss-based congestion control collapses. The
-    /// returned proxy must stay alive for as long as the client is used;
-    /// without one the shared direct client is handed out instead.
     async fn upload_client(
         config: &Arc<crate::config::Config>,
         sample_url: Option<&str>,
@@ -73,7 +81,10 @@ impl S3Backup {
         Option<crate::net::CongestionControlProxy>,
         Arc<reqwest::Client>,
     ) {
-        let proxy = match sample_url.and_then(|url| reqwest::Url::parse(url).ok()) {
+        let proxy = match sample_url
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .filter(|parsed| parsed.scheme() == "https")
+        {
             Some(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
                 (Some(host), Some(port)) => {
                     crate::net::CongestionControlProxy::start(config, host.to_string(), port).await
@@ -91,7 +102,7 @@ impl S3Backup {
                     ))
                     .tls_danger_accept_invalid_certs(config.ignore_certificate_errors);
 
-                match reqwest::Proxy::all(active_proxy.url()) {
+                match reqwest::Proxy::https(active_proxy.url()) {
                     Ok(reqwest_proxy) => builder = builder.proxy(reqwest_proxy),
                     Err(err) => {
                         tracing::debug!("failed to construct s3 upload proxy definition: {}", err);
@@ -120,6 +131,47 @@ impl S3Backup {
         config
             .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join(format!("{uuid}.s3.part"))
+    }
+
+    #[inline]
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status.is_server_error()
+            || matches!(
+                status,
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            )
+    }
+
+    async fn describe_failed_response(response: reqwest::Response) -> String {
+        const MAX_BODY_LENGTH: usize = 1024;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = body
+            .trim()
+            .chars()
+            .take(MAX_BODY_LENGTH)
+            .collect::<String>();
+
+        format!("status code {status}: {body}")
+    }
+
+    fn part_etag(
+        response: &reqwest::Response,
+        part_number: usize,
+    ) -> Result<String, anyhow::Error> {
+        response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "s3 accepted backup part {} but returned no ETag",
+                    part_number
+                )
+            })
     }
 
     async fn upload_part(
@@ -161,7 +213,7 @@ impl S3Backup {
 
             let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
                 reader,
-                crate::BUFFER_SIZE,
+                crate::FILE_STREAM_BUFFER_SIZE,
             ));
 
             match client
@@ -173,20 +225,24 @@ impl S3Backup {
                 .await
             {
                 Ok(response) if response.status().is_success() => {
-                    let etag = response
-                        .headers()
-                        .get("ETag")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string();
-                    return Ok(etag);
+                    return Self::part_etag(&response, part_number);
                 }
                 Ok(response) => {
+                    let retryable = Self::is_retryable_status(response.status());
+                    let failure = Self::describe_failed_response(response).await;
+                    if !retryable {
+                        return Err(anyhow::anyhow!(
+                            "s3 rejected backup part {}: {}",
+                            part_number,
+                            failure
+                        ));
+                    }
+
                     tracing::error!(
                         backup = %backup_uuid,
-                        "failed to upload s3 backup part {}: status code {}",
+                        "failed to upload s3 backup part {}: {}",
                         part_number,
-                        response.status()
+                        failure
                     );
                 }
                 Err(err) => {
@@ -196,9 +252,11 @@ impl S3Backup {
                         part_number,
                         err.without_url()
                     );
-
-                    tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
                 }
+            }
+
+            if attempts < retry_limit {
+                tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
             }
         }
     }
@@ -209,7 +267,6 @@ impl S3Backup {
         mut reader: impl AsyncRead + Unpin,
         part_size: u64,
         initial_urls: Vec<String>,
-        total: Arc<AtomicU64>,
     ) -> Result<
         (
             String,
@@ -241,7 +298,7 @@ impl S3Backup {
             let mut url_queue: std::collections::VecDeque<String> =
                 initial_urls.into_iter().collect();
             let mut part_number = 1;
-            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+            let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
 
             let (_upload_proxy, upload_http) =
                 Self::upload_client(config, url_queue.front().map(String::as_str)).await;
@@ -264,7 +321,6 @@ impl S3Backup {
                     scratch.safe_write_all(&buffer, bytes_read).await?;
 
                     valid_len += bytes_read as u64;
-                    total.fetch_add(bytes_read as u64, Ordering::Relaxed);
                 }
 
                 scratch.flush().await?;
@@ -363,7 +419,7 @@ impl S3Backup {
             }
         };
 
-        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -464,7 +520,6 @@ impl S3Backup {
             archive_reader,
             part_size,
             initial_urls,
-            Arc::clone(&total),
         );
 
         let ((checksum, parts, size), total_files, _) =
@@ -504,12 +559,13 @@ impl S3Backup {
             .open(&file_name)
             .await?;
 
-        let (mut checksum_reader, checksum_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let (mut checksum_reader, checksum_writer) =
+            crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let checksum_task = async {
             let mut hasher = sha2::Sha256::new();
 
-            let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+            let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
             loop {
                 let bytes_read = checksum_reader.read(&mut buffer).await?;
                 if crate::unlikely(bytes_read == 0) {
@@ -518,7 +574,6 @@ impl S3Backup {
 
                 hasher.safe_update(&buffer, bytes_read)?;
                 file.safe_write_all(&buffer, bytes_read).await?;
-                total.fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
 
             Ok::<_, anyhow::Error>(hex::encode(hasher.finalize()))
@@ -670,7 +725,7 @@ impl S3Backup {
 
                 let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
                     reader,
-                    crate::BUFFER_SIZE,
+                    crate::FILE_STREAM_BUFFER_SIZE,
                 ));
 
                 match upload_http
@@ -682,20 +737,25 @@ impl S3Backup {
                     .await
                 {
                     Ok(response) if response.status().is_success() => {
-                        break response
-                            .headers()
-                            .get("ETag")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
+                        break Self::part_etag(&response, i + 1)?;
                     }
                     Ok(response) => {
+                        let retryable = Self::is_retryable_status(response.status());
+                        let failure = Self::describe_failed_response(response).await;
+                        if !retryable {
+                            return Err(anyhow::anyhow!(
+                                "s3 rejected backup part {}: {}",
+                                i + 1,
+                                failure
+                            ));
+                        }
+
                         tracing::error!(
                             backup = %uuid,
                             server = %server.uuid,
-                            "failed to upload s3 backup part {}: status code {}",
+                            "failed to upload s3 backup part {}: {}",
                             i + 1,
-                            response.status()
+                            failure
                         );
                     }
                     Err(err) => {
@@ -706,9 +766,11 @@ impl S3Backup {
                             i + 1,
                             err.without_url()
                         );
-
-                        tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
                     }
+                }
+
+                if attempts < retry_limit {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempts.pow(2))).await;
                 }
             };
 
@@ -741,11 +803,6 @@ impl S3Backup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for S3Backup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        let path = Self::get_file_name(&state.config, uuid);
-        Ok(tokio::fs::metadata(&path).await.is_ok())
-    }
-
     async fn find(
         _state: &crate::routes::State,
         uuid: uuid::Uuid,
@@ -807,7 +864,8 @@ impl BackupStreamCreateExt for S3Backup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         _extension: &str,
-        reader: DumpReader,
+        source_compression: CompressionType,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let (part_size, initial_urls) = state.config.client.backup_s3_part_urls(uuid, 1).await?;
 
@@ -820,6 +878,15 @@ impl BackupStreamCreateExt for S3Backup {
                 anyhow::anyhow!("no initial urls provided for s3 backup, cannot upload backup")
             })?;
         let compression = Self::compression_from_url(&url);
+        let reader = source.await?;
+        let (reader, compression) = if compression == source_compression {
+            (reader, CompressionType::None)
+        } else {
+            (
+                super::decompress_dump(reader, source_compression),
+                compression,
+            )
+        };
 
         let config = state.config.load();
         let compression_level = config.system.backups.compression_level;
@@ -844,14 +911,12 @@ impl BackupStreamCreateExt for S3Backup {
             Ok(())
         });
 
-        let total = Arc::new(AtomicU64::new(0));
         let upload_task = Self::upload_parts(
             &state.config,
             uuid,
             compressed_reader,
             part_size,
             initial_urls,
-            Arc::clone(&total),
         );
 
         let (upload_result, compress_result) = tokio::join!(upload_task, compress_task);
@@ -902,16 +967,19 @@ impl BackupStreamExt for S3Backup {
             .map(compact_str::CompactString::from)
             .unwrap_or_else(|| self.uuid.to_compact_string());
 
-        let response = get_client(&state.config)
+        let response = get_download_client(&state.config)
             .get(url)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .and_then(|response| response.error_for_status())
+            .map_err(|err| err.without_url())?;
         let content_length = response.content_length();
 
         let reader = AsyncLimitedReader::new_with_bytes_per_second(
             tokio_util::io::StreamReader::new(
-                response.bytes_stream().map_err(std::io::Error::other),
+                response
+                    .bytes_stream()
+                    .map_err(|err| std::io::Error::other(err.without_url())),
             ),
             state.config.load().system.backups.read_limit.as_bytes(),
         );
@@ -986,128 +1054,69 @@ impl BackupExt for S3Backup {
             }
         };
 
-        let response = get_client(&server.app_state.config)
-            .get(url.clone())
+        let format = ArchiveFormat::from_str(
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| anyhow::anyhow!("failed to determine archive format from download_url"))?;
+
+        let response = get_download_client(&server.app_state.config)
+            .get(url)
             .send()
             .await
             .map_err(|err| err.without_url())?;
-        if let Some(content_length) = response.content_length() {
-            total.store(content_length, Ordering::SeqCst);
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "s3 rejected the backup download: {}",
+                Self::describe_failed_response(response).await
+            ));
         }
+
+        let size = response.content_length();
 
         let reader = tokio_util::io::StreamReader::new(Box::pin(
             response
                 .bytes_stream()
                 .map_err(|err| std::io::Error::other(err.without_url())),
         ));
+        let reader = LimitedReader::new_with_bytes_per_second(
+            tokio_util::io::SyncIoBridge::new(reader),
+            server
+                .app_state
+                .config
+                .load()
+                .system
+                .backups
+                .read_limit
+                .as_bytes(),
+        );
 
-        let server = server.clone();
+        let (destination, destination_filesystem) =
+            server.filesystem.resolve_writable_fs(server, "").await;
 
-        tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-            let reader = tokio_util::io::SyncIoBridge::new(reader);
-            let reader = LimitedReader::new_with_bytes_per_second(
-                reader,
-                server.app_state.config.load().system.backups.read_limit.as_bytes(),
-            );
-            let reader = progress.counting_reader(reader);
-            let reader = CompressionReader::new(
-                reader,
-                ArchiveFormat::from_str(url.path_segments().and_then(|mut segments| segments.next_back()).unwrap_or_default())
-                    .map_err(|_| anyhow::anyhow!("failed to determine archive format from download_url"))?.compression_format(),
-            )?;
-            let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
+        Archive::from_stream(
+            server.clone(),
+            format.compression_format(),
+            format.archive_type(),
+            reader,
+            size,
+        )
+        .extract(
+            destination,
+            destination_filesystem,
+            progress,
+            Some(total),
+            ExtractOptions {
+                on_file: Some(Arc::new({
+                    let server = server.clone();
 
-            let mut archive = tar::Archive::new(reader);
-            let mut directory_entries = chunked_vec::ChunkedVec::new();
-            let mut last_parent = None;
-            let entries = archive.entries()?;
-
-            let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
-            for entry in entries {
-                let mut entry = entry?;
-                let path = server.filesystem.relative_path(&entry.path()?);
-
-                if path.as_os_str().is_empty() {
-                    continue;
-                }
-
-                let header = entry.header();
-                match header.entry_type() {
-                    tar::EntryType::Directory => {
-                        server.filesystem.create_chowned_dir_all(path.as_path())?;
-                        server
-                            .filesystem
-                            .set_permissions(
-                                path.as_path(),
-                                PortablePermissions::from_mode_dir(header.mode().unwrap_or(0o755)),
-                            )?;
-
-                        if let Ok(modified_time) = header.mtime() && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
-                            directory_entries.push((path.to_path_buf(), modified_time));
-                        }
-                    }
-                    tar::EntryType::Regular => {
-                        server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
-
-                        if let Some(parent) = path.parent()
-                            && last_parent.as_deref() != Some(parent)
-                        {
-                            server.filesystem.create_chowned_dir_all(parent)?;
-                            last_parent = Some(parent.to_path_buf());
-                        }
-
-                        let mut writer = crate::server::filesystem::file::ServerFile::new(
-                            server.clone(),
-                            &path,
-                            Some(PortablePermissions::from_mode_file(header.mode().unwrap_or(0o644))),
-                            header
-                                .mtime()
-                                .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
-                                .ok(),
-                        )?;
-
-                        crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
-                        writer.flush()?;
-
-                        progress.increment_files();
-                    }
-                    tar::EntryType::Symlink => {
-                        let link = entry.link_name().unwrap_or_default().unwrap_or_default();
-
-                        if let Err(err) = server.filesystem.symlink(link, path.as_path()) {
-                            tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
-                        } else {
-                            progress.increment_files();
-
-                            if let Ok(modified_time) = header.mtime() {
-                                server
-                                    .filesystem
-                                    .set_times(
-                                        path.as_path(),
-                                        std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(modified_time),
-                                        None,
-                                    )?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            for (destination_path, modified_time) in directory_entries {
-                server.filesystem.set_times(
-                    &destination_path,
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_time),
-                    None,
-                )?;
-            }
-
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
+                    move |path| super::log_restoring(&server, path)
+                })),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
@@ -1152,7 +1161,9 @@ impl BackupTestExt for S3Backup {
         let configuration = configuration
             .ok_or_else(|| anyhow::anyhow!("no presigned s3 upload url was provided"))?;
 
-        let response = get_client(&state.config)
+        let (_upload_proxy, upload_http) =
+            Self::upload_client(&state.config, Some(&configuration.upload_url)).await;
+        let response = upload_http
             .put(&configuration.upload_url)
             .header("Content-Length", PROBE.len())
             .header("Content-Type", "application/gzip")
@@ -1189,5 +1200,150 @@ impl BackupCleanExt for S3Backup {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn recording_origin() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let recorded = heads.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match socket.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buffer[..n]),
+                            }
+                            continue;
+                        };
+
+                        let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        while pending.len() < end + 4 + content_length {
+                            match socket.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buffer[..n]),
+                            }
+                        }
+                        pending.drain(..end + 4 + content_length);
+                        recorded.lock().unwrap().push(head);
+
+                        if socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (address, heads, task)
+    }
+
+    // S3Backup::upload_client
+
+    #[test]
+    fn upload_client_sends_origin_form_to_http_endpoints() {
+        tokio_test::block_on(async {
+            let (origin, heads, _origin_task) = recording_origin().await;
+            let config = Arc::new(crate::config::Config::mock());
+            config
+                .mutate_in_place_for_testing()
+                .system
+                .tcp_congestion_control = "cubic".to_string();
+
+            let url = format!("http://{origin}/bucket/key?partNumber=1&uploadId=a%2Fb");
+            let (_proxy, client) = S3Backup::upload_client(&config, Some(&url)).await;
+
+            for _ in 0..2 {
+                let response = client.put(&url).body("part").send().await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+            }
+
+            let heads = heads.lock().unwrap();
+            assert_eq!(heads.len(), 2);
+            for head in heads.iter() {
+                let mut lines = head.lines();
+                assert_eq!(
+                    lines.next(),
+                    Some("PUT /bucket/key?partNumber=1&uploadId=a%2Fb HTTP/1.1")
+                );
+                assert!(
+                    lines.any(|line| line.eq_ignore_ascii_case(&format!("host: {origin}"))),
+                    "missing host header in {head:?}"
+                );
+            }
+        });
+    }
+
+    // S3Backup::is_retryable_status
+
+    #[test]
+    fn is_retryable_status_retries_server_errors_timeouts_and_throttling() {
+        for status in [500, 502, 503, 504, 408, 429] {
+            assert!(
+                S3Backup::is_retryable_status(reqwest::StatusCode::from_u16(status).unwrap()),
+                "{status} should be retryable"
+            );
+        }
+        for status in [400, 401, 403, 404, 409, 413] {
+            assert!(
+                !S3Backup::is_retryable_status(reqwest::StatusCode::from_u16(status).unwrap()),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    // S3Backup::part_etag
+
+    fn response_with_etag(etag: Option<&str>) -> reqwest::Response {
+        let mut builder = axum::http::Response::builder().status(200);
+        if let Some(etag) = etag {
+            builder = builder.header("ETag", etag);
+        }
+
+        reqwest::Response::from(builder.body("").unwrap())
+    }
+
+    #[test]
+    fn part_etag_returns_header_value() {
+        let response = response_with_etag(Some("\"9b2cf535f27731c974343645a3985328\""));
+        assert_eq!(
+            S3Backup::part_etag(&response, 1).unwrap(),
+            "\"9b2cf535f27731c974343645a3985328\""
+        );
+    }
+
+    #[test]
+    fn part_etag_rejects_missing_or_empty_header() {
+        assert!(S3Backup::part_etag(&response_with_etag(None), 1).is_err());
+        assert!(S3Backup::part_etag(&response_with_etag(Some("")), 1).is_err());
     }
 }

@@ -3,9 +3,11 @@ use crate::{
     server::{
         activity::{Activity, ActivityEvent},
         filesystem::{
-            RenameParents,
+            RenameParents, RequestIgnored,
             archive::ArchiveFormat,
             cap::FileType,
+            patch::{Patch, PatchError},
+            trash::TrashSource,
             virtualfs::{AsyncWritableFileStream, IsIgnoredFn},
         },
     },
@@ -91,7 +93,7 @@ pub enum ScheduleBackupSelector {
     },
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct ResolvedBackupSelector {
     pub backup_uuid: Option<uuid::Uuid>,
     pub backup_name: Option<compact_str::CompactString>,
@@ -115,12 +117,7 @@ impl ScheduleBackupSelector {
                 ..Default::default()
             }),
             ScheduleBackupSelector::Uuid { uuid } => {
-                let uuid = match execution_context.resolve_parameter(uuid) {
-                    Some(uuid) => uuid,
-                    None => {
-                        return Err("unable to resolve parameter `uuid` into a string.".into());
-                    }
-                };
+                let uuid = execution_context.resolve_required(uuid, "uuid")?;
 
                 match uuid::Uuid::parse_str(uuid) {
                     Ok(uuid) => Ok(ResolvedBackupSelector {
@@ -134,17 +131,22 @@ impl ScheduleBackupSelector {
                 name,
                 backup_group_uuid,
                 oldest,
-            } => match execution_context.resolve_parameter(name) {
-                Some(name) => Ok(ResolvedBackupSelector {
-                    backup_name: Some(name.to_compact_string()),
-                    backup_group_uuid: *backup_group_uuid,
-                    oldest: *oldest,
-                    ..Default::default()
-                }),
-                None => Err("unable to resolve parameter `name` into a string.".into()),
-            },
+            } => Ok(ResolvedBackupSelector {
+                backup_name: Some(
+                    execution_context
+                        .resolve_required(name, "name")?
+                        .to_compact_string(),
+                ),
+                backup_group_uuid: *backup_group_uuid,
+                oldest: *oldest,
+                ..Default::default()
+            }),
         }
     }
+}
+
+fn patch_strip_default() -> usize {
+    1
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -302,6 +304,8 @@ pub enum ScheduleAction {
     DeleteFiles {
         #[serde(default)]
         ignore_failure: bool,
+        #[serde(default)]
+        trash: bool,
 
         root: ScheduleDynamicParameter,
         files: Vec<compact_str::CompactString>,
@@ -328,6 +332,17 @@ pub enum ScheduleAction {
 
         root: ScheduleDynamicParameter,
         file: ScheduleDynamicParameter,
+    },
+    PatchFiles {
+        ignore_failure: bool,
+
+        root: ScheduleDynamicParameter,
+        format: crate::server::filesystem::patch::PatchFormat,
+        patch: ScheduleDynamicParameter,
+        #[serde(default)]
+        file: Option<ScheduleDynamicParameter>,
+        #[serde(default = "patch_strip_default")]
+        strip: usize,
     },
     PullFile {
         ignore_failure: bool,
@@ -408,6 +423,7 @@ impl ScheduleAction {
             ScheduleAction::RenameFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CompressFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::DecompressFile { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::PatchFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::PullFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupVariable { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupCommand { ignore_failure, .. } => *ignore_failure,
@@ -547,12 +563,9 @@ impl ScheduleAction {
                 regex,
                 output_into,
             } => {
-                let input = match execution_context.resolve_parameter(input) {
-                    Some(input) => input.to_string(),
-                    None => {
-                        return Err("unable to resolve parameter `input` into a string.".into());
-                    }
-                };
+                let input = execution_context
+                    .resolve_required(input, "input")?
+                    .to_string();
 
                 let Some(matches) = regex.captures(&input) else {
                     return Ok(());
@@ -581,12 +594,7 @@ impl ScheduleAction {
                     }
                 };
 
-                let contains = match execution_context.resolve_parameter(contains) {
-                    Some(contains) => contains,
-                    None => {
-                        return Err("unable to resolve parameter `contains` into a string.".into());
-                    }
-                };
+                let contains = execution_context.resolve_required(contains, "contains")?;
 
                 let line_finder = async {
                     if *case_insensitive {
@@ -635,7 +643,10 @@ impl ScheduleAction {
                             timestamp: chrono::Utc::now(),
                         });
                     }
-                    Err(crate::server::PowerActionError::User(message)) => {
+                    Err(
+                        crate::server::PowerActionError::User(message)
+                        | crate::server::PowerActionError::Reported(message),
+                    ) => {
                         return Err(crate::utils::lowercase_first_ascii(message));
                     }
                     Err(crate::server::PowerActionError::Internal(_)) => {
@@ -652,12 +663,7 @@ impl ScheduleAction {
                     return Err("server is not running.".into());
                 }
 
-                let command = match execution_context.resolve_parameter(command) {
-                    Some(command) => command,
-                    None => {
-                        return Err("unable to resolve parameter `command` into a string.".into());
-                    }
-                };
+                let command = execution_context.resolve_required(command, "command")?;
 
                 if server
                     .send_stdin(format!("{command}\n").into())
@@ -684,15 +690,9 @@ impl ScheduleAction {
                 output_into,
                 ..
             } => {
-                let name = match name {
-                    Some(name) => match execution_context.resolve_parameter(name) {
-                        Some(name) => Some(name.as_str()),
-                        None => {
-                            return Err("unable to resolve parameter `name` into a string.".into());
-                        }
-                    },
-                    None => None,
-                };
+                let name = execution_context
+                    .resolve_optional(name.as_ref(), "name")?
+                    .map(|name| name.as_str());
 
                 let (adapter, uuid) = match state
                     .config
@@ -773,10 +773,7 @@ impl ScheduleAction {
                     .restore_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                         *truncate_directory,
                         *restore_startup,
                     )
@@ -886,10 +883,7 @@ impl ScheduleAction {
                     .delete_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                     )
                     .await
                 {
@@ -918,10 +912,7 @@ impl ScheduleAction {
                     .move_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                         *backup_group_uuid,
                     )
                     .await
@@ -946,15 +937,9 @@ impl ScheduleAction {
                 output_into,
                 ..
             } => {
-                let name = match name {
-                    Some(name) => match execution_context.resolve_parameter(name) {
-                        Some(name) => Some(name.as_str()),
-                        None => {
-                            return Err("unable to resolve parameter `name` into a string.".into());
-                        }
-                    },
-                    None => None,
-                };
+                let name = execution_context
+                    .resolve_optional(name.as_ref(), "name")?
+                    .map(|name| name.as_str());
 
                 let (adapter, uuid, extension) = match state
                     .config
@@ -1009,7 +994,7 @@ impl ScheduleAction {
                             .await
                         {
                             tracing::error!(
-                                "failed to create database backup {} (adapter = {:?}) for {}: {}",
+                                "failed to create database backup {} (adapter = {:?}) for {}: {:#}",
                                 uuid,
                                 adapter,
                                 server.uuid,
@@ -1040,10 +1025,7 @@ impl ScheduleAction {
                     .delete_database_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                         *database_instance_uuid,
                     )
                     .await
@@ -1074,10 +1056,7 @@ impl ScheduleAction {
                     .move_database_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                         *backup_group_uuid,
                         *database_instance_uuid,
                     )
@@ -1111,10 +1090,7 @@ impl ScheduleAction {
                     .restore_database_backup(
                         server.uuid,
                         Some(execution_context.schedule_uuid),
-                        selector.backup_uuid,
-                        selector.backup_name.as_deref(),
-                        selector.backup_group_uuid,
-                        selector.oldest,
+                        &selector,
                         *source_database_instance_uuid,
                         *database_instance_uuid,
                         request_uuid,
@@ -1159,18 +1135,8 @@ impl ScheduleAction {
                 }
             }
             ScheduleAction::CreateDirectory { root, name, .. } => {
-                let raw_root = match execution_context.resolve_parameter(root) {
-                    Some(root) => root,
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
-                let name = match execution_context.resolve_parameter(name) {
-                    Some(name) => name,
-                    None => {
-                        return Err("unable to resolve parameter `name` into a string.".into());
-                    }
-                };
+                let raw_root = execution_context.resolve_required(root, "root")?;
+                let name = execution_context.resolve_required(name, "name")?;
 
                 let (root, filesystem) = server
                     .filesystem
@@ -1202,7 +1168,7 @@ impl ScheduleAction {
                     return Err("destination not found".into());
                 }
 
-                if let Err(err) = filesystem.async_create_dir_all(&destination).await {
+                if let Err(err) = filesystem.async_create_dir_all(&destination, None).await {
                     tracing::error!(path = %destination.display(), "failed to create directory: {:?}", err);
 
                     return Err("failed to create directory".into());
@@ -1226,18 +1192,8 @@ impl ScheduleAction {
                 append,
                 ..
             } => {
-                let file_path = match execution_context.resolve_parameter(file_path) {
-                    Some(file_path) => file_path,
-                    None => {
-                        return Err("unable to resolve parameter `file` into a string.".into());
-                    }
-                };
-                let content = match execution_context.resolve_parameter(content) {
-                    Some(content) => content,
-                    None => {
-                        return Err("unable to resolve parameter `content` into a string.".into());
-                    }
-                };
+                let file_path = execution_context.resolve_required(file_path, "file")?;
+                let content = execution_context.resolve_required(content, "content")?;
 
                 let parent = match Path::new(&file_path).parent() {
                     Some(parent) => parent,
@@ -1272,7 +1228,11 @@ impl ScheduleAction {
                     return Err("file is not a file".into());
                 }
 
-                if let Err(err) = server.filesystem.async_create_dir_all(parent).await {
+                if let Err(err) = server
+                    .filesystem
+                    .async_create_chowned_dir_all(parent, None)
+                    .await
+                {
                     tracing::error!(path = %parent.display(), "failed to create parent directory: {:?}", err);
 
                     return Err("failed to create parent directory".into());
@@ -1332,20 +1292,8 @@ impl ScheduleAction {
                 destination,
                 ..
             } => {
-                let file = match execution_context.resolve_parameter(file) {
-                    Some(file) => file,
-                    None => {
-                        return Err("unable to resolve parameter `file` into a string.".into());
-                    }
-                };
-                let destination = match execution_context.resolve_parameter(destination) {
-                    Some(destination) => destination,
-                    None => {
-                        return Err(
-                            "unable to resolve parameter `destination` into a string.".into()
-                        );
-                    }
-                };
+                let file = execution_context.resolve_required(file, "file")?;
+                let destination = execution_context.resolve_required(destination, "destination")?;
 
                 let parent = match Path::new(file).parent() {
                     Some(parent) => parent,
@@ -1464,32 +1412,20 @@ impl ScheduleAction {
                     .map_err(|err| err.to_string())?;
 
                 if *foreground {
-                    match task.await {
-                        Ok(Some(Ok(()))) => {}
-                        Ok(None) => {
-                            return Err("file copy aborted by another source".into());
-                        }
-                        Ok(Some(Err(err))) => {
+                    crate::server::filesystem::operations::await_operation(
+                        task,
+                        "file copy aborted by another source",
+                        "failed to copy file",
+                        |err| {
                             tracing::error!(
                                 server = %server.uuid,
                                 root = %root.display(),
                                 "failed to copy file: {:#?}",
                                 err,
-                            );
-
-                            return Err(format!("failed to copy file: {err}").into());
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                server = %server.uuid,
-                                root = %root.display(),
-                                "failed to copy file: {:#?}",
-                                err,
-                            );
-
-                            return Err("failed to copy file".into());
-                        }
-                    }
+                            )
+                        },
+                    )
+                    .await?;
                 }
 
                 server.activity.log_activity(Activity {
@@ -1504,13 +1440,12 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
             }
-            ScheduleAction::DeleteFiles { root, files, .. } => {
-                let raw_root = match execution_context.resolve_parameter(root) {
-                    Some(root) => root,
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
+            ScheduleAction::DeleteFiles {
+                trash, root, files, ..
+            } => {
+                let raw_root = execution_context.resolve_required(root, "root")?;
+
+                let trash = *trash && server.filesystem.trash.is_enabled();
 
                 for file in files {
                     let (source, filesystem) = server
@@ -1526,9 +1461,34 @@ impl ScheduleAction {
                         Err(_) => continue,
                     };
 
+                    let ignored = RequestIgnored::default();
+                    if filesystem.is_primary_server_fs()
+                        && (ignored
+                            .is_ignored_resolved_parent(server, &source, metadata.file_type)
+                            .await
+                            || ignored
+                                .contains_ignored(server, metadata.file_type, &source, &[&source])
+                                .await)
+                    {
+                        continue;
+                    }
+
                     let result = if filesystem.is_primary_server_fs() {
-                        server.filesystem.truncate_path(&source).await
+                        if trash {
+                            server
+                                .filesystem
+                                .trash
+                                .trash(server, &source, TrashSource::Schedule)
+                                .await
+                                .map(drop)
+                        } else {
+                            server.filesystem.truncate_path(&source).await
+                        }
                     } else if metadata.file_type.is_dir() {
+                        if filesystem.async_holds_ignored(&source, &[]).await {
+                            continue;
+                        }
+
                         filesystem.async_remove_dir_all(&source).await
                     } else {
                         filesystem.async_remove_file(&source).await
@@ -1547,7 +1507,11 @@ impl ScheduleAction {
                 }
 
                 server.activity.log_activity(Activity {
-                    event: ActivityEvent::FileDelete,
+                    event: if trash {
+                        ActivityEvent::FileTrash
+                    } else {
+                        ActivityEvent::FileDelete
+                    },
                     user: None,
                     ip: None,
                     metadata: Some(serde_json::json!({
@@ -1559,12 +1523,7 @@ impl ScheduleAction {
                 });
             }
             ScheduleAction::RenameFiles { root, files, .. } => {
-                let raw_root = match execution_context.resolve_parameter(root) {
-                    Some(root) => Path::new(root),
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
+                let raw_root = Path::new(execution_context.resolve_required(root, "root")?);
 
                 let (root, filesystem) = server
                     .filesystem
@@ -1602,6 +1561,18 @@ impl ScheduleAction {
                                     .async_is_ignored(&to, from_metadata.file_type)
                                     .await))
                     {
+                        continue;
+                    }
+
+                    let holds_ignored = if filesystem.is_primary_server_fs() {
+                        RequestIgnored::default()
+                            .contains_ignored(server, from_metadata.file_type, &from, &[&from, &to])
+                            .await
+                    } else {
+                        from_metadata.file_type.is_dir()
+                            && filesystem.async_holds_ignored(&from, &[&to]).await
+                    };
+                    if holds_ignored {
                         continue;
                     }
 
@@ -1649,18 +1620,8 @@ impl ScheduleAction {
                 name,
                 ..
             } => {
-                let raw_root = match execution_context.resolve_parameter(root) {
-                    Some(root) => root,
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
-                let name = match execution_context.resolve_parameter(name) {
-                    Some(name) => name,
-                    None => {
-                        return Err("unable to resolve parameter `name` into a string.".into());
-                    }
-                };
+                let raw_root = execution_context.resolve_required(root, "root")?;
+                let name = execution_context.resolve_required(name, "name")?;
 
                 let (root, filesystem) = server
                     .filesystem
@@ -1744,87 +1705,26 @@ impl ScheduleAction {
                                 })
                                 .await??;
 
-                                let mut total_size = 0;
-                                for file in &files {
-                                    let directory_entry = match filesystem
-                                        .async_directory_entry_buffer(&root.join(file), &[])
-                                        .await
-                                    {
-                                        Ok(entry) => entry,
-                                        Err(_) => continue,
-                                    };
-
-                                    total_size += directory_entry.size;
-                                }
+                                let total_size = crate::server::filesystem::virtualfs::total_size(
+                                    filesystem.clone(),
+                                    files.iter().map(|file| root.join(file)).collect(),
+                                )
+                                .await?;
 
                                 bytes_total.store(total_size, std::sync::atomic::Ordering::Relaxed);
 
-                                match format {
-                                    ArchiveFormat::Tar
-                                    | ArchiveFormat::TarGz
-                                    | ArchiveFormat::TarXz
-                                    | ArchiveFormat::TarLzip
-                                    | ArchiveFormat::TarBz2
-                                    | ArchiveFormat::TarLz4
-                                    | ArchiveFormat::TarZstd => {
-                                        crate::server::filesystem::archive::create::create_tar(
-                                            server.filesystem.clone(),
-                                            writer,
-                                            &root,
-                                            files,
-                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored,
-                                            crate::server::filesystem::archive::create::CreateTarOptions {
-                                                compression_type: format.compression_format(),
-                                                compression_level: state
-                                                    .config.load()
-                                                    .system
-                                                    .backups
-                                                    .compression_level,
-                                                threads: state.config.load().api.file_compression_threads,
-                                            },
-                                        )
-                                        .await
-                                    }
-                                    ArchiveFormat::Zip => {
-                                        crate::server::filesystem::archive::create::create_zip(
-                                            server.filesystem.clone(),
-                                            writer,
-                                            &root,
-                                            files,
-                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored,
-                                            crate::server::filesystem::archive::create::CreateZipOptions {
-                                                compression_level: state
-                                                    .config.load()
-                                                    .system
-                                                    .backups
-                                                    .compression_level,
-                                                threads: state.config.load().api.file_compression_threads,
-                                            },
-                                        )
-                                        .await
-                                    }
-                                    ArchiveFormat::SevenZip => {
-                                        crate::server::filesystem::archive::create::create_7z(
-                                            server.filesystem.clone(),
-                                            writer,
-                                            &root,
-                                            files,
-                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored,
-                                            crate::server::filesystem::archive::create::Create7zOptions {
-                                                compression_level: state
-                                                    .config.load()
-                                                    .system
-                                                    .backups
-                                                    .compression_level,
-                                                threads: state.config.load().api.file_compression_threads,
-                                            },
-                                        )
-                                        .await
-                                    }
-                                }?;
+                                crate::server::filesystem::archive::create::create_archive(
+    format,
+    server.filesystem.clone(),
+    writer,
+    &root,
+    files,
+    crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
+    ignored,
+    state.config.load().system.backups.compression_level,
+    state.config.load().api.file_compression_threads,
+)
+.await?;
 
                                 Ok(())
                             }
@@ -1847,32 +1747,20 @@ impl ScheduleAction {
                 });
 
                 if *foreground {
-                    match task.await {
-                        Ok(Some(Ok(()))) => {}
-                        Ok(None) => {
-                            return Err("archive compression aborted by another source".into());
-                        }
-                        Ok(Some(Err(err))) => {
+                    crate::server::filesystem::operations::await_operation(
+                        task,
+                        "archive compression aborted by another source",
+                        "failed to compress files",
+                        |err| {
                             tracing::error!(
                                 server = %server.uuid,
                                 root = %root.display(),
                                 "failed to compress files: {:#?}",
                                 err,
-                            );
-
-                            return Err(format!("failed to compress files: {err}").into());
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                server = %server.uuid,
-                                root = %root.display(),
-                                "failed to compress files: {:#?}",
-                                err,
-                            );
-
-                            return Err("failed to compress files".into());
-                        }
-                    }
+                            )
+                        },
+                    )
+                    .await?;
                 }
             }
             ScheduleAction::DecompressFile {
@@ -1881,18 +1769,8 @@ impl ScheduleAction {
                 file,
                 ..
             } => {
-                let root = match execution_context.resolve_parameter(root) {
-                    Some(root) => root,
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
-                let file = match execution_context.resolve_parameter(file) {
-                    Some(file) => file,
-                    None => {
-                        return Err("unable to resolve parameter `file` into a string.".into());
-                    }
-                };
+                let root = execution_context.resolve_required(root, "root")?;
+                let file = execution_context.resolve_required(file, "file")?;
 
                 let root = match server.filesystem.async_canonicalize(root).await {
                     Ok(path) => path,
@@ -1957,6 +1835,7 @@ impl ScheduleAction {
                                         files_processed,
                                     ),
                                     Some(bytes_total),
+                                    crate::server::filesystem::archive::ExtractOptions::default(),
                                 )
                                 .await
                         },
@@ -1977,33 +1856,70 @@ impl ScheduleAction {
                 });
 
                 if *foreground {
-                    match task.await {
-                        Ok(Some(Ok(()))) => {}
-                        Ok(None) => {
-                            return Err("archive decompression aborted by another source".into());
-                        }
-                        Ok(Some(Err(err))) => {
+                    crate::server::filesystem::operations::await_operation(
+                        task,
+                        "archive decompression aborted by another source",
+                        "failed to decompress file",
+                        |err| {
                             tracing::error!(
                                 server = %server.uuid,
                                 path = %source.display(),
                                 "failed to decompress file: {:#?}",
                                 err,
-                            );
-
-                            return Err(format!("failed to decompress file: {err}").into());
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                server = %server.uuid,
-                                path = %source.display(),
-                                "failed to decompress file: {:#?}",
-                                err,
-                            );
-
-                            return Err("failed to decompress file".into());
-                        }
-                    }
+                            )
+                        },
+                    )
+                    .await?;
                 }
+            }
+            ScheduleAction::PatchFiles {
+                root,
+                format,
+                patch,
+                file,
+                strip,
+                ..
+            } => {
+                let root = execution_context.resolve_required(root, "root")?;
+                let patch = execution_context.resolve_required(patch, "patch")?;
+                let file = match file {
+                    Some(file) => Some(execution_context.resolve_required(file, "file")?.as_str()),
+                    None => None,
+                };
+
+                let ignored = RequestIgnored::default();
+                let result = async {
+                    let contents =
+                        Patch::read_file(server, Path::new(root), Path::new(patch), &ignored)
+                            .await?;
+
+                    Patch::parse(*format, &contents, file, *strip)?
+                        .apply(server, Path::new(root), &ignored, None)
+                        .await
+                }
+                .await;
+
+                match result {
+                    Ok(_) => {}
+                    Err(PatchError::Internal(err)) => {
+                        tracing::error!(server = %server.uuid, "failed to patch files: {:#?}", err);
+                        return Err("failed to patch files".into());
+                    }
+                    Err(err) => return Err(err.to_string().into()),
+                }
+
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FilePatch,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": root,
+                        "patch": patch,
+                        "file": file,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::PullFile {
                 foreground,
@@ -2013,29 +1929,13 @@ impl ScheduleAction {
                 use_header,
                 ..
             } => {
-                let raw_root = match execution_context.resolve_parameter(root) {
-                    Some(root) => root,
-                    None => {
-                        return Err("unable to resolve parameter `root` into a string.".into());
-                    }
-                };
-                let url = match execution_context.resolve_parameter(url) {
-                    Some(url) => url.to_compact_string(),
-                    None => {
-                        return Err("unable to resolve parameter `url` into a string.".into());
-                    }
-                };
-                let file_name = match file_name {
-                    Some(file_name) => match execution_context.resolve_parameter(file_name) {
-                        Some(file_name) => Some(file_name.to_compact_string()),
-                        None => {
-                            return Err(
-                                "unable to resolve parameter `file_name` into a string.".into()
-                            );
-                        }
-                    },
-                    None => None,
-                };
+                let raw_root = execution_context.resolve_required(root, "root")?;
+                let url = execution_context
+                    .resolve_required(url, "url")?
+                    .to_compact_string();
+                let file_name = execution_context
+                    .resolve_optional(file_name.as_ref(), "file_name")?
+                    .map(|file_name| file_name.to_compact_string());
 
                 if state.config.load().api.disable_remote_download {
                     return Err("remote pulling is disabled".into());
@@ -2060,7 +1960,7 @@ impl ScheduleAction {
                     return Err("root not found".into());
                 }
 
-                if let Err(err) = filesystem.async_create_dir_all(&root).await {
+                if let Err(err) = filesystem.async_create_dir_all(&root, None).await {
                     tracing::error!(path = %root.display(), "failed to create directory: {:?}", err);
 
                     return Err("failed to create directory".into());
@@ -2114,32 +2014,20 @@ impl ScheduleAction {
                 });
 
                 if *foreground {
-                    match task.await {
-                        Ok(Some(Ok(()))) => {}
-                        Ok(None) => {
-                            return Err("pull aborted by another source".into());
-                        }
-                        Ok(Some(Err(err))) => {
+                    crate::server::filesystem::operations::await_operation(
+                        task,
+                        "pull aborted by another source",
+                        "failed to pull file",
+                        |err| {
                             tracing::error!(
                                 server = %server.uuid,
                                 root = %root.display(),
                                 "failed to pull file: {:#?}",
                                 err,
-                            );
-
-                            return Err(format!("failed to pull file: {err}").into());
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                server = %server.uuid,
-                                root = %root.display(),
-                                "failed to pull file: {:#?}",
-                                err,
-                            );
-
-                            return Err("failed to pull file".into());
-                        }
-                    }
+                            )
+                        },
+                    )
+                    .await?;
                 }
             }
             ScheduleAction::UpdateStartupVariable {
@@ -2147,20 +2035,9 @@ impl ScheduleAction {
                 value,
                 ..
             } => {
-                let env_variable = match execution_context.resolve_parameter(env_variable) {
-                    Some(env_variable) => env_variable,
-                    None => {
-                        return Err(
-                            "unable to resolve parameter `env_variable` into a string.".into()
-                        );
-                    }
-                };
-                let value = match execution_context.resolve_parameter(value) {
-                    Some(value) => value,
-                    None => {
-                        return Err("unable to resolve parameter `value` into a string.".into());
-                    }
-                };
+                let env_variable =
+                    execution_context.resolve_required(env_variable, "env_variable")?;
+                let value = execution_context.resolve_required(value, "value")?;
 
                 match state
                     .config
@@ -2189,12 +2066,7 @@ impl ScheduleAction {
                 };
             }
             ScheduleAction::UpdateStartupCommand { command, .. } => {
-                let command = match execution_context.resolve_parameter(command) {
-                    Some(command) => command,
-                    None => {
-                        return Err("unable to resolve parameter `command` into a string.".into());
-                    }
-                };
+                let command = execution_context.resolve_required(command, "command")?;
 
                 match state
                     .config
@@ -2222,12 +2094,7 @@ impl ScheduleAction {
                 };
             }
             ScheduleAction::UpdateStartupDockerImage { image, .. } => {
-                let image = match execution_context.resolve_parameter(image) {
-                    Some(image) => image,
-                    None => {
-                        return Err("unable to resolve parameter `image` into a string.".into());
-                    }
-                };
+                let image = execution_context.resolve_required(image, "image")?;
 
                 match state
                     .config
@@ -2267,29 +2134,13 @@ impl ScheduleAction {
             } => {
                 let mut resolved_headers = Vec::with_capacity(headers.len());
                 for header in headers {
-                    match execution_context.resolve_parameter(&header.value) {
-                        Some(value) => {
-                            resolved_headers.push((header.name.clone(), value.clone()));
-                        }
-                        None => {
-                            return Err(format!(
-                                "unable to resolve parameter `{}` into a string.",
-                                header.name
-                            )
-                            .into());
-                        }
-                    }
+                    let value = execution_context.resolve_required(&header.value, &header.name)?;
+                    resolved_headers.push((header.name.clone(), value.clone()));
                 }
 
-                let resolved_body = match body {
-                    Some(body) => match execution_context.resolve_parameter(body) {
-                        Some(body) => Some(body.as_str()),
-                        None => {
-                            return Err("unable to resolve parameter `body` into a string.".into());
-                        }
-                    },
-                    None => None,
-                };
+                let resolved_body = execution_context
+                    .resolve_optional(body.as_ref(), "body")?
+                    .map(|body| body.as_str());
 
                 let outcome = super::http::execute(
                     &state.config,

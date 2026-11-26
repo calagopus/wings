@@ -54,16 +54,87 @@ mod post {
         #[serde(default)]
         destination_ignored: Vec<compact_str::CompactString>,
 
+        #[serde(default)]
+        overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
     }
 
     #[derive(ToSchema, Serialize)]
-    pub struct Response {}
+    pub struct Response {
+        #[schema(value_type = Vec<crate::models::DirectoryEntry>)]
+        skipped: Vec<serde_json::Value>,
+    }
 
     #[derive(ToSchema, Serialize)]
     pub struct ResponseAccepted {
         identifier: uuid::Uuid,
+        #[schema(value_type = Vec<crate::models::DirectoryEntry>)]
+        skipped: Vec<serde_json::Value>,
+    }
+
+    async fn existing_local(
+        state: &crate::routes::AppState,
+        data: &Payload,
+        destination_ignored: &crate::server::filesystem::RequestIgnored,
+    ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        let Some(destination_server) = state
+            .server_manager
+            .get_server(data.destination_server)
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut existing = Vec::new();
+        for file in &data.files {
+            let to = Path::new(&data.destination_path).join(&file.to);
+            let (Some(to_parent), Some(to_file_name)) = (to.parent(), to.file_name()) else {
+                continue;
+            };
+
+            let (destination_root, destination_filesystem) = destination_server
+                .filesystem
+                .resolve_writable_fs_ignoring(&destination_server, to_parent, destination_ignored)
+                .await;
+
+            if let Ok(mut entry) = destination_filesystem
+                .async_directory_entry(&destination_root.join(to_file_name))
+                .await
+            {
+                entry.name = file.to.clone();
+                existing.push(serde_json::to_value(entry)?);
+            }
+        }
+
+        Ok(existing)
+    }
+
+    async fn existing_remote(data: &Payload) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        #[derive(Deserialize)]
+        struct StatResponse {
+            entries: Vec<serde_json::Value>,
+        }
+
+        let response = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?
+            .post(format!("{}/stat", data.url.trim_end_matches('/')))
+            .header("Authorization", &data.token)
+            .json(&serde_json::json!({
+                "files": data.files.iter().map(|file| &file.to).collect::<Vec<_>>(),
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "remote server could not check for existing files (status: {})",
+                response.status()
+            ));
+        }
+
+        Ok(response.json::<StatResponse>().await?.entries)
     }
 
     #[utoipa::path(post, path = "/", responses(
@@ -81,7 +152,7 @@ mod post {
     pub async fn route(
         state: GetState,
         server: GetServer,
-        crate::Payload(data): crate::Payload<Payload>,
+        crate::Payload(mut data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
         let source_ignored =
             crate::routes::token::ignored(&server, &data.ignored, "file not found")?;
@@ -110,18 +181,49 @@ mod post {
                 .ok();
         }
 
-        let mut total_size = 0;
-        for file in &data.files {
-            let directory_entry = match filesystem
-                .async_directory_entry_buffer(&root.join(&file.from), &[])
-                .await
-            {
-                Ok(entry) => entry,
-                Err(_) => continue,
+        let mut skipped = Vec::new();
+        if !data.overwrite {
+            let existing = if data.url.is_empty() {
+                existing_local(&state, &data, &destination_ignored).await
+            } else {
+                existing_remote(&data).await
             };
 
-            total_size += directory_entry.size;
+            skipped = match existing {
+                Ok(existing) => existing,
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to check remote copy destination for existing files: {:#?}",
+                        err,
+                    );
+
+                    return ApiResponse::error(
+                        "failed to check the destination for existing files",
+                    )
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+                }
+            };
+
+            data.files.retain(|file| {
+                !skipped
+                    .iter()
+                    .any(|entry| entry.get("name").and_then(|name| name.as_str()) == Some(&file.to))
+            });
+            if data.files.is_empty() {
+                return ApiResponse::new_serialized(Response { skipped }).ok();
+            }
         }
+
+        let total_size = crate::server::filesystem::virtualfs::total_size(
+            filesystem.clone(),
+            data.files
+                .iter()
+                .map(|file| root.join(&file.from))
+                .collect(),
+        )
+        .await?;
 
         let bytes_processed = Arc::new(AtomicU64::new(0));
         let bytes_total = Arc::new(AtomicU64::new(total_size));
@@ -188,7 +290,6 @@ mod post {
                         let root = root.clone();
                         let files = Arc::new(data.files.clone());
                         let filesystem = filesystem.clone();
-                        let destination_server = destination_server.clone();
                         let destination_path = Arc::new(destination_path);
                         let destination_filesystem = destination_filesystem.clone();
                         let bytes_processed = bytes_processed.clone();
@@ -212,7 +313,6 @@ mod post {
                                             let filesystem = filesystem.clone();
                                             let source_path = Arc::new(root);
                                             let files = Arc::clone(&files);
-                                            let destination_server = destination_server.clone();
                                             let destination_path = Arc::new(destination_path);
                                             let destination_filesystem = destination_filesystem.clone();
                                             let bytes_processed = Arc::clone(&bytes_processed);
@@ -225,7 +325,6 @@ mod post {
                                                 let filesystem = filesystem.clone();
                                                 let source_path = Arc::clone(&source_path);
                                                 let files = Arc::clone(&files);
-                                                let destination_server = destination_server.clone();
                                                 let destination_path = Arc::clone(&destination_path);
                                                 let destination_filesystem = destination_filesystem.clone();
                                                 let bytes_processed = Arc::clone(&bytes_processed);
@@ -258,18 +357,17 @@ mod post {
 
                                                     if metadata.file_type.is_file() {
                                                         if let Some(parent) = destination_path.parent() {
-                                                            destination_filesystem.async_create_dir_all(&parent).await?;
+                                                            destination_filesystem.async_create_dir_all(&parent, None).await?;
                                                         }
 
                                                         if filesystem.is_primary_server_fs()
                                                             && destination_filesystem.is_primary_server_fs()
                                                         {
-                                                            server
-                                                                .filesystem
-                                                                .async_quota_copy(
+                                                            destination_filesystem
+                                                                .async_quota_copy_from(
+                                                                    &server,
                                                                     &source_path,
                                                                     &destination_path,
-                                                                    &destination_server,
                                                                     Some(metadata.permissions),
                                                                     Some(&bytes_processed),
                                                                 )
@@ -284,16 +382,13 @@ mod post {
                                                                 .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
                                                                 .await?;
 
-                                                            tokio::io::copy(&mut reader, &mut writer).await?;
+                                                            crate::io::async_copy(&mut reader, &mut writer).await?;
                                                             writer.shutdown().await?;
                                                         }
 
                                                         files_processed.fetch_add(1, Ordering::Relaxed);
                                                     } else if metadata.file_type.is_dir() {
-                                                        destination_filesystem.async_create_dir_all(&destination_path).await?;
-                                                        destination_filesystem
-                                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
-                                                            .await?;
+                                                        destination_filesystem.async_create_dir_all(&destination_path, Some(metadata.permissions)).await?;
 
                                                         bytes_processed.fetch_add(metadata.size, Ordering::Relaxed);
                                                     } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&source_path).await {
@@ -359,44 +454,29 @@ mod post {
                 .await;
 
             if data.foreground {
-                match destination_task.await {
-                    Ok(Some(Ok(()))) => {}
-                    Ok(None) => {
-                        return ApiResponse::error("copy process aborted by another source")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Ok(Some(Err(err))) => {
+                crate::routes::await_operation(
+                    destination_task,
+                    "copy process aborted by another source",
+                    "failed to copy to a remote",
+                    |err| {
                         tracing::error!(
                             server = %server.uuid,
                             root = %root.display(),
                             "failed to copy to a remote: {:#?}",
                             err,
-                        );
+                        )
+                    },
+                )
+                .await?;
 
-                        return ApiResponse::error(&format!("failed to copy to a remote: {err}"))
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            root = %root.display(),
-                            "failed to copy to a remote: {:#?}",
-                            err,
-                        );
-
-                        return ApiResponse::error("failed to copy to a remote")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                }
-
-                ApiResponse::new_serialized(Response {}).ok()
+                ApiResponse::new_serialized(Response { skipped }).ok()
             } else {
-                ApiResponse::new_serialized(ResponseAccepted { identifier })
-                    .with_status(StatusCode::ACCEPTED)
-                    .ok()
+                ApiResponse::new_serialized(ResponseAccepted {
+                    identifier,
+                    skipped,
+                })
+                .with_status(StatusCode::ACCEPTED)
+                .ok()
             }
         } else {
             let (identifier, task) = server
@@ -405,7 +485,7 @@ mod post {
                 .add_operation(
                     crate::server::filesystem::operations::FilesystemOperation::CopyRemote {
                         server: server.uuid,
-                        path: root.clone(),
+                        path: PathBuf::from(&data.root),
                         files: data.files.iter().map(|file| PathBuf::from(&file.from)).collect(),
                         destination_server: data.destination_server,
                         destination_path: PathBuf::from(data.destination_path),
@@ -468,6 +548,13 @@ mod post {
 
                             let form = reqwest::multipart::Form::new()
                                 .part(
+                                    "root-files",
+                                    reqwest::multipart::Part::bytes(serde_json::to_vec(
+                                        &data.files,
+                                    )?)
+                                    .mime_str("application/json")?,
+                                )
+                                .part(
                                     "archive",
                                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
                                         tokio_util::io::ReaderStream::with_capacity(
@@ -498,7 +585,6 @@ mod post {
                                 .post(&data.url)
                                 .header("Authorization", &data.token)
                                 .header("Total-Bytes", bytes_total.load(Ordering::Relaxed))
-                                .header("Root-Files", serde_json::to_string(&data.files)?)
                                 .multipart(form)
                                 .send();
 
@@ -528,44 +614,29 @@ mod post {
                 .await?;
 
             if data.foreground {
-                match task.await {
-                    Ok(Some(Ok(()))) => {}
-                    Ok(None) => {
-                        return ApiResponse::error("copy process aborted by another source")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Ok(Some(Err(err))) => {
+                crate::routes::await_operation(
+                    task,
+                    "copy process aborted by another source",
+                    "failed to copy to a remote",
+                    |err| {
                         tracing::error!(
                             server = %server.uuid,
                             root = %root.display(),
                             "failed to copy to a remote: {:#?}",
                             err,
-                        );
+                        )
+                    },
+                )
+                .await?;
 
-                        return ApiResponse::error(&format!("failed to copy to a remote: {err}"))
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            root = %root.display(),
-                            "failed to copy to a remote: {:#?}",
-                            err,
-                        );
-
-                        return ApiResponse::error("failed to copy to a remote")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                }
-
-                ApiResponse::new_serialized(Response {}).ok()
+                ApiResponse::new_serialized(Response { skipped }).ok()
             } else {
-                ApiResponse::new_serialized(ResponseAccepted { identifier })
-                    .with_status(StatusCode::ACCEPTED)
-                    .ok()
+                ApiResponse::new_serialized(ResponseAccepted {
+                    identifier,
+                    skipped,
+                })
+                .with_status(StatusCode::ACCEPTED)
+                .ok()
             }
         }
     }

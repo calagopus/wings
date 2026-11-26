@@ -98,7 +98,9 @@ pub async fn handle_jwt(
                         server.user_permissions.set_token_permissions(
                             jwt.user_uuid,
                             jwt.base.issued_at,
-                            jwt.permissions.clone(),
+                            jwt.full_permissions
+                                .clone()
+                                .unwrap_or_else(|| jwt.permissions.clone()),
                             jwt.ignored_files.as_deref(),
                         ),
                         TokenVerdict::Stale

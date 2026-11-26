@@ -1,7 +1,22 @@
-use crate::io::counting_reader::{AsyncCountingReader, CountingReader};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use crate::{
+    io::{
+        compression::CompressionLevel,
+        counting_reader::{AsyncCountingReader, CountingReader},
+        counting_writer::CountingWriter,
+    },
+    server::filesystem::{
+        archive::ArchiveFormat,
+        cap::{CapFilesystem, FileType},
+        virtualfs::IsIgnoredFn,
+    },
+};
+use std::{
+    io::{Seek, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::io::AsyncRead;
 
@@ -16,6 +31,142 @@ pub use pxar::*;
 pub use seven_zip::*;
 pub use tar::*;
 pub use zip::*;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_archive<W: Write + Seek + Send + 'static>(
+    format: ArchiveFormat,
+    filesystem: CapFilesystem,
+    destination: W,
+    base: &Path,
+    sources: Vec<impl AsRef<Path> + Send + 'static>,
+    progress: ArchiveProgress,
+    is_ignored: IsIgnoredFn,
+    compression_level: CompressionLevel,
+    threads: usize,
+) -> Result<W, anyhow::Error> {
+    match format {
+        ArchiveFormat::Tar
+        | ArchiveFormat::TarGz
+        | ArchiveFormat::TarXz
+        | ArchiveFormat::TarLzip
+        | ArchiveFormat::TarBz2
+        | ArchiveFormat::TarLz4
+        | ArchiveFormat::TarZstd => {
+            create_tar(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                CreateTarOptions {
+                    compression_type: format.compression_format(),
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+        ArchiveFormat::Zip => {
+            create_zip(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                CreateZipOptions {
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+        ArchiveFormat::SevenZip => {
+            create_7z(
+                filesystem,
+                destination,
+                base,
+                sources,
+                progress,
+                is_ignored,
+                Create7zOptions {
+                    compression_level,
+                    threads,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn walk_sources(
+    filesystem: &CapFilesystem,
+    base: &Path,
+    sources: impl IntoIterator<Item = impl AsRef<Path>>,
+    is_ignored: &IsIgnoredFn,
+    mut visit: impl FnMut(&Path, &Path, &cap_std::fs::Metadata) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    for source in sources {
+        let relative = source.as_ref();
+        let source = base.join(relative);
+
+        let source_metadata = match filesystem.symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                tracing::debug!(path = %source.display(), "skipping source while creating archive, failed to read metadata: {err:#}");
+                continue;
+            }
+        };
+
+        let file_type: FileType = source_metadata.file_type().into();
+        let verdict = (is_ignored)(file_type, source);
+        let kept = verdict.is_kept();
+        let Some(source) = verdict.reachable(file_type) else {
+            continue;
+        };
+
+        if kept {
+            visit(relative, &source, &source_metadata)?;
+        }
+
+        if !source_metadata.is_dir() {
+            continue;
+        }
+
+        let mut walker = filesystem
+            .walk_dir(&source)?
+            .with_is_ignored(is_ignored.clone());
+
+        while let Some(entry) = walker.next_entry() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to read directory entry while creating archive: {err:#}"
+                    );
+                    continue;
+                }
+            };
+
+            let Ok(relative) = entry.path.strip_prefix(base) else {
+                continue;
+            };
+
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::debug!(path = %entry.path.display(), "skipping entry while creating archive, failed to read metadata: {err:#}");
+                    continue;
+                }
+            };
+
+            visit(relative, &entry.path, &metadata)?;
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct ArchiveProgress {
@@ -61,6 +212,14 @@ impl ArchiveProgress {
     }
 
     #[inline]
+    pub fn without_bytes(&self) -> Self {
+        Self {
+            bytes_processed: None,
+            files_processed: self.files_processed.clone(),
+        }
+    }
+
+    #[inline]
     pub fn clone_bytes(&self) -> Option<Arc<AtomicU64>> {
         self.bytes_processed.clone()
     }
@@ -78,6 +237,16 @@ impl ArchiveProgress {
             .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
 
         CountingReader::new_with_bytes_read(reader, counter)
+    }
+
+    #[inline]
+    pub fn counting_writer<W: std::io::Write>(&self, writer: W) -> CountingWriter<W> {
+        let counter = self
+            .bytes_processed
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+
+        CountingWriter::new_with_bytes_written(writer, counter)
     }
 
     #[inline]

@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["application", "pbs-client", "unrar-rs"]
+members = ["application", "pbs-client"]
 default-members = ["application"]
-package.rust-version = "1.99.0"
+package.rust-version = "1.100.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.138", features = ["derive"] }
@@ -39,6 +39,31 @@ strip = true
 opt-level = 3
 
 [profile.release.package.aho-corasick]
+opt-level = 3
+
+# sftp transport: packet framing and the aes-gcm/ctr ciphers run per byte transferred
+[profile.release.package.russh]
+opt-level = 3
+
+[profile.release.package.russh-sftp]
+opt-level = 3
+
+[profile.release.package.russh-cryptovec]
+opt-level = 3
+
+[profile.release.package.aes]
+opt-level = 3
+
+[profile.release.package.aes-gcm]
+opt-level = 3
+
+[profile.release.package.ghash]
+opt-level = 3
+
+[profile.release.package.polyval]
+opt-level = 3
+
+[profile.release.package.ctr]
 opt-level = 3
 
 # build bundled c compressors for speed instead of minsizerel

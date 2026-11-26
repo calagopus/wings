@@ -79,6 +79,8 @@ pub async fn handle_ws(
             let server = server.clone();
 
             async move {
+                let mut revocations = state.config.jwt.subscribe_revocations();
+
                 loop {
                     let user_removal_fut: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(jwt) = socket_jwt.read().await.as_ref() {
                         Box::pin(server
@@ -98,6 +100,25 @@ pub async fn handle_ws(
                             }
                             websocket_handler.close("permission revoked").await;
                             break;
+                        }
+                        _ = revocations.recv() => {
+                            let revoked = socket_jwt.read().await.as_ref().is_some_and(|jwt| {
+                                matches!(
+                                    jwt.base.validate(&state.config.jwt, Some("websocket")),
+                                    Err(crate::remote::jwt::JwtValidateError::Denied)
+                                )
+                            });
+
+                            if revoked {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    "closing websocket due to token revocation",
+                                );
+                                websocket_handler.close("permission revoked").await;
+                                break;
+                            }
+
+                            continue;
                         }
                         data = receiver.next() => match data {
                             Some(Ok(data)) => {
@@ -314,7 +335,9 @@ pub async fn handle_ws(
                                             continue;
                                         }
 
-                                        if message.matches(&websocket_handler.connection_id, &socket_jwt.user_uuid, &socket_jwt.permissions) {
+                                        if message.matches(&websocket_handler.connection_id, &socket_jwt.user_uuid, |permission| {
+                                            socket_jwt.has_live_permission(&server.user_permissions, permission)
+                                        }) {
                                             websocket_handler.send_message(
                                                 message.into_message()
                                             ).await;
@@ -356,7 +379,7 @@ pub async fn handle_ws(
                         if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                             loop {
                                 match stdout.recv().await {
-                                    Ok(stdout) => {
+                                    Ok(line) => {
                                         if !websocket_handler.has_calagopus_permission_or(Permission::ControlReadConsole, true).await.is_ok_and(|h| h)
                                         {
                                             websocket_handler
@@ -366,13 +389,18 @@ pub async fn handle_ws(
                                             continue 'outer;
                                         }
 
-                                        websocket_handler.send_message(
+                                        let mut lines = vec![line];
+                                        while let Ok(line) = stdout.try_recv() {
+                                            lines.push(line);
+                                        }
+
+                                        websocket_handler.send_messages(lines.into_iter().map(|line| {
                                             websocket::WebsocketMessage::builder(
                                                 websocket::WebsocketEvent::ServerConsoleOutput,
                                             )
-                                            .arg(stdout.to_compact_string())
-                                            .build(),
-                                        )
+                                            .arg(line.as_str())
+                                            .build()
+                                        }))
                                         .await;
                                     }
                                     Err(RecvError::Closed) => break,

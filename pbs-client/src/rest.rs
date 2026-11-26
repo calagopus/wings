@@ -70,6 +70,21 @@ impl PbsClient {
             .await
             .map_err(|err| self.map_transport(err))?;
 
+        if response.status() == StatusCode::BAD_REQUEST {
+            let message = response.text().await.unwrap_or_default();
+            if message.contains("(os error 2)") || message.contains("No such file or directory") {
+                return Err(PbsError::SnapshotNotFound {
+                    backup_id: backup_id.into(),
+                    backup_time,
+                });
+            }
+
+            return Err(PbsError::Http {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                message: truncate_message(&message),
+            });
+        }
+
         self.check_status(response).await?;
 
         Ok(())
@@ -109,15 +124,10 @@ impl PbsClient {
                 datastore: self.config.datastore.clone(),
             },
             other => {
-                let message = response
-                    .text()
-                    .await
-                    .ok()
-                    .map(|t| t.chars().take(512).collect::<String>())
-                    .unwrap_or_default();
+                let message = response.text().await.unwrap_or_default();
                 PbsError::Http {
                     status: other.as_u16(),
-                    message: message.into(),
+                    message: truncate_message(&message),
                 }
             }
         })
@@ -161,4 +171,8 @@ fn error_chain(err: &reqwest::Error) -> String {
         source = cause.source();
     }
     out
+}
+
+fn truncate_message(message: &str) -> CompactString {
+    message.chars().take(512).collect()
 }

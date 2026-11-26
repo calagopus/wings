@@ -6,15 +6,53 @@ use compact_str::ToCompactString;
 use futures::TryStreamExt;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+
+async fn is_database_dump(filesystem: &dyn VirtualReadableFilesystem, uuid: uuid::Uuid) -> bool {
+    let Ok(listing) = filesystem
+        .async_read_dir(
+            &"",
+            Some(2),
+            1,
+            Default::default(),
+            crate::models::DirectorySortingMode::default(),
+        )
+        .await
+    else {
+        return false;
+    };
+    let prefix = format!("{uuid}.");
+
+    listing.total_entries == 1
+        && listing
+            .entries
+            .first()
+            .is_some_and(|entry| !entry.directory && entry.name.starts_with(&prefix))
+}
 
 pub struct BackupManager {
     cached_backups: moka::future::Cache<uuid::Uuid, Arc<super::Backup>>,
     cached_browse_backups: moka::future::Cache<uuid::Uuid, Arc<dyn VirtualReadableFilesystem>>,
-    cached_browse_backup_locks: moka::future::Cache<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>,
+    cached_browse_backup_locks: crate::utils::KeyedLocks<uuid::Uuid>,
     cached_backup_adapters: moka::future::Cache<uuid::Uuid, BackupAdapter>,
     database_backup_restores: tokio::sync::broadcast::Sender<DatabaseBackupRestore>,
+    active: AtomicUsize,
+}
+
+struct ActiveBackup<'a>(&'a AtomicUsize);
+
+impl<'a> ActiveBackup<'a> {
+    fn new(active: &'a AtomicUsize) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveBackup<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -74,12 +112,19 @@ impl Default for BackupManager {
                 .time_to_live(std::time::Duration::from_mins(5))
                 .build(),
             cached_backup_adapters: moka::future::Cache::new(1024),
-            cached_browse_backup_locks: moka::future::Cache::new(10240),
+            cached_browse_backup_locks: crate::utils::KeyedLocks::new(),
+            active: AtomicUsize::new(0),
         }
     }
 }
 
 impl BackupManager {
+    /// Backups being created or database backups being restored.
+    #[inline]
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
     pub fn subscribe_database_backup_restores(&self) -> DatabaseBackupRestoreWaiter {
         DatabaseBackupRestoreWaiter {
             receiver: self.database_backup_restores.subscribe(),
@@ -102,8 +147,12 @@ impl BackupManager {
     }
 
     pub async fn fast_contains(&self, server: &crate::server::Server, uuid: uuid::Uuid) -> bool {
-        self.cached_backups.contains_key(&uuid)
-            || server.configuration.read().await.backups.contains(&uuid)
+        if self.cached_backups.contains_key(&uuid) {
+            return true;
+        }
+
+        let configuration = server.configuration.read().await;
+        configuration.backups.contains(&uuid) || configuration.database_backups.contains(&uuid)
     }
 
     pub async fn create(
@@ -113,6 +162,8 @@ impl BackupManager {
         uuid: uuid::Uuid,
         ignore: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         tracing::info!(
             server = %server.uuid,
             backup = %uuid,
@@ -139,6 +190,8 @@ impl BackupManager {
         for line in server.configuration.read().await.egg.file_denylist.iter() {
             ignore_builder.push_line(line);
         }
+
+        ignore_builder.push_line(&crate::server::filesystem::trash::ignore_line());
 
         let ignore_raw = ignore_builder.raw().to_compact_string();
         let ignore = ignore_builder.build()?;
@@ -399,7 +452,12 @@ impl BackupManager {
             }))
             .build(),
         )?;
-        server.configuration.write().await.backups.push(uuid);
+        server
+            .configuration
+            .write()
+            .await
+            .database_backups
+            .push(uuid);
         self.cached_backup_adapters.insert(uuid, adapter).await;
 
         Ok(backup)
@@ -413,6 +471,8 @@ impl BackupManager {
         database_instance: uuid::Uuid,
         extension: &str,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         tracing::info!(
             server = %server.uuid,
             backup = %uuid,
@@ -446,28 +506,41 @@ impl BackupManager {
             .await;
 
         let result = async {
-            super::validate_dump_extension(extension)?;
+            super::parse_dump_extension(extension)?;
 
-            let response = server
-                .app_state
-                .config
-                .client
-                .database_backup_source(uuid, database_instance)
-                .await?;
-            if let Some(length) = response.content_length() {
-                total.store(length, Ordering::SeqCst);
-            }
+            let source: super::DumpSource = Box::pin({
+                let state = Arc::clone(&server.app_state);
+                let progress = Arc::clone(&progress);
+                let total = Arc::clone(&total);
 
-            let reader = tokio_util::io::StreamReader::new(
-                response.bytes_stream().map_err(std::io::Error::other),
-            );
-            let reader = crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
-                reader,
-                Arc::clone(&progress),
-            );
+                async move {
+                    let response = state
+                        .config
+                        .client
+                        .database_backup_source(uuid, database_instance)
+                        .await?;
+                    if let Some(length) = response.content_length() {
+                        total.store(length, Ordering::SeqCst);
+                    }
+
+                    let reader =
+                        tokio_util::io::StreamReader::new(response.bytes_stream().map_err(|err| {
+                            std::io::Error::other(
+                                anyhow::Error::from(err)
+                                    .context("failed to read database dump from panel"),
+                            )
+                        }));
+
+                    Ok(Box::new(
+                        crate::io::counting_reader::AsyncCountingReader::new_with_bytes_read(
+                            reader, progress,
+                        ),
+                    ) as super::DumpReader)
+                }
+            });
 
             adapter
-                .create_from_stream(&server.app_state, uuid, extension, Box::new(reader))
+                .create_from_stream(&server.app_state, uuid, extension, source)
                 .await
         }
         .await;
@@ -496,6 +569,8 @@ impl BackupManager {
         download_url: Option<compact_str::CompactString>,
         request_uuid: Option<uuid::Uuid>,
     ) -> Result<(), anyhow::Error> {
+        let _active = ActiveBackup::new(&self.active);
+
         let completion = request_uuid.map(|uuid| self.start_database_backup_restore(uuid));
         let uuid = backup.uuid();
 
@@ -622,7 +697,7 @@ impl BackupManager {
             ));
         }
         if let Err(err) = server
-            .stop_with_kill_timeout(std::time::Duration::from_secs(30), false)
+            .stop_with_kill_timeout(None, std::time::Duration::from_secs(30), false)
             .await
         {
             tracing::error!(
@@ -838,27 +913,22 @@ impl BackupManager {
 
         if let Some(backup) = self.find(&server.app_state, uuid).await? {
             let server = server.clone();
-            let cached_browse_backup_locks = self.cached_browse_backup_locks.clone();
+            let lock = self.cached_browse_backup_locks.get(uuid);
             let cached_browse_backups = self.cached_browse_backups.clone();
 
             return tokio::spawn(async move {
-                let _guard = if let Some(lock) = cached_browse_backup_locks.get(&uuid).await {
-                    lock
-                } else {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    cached_browse_backup_locks
-                        .insert(uuid, Arc::clone(&lock))
-                        .await;
-
-                    lock
-                };
-                let _guard = _guard.lock().await;
+                let _guard = lock.lock().await;
 
                 if let Some(browse_backup) = cached_browse_backups.get(&uuid).await {
                     return Ok(Some(browse_backup));
                 }
 
                 let browse_backup = backup.browse(&server).await?;
+                if is_database_dump(&*browse_backup, uuid).await {
+                    browse_backup.close().await.ok();
+
+                    return Err(anyhow::anyhow!("database backups cannot be browsed"));
+                }
 
                 cached_browse_backups
                     .insert(uuid, Arc::clone(&browse_backup))
@@ -872,9 +942,12 @@ impl BackupManager {
         Ok(None)
     }
 
-    pub async fn invalidate_cached_browse(&self, uuid: uuid::Uuid) {
-        self.cached_browse_backup_locks.invalidate(&uuid).await;
+    pub async fn invalidate_cached_backup(&self, uuid: uuid::Uuid) {
+        self.cached_backups.invalidate(&uuid).await;
+        self.cached_backup_adapters.invalidate(&uuid).await;
+    }
 
+    pub async fn invalidate_cached_browse(&self, uuid: uuid::Uuid) {
         if let Some(browse) = self.cached_browse_backups.remove(&uuid).await
             && let Err(err) = browse.close().await
         {
@@ -882,7 +955,6 @@ impl BackupManager {
         }
 
         self.cached_browse_backups.run_pending_tasks().await;
-        self.cached_browse_backup_locks.run_pending_tasks().await;
     }
 }
 
@@ -1021,5 +1093,45 @@ mod tests {
 
             wait.await
         })
+    }
+
+    // is_database_dump
+    #[test]
+    fn database_dump_is_a_lone_regular_file_named_after_the_backup() {
+        crate::server::Server::with_mock(|server| async move {
+            let uuid = uuid::Uuid::new_v4();
+            let dump = format!("{uuid}.sql");
+            let other = format!("{}.sql", uuid::Uuid::new_v4());
+            let bare = uuid.to_string();
+
+            let cases: [(&[&str], &[&str], bool); 6] = [
+                (&[dump.as_str()], &[], true),
+                (&[other.as_str()], &[], false),
+                (&[], &[dump.as_str()], false),
+                (&[dump.as_str(), "extra.txt"], &[], false),
+                (&[], &[], false),
+                (&[bare.as_str()], &[], false),
+            ];
+
+            for (files, dirs, expected) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                for file in files {
+                    std::fs::write(temp.path().join(file), b"dump").unwrap();
+                }
+                for dir in dirs {
+                    std::fs::create_dir(temp.path().join(dir)).unwrap();
+                }
+                let filesystem = crate::server::filesystem::cap::CapFilesystem::new(temp.path())
+                    .await
+                    .unwrap()
+                    .get_virtual(server.clone());
+
+                assert_eq!(
+                    is_database_dump(&filesystem, uuid).await,
+                    expected,
+                    "{files:?} {dirs:?}"
+                );
+            }
+        });
     }
 }

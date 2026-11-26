@@ -60,7 +60,7 @@ mod get {
     ) -> Result<compact_str::CompactString, anyhow::Error> {
         let file_read = filesystem.async_read_file(path, None).await?;
         let mut file = file_read.reader;
-        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
+        let mut buffer = crate::io::mem_buffer(crate::FILE_STREAM_BUFFER_SIZE);
 
         Ok(match algorithm {
             Algorithm::Md5 => {

@@ -22,6 +22,11 @@ mod get {
         token: String,
     }
 
+    enum FileMiss {
+        Missing,
+        Unsatisfiable(u64),
+    }
+
     #[derive(Deserialize)]
     pub struct FileJwtPayload {
         #[serde(flatten)]
@@ -45,6 +50,7 @@ mod get {
         (status = OK, body = String),
         (status = UNAUTHORIZED, body = String),
         (status = NOT_FOUND, body = String),
+        (status = RANGE_NOT_SATISFIABLE, body = String),
         (status = EXPECTATION_FAILED, body = String),
     ), params(
         (
@@ -82,59 +88,79 @@ mod get {
             .await;
         let path = root.join(file_name);
 
-        let metadata = match filesystem.async_metadata(&path).await {
-            Ok(metadata) => {
-                if !metadata.file_type.is_file() {
-                    return ApiResponse::error("file not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                } else {
-                    metadata
+        let range = ByteRange::from_headers(&headers);
+
+        let file = if filesystem.is_fast() {
+            tokio::task::spawn_blocking(move || {
+                let metadata = match filesystem.metadata(&path) {
+                    Ok(metadata) if metadata.file_type.is_file() => metadata,
+                    _ => return Err(FileMiss::Missing),
+                };
+                if let Some(range) = range
+                    && range.resolve(metadata.size).is_none()
+                {
+                    return Err(FileMiss::Unsatisfiable(metadata.size));
+                }
+
+                match filesystem.read_file(&path, range) {
+                    Ok(file_read) => Ok((
+                        file_read.headers(),
+                        ApiResponse::new_read_stream(file_read.reader, file_read.size),
+                        metadata.modified,
+                    )),
+                    Err(_) => Err(FileMiss::Missing),
+                }
+            })
+            .await
+            .map_err(anyhow::Error::from)?
+        } else {
+            async {
+                let metadata = match filesystem.async_metadata(&path).await {
+                    Ok(metadata) if metadata.file_type.is_file() => metadata,
+                    _ => return Err(FileMiss::Missing),
+                };
+                if let Some(range) = range
+                    && range.resolve(metadata.size).is_none()
+                {
+                    return Err(FileMiss::Unsatisfiable(metadata.size));
+                }
+
+                match filesystem.async_read_file(&path, range).await {
+                    Ok(file_read) => {
+                        let headers = file_read.headers();
+                        let reader = AsyncFixedReader::new_with_fixed_bytes(
+                            file_read.reader,
+                            file_read.size as usize,
+                        );
+
+                        Ok((
+                            headers,
+                            ApiResponse::new_stream_with_capacity(
+                                reader,
+                                crate::FILE_STREAM_BUFFER_SIZE,
+                            ),
+                            metadata.modified,
+                        ))
+                    }
+                    Err(_) => Err(FileMiss::Missing),
                 }
             }
-            Err(_) => {
+            .await
+        };
+
+        let (mut headers, response, modified) = match file {
+            Ok(file) => file,
+            Err(FileMiss::Missing) => {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
                     .ok();
             }
-        };
-
-        let range = ByteRange::from_headers(&headers);
-        let (mut headers, response) = if filesystem.is_fast() {
-            let file_read =
-                match tokio::task::spawn_blocking(move || filesystem.read_file(&path, range))
-                    .await
-                    .map_err(anyhow::Error::from)?
-                {
-                    Ok(file) => file,
-                    Err(_) => {
-                        return ApiResponse::error("file not found")
-                            .with_status(StatusCode::NOT_FOUND)
-                            .ok();
-                    }
-                };
-
-            (
-                file_read.headers(),
-                ApiResponse::new_read_stream(file_read.reader, file_read.size),
-            )
-        } else {
-            let file_read = match filesystem.async_read_file(&path, range).await {
-                Ok(file) => file,
-                Err(_) => {
-                    return ApiResponse::error("file not found")
-                        .with_status(StatusCode::NOT_FOUND)
-                        .ok();
-                }
-            };
-            let headers = file_read.headers();
-            let reader =
-                AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize);
-
-            (
-                headers,
-                ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE),
-            )
+            Err(FileMiss::Unsatisfiable(size)) => {
+                return ApiResponse::error("range not satisfiable")
+                    .with_status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .with_header("Content-Range", &format!("bytes */{size}"))
+                    .ok();
+            }
         };
         let is_range = headers.contains_key(axum::http::header::CONTENT_RANGE);
 
@@ -148,7 +174,7 @@ mod get {
         );
         headers.insert("Content-Type", "application/octet-stream".parse()?);
 
-        if let Some(modified) = &metadata.modified {
+        if let Some(modified) = modified {
             let modified = chrono::DateTime::from_timestamp(
                 modified
                     .duration_since(std::time::UNIX_EPOCH)

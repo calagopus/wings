@@ -19,16 +19,19 @@ fn is_assignable_ip(ip: &IpAddr) -> bool {
 
 pub async fn assignable_host_ips(
     docker_network_name: String,
-) -> Result<BTreeSet<IpAddr>, tokio::task::JoinError> {
-    let networks = tokio::task::spawn_blocking(sysinfo::Networks::new_with_refreshed_list).await?;
+) -> Result<BTreeSet<IpAddr>, anyhow::Error> {
+    let networks =
+        tokio::task::spawn_blocking(sysinfo::Networks::new_with_refreshed_list).await??;
 
     Ok(networks
         .iter()
         .filter(|(name, _)| {
-            *name != &docker_network_name
-                && !name.starts_with("docker")
-                && !name.starts_with("br-")
-                && !name.starts_with("veth")
+            let name = name.as_encoded_bytes();
+
+            name != docker_network_name.as_bytes()
+                && !name.starts_with(b"docker")
+                && !name.starts_with(b"br-")
+                && !name.starts_with(b"veth")
         })
         .flat_map(|(_, data)| data.ip_networks())
         .map(|network| network.addr)
@@ -85,6 +88,13 @@ pub fn is_single_component_file_name(name: &str) -> bool {
         (Some(std::path::Component::Normal(component)), None) => component.to_str() == Some(name),
         _ => false,
     }
+}
+
+pub fn is_log_file_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|c| matches!(c, '\\' | '%' | '?' | '#') || c.is_control())
+        && is_single_component_file_name(name)
 }
 
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
@@ -211,18 +221,27 @@ pub fn is_valid_utf8_slice(s: &[u8]) -> bool {
     }
 }
 
-pub async fn read_limited_multipart_field(
+pub async fn read_limited_multipart_bytes(
     field: &mut axum::extract::multipart::Field<'_>,
     max_len: usize,
-) -> Result<String, anyhow::Error> {
-    let mut buf = String::new();
+) -> Result<Vec<u8>, anyhow::Error> {
+    let mut buf = Vec::new();
     while let Some(chunk) = field.chunk().await? {
         if buf.len().saturating_add(chunk.len()) > max_len {
             anyhow::bail!("multipart field exceeds maximum length of {max_len} bytes");
         }
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+pub async fn read_limited_multipart_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_len: usize,
+) -> Result<String, anyhow::Error> {
+    let buf = read_limited_multipart_bytes(field, max_len).await?;
+
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
@@ -364,6 +383,29 @@ impl PortablePermissions {
     #[inline]
     pub fn mode(&self) -> u16 {
         self.mode
+    }
+
+    #[cfg(not(unix))]
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.mode & 0o200 == 0
+    }
+
+    /// Whether creating something with this mode through a mode-taking syscall (e.g. `mkdirat`)
+    /// may lose bits to the process umask, meaning a follow-up chmod is required.
+    /// The umask is read once from `/proc/self/status`; if unavailable this is always `true`.
+    #[cfg(unix)]
+    pub fn masked_by_umask(self) -> bool {
+        static UMASK: LazyLock<Option<u16>> = LazyLock::new(|| {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let umask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:"))?;
+
+            u16::from_str_radix(umask.trim(), 8).ok()
+        });
+
+        UMASK.is_none_or(|umask| self.mode & umask != 0)
     }
 
     #[inline]
@@ -570,6 +612,34 @@ impl CmpExt for Path {
     }
 }
 
+/// serde-saphyr expands every alias into a full copy of its anchor, so a few hundred KB of
+/// aliases can materialize into many GB; YAML parsed from untrusted input never needs them.
+pub fn yaml_deserialize_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        alias_limits: serde_saphyr::alias_limits! {
+            max_alias_expansions_per_anchor: 0,
+        },
+    }
+}
+
+/// Whether the error comes from a budget or alias limit rather than malformed YAML.
+pub fn is_yaml_limit_error(mut err: &serde_saphyr::Error) -> bool {
+    while let serde_saphyr::Error::AliasError { error, .. }
+    | serde_saphyr::Error::WithSnippet { error, .. } = err
+    {
+        err = error;
+    }
+
+    matches!(
+        err,
+        serde_saphyr::Error::Budget { .. }
+            | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. }
+            | serde_saphyr::Error::AliasReplayCounterOverflow { .. }
+    )
+}
+
 #[cfg(target_os = "linux")]
 pub fn process_memory_usage() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -591,6 +661,66 @@ pub fn process_memory_usage() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 pub fn process_memory_usage() -> Option<u64> {
     None
+}
+
+pub fn next_aligned_instant(period: std::time::Duration) -> std::time::Instant {
+    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+    let periods = EPOCH.elapsed().as_nanos() / period.as_nanos().max(1) + 1;
+
+    *EPOCH + period.saturating_mul(u32::try_from(periods).unwrap_or(u32::MAX))
+}
+
+pub fn aligned_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::from_std(next_aligned_instant(period)),
+        period,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    interval
+}
+
+/// A map of per-key async mutexes. An entry lives exactly as long as someone holds its
+/// mutex, so two callers asking for the same key always share one mutex, unlike a
+/// bounded cache, which can evict or refuse an entry that is still in use.
+pub struct KeyedLocks<K> {
+    locks:
+        parking_lot::Mutex<std::collections::HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K: std::hash::Hash + Eq> KeyedLocks<K> {
+    pub fn new() -> Self {
+        Self {
+            locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: K) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock();
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+
+        if locks.len() >= locks.capacity() {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, std::sync::Arc::downgrade(&lock));
+
+        lock
+    }
+
+    pub async fn lock(&self, key: K) -> tokio::sync::OwnedMutexGuard<()> {
+        self.get(key).lock_owned().await
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +762,28 @@ mod tests {
         assert!(!is_single_component_file_name("."));
         assert!(!is_single_component_file_name(".."));
         assert!(!is_single_component_file_name("./x"));
+    }
+
+    // is_log_file_name
+
+    #[test]
+    fn log_file_name_accepts_rotated_and_compressed_logs() {
+        assert!(is_log_file_name("wings.log"));
+        assert!(is_log_file_name("wings.2026-11-10.log"));
+        assert!(is_log_file_name("wings.log.gz"));
+    }
+
+    #[test]
+    fn log_file_name_rejects_url_significant_characters() {
+        assert!(!is_log_file_name("..\\config"));
+        assert!(!is_log_file_name("a\\b"));
+        assert!(!is_log_file_name("%2e%2e"));
+        assert!(!is_log_file_name("a?b"));
+        assert!(!is_log_file_name("a#b"));
+        assert!(!is_log_file_name("a\0b"));
+        assert!(!is_log_file_name("a\nb"));
+        assert!(!is_log_file_name("../config"));
+        assert!(!is_log_file_name(".."));
     }
 
     // draw_progress_bar

@@ -8,6 +8,16 @@ mod post {
         server::installation::InstallationScript,
     };
     use axum::http::StatusCode;
+    use serde::Deserialize;
+    use utoipa::ToSchema;
+
+    #[derive(ToSchema, Deserialize)]
+    pub struct Payload {
+        #[serde(flatten)]
+        script: InstallationScript,
+
+        timeout_seconds: Option<u64>,
+    }
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = String),
@@ -17,13 +27,19 @@ mod post {
             description = "The server uuid",
             example = "123e4567-e89b-12d3-a456-426614174000",
         ),
-    ), request_body = InstallationScript)]
+    ), request_body = inline(Payload))]
     pub async fn route(
         state: GetState,
         server: GetServer,
-        crate::Payload(data): crate::Payload<InstallationScript>,
+        crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        match crate::server::script::script_server(&server, &state.executor, data).await {
+        let timeout = data
+            .timeout_seconds
+            .filter(|seconds| *seconds > 0)
+            .map(std::time::Duration::from_secs);
+        match crate::server::script::script_server(&server, &state.executor, data.script, timeout)
+            .await
+        {
             Ok(stdout_stream) => ApiResponse::new_stream(stdout_stream)
                 .with_header("Content-Type", "text/plain")
                 .ok(),

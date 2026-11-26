@@ -1,4 +1,5 @@
 use crate::utils::{PortablePermissions, PortablePermissionsApplier};
+use futures::ready;
 use positioned_io::{ReadAt, WriteAt};
 use std::{
     future::Future,
@@ -11,6 +12,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub const ALLOCATION_THRESHOLD: i64 = 1024 * 1024; // 1 MiB
+
+type NoCheck = fn(&std::fs::File) -> Result<(), anyhow::Error>;
 
 pub struct ServerFile {
     server: crate::server::Server,
@@ -35,31 +38,65 @@ fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) ->
     false
 }
 
-/// Opens `path` with `options`, runs `check` on the opened file and only then
-/// truncates it when asked, so nothing is lost before the check passes. Returns
-/// the file and its size before truncation.
+/// Opens `path` with `options`, runs `check`, if any, on the opened file and only then
+/// truncates it when asked, so nothing is lost before the check passes. An empty
+/// file the open created is removed again when the check rejects it. Returns
+/// the file, its size before truncation and its metadata from before truncation.
 fn open_and_check(
     server: &crate::server::Server,
     path: &Path,
     mut options: cap_std::fs::OpenOptions,
     truncate: bool,
-    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
-) -> Result<(std::fs::File, u64), anyhow::Error> {
+    check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
+) -> Result<(std::fs::File, u64, Option<std::fs::Metadata>), anyhow::Error> {
     options.truncate(false);
 
+    let missing = check.is_some()
+        && server
+            .filesystem
+            .metadata(path)
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
     let file = server.filesystem.open_with(path, options)?;
-    check(&file)?;
-    let previous_size = file
-        .metadata()
-        .ok()
+    if let Some(check) = check
+        && let Err(err) = check(&file)
+    {
+        if missing {
+            remove_created(server, &file);
+        }
+
+        return Err(err);
+    }
+    let metadata = file.metadata().ok();
+    let previous_size = metadata
+        .as_ref()
         .filter(|metadata| metadata.is_file())
         .map_or(0, |metadata| metadata.len());
     if truncate && previous_size > 0 {
         file.set_len(0)?;
     }
 
-    Ok((file, previous_size))
+    Ok((file, previous_size, metadata))
 }
+
+#[cfg(target_os = "linux")]
+fn remove_created(server: &crate::server::Server, file: &std::fs::File) {
+    if !file.metadata().is_ok_and(|metadata| metadata.len() == 0) {
+        return;
+    }
+
+    if let Ok(created) = server.filesystem.opened_relative_path(file)
+        && let Err(err) = server.filesystem.remove_file(&created)
+    {
+        tracing::debug!(
+            path = %created.display(),
+            "failed to remove file created before a rejected open: {:?}",
+            err
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_created(_server: &crate::server::Server, _file: &std::fs::File) {}
 
 fn parent_components(
     server: &crate::server::Server,
@@ -81,7 +118,7 @@ fn open_destination(
     server: &crate::server::Server,
     destination: &Path,
     permissions: Option<PortablePermissions>,
-    check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+    check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
 ) -> Result<(std::fs::File, u64), anyhow::Error> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create(true);
@@ -90,17 +127,25 @@ fn open_destination(
         cap_std::fs::OpenOptionsExt::mode(&mut options, permissions.mode().into());
     }
 
-    let (file, previous_size) = open_and_check(server, destination, options, true, check)?;
+    let (file, previous_size, metadata) =
+        open_and_check(server, destination, options, true, check)?;
+
+    // chown runs first since it clears setuid/setgid, which the chmod may be asked to set
+    let chowned = !metadata
+        .as_ref()
+        .is_some_and(|metadata| server.filesystem.is_owned(metadata));
+    if chowned {
+        server.filesystem.chown_file(&file)?;
+    }
 
     if let Some(permissions) = permissions
-        && !file
-            .metadata()
-            .is_ok_and(|metadata| has_mode(&metadata, permissions))
+        && ((chowned && permissions.mode() & 0o6000 != 0)
+            || !metadata
+                .as_ref()
+                .is_some_and(|metadata| has_mode(metadata, permissions)))
     {
         file.apply_permissions(permissions)?;
     }
-
-    server.filesystem.chown_file(&file)?;
 
     Ok((file, previous_size))
 }
@@ -112,7 +157,7 @@ impl ServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_checked(server, destination, permissions, modified, |_| Ok(()))
+        Self::new_checked(server, destination, permissions, modified, None::<NoCheck>)
     }
 
     /// Like [`Self::new`], but runs `check` on the opened file before it is
@@ -122,7 +167,7 @@ impl ServerFile {
         destination: &Path,
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
     ) -> Result<Self, anyhow::Error> {
         let (file, previous_size) = open_destination(&server, destination, permissions, check)?;
 
@@ -140,31 +185,15 @@ impl ServerFile {
         path: &Path,
         options: cap_std::fs::OpenOptions,
         truncate: bool,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error>>,
     ) -> Result<Self, anyhow::Error> {
-        let (file, previous_size) = open_and_check(&server, path, options, truncate, check)?;
+        let (file, previous_size, _) = open_and_check(&server, path, options, truncate, check)?;
 
         if truncate {
             Self::wrap(server, path, file, -(previous_size as i64), 0)
         } else {
             Self::wrap(server, path, file, 0, previous_size)
         }
-    }
-
-    /// Wraps an already opened file, accounting only for what is written past
-    /// `initial_size`.
-    ///
-    /// Positions are counted from this handle, not from the file, so `initial_size`
-    /// must be `0` for an `O_APPEND` handle: writes there land at the end of the file
-    /// while the handle's own position starts at zero, and any other value would leave
-    /// that many appended bytes uncharged.
-    pub fn new_file(
-        server: crate::server::Server,
-        destination: &Path,
-        file: std::fs::File,
-        initial_size: u64,
-    ) -> Result<Self, anyhow::Error> {
-        Self::wrap(server, destination, file, 0, initial_size)
     }
 
     fn wrap(
@@ -188,30 +217,36 @@ impl ServerFile {
         })
     }
 
-    /// Skip Disk Limit Checks
-    pub fn ignorant(mut self) -> Self {
-        self.ignorant = true;
-        self
+    fn file(&self) -> std::io::Result<&std::fs::File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
     }
 
-    pub fn with_transfer_limits(self) -> Self {
-        if self.server.app_state.config.load().runtime.backend
-            == crate::config::RuntimeBackend::Incus
-        {
-            self
-        } else {
-            self.ignorant()
-        }
+    fn file_mut(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
+    }
+
+    /// Skip Disk Limit Checks if `ignorant` is set
+    pub fn ignorant_if(mut self, ignorant: bool) -> Self {
+        self.ignorant |= ignorant;
+        self
     }
 
     pub fn sync_all(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_ref() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file()?;
 
         file.sync_all()
+    }
+
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        let file = self.file()?;
+
+        file.metadata()
     }
 
     fn allocate_accumulated(&mut self) -> std::io::Result<()> {
@@ -236,9 +271,7 @@ impl ServerFile {
 
 impl Write for ServerFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let written = file.write(buf)?;
 
@@ -260,9 +293,7 @@ impl Write for ServerFile {
     fn flush(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Write::flush(file)
     }
@@ -272,9 +303,7 @@ impl Seek for ServerFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let new_pos = file.seek(pos)?;
 
@@ -286,9 +315,7 @@ impl Seek for ServerFile {
 
 impl Read for ServerFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         file.read(buf)
     }
@@ -296,9 +323,7 @@ impl Read for ServerFile {
 
 impl ReadAt for ServerFile {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_ref() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file()?;
 
         file.read_at(pos, buf)
     }
@@ -306,9 +331,7 @@ impl ReadAt for ServerFile {
 
 impl WriteAt for ServerFile {
     fn write_at(&mut self, pos: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         let written = file.write_at(pos, buf)?;
         let end = pos.saturating_add(written as u64);
@@ -330,9 +353,7 @@ impl WriteAt for ServerFile {
     fn flush(&mut self) -> std::io::Result<()> {
         self.allocate_accumulated()?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Write::flush(file)
     }
@@ -389,7 +410,7 @@ impl AsyncServerFile {
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_checked(server, destination, permissions, modified, |_| Ok(())).await
+        Self::new_checked(server, destination, permissions, modified, None::<NoCheck>).await
     }
 
     /// Async counterpart of [`ServerFile::new_checked`].
@@ -398,7 +419,7 @@ impl AsyncServerFile {
         destination: &Path,
         permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
-        check: impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static,
+        check: Option<impl FnOnce(&std::fs::File) -> Result<(), anyhow::Error> + Send + 'static>,
     ) -> Result<Self, anyhow::Error> {
         let (file, previous_size) = tokio::task::spawn_blocking({
             let server = server.clone();
@@ -415,8 +436,13 @@ impl AsyncServerFile {
         Ok(file)
     }
 
-    /// Async counterpart of [`ServerFile::new_file`], with the same `initial_size`
-    /// requirement for `O_APPEND` handles.
+    /// Wraps an already opened file, accounting only for what is written past
+    /// `initial_size`.
+    ///
+    /// Positions are counted from this handle, not from the file, so `initial_size`
+    /// must be `0` for an `O_APPEND` handle: writes there land at the end of the file
+    /// while the handle's own position starts at zero, and any other value would leave
+    /// that many appended bytes uncharged.
     pub fn new_file(
         server: crate::server::Server,
         destination: &Path,
@@ -449,10 +475,15 @@ impl AsyncServerFile {
         })
     }
 
-    /// Skip Disk Limit Checks
-    #[allow(dead_code)]
-    pub fn ignorant(mut self) -> Self {
-        self.ignorant = true;
+    fn file_mut(&mut self) -> std::io::Result<&mut tokio::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("file is not available"))
+    }
+
+    /// Skip Disk Limit Checks if `ignorant` is set
+    pub fn ignorant_if(mut self, ignorant: bool) -> Self {
+        self.ignorant |= ignorant;
         self
     }
 
@@ -506,15 +537,9 @@ impl AsyncWrite for AsyncServerFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         let result = Pin::new(file).poll_write(cx, buf);
 
@@ -537,49 +562,29 @@ impl AsyncWrite for AsyncServerFile {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
         if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
-            match self.poll_allocation(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(self.poll_allocation(cx))?;
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
         if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
-            match self.poll_allocation(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(self.poll_allocation(cx))?;
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_shutdown(cx)
     }
@@ -591,23 +596,15 @@ impl AsyncSeek for AsyncServerFile {
             self.start_allocation();
         }
 
-        let Some(file) = self.file.as_mut() else {
-            return Err(std::io::Error::other("file is not available"));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).start_seek(position)
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
-        match self.poll_allocation(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self.poll_allocation(cx))?;
 
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         let result = Pin::new(file).poll_complete(cx);
 
@@ -625,9 +622,7 @@ impl AsyncRead for AsyncServerFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let Some(file) = self.file.as_mut() else {
-            return Poll::Ready(Err(std::io::Error::other("file is not available")));
-        };
+        let file = self.file_mut()?;
 
         Pin::new(file).poll_read(cx, buf)
     }
@@ -635,17 +630,28 @@ impl AsyncRead for AsyncServerFile {
 
 impl Drop for AsyncServerFile {
     fn drop(&mut self) {
-        let leftover = self.accumulated_bytes + self.allocating_bytes;
-        if leftover != 0 {
+        let in_progress = self.allocation_in_progress.take();
+        let accumulated = self.accumulated_bytes;
+        if in_progress.is_some() || accumulated != 0 {
             let server = self.server.clone();
             let parent = self.parent.clone();
+            let allocating = self.allocating_bytes;
             let ignorant = self.ignorant;
 
             tokio::spawn(async move {
-                server
-                    .filesystem
-                    .async_allocate_in_path_iterator(&parent, leftover, ignorant)
-                    .await;
+                let mut leftover = accumulated;
+                if let Some(in_progress) = in_progress
+                    && !in_progress.await
+                {
+                    leftover += allocating;
+                }
+
+                if leftover != 0 {
+                    server
+                        .filesystem
+                        .async_allocate_in_path_iterator(&parent, leftover, ignorant)
+                        .await;
+                }
             });
         }
 
@@ -662,5 +668,83 @@ impl Drop for AsyncServerFile {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reject(_: &std::fs::File) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!("rejected"))
+    }
+
+    // ServerFile::new_checked
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_checked_rejection_removes_file_it_created() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("new.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert!(!root.join("new.txt").exists());
+        });
+    }
+
+    #[test]
+    fn new_checked_rejection_keeps_existing_content() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::write(root.join("old.txt"), b"content").unwrap();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("old.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"content");
+        });
+    }
+
+    #[test]
+    fn new_checked_rejection_keeps_existing_empty_file() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::write(root.join("empty.txt"), b"").unwrap();
+
+            let result = ServerFile::new_checked(
+                server.clone(),
+                Path::new("empty.txt"),
+                None,
+                None,
+                Some(reject),
+            );
+            assert!(result.is_err());
+            assert!(root.join("empty.txt").exists());
+        });
+    }
+
+    // ServerFile::new
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn new_creates_missing_file() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+
+            let file = ServerFile::new(server.clone(), Path::new("created.txt"), None, None);
+            assert!(file.is_ok());
+            drop(file);
+            assert!(root.join("created.txt").is_file());
+        });
     }
 }

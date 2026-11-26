@@ -7,6 +7,7 @@ mod put {
         routes::{ApiError, api::servers::_server_::GetServer},
     };
     use serde::{Deserialize, Serialize};
+    use std::path::Path;
     use utoipa::ToSchema;
 
     fn true_fn() -> bool {
@@ -35,6 +36,7 @@ mod put {
     #[utoipa::path(put, path = "/", responses(
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
+        (status = EXPECTATION_FAILED, body = ApiError),
     ), params(
         (
             "server" = uuid::Uuid,
@@ -59,7 +61,23 @@ mod put {
             crate::server::filesystem::RenameParents::Require
         };
 
+        super::super::reject_any_protected(
+            &server,
+            &data
+                .files
+                .iter()
+                .flat_map(|file| {
+                    [
+                        Path::new(&data.root).join(&file.from),
+                        Path::new(&data.root).join(&file.to),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         let mut renamed_count = 0;
+        let mut kept_ignored = false;
         for file in data.files {
             let from = root.join(file.from);
             if from == root {
@@ -97,6 +115,19 @@ mod put {
                 continue;
             }
 
+            let holds_ignored = if filesystem.is_primary_server_fs() {
+                ignored
+                    .contains_ignored(&server, from_metadata.file_type, &from, &[&from, &to])
+                    .await
+            } else {
+                from_metadata.file_type.is_dir()
+                    && filesystem.async_holds_ignored(&from, &[&to]).await
+            };
+            if holds_ignored {
+                kept_ignored = true;
+                continue;
+            }
+
             if filesystem.is_primary_server_fs() {
                 let from_path = server
                     .filesystem
@@ -131,6 +162,10 @@ mod put {
             {
                 renamed_count += 1;
             }
+        }
+
+        if kept_ignored {
+            return super::super::ignored_contents_error();
         }
 
         ApiResponse::new_serialized(Response {

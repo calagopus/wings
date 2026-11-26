@@ -4,6 +4,7 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct ScheduleManager {
     schedules: Arc<RwLock<Vec<super::Schedule>>>,
+    completed: Arc<tokio::sync::Notify>,
     schedule_task: tokio::task::JoinHandle<()>,
 }
 
@@ -11,11 +12,14 @@ impl ScheduleManager {
     #[inline]
     pub fn new(config: Arc<crate::config::Config>) -> Self {
         let schedules = Arc::new(RwLock::new(Vec::new()));
+        let completed = Arc::new(tokio::sync::Notify::new());
 
         Self {
             schedules: Arc::clone(&schedules),
+            completed: Arc::clone(&completed),
             schedule_task: tokio::spawn(async move {
                 loop {
+                    completed.notified().await;
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
                     let mut schedule_completions = Vec::new();
@@ -38,6 +42,11 @@ impl ScheduleManager {
                 }
             }),
         }
+    }
+
+    #[inline]
+    pub fn notify_completed(&self) {
+        self.completed.notify_one();
     }
 
     #[inline]

@@ -21,12 +21,26 @@ fn unified_dir(proc_cgroup: &str) -> Option<PathBuf> {
             continue;
         };
 
-        if hierarchy == "0" && controllers.is_empty() && !path.is_empty() && path != "/" {
-            return Some(Path::new(ROOT).join(path.trim_start_matches('/')));
+        if hierarchy == "0" && controllers.is_empty() && path != "/" {
+            return reachable_dir(Path::new(ROOT), path);
         }
     }
 
     None
+}
+
+fn reachable_dir(root: &Path, path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+
+    Some(root.join(path.strip_prefix("/").unwrap_or(path)))
 }
 
 pub fn io_weight_effective() -> bool {
@@ -109,9 +123,7 @@ impl CpuCgroup {
             }
 
             if controllers.split(',').any(|controller| controller == "cpu") {
-                let dir = Path::new(ROOT)
-                    .join("cpu")
-                    .join(path.trim_start_matches('/'));
+                let dir = reachable_dir(&Path::new(ROOT).join("cpu"), path)?;
 
                 return Some(Self {
                     quota: dir.join("cpu.cfs_quota_us"),
@@ -329,7 +341,7 @@ impl StatFiles {
             let Some((iface, counters)) = line.split_once(':') else {
                 continue;
             };
-            if iface.trim() == "lo" {
+            if matches!(iface.trim(), "lo" | crate::server::bandwidth::IFB_DEVICE) {
                 continue;
             }
 
@@ -398,7 +410,7 @@ impl StatsSampler {
 
         let mut entries = Vec::new();
         let mut host_memory = 0;
-        let mut next_tick = std::time::Instant::now() + PERIOD;
+        let mut next_tick = crate::utils::next_aligned_instant(PERIOD);
 
         while !listener.is_aborted() {
             match next_tick.checked_duration_since(std::time::Instant::now()) {
@@ -406,7 +418,7 @@ impl StatsSampler {
                     std::thread::sleep(delay);
                     next_tick += PERIOD;
                 }
-                None => next_tick = std::time::Instant::now() + PERIOD,
+                None => next_tick = crate::utils::next_aligned_instant(PERIOD),
             }
 
             entries.append(&mut incoming.lock());
@@ -614,6 +626,29 @@ mod tests {
         assert!(CpuCgroup::parse("", true).is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ignores_a_unified_path_outside_the_cgroup_namespace() {
+        assert!(CpuCgroup::parse("0::/../docker-3f1a.scope\n", true).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ignores_a_v1_path_outside_the_cgroup_namespace() {
+        let proc_cgroup = "4:cpu,cpuacct:/../docker/3f1a\n0::/\n";
+
+        assert!(CpuCgroup::parse(proc_cgroup, false).is_none());
+    }
+
+    // unified_dir
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unified_dir_rejects_any_parent_component() {
+        assert!(unified_dir("0::/../docker-3f1a.scope\n").is_none());
+        assert!(unified_dir("0::/system.slice/../../docker-3f1a.scope\n").is_none());
+    }
+
     // StatFiles::parse_keyed
 
     #[test]
@@ -659,6 +694,18 @@ mod tests {
         assert_eq!(
             StatFiles::parse_net_dev(net_dev),
             Some((5500, 55, 7700, 77))
+        );
+    }
+
+    #[test]
+    fn parse_net_dev_skips_the_bandwidth_ifb_device() {
+        let net_dev = "h1\nh2\n\
+              eth0:    5000      50    0    0    0     0          0         0     7000      70    0    0    0     0       0          0\n\
+          wings-dl:    5000      50    0    0    0     0          0         0     5000      50    0    0    0     0       0          0\n";
+
+        assert_eq!(
+            StatFiles::parse_net_dev(net_dev),
+            Some((5000, 50, 7000, 70))
         );
     }
 

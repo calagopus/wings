@@ -36,6 +36,23 @@ pub fn split_image_reference(image: &str) -> (&str, &str) {
     }
 }
 
+fn registry_matches(registry: &str, image: &str) -> bool {
+    let registry = registry.trim_end_matches('/');
+    let (registry_host, registry_path) = registry.split_once('/').unwrap_or((registry, ""));
+    let Some((image_host, image_path)) = image.split_once('/') else {
+        return false;
+    };
+
+    if registry_host.is_empty() || !registry_host.eq_ignore_ascii_case(image_host) {
+        return false;
+    }
+
+    registry_path.is_empty()
+        || image_path
+            .strip_prefix(registry_path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':', '@']))
+}
+
 pub fn registry_credentials(
     config: &crate::config::InnerConfig,
     image: &str,
@@ -44,7 +61,8 @@ pub fn registry_credentials(
         .docker
         .registries
         .iter()
-        .find(|(registry, _)| image.starts_with(registry.as_str()))
+        .filter(|(registry, _)| registry_matches(registry, image))
+        .max_by_key(|(registry, _)| registry.len())
         .map(|(registry, config)| bollard::auth::DockerCredentials {
             username: Some(config.username.clone()),
             password: Some(config.password.clone()),
@@ -68,23 +86,31 @@ fn selinux_enabled() -> bool {
     *ENABLED.get_or_init(|| Path::new("/sys/fs/selinux/enforce").exists())
 }
 
-fn is_relabelable(source: &str) -> bool {
+fn is_kernel_filesystem(source: &str) -> bool {
     let source = Path::new(source);
 
-    !source.starts_with("/dev") && !source.starts_with("/proc") && !source.starts_with("/sys")
+    source.starts_with("/dev") || source.starts_with("/proc") || source.starts_with("/sys")
 }
 
-fn split_selinux_binds(
+fn split_binds(
     mounts: Vec<bollard::models::Mount>,
+    options: &[String],
 ) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
-    split_binds_for_relabel(mounts, selinux_enabled())
+    split_binds_with(mounts, selinux_enabled(), options)
 }
 
-fn split_binds_for_relabel(
+fn split_binds_with(
     mounts: Vec<bollard::models::Mount>,
     relabel: bool,
+    options: &[String],
 ) -> (Vec<bollard::models::Mount>, Option<Vec<String>>) {
-    if !relabel {
+    let options = options
+        .iter()
+        .map(|option| option.trim())
+        .filter(|option| !option.is_empty())
+        .collect::<Vec<_>>();
+
+    if !relabel && options.is_empty() {
         return (mounts, None);
     }
 
@@ -93,14 +119,18 @@ fn split_binds_for_relabel(
 
     for mount in mounts {
         match (mount.source.as_deref(), mount.target.as_deref()) {
-            (Some(source), Some(target)) if is_relabelable(source) => {
-                let mode = if mount.read_only.unwrap_or(false) {
+            (Some(source), Some(target)) if !is_kernel_filesystem(source) => {
+                let mut bind_options = vec![if mount.read_only.unwrap_or(false) {
                     "ro"
                 } else {
                     "rw"
-                };
+                }];
+                if relabel {
+                    bind_options.push("z");
+                }
+                bind_options.extend(&options);
 
-                binds.push(format!("{source}:{target}:{mode},z"));
+                binds.push(format!("{source}:{target}:{}", bind_options.join(",")));
             }
             _ => structured.push(mount),
         }
@@ -282,50 +312,7 @@ fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
     None
 }
 
-#[async_trait::async_trait]
-trait DockerServerConfigurationExt {
-    async fn convert_mounts(
-        &self,
-        config: &crate::config::Config,
-        filesystem: &crate::server::filesystem::Filesystem,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Vec<bollard::plugin::Mount>;
-
-    #[cfg(unix)]
-    async fn convert_devices(
-        &self,
-        config: &crate::config::Config,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Vec<bollard::models::DeviceMapping>;
-
-    fn convert_allocations_bindings(&self) -> bollard::models::PortMap;
-    fn convert_allocations_docker_bindings(
-        &self,
-        config: &crate::config::Config,
-    ) -> bollard::models::PortMap;
-    fn convert_allocations_exposed(&self) -> Vec<String>;
-    fn convert_firewall_spec(
-        &self,
-        config: &crate::config::Config,
-    ) -> crate::server::firewall::FirewallServerSpec;
-
-    async fn container_config(
-        &self,
-        config: &crate::config::Config,
-        client: &bollard::Docker,
-        filesystem: &crate::server::filesystem::Filesystem,
-        host_mounts: Option<&host_mounts::HostMountTable>,
-    ) -> Result<bollard::plugin::ContainerCreateBody, anyhow::Error>;
-    fn container_update_config(
-        &self,
-        config: &crate::config::Config,
-    ) -> bollard::plugin::ContainerUpdateBody;
-
-    fn installer_resources(&self, config: &crate::config::Config) -> bollard::models::Resources;
-}
-
-#[async_trait::async_trait]
-impl DockerServerConfigurationExt for crate::server::configuration::ServerConfiguration {
+impl crate::server::configuration::ServerConfiguration {
     async fn convert_mounts(
         &self,
         config: &crate::config::Config,
@@ -580,23 +567,10 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             }
         }
 
-        let mut security_opt = vec!["no-new-privileges".to_string()];
-        if config.load().docker.container_apply_seccomp {
-            security_opt.push(
-                crate::server::configuration::seccomp::Seccomp::default()
-                    .remove_names(
-                        &self.container.seccomp.remove_allowed,
-                        crate::server::configuration::seccomp::Action::Allow,
-                    )
-                    .to_string()?,
-            );
-        }
-        if let Some(profile) = string_to_option(&config.load().docker.container_apparmor_profile) {
-            security_opt.push(format!("apparmor={profile}"));
-        }
-
-        let (mut mounts, binds) =
-            split_selinux_binds(self.convert_mounts(config, filesystem, host_mounts).await);
+        let (mut mounts, binds) = split_binds(
+            self.convert_mounts(config, filesystem, host_mounts).await,
+            &config.load().docker.mount_options,
+        );
 
         #[cfg(unix)]
         if config.load().docker.lxcfs.enabled {
@@ -641,13 +615,23 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 network_mode: Some(network_mode),
                 dns: Some(config.load().docker.network.dns.clone()),
                 dns_options: Some(config.load().docker.network.dns_options.clone()),
-                tmpfs: Some(HashMap::from([(
-                    "/tmp".to_string(),
-                    format!(
-                        "rw,exec,nosuid,size={}M",
-                        config.load().docker.tmpfs_size.as_mib()
+                tmpfs: Some(HashMap::from([
+                    (
+                        "/tmp".to_string(),
+                        format!(
+                            "rw,exec,nosuid,size={}M",
+                            config.load().docker.tmpfs_size.as_mib()
+                        ),
                     ),
-                )])),
+                    (
+                        format!(
+                            "{}/{}",
+                            crate::server::configuration::CONTAINER_ROOT,
+                            crate::server::filesystem::trash::TRASH_DIRECTORY
+                        ),
+                        TRASH_TMPFS_OPTIONS.to_string(),
+                    ),
+                ])),
                 log_config: Some(bollard::plugin::HostConfigLogConfig {
                     typ: Some(config.load().docker.log_config.r#type.clone()),
                     config: Some(
@@ -661,7 +645,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                             .collect(),
                     ),
                 }),
-                security_opt: Some(security_opt),
+                security_opt: Some(self.security_opt(config)?),
                 ulimits: convert_ulimits(config),
                 sysctls,
                 cap_drop: Some(vec![
@@ -752,10 +736,39 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
 
         resources
     }
+
+    fn security_opt(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<Vec<String>, serde_json::Error> {
+        let config = config.load();
+
+        let mut security_opt = vec!["no-new-privileges".to_string()];
+        if config.docker.container_apply_seccomp {
+            security_opt.push(
+                crate::server::configuration::seccomp::Seccomp::default()
+                    .remove_names(
+                        &self.container.seccomp.remove_allowed,
+                        crate::server::configuration::seccomp::Action::Allow,
+                    )
+                    .to_string()?,
+            );
+        }
+        if let Some(profile) = string_to_option(&config.docker.container_apparmor_profile) {
+            security_opt.push(format!("apparmor={profile}"));
+        }
+
+        Ok(security_opt)
+    }
 }
+
+/// An empty read-only mount hiding the host-side trash directory from the container.
+const TRASH_TMPFS_OPTIONS: &str = "ro,nosuid,nodev,noexec,size=4k";
 
 const TRANSIENT_JSON_ATTEMPTS: u32 = 4;
 const TRANSIENT_JSON_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+const REMOVAL_IN_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const REMOVAL_IN_PROGRESS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[inline]
 fn is_transient_json_error(err: &bollard::errors::Error) -> bool {
@@ -766,8 +779,7 @@ fn is_transient_json_error(err: &bollard::errors::Error) -> bool {
     )
 }
 
-#[async_trait::async_trait]
-trait DockerCompatJsonExt {
+trait DockerExt {
     async fn list_containers_settled(
         &self,
         options: Option<bollard::query_parameters::ListContainersOptions>,
@@ -778,10 +790,18 @@ trait DockerCompatJsonExt {
         container_id: &str,
         options: Option<bollard::query_parameters::InspectContainerOptions>,
     ) -> Result<bollard::models::ContainerInspectResponse, bollard::errors::Error>;
+
+    async fn remove_container_forgiving(
+        &self,
+        container_id: &str,
+    ) -> Result<(), bollard::errors::Error>;
+
+    async fn write_cfs_burst(&self, container_id: &str, multiple: f64);
+    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config);
+    async fn clear_cfs_burst(&self, container_id: &str);
 }
 
-#[async_trait::async_trait]
-impl DockerCompatJsonExt for bollard::Docker {
+impl DockerExt for bollard::Docker {
     async fn list_containers_settled(
         &self,
         options: Option<bollard::query_parameters::ListContainersOptions>,
@@ -829,18 +849,7 @@ impl DockerCompatJsonExt for bollard::Docker {
 
         self.inspect_container(container_id, options).await
     }
-}
 
-#[async_trait::async_trait]
-trait DockerRemoveExt {
-    async fn remove_container_forgiving(
-        &self,
-        container_id: &str,
-    ) -> Result<(), bollard::errors::Error>;
-}
-
-#[async_trait::async_trait]
-impl DockerRemoveExt for bollard::Docker {
     async fn remove_container_forgiving(
         &self,
         container_id: &str,
@@ -860,6 +869,32 @@ impl DockerRemoveExt for bollard::Docker {
             Err(DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(()),
+            Err(
+                err @ DockerResponseServerError {
+                    status_code: 409, ..
+                },
+            ) => {
+                // with force=true a 409 means another removal is in flight; the container may still report
+                // running while it is being killed, and only turns dead if that removal fails
+                let deadline = tokio::time::Instant::now() + REMOVAL_IN_PROGRESS_TIMEOUT;
+
+                while tokio::time::Instant::now() < deadline {
+                    match self.inspect_container_settled(container_id, None).await {
+                        Err(DockerResponseServerError {
+                            status_code: 404, ..
+                        }) => return Ok(()),
+                        Ok(inspect)
+                            if inspect.state.as_ref().and_then(|state| state.status)
+                                != Some(bollard::plugin::ContainerStateStatusEnum::DEAD) =>
+                        {
+                            tokio::time::sleep(REMOVAL_IN_PROGRESS_POLL).await;
+                        }
+                        _ => return Err(err),
+                    }
+                }
+
+                Err(err)
+            }
             Err(err) => match self.inspect_container_settled(container_id, None).await {
                 Err(DockerResponseServerError {
                     status_code: 404, ..
@@ -876,17 +911,7 @@ impl DockerRemoveExt for bollard::Docker {
             },
         }
     }
-}
 
-#[async_trait::async_trait]
-trait DockerCfsBurstExt {
-    async fn write_cfs_burst(&self, container_id: &str, multiple: f64);
-    async fn apply_cfs_burst(&self, container_id: &str, config: &crate::config::Config);
-    async fn clear_cfs_burst(&self, container_id: &str);
-}
-
-#[async_trait::async_trait]
-impl DockerCfsBurstExt for bollard::Docker {
     async fn write_cfs_burst(&self, container_id: &str, multiple: f64) {
         for attempt in 0..2 {
             let inspect = match self.inspect_container_settled(container_id, None).await {
@@ -934,6 +959,7 @@ pub struct DockerExecutor {
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
     firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
+    bandwidth: Arc<crate::server::bandwidth::Bandwidth>,
     stats_sampler: Arc<cgroup::StatsSampler>,
     host_mounts: OnceLock<Option<host_mounts::HostMountTable>>,
     host_gateway: OnceLock<Option<std::net::IpAddr>>,
@@ -944,11 +970,13 @@ impl DockerExecutor {
         docker: Arc<bollard::Docker>,
         app_config: Arc<crate::config::Config>,
         firewall: Arc<dyn crate::server::firewall::FirewallBackend>,
+        bandwidth: Arc<crate::server::bandwidth::Bandwidth>,
     ) -> Self {
         Self {
             docker,
             app_config,
             firewall,
+            bandwidth,
             stats_sampler: Arc::new(cgroup::StatsSampler::default()),
             host_mounts: OnceLock::new(),
             host_gateway: OnceLock::new(),
@@ -1036,28 +1064,32 @@ impl DockerExecutor {
         resources: bollard::models::Resources,
         staging_dir: &std::path::Path,
         staging_target: &str,
+        security_opt: Vec<String>,
     ) -> bollard::plugin::HostConfig {
-        let (mounts, binds) = split_selinux_binds(vec![
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    server_base,
-                )),
-                target: Some("/mnt/server".to_string()),
-                ..Default::default()
-            },
-            bollard::plugin::Mount {
-                typ: Some(bollard::plugin::MountType::BIND),
-                source: Some(host_mounts::translate_source(
-                    self.host_mounts(),
-                    &staging_dir.to_string_lossy(),
-                )),
-                target: Some(staging_target.to_string()),
-                ..Default::default()
-            },
-        ]);
         let config = self.app_config.load();
+        let (mounts, binds) = split_binds(
+            vec![
+                bollard::plugin::Mount {
+                    typ: Some(bollard::plugin::MountType::BIND),
+                    source: Some(host_mounts::translate_source(
+                        self.host_mounts(),
+                        server_base,
+                    )),
+                    target: Some("/mnt/server".to_string()),
+                    ..Default::default()
+                },
+                bollard::plugin::Mount {
+                    typ: Some(bollard::plugin::MountType::BIND),
+                    source: Some(host_mounts::translate_source(
+                        self.host_mounts(),
+                        &staging_dir.to_string_lossy(),
+                    )),
+                    target: Some(staging_target.to_string()),
+                    ..Default::default()
+                },
+            ],
+            &config.docker.mount_options,
+        );
 
         bollard::plugin::HostConfig {
             memory: resources.memory,
@@ -1075,10 +1107,19 @@ impl DockerExecutor {
             network_mode: Some(config.docker.network.mode.clone()),
             dns: Some(config.docker.network.dns.clone()),
             dns_options: Some(config.docker.network.dns_options.clone()),
-            tmpfs: Some(HashMap::from([(
-                "/tmp".to_string(),
-                format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size.as_mib()),
-            )])),
+            tmpfs: Some(HashMap::from([
+                (
+                    "/tmp".to_string(),
+                    format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size.as_mib()),
+                ),
+                (
+                    format!(
+                        "/mnt/server/{}",
+                        crate::server::filesystem::trash::TRASH_DIRECTORY
+                    ),
+                    TRASH_TMPFS_OPTIONS.to_string(),
+                ),
+            ])),
             log_config: Some(bollard::plugin::HostConfigLogConfig {
                 typ: Some(config.docker.log_config.r#type.clone()),
                 config: Some(
@@ -1091,6 +1132,7 @@ impl DockerExecutor {
                         .collect(),
                 ),
             }),
+            security_opt: Some(security_opt),
             userns_mode: string_to_option(&config.docker.userns_mode),
             ..Default::default()
         }
@@ -1162,13 +1204,13 @@ impl DockerExecutor {
         }
     }
 
-    async fn image_exists(&self, image_name: &str) -> bool {
+    async fn image_exists(&self, image: &str) -> bool {
         self.docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: true,
                 filters: Some(HashMap::from([(
                     "reference".to_string(),
-                    vec![image_name.to_string()],
+                    vec![image.to_string()],
                 )])),
                 ..Default::default()
             }))
@@ -1232,7 +1274,7 @@ impl DockerExecutor {
 
         let registry_auth = registry_credentials(&self.app_config.load(), image);
 
-        if cache_config.background_refresh && self.image_exists(image_name).await {
+        if cache_config.background_refresh && self.image_exists(image).await {
             let entry = {
                 let mut cache = pull_cache.lock();
                 Arc::clone(cache.entry(image.into()).or_default())
@@ -1302,7 +1344,7 @@ impl DockerExecutor {
         if let Some(guard) = &last_pull
             && let Some(pulled_at) = **guard
             && pulled_at.elapsed().as_secs() < cache_config.duration
-            && self.image_exists(image_name).await
+            && self.image_exists(image).await
         {
             tracing::debug!(
                 server = %server.uuid,
@@ -1421,7 +1463,7 @@ impl DockerExecutor {
                         server.log_daemon_error(&format!("failed to pull image: {err}"));
                     }
 
-                    if !self.image_exists(image_name).await {
+                    if !self.image_exists(image).await {
                         return Err(err.into());
                     }
 
@@ -1493,6 +1535,7 @@ struct DockerProcessHandle {
 
     resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
     publish_resource_usage: bool,
+    bandwidth: Option<Arc<crate::server::bandwidth::Bandwidth>>,
     cfs_lock: Arc<tokio::sync::Mutex<()>>,
     boosted_limit_percent: Arc<AtomicU32>,
     stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1516,6 +1559,7 @@ impl DockerProcessHandle {
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
         attach_stdin: bool,
+        bandwidth: Option<Arc<crate::server::bandwidth::Bandwidth>>,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -1657,17 +1701,14 @@ impl DockerProcessHandle {
             }
 
             let mut source = StatsSource::Unresolved;
+            let mut cgroup_sampled = false;
             let mut prev_cpu_total = 0;
             let mut prev_at = None;
 
             let mut boost_streak = 0u64;
             let mut boost_cooldown_until: Option<std::time::Instant> = None;
 
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(1),
-            );
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
 
             loop {
                 let received = match &mut source {
@@ -1724,6 +1765,8 @@ impl DockerProcessHandle {
                             {
                                 Some(pid) => match cgroup::StatFiles::resolve(pid) {
                                     Some(files) => {
+                                        cgroup_sampled = false;
+
                                         StatsSource::Cgroup(stats_sampler.register(files))
                                     }
                                     None => {
@@ -1747,8 +1790,14 @@ impl DockerProcessHandle {
                 }
 
                 let sample = match received {
-                    Some(Ok(sample)) => sample,
-                    Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Some(Ok(sample)) => {
+                        cgroup_sampled = true;
+
+                        sample
+                    }
+                    Some(Err(err))
+                        if err.kind() == std::io::ErrorKind::NotFound && cgroup_sampled =>
+                    {
                         source = StatsSource::Unresolved;
 
                         continue;
@@ -1812,7 +1861,9 @@ impl DockerProcessHandle {
                             network: stats.networks.as_ref().and_then(|networks| {
                                 let mut totals: Option<(u64, u64, u64, u64)> = None;
 
-                                for net in networks.values() {
+                                for (_, net) in networks.iter().filter(|(name, _)| {
+                                    *name != crate::server::bandwidth::IFB_DEVICE
+                                }) {
                                     let total = totals.get_or_insert((0, 0, 0, 0));
                                     total.0 = total.0.saturating_add(net.rx_bytes.unwrap_or(0));
                                     total.1 = total.1.saturating_add(net.rx_packets.unwrap_or(0));
@@ -1923,10 +1974,14 @@ impl DockerProcessHandle {
 
         let state_task = tokio::spawn(async move {
             const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+            let host_cpu_limit = std::thread::available_parallelism()
+                .map_or(1, |threads| threads.get()) as u32
+                * 100;
 
             struct CachedState {
                 status: Option<bollard::plugin::ContainerStateStatusEnum>,
                 started_at: Option<chrono::DateTime<chrono::Utc>>,
+                started_instant: Option<std::time::Instant>,
                 exit_code: i32,
                 oom_killed: bool,
                 cpu_limit: u32,
@@ -1950,11 +2005,7 @@ impl DockerProcessHandle {
             #[cfg(unix)]
             let mut lxcfs_stale_reported = false;
 
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(1),
-            );
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = crate::utils::aligned_interval(std::time::Duration::from_secs(1));
 
             loop {
                 let died = tokio::select! {
@@ -2014,13 +2065,29 @@ impl DockerProcessHandle {
                     }
                     let host_config = inspect.host_config.unwrap_or_default();
 
+                    let started_at = state.started_at.as_deref().and_then(|started_at| {
+                        chrono::DateTime::parse_from_rfc3339(started_at)
+                            .ok()
+                            .map(|started_at| started_at.with_timezone(&chrono::Utc))
+                    });
+                    let started_instant = match &cached {
+                        Some(previous) if previous.started_at == started_at => {
+                            previous.started_instant
+                        }
+                        _ => started_at.map(|started_at| {
+                            let now = std::time::Instant::now();
+                            let elapsed = (chrono::Utc::now() - started_at)
+                                .to_std()
+                                .unwrap_or_default();
+
+                            now.checked_sub(elapsed).unwrap_or(now)
+                        }),
+                    };
+
                     cached = Some(CachedState {
                         status: state.status,
-                        started_at: state.started_at.as_deref().and_then(|started_at| {
-                            chrono::DateTime::parse_from_rfc3339(started_at)
-                                .ok()
-                                .map(|started_at| started_at.with_timezone(&chrono::Utc))
-                        }),
+                        started_at,
+                        started_instant,
                         exit_code: state.exit_code.or(wait_exit_code).unwrap_or(-1) as i32,
                         oom_killed: state.oom_killed.unwrap_or(false),
                         cpu_limit: cgroup::CpuCgroup::limit_percent(
@@ -2036,27 +2103,18 @@ impl DockerProcessHandle {
 
                 let process_status = match state.status {
                     Some(bollard::plugin::ContainerStateStatusEnum::RUNNING) => {
-                        if publish_resource_usage && let Some(started_at) = state.started_at {
-                            let uptime = chrono::Utc::now()
-                                .signed_duration_since(started_at)
-                                .num_milliseconds()
-                                .max(0) as u64;
-
+                        if publish_resource_usage
+                            && let Some(started_instant) = state.started_instant
+                        {
                             let limit = match state_boosted_limit.load(Ordering::Relaxed) {
                                 0 => state.cpu_limit,
                                 boosted => boosted,
                             };
 
                             state_usage.send_modify(|usage| {
-                                usage.uptime = uptime;
-                                usage.cpu_limit_absolute = if limit > 0 {
-                                    limit
-                                } else {
-                                    std::thread::available_parallelism()
-                                        .map_or(1, |threads| threads.get())
-                                        as u32
-                                        * 100
-                                };
+                                usage.started_at = Some(started_instant);
+                                usage.cpu_limit_absolute =
+                                    if limit > 0 { limit } else { host_cpu_limit };
                             });
                         }
                         super::ProcessStatus::Running
@@ -2064,9 +2122,15 @@ impl DockerProcessHandle {
                     Some(bollard::plugin::ContainerStateStatusEnum::PAUSED) => {
                         super::ProcessStatus::Paused
                     }
+                    _ if state
+                        .started_at
+                        .is_none_or(|started_at| started_at.timestamp() <= 0) =>
+                    {
+                        continue;
+                    }
                     _ => {
                         if publish_resource_usage {
-                            state_usage.send_modify(|usage| usage.uptime = 0);
+                            state_usage.send_if_modified(|usage| usage.started_at.take().is_some());
                         }
                         super::ProcessStatus::Stopped {
                             exit_code: state.exit_code,
@@ -2124,6 +2188,7 @@ impl DockerProcessHandle {
             firewall,
             resource_usage,
             publish_resource_usage,
+            bandwidth,
             cfs_lock,
             boosted_limit_percent,
             stdin_tx,
@@ -2136,6 +2201,77 @@ impl DockerProcessHandle {
     }
 
     #[inline]
+    async fn start_container(&self) -> Result<(), anyhow::Error> {
+        static NETWORK_RECREATIONS: tokio::sync::Mutex<u64> = tokio::sync::Mutex::const_new(0);
+
+        let generation = *NETWORK_RECREATIONS.lock().await;
+        let err = match self.docker.start_container(&self.container_id, None).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        let network_name = self.app_config.load().docker.network.name.clone();
+        let uses_network = self
+            .docker
+            .inspect_container_settled(&self.container_id, None)
+            .await
+            .ok()
+            .and_then(|inspect| inspect.host_config?.network_mode)
+            .is_some_and(|network_mode| network_mode == network_name);
+        if !uses_network {
+            return Err(err.into());
+        }
+
+        let mut recreations = NETWORK_RECREATIONS.lock().await;
+        if *recreations == generation {
+            if !matches!(
+                self.docker.inspect_network(&network_name, None).await,
+                Err(DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ) {
+                return Err(err.into());
+            }
+
+            tracing::warn!(
+                network = %network_name,
+                "docker network is missing, recreating it"
+            );
+
+            match crate::config::Config::create_docker_network(
+                &self.docker,
+                &self.app_config.load(),
+            )
+            .await
+            {
+                Ok(())
+                | Err(DockerResponseServerError {
+                    status_code: 409, ..
+                }) => {}
+                Err(create_err) => {
+                    return Err(anyhow::anyhow!(
+                        "{err}, recreating the missing docker network {network_name} failed: {create_err}"
+                    ));
+                }
+            }
+
+            *recreations += 1;
+
+            if let Ok(server) = self.get_server() {
+                server.log_daemon(compact_str::format_compact!(
+                    "Recreated the missing docker network {network_name}."
+                ));
+            }
+        }
+        drop(recreations);
+
+        self.docker
+            .start_container(&self.container_id, None)
+            .await
+            .map_err(Into::into)
+    }
+
     fn get_server(&self) -> Result<Arc<super::super::InnerServer>, anyhow::Error> {
         self.server
             .upgrade()
@@ -2173,6 +2309,25 @@ impl DockerProcessHandle {
                 server = %spec.server,
                 "failed to sync firewall rules: {err:#}"
             );
+        }
+    }
+
+    async fn apply_bandwidth(
+        docker: &bollard::Docker,
+        bandwidth: &crate::server::bandwidth::Bandwidth,
+        container_id: &str,
+        server: &super::super::InnerServer,
+    ) -> Result<(), anyhow::Error> {
+        let _guard = server.bandwidth_lock.lock().await;
+        let limits = server.configuration.read().await.build.bandwidth;
+
+        match bandwidth.apply(docker, container_id, limits).await {
+            Err(err) if !limits.is_limited() => {
+                tracing::warn!(server = %server.uuid, "failed to clear bandwidth limits: {err:#}");
+
+                Ok(())
+            }
+            result => result,
         }
     }
 
@@ -2527,15 +2682,29 @@ impl super::ProcessHandle for DockerProcessHandle {
             .apply_cfs_burst(&self.container_id, &self.app_config)
             .await;
 
+        if let Some(bandwidth) = &self.bandwidth
+            && let Err(err) =
+                Self::apply_bandwidth(&self.docker, bandwidth, &self.container_id, &server).await
+        {
+            tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
+        }
+
         Ok(())
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        self.docker
-            .start_container(&self.container_id, None)
-            .await?;
+        self.start_container().await?;
 
         if let Ok(server) = self.get_server() {
+            if let Some(bandwidth) = &self.bandwidth
+                && let Err(err) =
+                    Self::apply_bandwidth(&self.docker, bandwidth, &self.container_id, &server)
+                        .await
+            {
+                self.kill().await.ok();
+                return Err(err.context("failed to apply bandwidth limits"));
+            }
+
             Self::sync_firewall(
                 &self.docker,
                 &*self.firewall,
@@ -2608,7 +2777,8 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn kill(&self) -> Result<(), anyhow::Error> {
-        self.docker
+        match self
+            .docker
             .kill_container(
                 &self.container_id,
                 Some(bollard::query_parameters::KillContainerOptions {
@@ -2616,7 +2786,14 @@ impl super::ProcessHandle for DockerProcessHandle {
                 }),
             )
             .await
-            .map_err(Into::into)
+        {
+            Ok(())
+            | Err(DockerResponseServerError {
+                status_code: 404 | 409,
+                ..
+            }) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -2758,7 +2935,6 @@ impl super::ServerExecutor for DockerExecutor {
     }
 
     async fn boot(&self) -> Result<(), anyhow::Error> {
-        self.app_config.ensure_docker_network(&self.docker).await?;
         self.firewall.boot().await?;
 
         if std::env::var("OCI_CONTAINER").is_ok() {
@@ -2807,6 +2983,8 @@ impl super::ServerExecutor for DockerExecutor {
 
         let container_name = self.container_name(server).await;
 
+        server.filesystem.ensure_trash_directory().await;
+
         let bollard_config = server
             .configuration
             .read()
@@ -2842,6 +3020,14 @@ impl super::ServerExecutor for DockerExecutor {
             }
         }
 
+        let bandwidth = server.configuration.read().await.build.bandwidth;
+        if bandwidth.is_limited()
+            && self.bandwidth.enabled()
+            && let Err(err) = self.bandwidth.ready().await
+        {
+            return Err(err.context("failed to apply bandwidth limits"));
+        }
+
         let container = self
             .docker
             .create_container(
@@ -2865,6 +3051,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                Some(Arc::clone(&self.bandwidth)),
             )
             .await?,
         );
@@ -2897,6 +3084,17 @@ impl super::ServerExecutor for DockerExecutor {
             .apply_cfs_burst(&container_id, &self.app_config)
             .await;
 
+        if let Err(err) = DockerProcessHandle::apply_bandwidth(
+            &self.docker,
+            &self.bandwidth,
+            &container_id,
+            server,
+        )
+        .await
+        {
+            tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
+        }
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             DockerProcessHandle::new(
@@ -2909,6 +3107,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                Some(Arc::clone(&self.bandwidth)),
             )
             .await?,
         );
@@ -2933,7 +3132,9 @@ impl super::ServerExecutor for DockerExecutor {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![server.uuid.to_string()],
+                    // `[<name>.]<uuid>` (see container_name) but not `<uuid>_installer` etc.;
+                    // docker matches names with a leading slash, podman without
+                    vec![format!(r"^/?([A-Za-z0-9_-]*\.)?{}$", server.uuid)],
                 )])),
                 ..Default::default()
             }))
@@ -2964,6 +3165,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         let server_config = server.configuration.read().await;
         let resources = server_config.installer_resources(&self.app_config);
+        let security_opt = server_config.security_opt(&self.app_config)?;
 
         let mut env = server_config.environment(&self.app_config);
         for (k, v) in &script.environment {
@@ -3024,12 +3226,15 @@ impl super::ServerExecutor for DockerExecutor {
             )
         })?;
 
+        server.filesystem.ensure_trash_directory().await;
+
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(self.installer_host_config(
                 &server.filesystem.base(),
                 resources,
                 &tmp_dir,
                 "/mnt/install",
+                security_opt,
             )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
@@ -3076,6 +3281,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                None,
             )
             .await?,
         );
@@ -3111,6 +3317,7 @@ impl super::ServerExecutor for DockerExecutor {
                 status_tx,
                 true,
                 true,
+                None,
             )
             .await?,
         );
@@ -3153,12 +3360,14 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
         script: &super::super::installation::InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
         self.pull_image(&script.container_image, server, true)
             .await?;
 
         let server_config = server.configuration.read().await;
         let resources = server_config.installer_resources(&self.app_config);
+        let security_opt = server_config.security_opt(&self.app_config)?;
 
         let mut env = server_config.environment(&self.app_config);
         for (k, v) in &script.environment {
@@ -3173,25 +3382,46 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
+        let suffix = rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8);
         let tmp_dir = self.app_config.tmp_data_path(server.uuid);
-        tokio::fs::create_dir_all(&tmp_dir).await?;
-        tokio::fs::write(
-            tmp_dir.join("script.sh"),
-            script.script.replace("\r\n", "\n"),
-        )
-        .await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
+        let script_dir = tmp_dir.join(format!("script-{suffix}"));
+        let staged = async {
+            tokio::fs::create_dir_all(&script_dir).await?;
+            tokio::fs::write(
+                script_dir.join("script.sh"),
+                script.script.replace("\r\n", "\n"),
+            )
+            .await?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755))
+                    .await?;
+                tokio::fs::set_permissions(&script_dir, std::fs::Permissions::from_mode(0o755))
+                    .await?;
+            }
+
+            Ok::<(), std::io::Error>(())
         }
+        .await;
+        if let Err(err) = staged {
+            tokio::fs::remove_dir_all(&script_dir).await.ok();
+            return Err(anyhow::anyhow!(
+                "failed to prepare script staging directory {}: {err}",
+                script_dir.display()
+            ));
+        }
+
+        server.filesystem.ensure_trash_directory().await;
 
         let bollard_config = bollard::plugin::ContainerCreateBody {
             host_config: Some(self.installer_host_config(
                 &server.filesystem.base(),
                 resources,
-                &tmp_dir,
+                &script_dir,
                 "/mnt/script",
+                security_opt,
             )),
             cmd: Some(vec![
                 script.entrypoint.to_string(),
@@ -3213,54 +3443,101 @@ impl super::ServerExecutor for DockerExecutor {
             ..Default::default()
         };
 
-        let name = format!(
-            "{}_script_runner_{}",
-            server.uuid,
-            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
-        );
-
-        let container = self
+        let container = match self
             .docker
             .create_container(
                 Some(bollard::query_parameters::CreateContainerOptions {
-                    name: Some(name),
+                    name: Some(format!("{}_script_runner_{suffix}", server.uuid)),
                     ..Default::default()
                 }),
                 bollard_config,
             )
-            .await?;
+            .await
+        {
+            Ok(container) => container,
+            Err(err) => {
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
+                return Err(err.into());
+            }
+        };
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
-        let handle = Arc::new(
-            DockerProcessHandle::new(
-                container.id.clone(),
-                Arc::clone(&self.docker),
-                server,
-                Arc::clone(&self.app_config),
-                Arc::clone(&self.firewall),
-                Arc::clone(&self.stats_sampler),
-                status_tx,
-                false,
-                false,
-            )
-            .await?,
-        );
+        let handle = match DockerProcessHandle::new(
+            container.id.clone(),
+            Arc::clone(&self.docker),
+            server,
+            Arc::clone(&self.app_config),
+            Arc::clone(&self.firewall),
+            Arc::clone(&self.stats_sampler),
+            status_tx,
+            false,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(handle) => Arc::new(handle),
+            Err(err) => {
+                self.docker
+                    .remove_container_forgiving(&container.id)
+                    .await
+                    .ok();
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
+                return Err(err);
+            }
+        };
 
         tokio::spawn({
             let docker = Arc::clone(&self.docker);
             let server = server.uuid;
 
             async move {
-                if let Some(Err(err)) = docker
-                    .wait_container(
-                        &container.id,
-                        Some(bollard::query_parameters::WaitContainerOptions {
-                            condition: "next-exit".to_string(),
-                        }),
-                    )
-                    .next()
-                    .await
-                {
+                let mut wait = docker.wait_container(
+                    &container.id,
+                    Some(bollard::query_parameters::WaitContainerOptions {
+                        condition: "next-exit".to_string(),
+                    }),
+                );
+                let start_deadline = tokio::time::sleep(std::time::Duration::from_secs(120));
+                tokio::pin!(start_deadline);
+                let mut start_checked = false;
+                let run_deadline = tokio::time::sleep(timeout.unwrap_or_default());
+                tokio::pin!(run_deadline);
+
+                let exit = loop {
+                    tokio::select! {
+                        exit = wait.next() => break exit,
+                        _ = &mut run_deadline, if timeout.is_some() => {
+                            tracing::warn!(
+                                server = %server,
+                                container = %container.id,
+                                "script timed out, killing container"
+                            );
+                            break None;
+                        }
+                        _ = &mut start_deadline, if !start_checked => {
+                            start_checked = true;
+                            let never_started = match docker
+                                .inspect_container_settled(&container.id, None)
+                                .await
+                            {
+                                Ok(inspect) => {
+                                    inspect.state.and_then(|state| state.status)
+                                        == Some(bollard::plugin::ContainerStateStatusEnum::CREATED)
+                                }
+                                Err(DockerResponseServerError {
+                                    status_code: 404, ..
+                                }) => true,
+                                Err(_) => false,
+                            };
+                            if never_started {
+                                break None;
+                            }
+                        }
+                    }
+                };
+
+                if let Some(Err(err)) = exit {
                     tracing::error!(
                         server = %server,
                         container = %container.id,
@@ -3277,6 +3554,8 @@ impl super::ServerExecutor for DockerExecutor {
                         err
                     );
                 }
+
+                tokio::fs::remove_dir_all(&script_dir).await.ok();
             }
         });
 
@@ -3467,6 +3746,10 @@ impl super::ServerExecutor for DockerExecutor {
             })
             .collect())
     }
+
+    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
+        Some(&self.bandwidth)
+    }
 }
 
 #[cfg(test)]
@@ -3569,7 +3852,7 @@ mod tests {
         assert_eq!(installer.cpu_quota, Some(80000));
     }
 
-    // selinux relabelling
+    // split_binds_with
 
     fn bind(source: &str, target: &str, read_only: bool) -> bollard::models::Mount {
         bollard::models::Mount {
@@ -3583,9 +3866,10 @@ mod tests {
 
     #[test]
     fn without_selinux_mounts_stay_structured() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
             false,
+            &[],
         );
 
         assert_eq!(mounts.len(), 1);
@@ -3594,12 +3878,13 @@ mod tests {
 
     #[test]
     fn with_selinux_binds_carry_the_shared_relabel_option() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![
                 bind("/var/lib/wings/volumes/a", "/home/container", false),
                 bind("/run/wings/etc/passwd", "/etc/passwd", true),
             ],
             true,
+            &[],
         );
 
         assert!(mounts.is_empty());
@@ -3614,12 +3899,13 @@ mod tests {
 
     #[test]
     fn kernel_filesystems_are_never_relabelled() {
-        let (mounts, binds) = split_binds_for_relabel(
+        let (mounts, binds) = split_binds_with(
             vec![
                 bind("/dev/hugepages", "/dev/hugepages", false),
                 bind("/var/lib/wings/volumes/a", "/home/container", false),
             ],
             true,
+            &[],
         );
 
         assert_eq!(
@@ -3632,5 +3918,219 @@ mod tests {
                 "/var/lib/wings/volumes/a:/home/container:rw,z".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn mount_options_without_selinux_become_binds() {
+        let (mounts, binds) = split_binds_with(
+            vec![
+                bind("/var/lib/wings/volumes/a", "/home/container", false),
+                bind("/run/wings/etc/passwd", "/etc/passwd", true),
+            ],
+            false,
+            &["idmap".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,idmap".to_string(),
+                "/run/wings/etc/passwd:/etc/passwd:ro,idmap".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn relabel_precedes_mount_options_in_configured_order() {
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", true)],
+            true,
+            &["noexec".to_string(), "idmap".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:ro,z,noexec,idmap".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn blank_mount_options_are_ignored() {
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
+            false,
+            &[String::new(), "  ".to_string()],
+        );
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(binds, None);
+
+        let (mounts, binds) = split_binds_with(
+            vec![bind("/var/lib/wings/volumes/a", "/home/container", false)],
+            false,
+            &[" idmap ".to_string(), " ".to_string()],
+        );
+
+        assert!(mounts.is_empty());
+        assert_eq!(
+            binds,
+            Some(vec![
+                "/var/lib/wings/volumes/a:/home/container:rw,idmap".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn kernel_filesystems_keep_structured_mounts_with_mount_options() {
+        let (mounts, binds) = split_binds_with(
+            vec![
+                bind("/sys/fs/cgroup", "/sys/fs/cgroup", true),
+                bind("/proc/cpuinfo", "/proc/cpuinfo", true),
+                bind("/devices/a", "/home/container", false),
+            ],
+            false,
+            &["idmap".to_string()],
+        );
+
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|mount| mount.source.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("/sys/fs/cgroup"), Some("/proc/cpuinfo")]
+        );
+        assert_eq!(
+            binds,
+            Some(vec!["/devices/a:/home/container:rw,idmap".to_string()])
+        );
+    }
+
+    // registry_matches
+
+    #[test]
+    fn registry_host_must_equal_the_image_host_exactly() {
+        for (registry, image, expected) in [
+            ("ghcr.io", "ghcr.io/org/img:tag", true),
+            ("GHCR.io", "ghcr.IO/img", true),
+            ("ghcr.io/", "ghcr.io/img", true),
+            (
+                "registry.example.com:5000",
+                "registry.example.com:5000/img",
+                true,
+            ),
+            ("ghcr.io", "ghcr.io.example.com/img", false),
+            ("ghcr.io", "evilghcr.io/img", false),
+            (
+                "registry.example.com:5000",
+                "registry.example.com:5001/img",
+                false,
+            ),
+            (
+                "registry.example.com:5000",
+                "registry.example.com/img",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                registry_matches(registry, image),
+                expected,
+                "{registry} vs {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostless_images_and_empty_registry_hosts_never_match() {
+        for (registry, image) in [
+            ("ubuntu", "ubuntu:latest"),
+            ("docker.io", "ubuntu:latest"),
+            ("", "ghcr.io/img"),
+            ("", "/img"),
+            ("/org", "/org/img"),
+            ("/org", "ghcr.io/org/img"),
+        ] {
+            assert!(!registry_matches(registry, image), "{registry} vs {image}");
+        }
+    }
+
+    #[test]
+    fn registry_path_prefix_must_end_at_a_component_boundary() {
+        for (image, expected) in [
+            ("host:5000/org/img", true),
+            ("host:5000/org/img:tag", true),
+            ("host:5000/org:tag", true),
+            ("host:5000/org@sha256:abcdef", true),
+            ("host:5000/organisation/img", false),
+            ("host:5000/other/img", false),
+        ] {
+            assert_eq!(
+                registry_matches("host:5000/org", image),
+                expected,
+                "{image}"
+            );
+            assert_eq!(
+                registry_matches("host:5000/org/", image),
+                expected,
+                "{image} (trailing slash)"
+            );
+        }
+    }
+
+    // registry_credentials
+
+    fn config_with_registries(registries: &[&str]) -> crate::config::InnerConfig {
+        let mut config = crate::config::InnerConfig::default();
+        for registry in registries {
+            config.docker.registries.insert(
+                registry.to_string(),
+                crate::config::DockerRegistryConfiguration {
+                    username: format!("user-{registry}"),
+                    password: format!("pass-{registry}"),
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn the_most_specific_matching_registry_supplies_the_credentials() {
+        let config = config_with_registries(&["ghcr.io", "ghcr.io/org", "ghcr.io/org/team"]);
+
+        let credentials = registry_credentials(&config, "ghcr.io/org/team/img:tag").unwrap();
+        assert_eq!(
+            credentials.username.as_deref(),
+            Some("user-ghcr.io/org/team")
+        );
+        assert_eq!(
+            credentials.password.as_deref(),
+            Some("pass-ghcr.io/org/team")
+        );
+        assert_eq!(
+            credentials.serveraddress.as_deref(),
+            Some("ghcr.io/org/team")
+        );
+
+        let credentials = registry_credentials(&config, "ghcr.io/org/other").unwrap();
+        assert_eq!(credentials.serveraddress.as_deref(), Some("ghcr.io/org"));
+
+        let credentials = registry_credentials(&config, "ghcr.io/elsewhere/img").unwrap();
+        assert_eq!(credentials.serveraddress.as_deref(), Some("ghcr.io"));
+    }
+
+    #[test]
+    fn lookalike_or_unconfigured_hosts_get_no_registry_credentials() {
+        let config = config_with_registries(&["ghcr.io"]);
+
+        for image in [
+            "ghcr.io.attacker.tld/img",
+            "docker.io/library/ubuntu",
+            "ubuntu:latest",
+        ] {
+            assert!(registry_credentials(&config, image).is_none(), "{image}");
+        }
     }
 }

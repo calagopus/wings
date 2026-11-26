@@ -17,8 +17,10 @@ use crate::io::SafeSliceExt;
 
 pub mod activity;
 pub mod backup;
+pub mod bandwidth;
 pub mod collab;
 pub mod configuration;
+pub mod crash_history;
 pub mod diff;
 pub mod executor;
 pub mod filesystem;
@@ -26,6 +28,7 @@ pub mod firewall;
 pub mod installation;
 pub mod manager;
 pub mod permissions;
+pub mod resource_history;
 pub mod resources;
 pub mod schedule;
 pub mod script;
@@ -36,8 +39,28 @@ pub mod websocket;
 
 pub enum PowerActionError {
     User(std::borrow::Cow<'static, str>),
+    Reported(std::borrow::Cow<'static, str>),
     Internal(anyhow::Error),
 }
+
+struct ConsoleReported {
+    line: std::borrow::Cow<'static, str>,
+    err: anyhow::Error,
+}
+
+impl std::fmt::Display for ConsoleReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+impl std::fmt::Debug for ConsoleReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.err, f)
+    }
+}
+
+impl std::error::Error for ConsoleReported {}
 
 pub struct InnerServer {
     pub uuid: uuid::Uuid,
@@ -72,16 +95,18 @@ pub struct InnerServer {
     installing: AtomicBool,
     restoring: AtomicBool,
     transferring: AtomicBool,
+    destroying: AtomicBool,
     last_locked: tokio::sync::watch::Sender<i64>,
 
     pub restarting: AtomicBool,
     stopping: AtomicBool,
     last_crash: Mutex<Option<std::time::Instant>>,
     crash_handled: AtomicBool,
+    pub bandwidth_lock: Mutex<()>,
 
     pub user_permissions: permissions::UserPermissionsMap,
     pub filesystem: filesystem::Filesystem,
-    pub sqlite_memory: filesystem::sqlite::QueryMemory,
+    pub sqlite_query_semaphore: tokio::sync::Semaphore,
 }
 
 impl Drop for InnerServer {
@@ -156,6 +181,47 @@ impl InnerServer {
         );
     }
 
+    pub fn log_daemon_admin_error(&self, message: &str, details: &str) {
+        self.log_daemon_error(message);
+
+        let mut permissions = permissions::Permissions::default();
+        permissions.insert(permissions::Permission::AdminWebsocketErrors);
+
+        self.targeted_websocket
+            .send(websocket::TargetedWebsocketMessage::new(
+                std::collections::HashSet::new(),
+                permissions,
+                self.get_daemon_error(details),
+            ))
+            .ok();
+    }
+
+    fn report_power_error(
+        &self,
+        action: crate::models::ServerPowerAction,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        let line = match err.downcast_ref::<&'static str>() {
+            Some(message) => {
+                self.log_daemon_error(message);
+                std::borrow::Cow::Borrowed(*message)
+            }
+            None => {
+                let line = format!(
+                    "Failed to {} the server. Please contact an Administrator.",
+                    action.to_str()
+                );
+                self.log_daemon_admin_error(
+                    &line,
+                    &format!("Failed to {} the server: {err:#}", action.to_str()),
+                );
+                std::borrow::Cow::Owned(line)
+            }
+        };
+
+        anyhow::Error::new(ConsoleReported { line, err })
+    }
+
     pub fn get_daemon_error(&self, message: &str) -> websocket::WebsocketMessage {
         websocket::WebsocketMessage::builder(websocket::WebsocketEvent::ServerDaemonMessage)
             .arg(
@@ -193,6 +259,8 @@ impl Server {
             Arc::clone(&app_state.config),
             &configuration.egg.file_denylist,
         );
+        filesystem.trash.update(configuration.trash);
+        filesystem.update_mounts(&configuration.mounts);
 
         let activity = activity::ActivityManager::new(configuration.uuid, &app_state.config);
         let collab = collab::manager::CollabManager::new(
@@ -205,6 +273,7 @@ impl Server {
             &app_state.config,
         )));
 
+        let suspended = configuration.suspended;
         let server = Self(Arc::new(InnerServer {
             uuid: configuration.uuid,
             app_state,
@@ -231,23 +300,28 @@ impl Server {
             incoming_transfer: RwLock::new(None),
             installer: RwLock::new(None),
 
-            suspended: AtomicBool::new(false),
+            suspended: AtomicBool::new(suspended),
             installing: AtomicBool::new(false),
             restoring: AtomicBool::new(false),
             transferring: AtomicBool::new(false),
+            destroying: AtomicBool::new(false),
             last_locked: tokio::sync::watch::Sender::new(0),
 
             restarting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             last_crash: Mutex::new(None),
             crash_handled: AtomicBool::new(false),
+            bandwidth_lock: Mutex::new(()),
 
             user_permissions: permissions::UserPermissionsMap::default(),
             filesystem,
-            sqlite_memory: filesystem::sqlite::QueryMemory::default(),
+            sqlite_query_semaphore: tokio::sync::Semaphore::new(
+                filesystem::sqlite::QUERY_MAX_CONCURRENT,
+            ),
         }));
 
         server.spawn_stats_forwarder();
+        server.spawn_trash_purge_task();
 
         server
     }
@@ -257,12 +331,28 @@ impl Server {
         let mut usage_rx = self.resource_usage.subscribe();
 
         tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(1);
+            let mut throttle = tokio::time::interval_at(
+                tokio::time::Instant::from_std(
+                    crate::utils::next_aligned_instant(period) + period / 2,
+                ),
+                period,
+            );
+            throttle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             while usage_rx.changed().await.is_ok() {
+                let mut deadline = throttle.tick().await;
+                if deadline.elapsed() >= period {
+                    deadline = throttle.tick().await;
+                }
+
                 let Some(server) = weak.upgrade() else {
                     break;
                 };
 
-                let mut usage = *usage_rx.borrow_and_update();
+                let mut usage = usage_rx
+                    .borrow_and_update()
+                    .with_uptime_at(deadline.into_std());
                 usage.state = server.state.get_state();
 
                 server
@@ -275,11 +365,27 @@ impl Server {
                         .build(),
                     )
                     .ok();
-                drop(server);
-
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+    }
+
+    fn spawn_trash_purge_task(&self) {
+        let weak = Arc::downgrade(&self.0);
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(filesystem::trash::PURGE_INTERVAL).await;
+
+                let Some(server) = weak.upgrade() else {
+                    break;
+                };
+                let server = Self(server);
+
+                server.filesystem.trash.run_maintenance(&server).await;
+            }
+        });
+
+        self.filesystem.trash.set_purge_task(task.abort_handle());
     }
 
     #[cfg(test)]
@@ -451,9 +557,9 @@ impl Server {
                         server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
                     }
 
-                    if server.filesystem.is_full().await
-                        && server.state.get_state() != state::ServerState::Offline
+                    if server.state.get_state() != state::ServerState::Offline
                         && !server.stopping.load(Ordering::SeqCst)
+                        && !server.filesystem.trash.ensure_not_full(&server).await
                     {
                         if full_since.is_none_or(|since| {
                             since.elapsed() < std::time::Duration::from_secs(5)
@@ -468,6 +574,7 @@ impl Server {
                             tokio::spawn(async move {
                                 if let Err(err) = server_clone
                                     .stop_with_kill_timeout(
+                                        None,
                                         std::time::Duration::from_secs(30),
                                         false,
                                     )
@@ -507,6 +614,10 @@ impl Server {
                                 oom_killed = %oom_killed,
                                 "container stopped, handling crash"
                             );
+
+                            if server.destroying.load(Ordering::SeqCst) {
+                                break;
+                            }
 
                             if server.restarting.load(Ordering::SeqCst) {
                                 server
@@ -594,6 +705,12 @@ impl Server {
                                     return;
                                 }
 
+                                let crash = server
+                                    .app_state
+                                    .crash_history
+                                    .capture(&server, exit_code, oom_killed)
+                                    .await;
+
                                 server.activity.log_activity(activity::Activity {
                                     event: activity::ActivityEvent::CrashDetected,
                                     user: None,
@@ -601,6 +718,7 @@ impl Server {
                                     metadata: Some(json!({
                                         "exit_code": exit_code,
                                         "oom_killed": oom_killed,
+                                        "crash": crash,
                                     })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
@@ -764,7 +882,10 @@ impl Server {
     }
 
     pub fn resource_usage(&self) -> resources::ResourceUsage {
-        let mut usage = *self.resource_usage.borrow();
+        let mut usage = self
+            .resource_usage
+            .borrow()
+            .with_uptime_at(std::time::Instant::now());
         usage.state = self.state.get_state();
 
         usage
@@ -779,6 +900,8 @@ impl Server {
         self.filesystem
             .update_ignored(&configuration.egg.file_denylist)
             .await;
+        self.filesystem.trash.update(configuration.trash);
+        self.filesystem.update_mounts(&configuration.mounts);
         self.set_suspended(configuration.suspended).await;
         {
             let mut configuration_lock = self.configuration.write().await;
@@ -1216,6 +1339,12 @@ impl Server {
                             }
                         }
 
+                        if server.suspended.load(Ordering::Relaxed) {
+                            return Err(anyhow::anyhow!(
+                                "Server is in a locked state (suspended), cannot start the server."
+                            ));
+                        }
+
                         if !server.filesystem.disk_checker_state_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1243,7 +1372,7 @@ impl Server {
                             }
                         }
 
-                        if server.filesystem.is_full().await {
+                        if !server.filesystem.trash.ensure_not_full(&server).await {
                             return Err(anyhow::anyhow!(
                                 "Disk space is full, cannot start the server."
                             ));
@@ -1314,7 +1443,7 @@ impl Server {
                             "Another power action is currently being processed for this server, please try again later."
                         ))
                     },
-                    Err(err) => Err(err),
+                    Err(err) => Err(server.report_power_error(crate::models::ServerPowerAction::Start, err)),
                 }
         })
         .await?
@@ -1337,16 +1466,20 @@ impl Server {
 
         let server = self.clone();
         tokio::spawn(async move {
-            server.stopping.store(true, Ordering::SeqCst);
-            if process_handle.kill().await.is_ok() {
-                if !skip_schedules {
-                    server
-                        .schedules
-                        .execute_power_action_trigger(crate::models::ServerPowerAction::Kill)
-                        .await;
-                }
-                server.reset_state().await;
+            let was_stopping = server.stopping.swap(true, Ordering::SeqCst);
+            if let Err(err) = process_handle.kill().await {
+                server.stopping.store(was_stopping, Ordering::SeqCst);
+
+                return Err(server.report_power_error(crate::models::ServerPowerAction::Kill, err));
             }
+
+            if !skip_schedules {
+                server
+                    .schedules
+                    .execute_power_action_trigger(crate::models::ServerPowerAction::Kill)
+                    .await;
+            }
+            server.reset_state().await;
 
             Ok(())
         })
@@ -1479,7 +1612,7 @@ impl Server {
                 server.restarting.store(true, Ordering::SeqCst);
 
                 if server.state.get_state() != state::ServerState::Stopping
-                    && let Err(err) = server.stop(None, true).await
+                    && let Err(err) = server.stop(aquire_timeout, true).await
                 {
                     server.restarting.store(false, Ordering::SeqCst);
 
@@ -1495,13 +1628,7 @@ impl Server {
                         server = %server.uuid,
                         "kill timeout reached during restart, killing server"
                     );
-                    if let Err(err) = server.kill(true).await {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to kill server during restart: {}",
-                            err
-                        );
-                    }
+                    server.kill(true).await?;
                 }
             } else {
                 server.start(aquire_timeout, true).await?;
@@ -1519,6 +1646,7 @@ impl Server {
 
     pub async fn stop_with_kill_timeout(
         &self,
+        aquire_timeout: Option<std::time::Duration>,
         timeout: std::time::Duration,
         skip_schedules: bool,
     ) -> Result<(), anyhow::Error> {
@@ -1537,7 +1665,7 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             if server.state.get_state() != state::ServerState::Stopping {
-                server.stop(None, skip_schedules).await?;
+                server.stop(aquire_timeout, skip_schedules).await?;
             }
 
             if server
@@ -1574,7 +1702,8 @@ impl Server {
         match (action, kill_timeout) {
             (ServerPowerAction::Start, _) => self.start(aquire_timeout, false).await,
             (ServerPowerAction::Stop, Some(timeout)) => {
-                self.stop_with_kill_timeout(timeout, false).await
+                self.stop_with_kill_timeout(aquire_timeout, timeout, false)
+                    .await
             }
             (ServerPowerAction::Stop, None) => self.stop(aquire_timeout, false).await,
             (ServerPowerAction::Restart, Some(timeout)) => {
@@ -1616,9 +1745,19 @@ impl Server {
             return Err(PowerActionError::User(message.into()));
         }
 
-        self.power_action(action, None)
-            .await
-            .map_err(|err| match err.downcast::<&str>() {
+        self.power_action(action, None).await.map_err(|err| {
+            if let Some(reported) = err.downcast_ref::<ConsoleReported>() {
+                tracing::error!(
+                    server = %self.uuid,
+                    "failed to {} server: {:#?}",
+                    action.to_str(),
+                    reported
+                );
+
+                return PowerActionError::Reported(reported.line.clone());
+            }
+
+            match err.downcast::<&str>() {
                 Ok(message) => PowerActionError::User(message.into()),
                 Err(err) => {
                     tracing::error!(
@@ -1630,7 +1769,8 @@ impl Server {
 
                     PowerActionError::Internal(err)
                 }
-            })
+            }
+        })
     }
 
     pub async fn destroy_container(&self) {
@@ -1663,31 +1803,41 @@ impl Server {
             "destroying server"
         );
 
+        self.destroying.store(true, Ordering::SeqCst);
         self.set_suspended(true).await;
+        if let Some(installer) = self.installer.read().await.as_ref() {
+            installer.abort();
+        }
         self.kill(true).await.ok();
         self.destroy_container().await;
+
+        crate::server::installation::ServerInstaller::delete_install_logs(self).await;
+
+        self.diff.close().await;
+        self.app_state
+            .resource_history
+            .delete_server(self.uuid)
+            .await;
+        self.app_state.crash_history.delete_server(self.uuid).await;
+
+        self.diff.destroy().await;
+        let result = self.filesystem.destroy().await;
+        self.filesystem.close();
         self.configuration
             .read()
             .await
             .remove_vmounts(&self.app_state.config)
             .await;
 
-        crate::server::installation::ServerInstaller::delete_install_logs(self).await;
-
-        self.diff.close().await;
-
-        tokio::spawn({
-            let server = self.clone();
-
-            async move {
-                if let Some(installer) = server.installer.read().await.as_ref() {
-                    installer.abort();
-                }
-                server.diff.destroy().await;
-                server.filesystem.destroy().await;
-                server.filesystem.close();
-            }
-        });
+        match result {
+            Ok(()) => tracing::info!(server = %self.uuid, "server destroyed"),
+            Err(err) => tracing::error!(
+                server = %self.uuid,
+                path = %self.filesystem.base_path.display(),
+                "failed to delete server base directory: {}",
+                err
+            ),
+        }
     }
 
     pub async fn to_api_response(&self) -> serde_json::Value {
@@ -1848,6 +1998,9 @@ mod tests {
             match server.checked_power_action(action).await {
                 Err(PowerActionError::User(message)) => message.into_owned(),
                 Err(PowerActionError::Internal(err)) => panic!("{action:?}: internal error {err}"),
+                Err(PowerActionError::Reported(message)) => {
+                    panic!("{action:?}: reported error {message}")
+                }
                 Ok(()) => panic!("{action:?}: unexpectedly executed"),
             }
         }

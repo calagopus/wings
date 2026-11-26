@@ -148,7 +148,11 @@ fn disk_bytes_for(path: &Path) -> u64 {
         .unwrap_or(Path::new("/"));
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    sysinfo::Disks::new_with_refreshed_list()
+    let Ok(disks) = sysinfo::Disks::new_with_refreshed_list() else {
+        return 0;
+    };
+
+    disks
         .iter()
         .filter(|disk| path.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
@@ -172,21 +176,21 @@ async fn probe(
     let data_directory = state.config.system.data_directory.as_path(&state.config);
 
     let (cpu_count, memory_bytes, disk_bytes) = tokio::task::spawn_blocking(move || {
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new()?;
         system.refresh_memory();
         system.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
 
-        (
+        Ok::<_, sysinfo::Error>((
             system.cpus().len(),
             system.total_memory(),
             disk_bytes_for(&data_directory),
-        )
+        ))
     })
     .await
     .or_api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "failed to read system information",
-    )?;
+    )??;
 
     let ips = if container {
         BTreeSet::new()

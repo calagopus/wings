@@ -8,7 +8,7 @@ mod process;
 mod provision;
 mod storage;
 
-use super::{ProcessHandle, ServerExecutor, StatusReceiver, UsedPort};
+use super::{ProcessHandle, ProcessStatus, ServerExecutor, StatusReceiver, UsedPort};
 use crate::{
     config::Config,
     remote::servers::RawServer,
@@ -308,6 +308,39 @@ pub fn verify_version(version: &str, extensions: &[String]) -> anyhow::Result<()
     Ok(())
 }
 
+const SCRIPT_START_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Follows a script instance until it stops. Returns `false` if it never reported a status within
+/// `start_deadline`, ran past `timeout`, or its monitor ended without reporting a stop.
+async fn wait_for_script(
+    mut statuses: StatusReceiver,
+    forward: tokio::sync::mpsc::Sender<ProcessStatus>,
+    start_deadline: Duration,
+    timeout: Option<Duration>,
+) -> bool {
+    let finished = async {
+        let mut next = tokio::time::timeout(start_deadline, statuses.recv())
+            .await
+            .ok()
+            .flatten();
+        while let Some(status) = next {
+            // Nobody is required to listen, so a closed or full channel is fine.
+            let _ = forward.try_send(status);
+            if matches!(status, ProcessStatus::Stopped { .. }) {
+                return true;
+            }
+            next = statuses.recv().await;
+        }
+        false
+    };
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, finished)
+            .await
+            .unwrap_or(false),
+        None => finished.await,
+    }
+}
+
 fn firewall_spec(
     config: &ServerConfiguration,
     private: IpAddr,
@@ -507,7 +540,8 @@ impl ServerExecutor for IncusExecutor {
         server: &Server,
         script: &InstallationScript,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        self.setup_helper(server, script, true).await
+        let (_, handle, status_rx) = self.setup_helper(server, script, true).await?;
+        Ok((handle, status_rx))
     }
     async fn attach_installation_process(
         &self,
@@ -525,8 +559,28 @@ impl ServerExecutor for IncusExecutor {
         &self,
         server: &Server,
         script: &InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        self.setup_helper(server, script, false).await
+        let (name, handle, statuses) = self.setup_helper(server, script, false).await?;
+        let (forward, status_rx) = tokio::sync::mpsc::channel(8);
+        let executor = self.clone();
+        let supervised = Arc::clone(&handle);
+
+        // Script callers drop both the handle and the receiver right after starting, and dropping
+        // the handle stops its console and monitor tasks, so this task keeps them until the end.
+        tokio::spawn(async move {
+            if !wait_for_script(statuses, forward, SCRIPT_START_DEADLINE, timeout).await {
+                tracing::warn!(instance = %name, "Incus script did not finish in time, removing it");
+                if let Err(error) = executor.remove_instance(&name).await {
+                    tracing::warn!(instance = %name, %error, "could not remove Incus script instance");
+                }
+            }
+            // Give the console task time to forward the last output.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(supervised);
+        });
+
+        Ok((handle, status_rx))
     }
     async fn resolve_internal_target(
         &self,
@@ -558,6 +612,11 @@ impl ServerExecutor for IncusExecutor {
     }
     async fn used_ports(&self, ips: &[IpAddr]) -> anyhow::Result<HashMap<IpAddr, Vec<UsedPort>>> {
         self.network.used_ports(ips).await
+    }
+    // Bandwidth shaping is implemented only for Docker containers (it works on their
+    // network namespaces), so Incus instances run without per-server bandwidth limits.
+    fn bandwidth(&self) -> Option<&crate::server::bandwidth::Bandwidth> {
+        None
     }
     async fn reconcile_firewall(&self, servers: &[RawServer]) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;

@@ -7,9 +7,10 @@ pub async fn script_server(
     server: &super::Server,
     executor: &Arc<dyn crate::server::executor::ServerExecutor>,
     container_script: InstallationScript,
+    timeout: Option<std::time::Duration>,
 ) -> Result<crate::io::pipe::PipeReader, anyhow::Error> {
     let (handle, _) = executor
-        .setup_script_process(server, &container_script)
+        .setup_script_process(server, &container_script, timeout)
         .await
         .context("Failed to setup script process")?;
 

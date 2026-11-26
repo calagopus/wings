@@ -11,11 +11,7 @@ use crate::{
 };
 use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
-use std::{
-    borrow::Cow,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{borrow::Cow, io::Write, path::Path};
 
 pub struct CreateItafOptions {
     pub compression_type: CompressionType,
@@ -100,8 +96,8 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
-                            tracing::debug!("failed to read directory entry while creating itaf archive: {err:#}");
-                            break;
+                            tracing::warn!("failed to read directory entry while creating itaf archive: {err:#}");
+                            continue;
                         }
                     };
 
@@ -226,12 +222,10 @@ pub async fn create_itaf<W: Write + Send + 'static>(
 pub async fn create_itaf_distributed<W: Write + Send + 'static>(
     filesystem: crate::server::filesystem::cap::CapFilesystem,
     destination: W,
-    base: &Path,
-    sources: async_channel::Receiver<PathBuf>,
+    sources: async_channel::Receiver<crate::server::filesystem::cap::WalkEntry>,
     progress: ArchiveProgress,
     options: CreateItafOptions,
 ) -> Result<W, anyhow::Error> {
-    let base = filesystem.relative_path(base);
     let (_guard, listener) = AbortGuard::new();
 
     tokio::task::spawn_blocking(move || {
@@ -252,11 +246,11 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
 
         let mut dir_stack = Vec::new();
 
-        while let Ok(source) = sources.recv_blocking() {
-            let relative = &source;
-            let full = base.join(relative);
+        while let Ok(entry) = sources.recv_blocking() {
+            let relative = &entry.path;
+            let full = &entry.path;
 
-            let metadata = match filesystem.symlink_metadata(&full) {
+            let metadata = match entry.metadata() {
                 Ok(m) => m,
                 Err(err) => {
                     tracing::debug!(path = %full.display(), "skipping source while creating itaf archive, failed to read metadata: {err:#}");
@@ -278,7 +272,7 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                     &mut dir_stack,
                     parent_components,
                     &filesystem,
-                    &base,
+                    Path::new(""),
                 )?;
 
                 let Some(name) = components.last() else {
@@ -295,27 +289,27 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                     &mut dir_stack,
                     dir_components,
                     &filesystem,
-                    &base,
+                    Path::new(""),
                 )?;
 
                 let Some(name) = components.last() else {
                     continue;
                 };
 
-                let file = filesystem.open(&full)?;
+                let file = entry.open()?;
                 let reader = progress.counting_reader(file);
                 let reader = FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                 archive.add_file(name, &meta, metadata.len(), &mut { reader })?;
                 progress.increment_files();
-            } else if let Ok(link_target) = filesystem.read_link_contents(&full) {
+            } else if let Ok(link_target) = filesystem.read_link_contents(full) {
                 let dir_components = components.get_slice(..components.len().saturating_sub(1))?;
                 sync_dir_stack_with_meta(
                     &mut archive,
                     &mut dir_stack,
                     dir_components,
                     &filesystem,
-                    &base,
+                    Path::new(""),
                 )?;
 
                 let Some(name) = components.last() else {
@@ -326,7 +320,7 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                     archive.add_symlink(
                         name,
                         &target,
-                        symlink_targets_dir(&filesystem, &full),
+                        symlink_targets_dir(&filesystem, full),
                         &meta,
                     )?;
                 }

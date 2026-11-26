@@ -42,7 +42,7 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> anyhow::Result<()
         .as_path(&cfg)
         .join("{server}")
         .join("hosts");
-    let mut rendered: serde_json::Value = serde_norway::from_str(&daemon::render_config(
+    let mut rendered: serde_json::Value = serde_saphyr::from_str(&daemon::render_config(
         manager,
         own.tunnel_port,
         cfg.tundra.metrics_port,
@@ -53,7 +53,7 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> anyhow::Result<()
         .and_then(|restart| restart.get_mut("binary_path"))
         .context("Tundra restart configuration missing")? = executable.display().to_string().into();
     let path = manager.data_dir.join("config.yml");
-    let changed = daemon::sync_config(&path, &serde_norway::to_string(&rendered)?)?;
+    let changed = daemon::sync_config(&path, &serde_saphyr::to_string(&rendered)?)?;
     let mut slot = manager.child.lock().await;
     if let Some(child) = slot.as_mut() {
         if child.try_wait()?.is_none() && !changed {

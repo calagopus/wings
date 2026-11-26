@@ -1,8 +1,13 @@
 use crate::{
+    io::compression::{CompressionType, reader::AsyncCompressionReader},
     remote::backups::RawServerBackup,
-    server::backup::{Backup, DumpReader},
+    server::{
+        backup::{Backup, DumpReader, DumpSource},
+        filesystem::archive::{Archive, ArchiveType, ExtractOptions},
+    },
+    utils::TokioStdoutTakeExt,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 pub mod btrfs;
 pub mod ddup_bak;
@@ -10,6 +15,8 @@ pub mod kopia;
 pub mod pbs;
 pub mod restic;
 pub mod s3;
+mod snapshot_dir;
+mod tree;
 pub mod wings;
 pub mod zfs;
 
@@ -18,6 +25,17 @@ pub use super::BackupAdapter;
 /// Above this many exclusion frontier entries an external engine, which matches
 /// every path against every pattern, gets noticeably slow.
 const EXCLUSION_FRONTIER_WARN: usize = 20_000;
+
+/// Whether the panel answered that the backup is missing or not stored on this adapter.
+fn is_configuration_missing(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::remote::ApiError>()
+        .is_some_and(|err| {
+            matches!(
+                err.status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::EXPECTATION_FAILED
+            )
+        })
+}
 
 /// A path spelled as a literal pattern for an external engine's glob syntax.
 fn glob_literal(path: &std::path::Path) -> String {
@@ -34,6 +52,142 @@ fn glob_literal(path: &std::path::Path) -> String {
     literal
 }
 
+fn log_restoring(server: &crate::server::Server, path: &std::path::Path) {
+    server.log_daemon(compact_str::format_compact!(
+        "(restoring): {}",
+        path.display()
+    ));
+}
+
+/// Runs `create` for an entry restored by a walk with inline directories, where
+/// the parent normally exists already. Only when `create` fails with `NotFound`
+/// is the parent created, after which `create` runs once more.
+async fn create_with_parent<T, Fut: Future<Output = Result<T, std::io::Error>>>(
+    server: &crate::server::Server,
+    path: &std::path::Path,
+    mut create: impl FnMut() -> Fut,
+) -> Result<T, std::io::Error> {
+    match create().await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Err(err);
+            };
+
+            server
+                .filesystem
+                .async_create_chowned_dir_all(parent, None)
+                .await?;
+            create().await
+        }
+        result => result,
+    }
+}
+
+fn spawn_stderr_capture(
+    stderr: tokio::process::ChildStderr,
+    limit: usize,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut output = String::new();
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if output.len() < limit {
+                        output.push_str(&String::from_utf8_lossy(&line));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        output
+    })
+}
+
+async fn restore_tar_command(
+    server: &crate::server::Server,
+    tool: &str,
+    mut command: tokio::process::Command,
+    progress: crate::server::filesystem::archive::create::ArchiveProgress,
+    total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stderr_limit: usize,
+) -> Result<(), anyhow::Error> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child.take_stdout()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+    let stderr_task = spawn_stderr_capture(stderr, stderr_limit);
+
+    let (destination, destination_filesystem) =
+        server.filesystem.resolve_writable_fs(server, "").await;
+
+    let extracted = Archive::from_stream(
+        server.clone(),
+        CompressionType::None,
+        ArchiveType::Tar,
+        tokio_util::io::SyncIoBridge::new(stdout),
+        None,
+    )
+    .extract(
+        destination,
+        destination_filesystem,
+        progress,
+        Some(total),
+        ExtractOptions {
+            on_file: Some(std::sync::Arc::new({
+                let server = server.clone();
+
+                move |path| log_restoring(&server, path)
+            })),
+            count_written: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    if extracted.is_err() {
+        child.start_kill().ok();
+    }
+
+    let status = child.wait().await?;
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if let Err(err) = extracted {
+        if !status.success() && !stderr.trim().is_empty() {
+            return Err(err.context(format!("{tool} failed: {}", stderr.trim_end())));
+        }
+
+        return Err(err);
+    }
+
+    if !status.success() {
+        let mut message = compact_str::format_compact!("failed to restore {tool} backup");
+        if !stderr.is_empty() {
+            message.push_str(":\n");
+            message.push_str(stderr.trim_end());
+        }
+
+        return Err(anyhow::anyhow!("{}", message));
+    }
+
+    server.filesystem.rerun_disk_checker();
+
+    Ok(())
+}
+
 async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyhow::Error> {
     let mut first_byte = [0; 1];
     if reader.read(&mut first_byte).await? == 0 {
@@ -41,6 +195,16 @@ async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyho
     }
 
     Ok(Box::new(std::io::Cursor::new(first_byte).chain(reader)))
+}
+
+fn decompress_dump(reader: DumpReader, compression: CompressionType) -> DumpReader {
+    match compression {
+        CompressionType::None => reader,
+        compression => Box::new(AsyncCompressionReader::new_with_async_reader(
+            reader,
+            compression,
+        )),
+    }
 }
 
 async fn probe_backup_directory(config: &crate::config::Config) -> Result<(), anyhow::Error> {
@@ -98,17 +262,27 @@ impl BackupAdapter {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<(Self, Backup)>, anyhow::Error> {
+        let mut first_error = None;
+
         for adapter in Self::variants() {
             if *adapter == Self::S3 {
                 continue;
             }
 
-            if let Some(backup) = adapter.find(state, uuid).await? {
-                return Ok(Some((*adapter, backup)));
+            match adapter.find(state, uuid).await {
+                Ok(Some(backup)) => return Ok(Some((*adapter, backup))),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(backup = %uuid, "failed to search {} backups: {:#}", adapter.to_str(), err);
+                    first_error.get_or_insert(err);
+                }
             }
         }
 
-        Ok(None)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(None),
+        }
     }
 
     pub async fn create_from_stream(
@@ -116,12 +290,29 @@ impl BackupAdapter {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
-        reader: DumpReader,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
-        super::validate_dump_extension(extension)?;
-        let reader = prepare_dump_reader(reader).await?;
+        let (extension, compression) = super::parse_dump_extension(extension)?;
 
-        self.create_from_prepared_stream(state, uuid, extension, reader)
+        // Deduplicating adapters compress chunks themselves, and a compressed
+        // stream defeats their content-defined chunking.
+        let decompress = !matches!(self, Self::Wings | Self::S3);
+        let source: DumpSource = Box::pin(async move {
+            let reader = prepare_dump_reader(source.await?).await?;
+
+            Ok(if decompress {
+                decompress_dump(reader, compression)
+            } else {
+                reader
+            })
+        });
+        let compression = if decompress {
+            CompressionType::None
+        } else {
+            compression
+        };
+
+        self.create_from_prepared_stream(state, uuid, extension, compression, source)
             .await
     }
 }
@@ -131,7 +322,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_dump_is_rejected_before_adapter_creation() {
+    fn empty_dump_is_rejected() {
         tokio_test::block_on(async {
             let result = prepare_dump_reader(Box::new(tokio::io::empty())).await;
             assert!(result.is_err_and(|err| err.to_string().contains("0 bytes")));
@@ -179,6 +370,44 @@ mod tests {
         })
     }
 
+    // decompress_dump
+    #[test]
+    fn decompress_dump_passes_uncompressed_through() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            let input = b"database dump".as_slice();
+            let mut reader =
+                decompress_dump(Box::new(std::io::Cursor::new(input)), CompressionType::None);
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            assert_eq!(output, input);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn decompress_dump_decodes_gzip() -> Result<(), anyhow::Error> {
+        use std::io::Write;
+
+        tokio_test::block_on(async {
+            let input = b"database dump".repeat(64);
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input)?;
+            let compressed = encoder.finish()?;
+
+            let mut reader = decompress_dump(
+                Box::new(std::io::Cursor::new(compressed)),
+                CompressionType::Gz,
+            );
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            assert_eq!(output, input);
+
+            Ok(())
+        })
+    }
+
     // glob_literal
     #[test]
     fn glob_literal_escapes_every_metacharacter() {
@@ -190,5 +419,54 @@ mod tests {
             glob_literal(std::path::Path::new("plain/path.txt")),
             "plain/path.txt"
         );
+    }
+
+    // create_with_parent
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn create_with_parent_retries_once_after_creating_parents() {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            let root = server.filesystem.base_path.clone();
+            let path = std::path::Path::new("a/b/file.txt");
+
+            let mut attempts = 0;
+            create_with_parent(&server, path, || {
+                attempts += 1;
+                let target = root.join(path);
+                async move { std::fs::write(target, b"x") }
+            })
+            .await
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(std::fs::read(root.join(path)).unwrap(), b"x");
+
+            let mut attempts = 0;
+            let result = create_with_parent(&server, std::path::Path::new("c/d/file"), || {
+                attempts += 1;
+                async { Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound)) }
+            })
+            .await;
+            assert_eq!(attempts, 2);
+            assert!(result.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound));
+            assert!(root.join("c/d").is_dir());
+        });
+    }
+
+    #[test]
+    fn create_with_parent_returns_other_errors_untouched() {
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+
+            let mut attempts = 0;
+            let result = create_with_parent(&server, std::path::Path::new("a/b/file"), || {
+                attempts += 1;
+                async { Err::<(), _>(std::io::Error::other("create failed")) }
+            })
+            .await;
+            assert_eq!(attempts, 1);
+            assert!(result.is_err_and(|err| err.to_string() == "create failed"));
+            assert!(!server.filesystem.base_path.join("a").exists());
+        });
     }
 }

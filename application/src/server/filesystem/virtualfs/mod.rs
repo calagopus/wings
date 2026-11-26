@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::{
     io::{
         compression::CompressionLevel,
@@ -26,6 +24,7 @@ use tokio::{
 
 pub mod archive;
 pub mod cap;
+pub mod filtered;
 pub mod functions;
 pub mod mount;
 
@@ -69,6 +68,12 @@ impl ByteRange {
             }
         };
 
+        match (start, end) {
+            (Bound::Unbounded, Bound::Unbounded) => return None,
+            (Bound::Included(start), Bound::Included(end)) if start > end => return None,
+            _ => {}
+        }
+
         Some(Self::new(start, end))
     }
 
@@ -92,26 +97,36 @@ impl ByteRange {
         matches!((&self.0, &self.1), (Bound::Unbounded, Bound::Unbounded))
     }
 
+    /// Resolves against `total` bytes into inclusive `(start, end)` offsets with the end clamped.
+    /// An unbounded start with a bounded end is a suffix range (`bytes=-N`).
+    /// `None` means the range cannot be satisfied.
+    pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
+        let suffix = match (self.0, self.1) {
+            (Bound::Unbounded, Bound::Included(n)) => n,
+            (Bound::Unbounded, Bound::Excluded(n)) => n.checked_sub(1)?,
+            range => return crate::io::range_reader::resolve_range(range, total).ok(),
+        };
+        if suffix == 0 || total == 0 {
+            return None;
+        }
+
+        Some((total.saturating_sub(suffix), total - 1))
+    }
+
     pub fn get_header_value(&self, total: u64) -> HeaderValue {
-        let range_header_value = match (&self.0, &self.1) {
-            (Bound::Included(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s, e, total),
-            (Bound::Included(s), Bound::Excluded(e)) => format!("bytes {}-{}/{}", s, e - 1, total),
-            (Bound::Included(s), Bound::Unbounded) => {
-                format!("bytes {}-{}/{}", s, total - 1, total)
-            }
-            (Bound::Excluded(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s + 1, e, total),
-            (Bound::Excluded(s), Bound::Excluded(e)) => {
-                format!("bytes {}-{}/{}", s + 1, e - 1, total)
-            }
-            (Bound::Excluded(s), Bound::Unbounded) => {
-                format!("bytes {}-{}/{}", s + 1, total - 1, total)
-            }
-            (Bound::Unbounded, Bound::Included(e)) => format!("bytes 0-{}/{}", e, total),
-            (Bound::Unbounded, Bound::Excluded(e)) => format!("bytes 0-{}/{}", e - 1, total),
-            (Bound::Unbounded, Bound::Unbounded) => format!("bytes 0-{}/{}", total - 1, total),
+        let range_header_value = match self.resolve(total) {
+            Some((start, end)) => format!("bytes {start}-{end}/{total}"),
+            None => format!("bytes */{total}"),
         };
 
         unsafe { HeaderValue::from_str(&range_header_value).unwrap_unchecked() }
+    }
+}
+
+impl crate::io::range_reader::ResolveRange for ByteRange {
+    #[inline]
+    fn resolve(&self, len: u64) -> Option<(u64, u64)> {
+        ByteRange::resolve(self, len)
     }
 }
 
@@ -128,7 +143,6 @@ pub type WritableFileStream = Box<dyn std::io::Write + Send + Sync>;
 pub type AsyncWritableFileStream = Box<dyn AsyncWrite + Unpin + Send>;
 pub type WritableSeekableFileStream = Box<dyn crate::io::WriteSeek + Send + Sync>;
 pub type AsyncWritableSeekableFileStream = Box<dyn crate::io::AsyncWriteSeek + Send>;
-pub type ReadableWritableSeekableFileStream = Box<dyn crate::io::ReadWriteSeek + Send>;
 pub type AsyncReadableWritableSeekableFileStream = Box<dyn crate::io::AsyncReadWriteSeek + Send>;
 
 pub struct DirectoryListing {
@@ -153,6 +167,21 @@ fn file_read_headers(size: u64, total_size: u64, reader_range: Option<ByteRange>
     }
 
     headers
+}
+
+/// Sums the sizes of `paths` on a single blocking task, skipping entries that cannot be read.
+pub async fn total_size(
+    filesystem: Arc<dyn VirtualReadableFilesystem>,
+    paths: Vec<PathBuf>,
+) -> Result<u64, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .filter_map(|path| filesystem.directory_entry_buffer(path, &[]).ok())
+            .map(|entry| entry.size)
+            .sum()
+    })
+    .await
 }
 
 pub enum CheckedDirectoryListing {
@@ -280,6 +309,7 @@ pub struct FileMetadata {
     pub permissions: PortablePermissions,
     pub size: u64,
     pub modified: Option<std::time::SystemTime>,
+    #[allow(dead_code)]
     pub created: Option<std::time::SystemTime>,
 }
 
@@ -340,26 +370,6 @@ impl VirtualWalkEntry {
         }
     }
 
-    pub fn metadata(
-        &self,
-        filesystem: &dyn VirtualReadableFilesystem,
-    ) -> Result<FileMetadata, anyhow::Error> {
-        match &self.source {
-            Some(source) => Ok(source.metadata()?.into()),
-            None => filesystem.symlink_metadata(&self.path),
-        }
-    }
-
-    pub async fn async_metadata(
-        &self,
-        filesystem: &dyn VirtualReadableFilesystem,
-    ) -> Result<FileMetadata, anyhow::Error> {
-        match &self.source {
-            Some(source) => Ok(source.async_metadata().await?.into()),
-            None => filesystem.async_symlink_metadata(&self.path).await,
-        }
-    }
-
     /// Metadata taken straight from the directory entry the walker read (a single
     /// `statx` on the parent directory), when this walk has one.
     pub fn source_metadata(&self) -> Option<Result<cap_std::fs::Metadata, std::io::Error>> {
@@ -381,14 +391,6 @@ pub trait DirectoryWalk {
             self.next_entry()?
                 .map(|(file_type, path)| VirtualWalkEntry::new(file_type, path)),
         )
-    }
-
-    fn run_multithreaded(
-        &mut self,
-        threads: usize,
-        func: DirectoryWalkFn,
-    ) -> Result<(), anyhow::Error> {
-        self.run_multithreaded_filtered(threads, None, func)
     }
 
     fn run_multithreaded_filtered(
@@ -526,7 +528,10 @@ pub trait AsyncDirectoryWalk {
                         }
                     });
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    error.fail(err);
+                    break;
+                }
             }
         }
 
@@ -602,7 +607,10 @@ pub trait AsyncDirectoryStreamWalk {
                         }
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    error.fail(err);
+                    break;
+                }
             }
         }
 
@@ -637,11 +645,19 @@ pub trait VirtualReadableFilesystem: Send + Sync {
     fn is_primary_server_fs(&self) -> bool {
         false
     }
+    fn is_ignored(&self, _path: &Path, _file_type: FileType) -> bool {
+        false
+    }
     fn is_fast(&self) -> bool {
         false
     }
     fn is_writable(&self) -> bool {
         false
+    }
+    /// The cap filesystem this is, so a request can take its own copy of a shared
+    /// one and judge entries by the paths symlinks lead to.
+    fn as_virtual_cap(&self) -> Option<&cap::VirtualCapFilesystem> {
+        None
     }
 
     fn backing_server(&self) -> &crate::server::Server;
@@ -749,24 +765,6 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error>;
-    async fn async_walk_dir_files<'a>(
-        &'a self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        file_paths: Vec<PathBuf>,
-        is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let root_path = path.as_ref().to_path_buf();
-        let is_ignored = move |file_type, path: PathBuf| {
-            let stripped_path = path.strip_prefix(&root_path).unwrap_or(&path);
-            if file_paths.iter().any(|p| stripped_path.starts_with(p)) {
-                is_ignored(file_type, path)
-            } else {
-                IgnoreVerdict::Skip
-            }
-        };
-        self.async_walk_dir(path, IsIgnoredFn::from(is_ignored))
-            .await
-    }
     async fn async_walk_dir_stream<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -851,17 +849,24 @@ pub trait VirtualReadableFilesystem: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
-    fn create_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
+    fn create_dir_all(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), anyhow::Error>;
     async fn async_create_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        permissions: Option<PortablePermissions>,
     ) -> Result<(), anyhow::Error>;
-    fn remove_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
     async fn async_remove_dir_all(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
-    fn remove_file(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
+    /// Whether the directory at `directory` holds an entry this filesystem hides,
+    /// where it is now or re-rooted under any of `roots`, so moving or removing the
+    /// directory would take it along. Anything unreadable counts as hidden.
+    async fn async_holds_ignored(&self, directory: &Path, roots: &[&Path]) -> bool;
     async fn async_remove_file(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -872,6 +877,19 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
+    fn create_symlink_with_metadata(
+        &self,
+        original: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.create_symlink(original, link)?;
+        if let Some(modified) = modified {
+            self.set_times(link, FileType::Symlink, modified, None)?;
+        }
+
+        Ok(())
+    }
     async fn async_create_symlink(
         &self,
         original: &(dyn AsRef<Path> + Send + Sync),
@@ -880,6 +898,11 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     async fn async_create_symlink_contents(
         &self,
         contents: &(dyn AsRef<Path> + Send + Sync),
+        link: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<(), anyhow::Error>;
+    fn create_hard_link(
+        &self,
+        original: &(dyn AsRef<Path> + Send + Sync),
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
     fn create_file(
@@ -921,11 +944,6 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<AsyncWritableSeekableFileStream, anyhow::Error>;
-    fn open_file_with_options(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        options: cap_std::fs::OpenOptions,
-    ) -> Result<ReadableWritableSeekableFileStream, anyhow::Error>;
     async fn async_open_file_with_options(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -951,23 +969,23 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error>;
-    async fn async_set_times(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
-        modification_time: std::time::SystemTime,
-        access_time: Option<std::time::SystemTime>,
-    ) -> Result<(), anyhow::Error>;
-    fn rename(
-        &self,
-        from: &(dyn AsRef<Path> + Send + Sync),
-        to: &(dyn AsRef<Path> + Send + Sync),
-        file_type: FileType,
-    ) -> Result<(), anyhow::Error>;
     async fn async_rename(
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
         file_type: FileType,
     ) -> Result<(), anyhow::Error>;
+
+    /// Copies the regular file at `source` on `source_server`'s own filesystem to
+    /// `destination` here, through the server's quota accounting. Only a primary
+    /// server filesystem can do this, and `destination` is judged like any other
+    /// file created here.
+    async fn async_quota_copy_from(
+        &self,
+        source_server: &crate::server::Server,
+        source: &Path,
+        destination: &Path,
+        permissions: Option<PortablePermissions>,
+        progress: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<u64, anyhow::Error>;
 }

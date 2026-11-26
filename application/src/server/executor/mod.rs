@@ -19,19 +19,37 @@ pub async fn create_runtime(config: Arc<crate::config::Config>) -> anyhow::Resul
             tracing::info!("connecting to docker");
             let socket = config.load().docker.socket.clone();
             let docker = Arc::new(
-                if socket.starts_with("http://") || socket.starts_with("tcp://") {
-                    bollard::Docker::connect_with_http(&socket, 120, bollard::API_DEFAULT_VERSION)?
+                match if socket.starts_with("http://") || socket.starts_with("tcp://") {
+                    bollard::Docker::connect_with_http(&socket, 120, bollard::API_DEFAULT_VERSION)
                 } else {
-                    bollard::Docker::connect_with_local(&socket, 120, bollard::API_DEFAULT_VERSION)?
+                    bollard::Docker::connect_with_local(&socket, 120, bollard::API_DEFAULT_VERSION)
+                } {
+                    Ok(docker) => docker,
+                    Err(err) => anyhow::bail!("failed to connect to docker: {err:?}"),
                 },
             );
+
+            config
+                .ensure_docker_network(&docker)
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to boot server executor: {err:?}"))?;
+
             let own_container = docker::DockerExecutor::own_container(&docker).await;
             let firewall =
                 crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
+            let bandwidth = Arc::new(
+                crate::server::bandwidth::Bandwidth::create(
+                    &config,
+                    &docker,
+                    own_container.as_ref(),
+                )
+                .await,
+            );
             let executor = Arc::new(docker::DockerExecutor::new(
                 Arc::clone(&docker),
                 Arc::clone(&config),
                 firewall,
+                bandwidth,
             ));
             Ok(Runtime {
                 executor,
@@ -131,6 +149,7 @@ pub trait ServerExecutor: Send + Sync {
         &self,
         server: &super::Server,
         script: &super::installation::InstallationScript,
+        timeout: Option<std::time::Duration>,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error>;
 
     async fn resolve_internal_target(
@@ -146,4 +165,6 @@ pub trait ServerExecutor: Send + Sync {
         &self,
         ips: &[IpAddr],
     ) -> Result<HashMap<IpAddr, Vec<UsedPort>>, anyhow::Error>;
+
+    fn bandwidth(&self) -> Option<&super::bandwidth::Bandwidth>;
 }

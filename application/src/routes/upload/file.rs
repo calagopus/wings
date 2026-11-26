@@ -7,11 +7,7 @@ use crate::{
 };
 use axum::{extract::DefaultBodyLimit, http::StatusCode};
 use serde::Deserialize;
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::{Arc, LazyLock},
-};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use utoipa_axum::{
     router::{OpenApiRouter, UtoipaMethodRouterExt},
@@ -46,15 +42,10 @@ fn issued_before_lock(payload: &FileJwtPayload, server: &crate::server::Server) 
     payload.base.issued_at.unwrap_or(0) < server.last_locked_at()
 }
 
-type UploadLocks = moka::future::Cache<(uuid::Uuid, std::path::PathBuf), Arc<Mutex<()>>>;
-static UPLOAD_LOCKS: LazyLock<UploadLocks> = LazyLock::new(|| moka::future::Cache::new(10240));
-
 /// Returns the per-file upload lock, serializing concurrent `PATCH` slices that
 /// append to the same path so their offset checks and writes cannot interleave.
-async fn upload_lock(key: (uuid::Uuid, std::path::PathBuf)) -> Arc<Mutex<()>> {
-    UPLOAD_LOCKS
-        .get_with(key, async { Arc::new(Mutex::new(())) })
-        .await
+fn upload_lock(key: (uuid::Uuid, std::path::PathBuf)) -> Arc<Mutex<()>> {
+    crate::server::filesystem::uploads::PART_LOCKS.get(key)
 }
 
 async fn authenticate(
@@ -132,16 +123,33 @@ async fn resolve_upload_target(
     })
 }
 
+async fn finalize_upload(
+    server: &crate::server::Server,
+    target: &UploadTarget,
+    size: u64,
+) -> Result<(), anyhow::Error> {
+    crate::server::filesystem::uploads::finalize_upload(
+        server,
+        &target.root,
+        target.filesystem.as_ref(),
+        &target.path,
+        &target.part,
+        size,
+    )
+    .await
+}
+
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::{cap::FileType, uploads::NewUpload},
+            filesystem::uploads::NewUpload,
         },
     };
     use axum::{
+        body::Bytes,
         extract::{ConnectInfo, Multipart, Query},
         http::{HeaderMap, StatusCode},
     };
@@ -216,11 +224,11 @@ mod post {
             }
             drop(config);
 
-            let disk_limit = server.filesystem.disk_limit();
-            if disk_limit > 0
-                && total_size
-                    > (disk_limit as u64)
-                        .saturating_sub(server.filesystem.get_physical_cached_size())
+            if !server
+                .filesystem
+                .trash
+                .ensure_headroom(&server, i64::try_from(total_size).unwrap_or(i64::MAX))
+                .await
             {
                 return ApiResponse::error(
                     "file size is larger than the server's available disk space",
@@ -254,22 +262,26 @@ mod post {
                         .ok();
                 }
             };
+            let target =
+                super::resolve_upload_target(&server, &ignored, &params.directory, &filename)
+                    .await?;
             let super::UploadTarget {
                 root,
                 filesystem,
                 path,
                 part,
                 ..
-            } = super::resolve_upload_target(&server, &ignored, &params.directory, &filename)
-                .await?;
+            } = &target;
 
-            filesystem.async_create_dir_all(&root).await?;
+            filesystem.async_create_dir_all(&root, None).await?;
 
-            let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
-            let _lock_guard = lock.lock().await;
+            let lock = super::upload_lock((payload.server_uuid, part.clone()));
+            let lock_guard = lock.lock_owned().await;
 
-            let mut written_size = 0;
-            let mut writer = filesystem.async_create_file(&part).await?;
+            let mut writer = tokio::io::BufWriter::with_capacity(
+                crate::FILE_STREAM_BUFFER_SIZE,
+                filesystem.async_create_file(&part).await?,
+            );
 
             let guard = if filesystem.is_primary_server_fs() {
                 Some(
@@ -278,8 +290,8 @@ mod post {
                         .uploads
                         .register(
                             NewUpload {
-                                target: &path,
-                                part: &part,
+                                target: path,
+                                part,
                                 user: payload.user_uuid,
                                 user_name: payload.user_name.clone(),
                                 total: None,
@@ -294,17 +306,35 @@ mod post {
                 None
             };
 
-            loop {
+            let (chunks, mut received) = tokio::sync::mpsc::channel::<Bytes>(4);
+            let append = tokio::spawn(async move {
+                let mut written = Ok(());
+                while let Some(chunk) = received.recv().await {
+                    if let Err(err) = writer.write_all(&chunk).await {
+                        written = Err(err);
+                        break;
+                    }
+                }
+
+                (written.and(writer.shutdown().await), lock_guard)
+            });
+
+            let mut written_size = 0;
+            let stopped: Option<ApiResponseResult> = loop {
                 let chunk = tokio::select! {
-                    chunk = field.chunk() => chunk?,
+                    chunk = field.chunk() => chunk,
                     _ = &mut locked => {
-                        return ApiResponse::error(super::LOCKED_ERROR)
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
+                        break Some(
+                            ApiResponse::error(super::LOCKED_ERROR)
+                                .with_status(StatusCode::EXPECTATION_FAILED)
+                                .ok(),
+                        );
                     }
                 };
-                let Some(chunk) = chunk else {
-                    break;
+                let chunk = match chunk {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break None,
+                    Err(err) => break Some(Err(err.into())),
                 };
 
                 let config = state.config.load();
@@ -312,28 +342,34 @@ mod post {
                     config.api.upload_limit.as_bytes() != 0
                         && written_size + chunk.len() as u64 > config.api.upload_limit.as_bytes(),
                 ) {
-                    return ApiResponse::error(&format!(
-                        "file size is larger than {}MiB",
-                        config.api.upload_limit.as_mib()
-                    ))
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
+                    break Some(
+                        ApiResponse::error(&format!(
+                            "file size is larger than {}MiB",
+                            config.api.upload_limit.as_mib()
+                        ))
+                        .with_status(StatusCode::EXPECTATION_FAILED)
+                        .ok(),
+                    );
                 }
                 drop(config);
 
-                writer.write_all(&chunk).await?;
                 written_size += chunk.len() as u64;
+                if chunks.send(chunk).await.is_err() {
+                    break None;
+                }
                 if let Some(guard) = &guard {
                     guard.set_progress(written_size);
                 }
+            };
+
+            drop(chunks);
+            let (written, _lock_guard) = append.await?;
+            if let Some(result) = stopped {
+                return result;
             }
+            written?;
 
-            writer.shutdown().await?;
-            drop(writer);
-
-            filesystem
-                .async_rename(&part, &path, FileType::File)
-                .await?;
+            super::finalize_upload(&server, &target, written_size).await?;
 
             if let Some(guard) = guard {
                 guard.complete().await;
@@ -390,6 +426,9 @@ mod head {
             filesystem, part, ..
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
+        let _lock_guard = lock.lock().await;
+
         let offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
                 if !metadata.file_type.is_file() {
@@ -415,7 +454,7 @@ mod patch {
         routes::{ApiError, GetState},
         server::{
             activity::{Activity, ActivityEvent},
-            filesystem::{cap::FileType, uploads::NewUpload},
+            filesystem::uploads::NewUpload,
         },
     };
     use axum::{
@@ -436,6 +475,13 @@ mod patch {
         #[serde(default)]
         directory: compact_str::CompactString,
         file: compact_str::CompactString,
+    }
+
+    enum AppendOutcome {
+        Written(u64),
+        Locked,
+        OverLimit,
+        Failed(std::io::Error),
     }
 
     #[utoipa::path(patch, path = "/", responses(
@@ -482,7 +528,6 @@ mod patch {
             .and_then(|value| value.parse::<u64>().ok());
 
         let locked = server.locked_signal();
-        tokio::pin!(locked);
 
         if super::issued_before_lock(&payload, &server) {
             return ApiResponse::error(super::LOCKED_ERROR)
@@ -502,21 +547,21 @@ mod patch {
 
         if upload_offset == 0
             && let Some(total_size) = upload_length
+            && !server
+                .filesystem
+                .trash
+                .ensure_headroom(&server, i64::try_from(total_size).unwrap_or(i64::MAX))
+                .await
         {
-            let disk_limit = server.filesystem.disk_limit();
-            if disk_limit > 0
-                && total_size
-                    > (disk_limit as u64)
-                        .saturating_sub(server.filesystem.get_physical_cached_size())
-            {
-                return ApiResponse::error(
-                    "file size is larger than the server's available disk space",
-                )
-                .with_status(StatusCode::EXPECTATION_FAILED)
-                .ok();
-            }
+            return ApiResponse::error(
+                "file size is larger than the server's available disk space",
+            )
+            .with_status(StatusCode::EXPECTATION_FAILED)
+            .ok();
         }
 
+        let target =
+            super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
         let super::UploadTarget {
             parent,
             file_name,
@@ -524,12 +569,12 @@ mod patch {
             filesystem,
             path,
             part,
-        } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
+        } = &target;
 
-        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
-        let _lock_guard = lock.lock().await;
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
+        let lock_guard = lock.lock_owned().await;
 
-        filesystem.async_create_dir_all(&root).await?;
+        filesystem.async_create_dir_all(&root, None).await?;
 
         let disk_offset = match filesystem.async_metadata(&part).await {
             Ok(metadata) => {
@@ -553,9 +598,12 @@ mod patch {
 
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).append(true).create(true);
-        let mut file = filesystem
-            .async_open_file_with_options(&part, options)
-            .await?;
+        let mut file = tokio::io::BufWriter::with_capacity(
+            crate::FILE_STREAM_BUFFER_SIZE,
+            filesystem
+                .async_open_file_with_options(&part, options)
+                .await?,
+        );
 
         let guard = if filesystem.is_primary_server_fs() {
             Some(
@@ -564,8 +612,8 @@ mod patch {
                     .uploads
                     .register(
                         NewUpload {
-                            target: &path,
-                            part: &part,
+                            target: path,
+                            part,
                             user: payload.user_uuid,
                             user_name: payload.user_name.clone(),
                             total: upload_length,
@@ -580,33 +628,62 @@ mod patch {
             None
         };
 
-        let mut written_size = disk_offset;
-        let mut stream = body.into_data_stream();
+        let (outcome, guard, _lock_guard) = tokio::spawn(async move {
+            tokio::pin!(locked);
 
-        loop {
-            let chunk = tokio::select! {
-                chunk = stream.next() => chunk,
-                _ = &mut locked => {
-                    file.shutdown().await?;
+            let mut written_size = disk_offset;
+            let mut stream = body.into_data_stream();
 
-                    return ApiResponse::error(super::LOCKED_ERROR)
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
+            let outcome = loop {
+                let chunk = tokio::select! {
+                    chunk = stream.next() => chunk,
+                    _ = &mut locked => break AppendOutcome::Locked,
+                };
+                let Some(chunk) = chunk else {
+                    break AppendOutcome::Written(written_size);
+                };
+
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        break AppendOutcome::Failed(std::io::Error::other(format!(
+                            "failed to read request body: {err}"
+                        )));
+                    }
+                };
+
+                if crate::unlikely(
+                    upload_limit != 0 && written_size + chunk.len() as u64 > upload_limit,
+                ) {
+                    break AppendOutcome::OverLimit;
+                }
+
+                if let Err(err) = file.write_all(&chunk).await {
+                    break AppendOutcome::Failed(err);
+                }
+                written_size += chunk.len() as u64;
+                if let Some(guard) = &guard {
+                    guard.set_progress(written_size);
                 }
             };
-            let Some(chunk) = chunk else {
-                break;
+
+            let outcome = match (outcome, file.shutdown().await) {
+                (AppendOutcome::Written(_), Err(err)) => AppendOutcome::Failed(err),
+                (outcome, _) => outcome,
             };
 
-            let chunk = chunk.map_err(|err| {
-                std::io::Error::other(format!("failed to read request body: {err}"))
-            })?;
+            (outcome, guard, lock_guard)
+        })
+        .await?;
 
-            if crate::unlikely(
-                upload_limit != 0 && written_size + chunk.len() as u64 > upload_limit,
-            ) {
-                file.shutdown().await?;
-
+        let written_size = match outcome {
+            AppendOutcome::Written(written_size) => written_size,
+            AppendOutcome::Locked => {
+                return ApiResponse::error(super::LOCKED_ERROR)
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+            AppendOutcome::OverLimit => {
                 return ApiResponse::error(&format!(
                     "file size is larger than {}MiB",
                     state.config.load().api.upload_limit.as_mib()
@@ -614,16 +691,8 @@ mod patch {
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
             }
-
-            file.write_all(&chunk).await?;
-            written_size += chunk.len() as u64;
-            if let Some(guard) = &guard {
-                guard.set_progress(written_size);
-            }
-        }
-
-        file.shutdown().await?;
-        drop(file);
+            AppendOutcome::Failed(err) => return Err(err.into()),
+        };
 
         if upload_complete {
             if let Some(total_size) = upload_length
@@ -636,9 +705,7 @@ mod patch {
                 .ok();
             }
 
-            filesystem
-                .async_rename(&part, &path, FileType::File)
-                .await?;
+            super::finalize_upload(&server, &target, written_size).await?;
 
             if let Some(guard) = guard {
                 guard.complete().await;
@@ -652,7 +719,7 @@ mod patch {
                 ip: user_ip,
                 metadata: Some(json!({
                     "files": [file_name.to_string_lossy()],
-                    "directory": server.filesystem.relative_path(&parent),
+                    "directory": server.filesystem.relative_path(parent),
                 })),
                 schedule: None,
                 timestamp: chrono::Utc::now(),
@@ -702,7 +769,7 @@ mod delete {
             filesystem, part, ..
         } = super::resolve_target(&server, &payload, &params.directory, &params.file).await?;
 
-        let lock = super::upload_lock((payload.server_uuid, part.clone())).await;
+        let lock = super::upload_lock((payload.server_uuid, part.clone()));
         let _lock_guard = lock.lock().await;
 
         if filesystem.is_primary_server_fs()

@@ -124,7 +124,7 @@ mod post {
 
                 if i == 50 {
                     let timestamp = chrono::Utc::now().to_rfc3339();
-                    suffix = compact_str::format_compact!("copy.{timestamp}");
+                    suffix = compact_str::format_compact!(" copy.{timestamp}");
 
                     let final_name = compact_str::format_compact!("{base_name}{suffix}{extension}");
                     return final_name;
@@ -165,6 +165,15 @@ mod post {
         {
             return ApiResponse::error("destination file not found")
                 .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
+        if filesystem.is_primary_server_fs()
+            && destination_filesystem.is_primary_server_fs()
+            && path == destination_path
+        {
+            return ApiResponse::error("cannot copy a file onto itself")
+                .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
         }
 
@@ -230,38 +239,20 @@ mod post {
             .await?;
 
         if data.foreground {
-            match task.await {
-                Ok(Some(Ok(()))) => {}
-                Ok(None) => {
-                    return ApiResponse::error("file copy aborted by another source")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Ok(Some(Err(err))) => {
+            crate::routes::await_operation(
+                task,
+                "file copy aborted by another source",
+                "failed to copy file",
+                |err| {
                     tracing::error!(
                         server = %server.uuid,
                         root = %root.display(),
                         "failed to copy file: {:#?}",
                         err,
-                    );
-
-                    return ApiResponse::error(&format!("failed to copy file: {err}"))
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-                Err(err) => {
-                    tracing::error!(
-                        server = %server.uuid,
-                        root = %root.display(),
-                        "failed to copy file: {:#?}",
-                        err,
-                    );
-
-                    return ApiResponse::error("failed to copy file")
-                        .with_status(StatusCode::EXPECTATION_FAILED)
-                        .ok();
-                }
-            }
+                    )
+                },
+            )
+            .await?;
 
             ApiResponse::new_serialized(
                 destination_filesystem

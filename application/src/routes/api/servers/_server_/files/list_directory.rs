@@ -56,7 +56,10 @@ mod get {
         let entries = match filesystem
             .async_read_dir_checked(
                 &root,
-                Some(state.config.load().api.directory_entry_limit),
+                match state.config.load().api.directory_entry_limit {
+                    0 => None,
+                    limit => Some(limit),
+                },
                 1,
                 is_ignored,
                 crate::models::DirectorySortingMode::NameAsc,

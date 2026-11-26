@@ -52,7 +52,7 @@ pub fn looks_incompressible(sample: &[u8]) -> bool {
     entropy > INCOMPRESSIBLE_ENTROPY
 }
 
-#[derive(Debug, Clone, Copy, ToSchema, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[schema(rename_all = "snake_case")]
 pub enum CompressionType {

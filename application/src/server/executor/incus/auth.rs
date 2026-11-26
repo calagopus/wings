@@ -51,7 +51,7 @@ impl PullEnvironment {
         }});
         tokio::fs::write(
             directory.path().join("config.yml"),
-            serde_norway::to_string(&client_config)?,
+            serde_saphyr::to_string(&client_config)?,
         )
         .await?;
         let credentials = registries.get(registry).or_else(|| {

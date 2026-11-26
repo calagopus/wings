@@ -20,6 +20,7 @@ const AVG_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 const INDEX_BATCH_SIZE: usize = 256;
+const MAX_UPLOADS_IN_FLIGHT: usize = 4;
 
 fn stream_chunker<R: AsyncRead + Unpin>(reader: R) -> fastcdc::v2020::AsyncStreamCDC<R> {
     fastcdc::v2020::AsyncStreamCDC::new(reader, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE)
@@ -116,9 +117,19 @@ impl PbsBackupWriter {
             tokio::pin!(stream);
 
             let mut messages = stream
-                .map(move |chunk| match chunk {
-                    Ok(chunk) => {
+                .map(|chunk| async move {
+                    let chunk = chunk.map_err(|err| err.to_string())?;
+
+                    tokio::task::spawn_blocking(move || {
                         let digest = datablob::sha256(&chunk.data);
+                        (chunk, digest)
+                    })
+                    .await
+                    .map_err(|err| err.to_string())
+                })
+                .buffered(compression_threads.max(1))
+                .map(move |hashed| match hashed {
+                    Ok((chunk, digest)) => {
                         if known.contains(&digest) {
                             futures::future::Either::Left(std::future::ready(Ok(
                                 ChunkMessage::Known {
@@ -140,9 +151,7 @@ impl PbsBackupWriter {
                             })
                         }
                     }
-                    Err(err) => {
-                        futures::future::Either::Left(std::future::ready(Err(err.to_string())))
-                    }
+                    Err(err) => futures::future::Either::Left(std::future::ready(Err(err))),
                 })
                 .buffered(compression_threads.max(1));
 
@@ -162,6 +171,7 @@ impl PbsBackupWriter {
             let mut digest_list = Vec::new();
             let mut offset_list = Vec::new();
             let mut end_offset = 0;
+            let mut uploads = futures::stream::FuturesOrdered::new();
 
             while let Some(message) = rx.recv().await {
                 let message = message.map_err(|err| PbsError::Transport(err.into()))?;
@@ -174,21 +184,32 @@ impl PbsBackupWriter {
                     }
                     ChunkMessage::New(blob) => {
                         end_offset += blob.plaintext_size;
-                        self.transport
-                            .upload(
-                                hyper::Method::POST,
-                                "dynamic_chunk",
-                                &[
-                                    ("wid", wid.to_string()),
-                                    ("digest", hex::encode(blob.digest)),
-                                    ("size", blob.plaintext_size.to_string()),
-                                    ("encoded-size", blob.data.len().to_string()),
-                                ],
-                                "application/octet-stream",
-                                Bytes::from(blob.data),
-                            )
-                            .await?;
-                        blob.digest
+                        if uploads.len() >= MAX_UPLOADS_IN_FLIGHT
+                            && let Some(result) = uploads.next().await
+                        {
+                            result?;
+                        }
+
+                        let digest = blob.digest;
+                        let mut transport = self.transport.clone();
+                        uploads.push_back(async move {
+                            transport
+                                .upload(
+                                    hyper::Method::POST,
+                                    "dynamic_chunk",
+                                    &[
+                                        ("wid", wid.to_string()),
+                                        ("digest", hex::encode(blob.digest)),
+                                        ("size", blob.plaintext_size.to_string()),
+                                        ("encoded-size", blob.data.len().to_string()),
+                                    ],
+                                    "application/octet-stream",
+                                    Bytes::from(blob.data),
+                                )
+                                .await
+                        });
+
+                        digest
                     }
                 };
 
@@ -197,6 +218,9 @@ impl PbsBackupWriter {
                 offset_list.push(start_offset);
 
                 if digest_list.len() >= INDEX_BATCH_SIZE {
+                    while let Some(result) = uploads.next().await {
+                        result?;
+                    }
                     Self::register_chunks(
                         &mut self.transport,
                         wid,
@@ -207,6 +231,9 @@ impl PbsBackupWriter {
                 }
             }
 
+            while let Some(result) = uploads.next().await {
+                result?;
+            }
             if !digest_list.is_empty() {
                 Self::register_chunks(&mut self.transport, wid, &mut digest_list, &mut offset_list)
                     .await?;

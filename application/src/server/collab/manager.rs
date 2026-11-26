@@ -7,9 +7,9 @@ use crate::server::{
         ServerWebsocketHandler, TargetedWebsocketMessage, WebsocketEvent, WebsocketMessage,
     },
 };
-use base64::Engine;
 use compact_str::ToCompactString;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
@@ -27,7 +27,6 @@ use yrs::{
     updates::{decoder::Decode, encoder::Encode},
 };
 
-const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const DIVERGED_REBUILD_TICKS: u32 = 5;
 
@@ -63,6 +62,87 @@ fn decode_awareness(update: &[u8]) -> Option<Vec<AwarenessEntry>> {
     }
 
     Some(entries)
+}
+
+fn is_plain_text_update(update: &[u8]) -> bool {
+    use yrs::block::{
+        BLOCK_GC_REF_NUMBER, BLOCK_ITEM_DELETED_REF_NUMBER, BLOCK_ITEM_STRING_REF_NUMBER,
+        BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
+    };
+
+    fn read_id(cursor: &mut Cursor) -> Option<()> {
+        cursor.read_var::<u64>().ok()?;
+        cursor.read_var::<u32>().ok()?;
+
+        Some(())
+    }
+
+    fn blocks(cursor: &mut Cursor) -> Option<()> {
+        let clients: u32 = cursor.read_var().ok()?;
+        for _ in 0..clients {
+            let blocks: u32 = cursor.read_var().ok()?;
+            cursor.read_var::<u64>().ok()?;
+            let mut clock = u64::from(cursor.read_var::<u32>().ok()?);
+
+            for _ in 0..blocks {
+                let info = cursor.read_u8().ok()?;
+
+                let len = if info == BLOCK_GC_REF_NUMBER || info == BLOCK_SKIP_REF_NUMBER {
+                    u64::from(cursor.read_var::<u32>().ok()?)
+                } else {
+                    if info & HAS_ORIGIN != 0 {
+                        read_id(cursor)?;
+                    }
+                    if info & HAS_RIGHT_ORIGIN != 0 {
+                        read_id(cursor)?;
+                    }
+                    if info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) == 0
+                        && (cursor.read_var::<u32>().ok()? != 1
+                            || cursor.read_string().ok()? != "content"
+                            || info & HAS_PARENT_SUB != 0)
+                    {
+                        return None;
+                    }
+
+                    match info & 0b1111 {
+                        BLOCK_ITEM_DELETED_REF_NUMBER => u64::from(cursor.read_var::<u32>().ok()?),
+                        BLOCK_ITEM_STRING_REF_NUMBER => {
+                            cursor.read_string().ok()?.encode_utf16().count() as u64
+                        }
+                        _ => return None,
+                    }
+                };
+
+                clock = clock.checked_add(len)?;
+                if clock > u64::from(u32::MAX) {
+                    return None;
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    fn delete_set(cursor: &mut Cursor) -> Option<()> {
+        let clients: u32 = cursor.read_var().ok()?;
+        for _ in 0..clients {
+            cursor.read_var::<u64>().ok()?;
+            let ranges: u32 = cursor.read_var().ok()?;
+            for _ in 0..ranges {
+                let clock = u64::from(cursor.read_var::<u32>().ok()?);
+                let len = u64::from(cursor.read_var::<u32>().ok()?);
+                if clock + len > u64::from(u32::MAX) {
+                    return None;
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    let mut cursor = Cursor::new(update);
+
+    blocks(&mut cursor).is_some() && delete_set(&mut cursor).is_some() && !cursor.has_content()
 }
 
 fn encode_awareness_removal(clients: &HashMap<u64, u64>) -> Vec<u8> {
@@ -464,7 +544,7 @@ impl CollabSession {
         Some(
             WebsocketMessage::builder(WebsocketEvent::FileCollabAwareness)
                 .arg(self.path.clone())
-                .arg(BASE64.encode(encode_awareness_removal(&clients)))
+                .binary_arg(encode_awareness_removal(&clients))
                 .build(),
         )
     }
@@ -562,6 +642,7 @@ impl CollabManager {
         }
 
         let path = root.join(file_name);
+        let key = server.filesystem.diff_key(&path).await;
         if server
             .filesystem
             .async_is_ignored(&path, FileType::File)
@@ -570,11 +651,13 @@ impl CollabManager {
                 .user_permissions
                 .async_is_ignored(server, user_uuid, &path, FileType::File)
                 .await
+            || server
+                .user_permissions
+                .async_is_ignored(server, user_uuid, &key, FileType::File)
+                .await
         {
             return Err(CollabError::User("file not found"));
         }
-
-        let key = server.filesystem.diff_key(&path).await;
 
         Ok((path, key.to_string_lossy().to_compact_string(), filesystem))
     }
@@ -780,14 +863,14 @@ impl CollabManager {
             .send_message(
                 WebsocketMessage::builder(WebsocketEvent::FileCollabSync)
                     .arg(key)
-                    .arg(BASE64.encode(state))
+                    .binary_arg(state)
                     .structured_arg(CollabSyncMeta {
                         dirty,
                         conflict,
                         epoch,
                     })
                     .arg(raw_path)
-                    .arg(BASE64.encode(state_vector))
+                    .binary_arg(state_vector)
                     .build(),
             )
             .await;
@@ -977,7 +1060,7 @@ impl CollabManager {
         user_uuid: uuid::Uuid,
         raw_path: &str,
         finished: bool,
-        chunk: &str,
+        chunk: Cow<'_, [u8]>,
         editor: Option<&str>,
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
@@ -992,10 +1075,6 @@ impl CollabManager {
             .await?;
 
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
-
-        let chunk = BASE64
-            .decode(chunk)
-            .map_err(|_| CollabError::User("invalid update encoding"))?;
 
         let update = {
             let mut pending = self.pending_updates.lock();
@@ -1019,13 +1098,17 @@ impl CollabManager {
                         return Err(CollabError::User("update is too large"));
                     }
                     if !finished {
-                        pending.insert(pending_key, chunk);
+                        pending.insert(pending_key, chunk.into_owned());
                         return Ok(());
                     }
-                    chunk
+                    chunk.into_owned()
                 }
             }
         };
+
+        if !is_plain_text_update(&update) {
+            return Err(CollabError::User("invalid update encoding"));
+        }
 
         let decoded =
             Update::decode_v1(&update).map_err(|_| CollabError::User("invalid update encoding"))?;
@@ -1077,7 +1160,7 @@ impl CollabManager {
                 Some(connection_id),
                 WebsocketMessage::builder(WebsocketEvent::FileCollabUpdate)
                     .arg(key)
-                    .arg(BASE64.encode(&update))
+                    .binary_arg(update)
                     .build(),
             )
             .await;
@@ -1091,18 +1174,13 @@ impl CollabManager {
         connection_id: uuid::Uuid,
         user_uuid: uuid::Uuid,
         raw_path: &str,
-        payload: &str,
+        payload: &[u8],
     ) -> Result<(), CollabError> {
         let (key, session) = self
             .subscribed_session(server, connection_id, user_uuid, raw_path, None)
             .await?;
 
-        match BASE64
-            .decode(payload)
-            .ok()
-            .as_deref()
-            .and_then(decode_awareness)
-        {
+        match decode_awareness(payload) {
             Some(entries) => {
                 let max_cursors = self
                     .config
@@ -1125,7 +1203,7 @@ impl CollabManager {
                 Some(connection_id),
                 WebsocketMessage::builder(WebsocketEvent::FileCollabAwareness)
                     .arg(key)
-                    .arg(payload)
+                    .binary_arg(payload)
                     .build(),
             )
             .await;
@@ -1237,7 +1315,9 @@ impl CollabManager {
 
         if !server
             .filesystem
-            .has_headroom(bytes.len() as i64 - old_content_size)
+            .trash
+            .ensure_headroom(server, bytes.len() as i64 - old_content_size)
+            .await
         {
             return Err(CollabError::User("failed to allocate space"));
         }
@@ -1796,5 +1876,117 @@ mod tests {
         assert!(!doc.bom);
         assert_eq!(doc.bom_len(), 0);
         assert_eq!(doc.to_disk_bytes(doc.content()), raw);
+    }
+
+    // is_plain_text_update
+    #[test]
+    fn plain_text_update_accepts_what_a_text_editor_sends() {
+        let (client, text, updates) = client_updates(&[(0, "hello"), (5, " world"), (0, "> ")]);
+        for update in &updates {
+            assert!(is_plain_text_update(update));
+        }
+
+        let before = client.transact().state_vector();
+        {
+            let mut txn = client.transact_mut();
+            text.remove_range(&mut txn, 2, 6);
+        }
+        assert!(is_plain_text_update(
+            &client.transact().encode_diff_v1(&before)
+        ));
+
+        let (other, other_text, _) = client_updates(&[(0, "other")]);
+        {
+            let mut txn = other.transact_mut();
+            other_text.remove_range(&mut txn, 1, 2);
+        }
+        {
+            let mut txn = client.transact_mut();
+            txn.apply_update(
+                Update::decode_v1(&other.transact().encode_diff_v1(&StateVector::default()))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let full = client
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        assert!(is_plain_text_update(&full));
+
+        let empty = Doc::new();
+        assert!(is_plain_text_update(
+            &empty
+                .transact()
+                .encode_state_as_update_v1(&StateVector::default())
+        ));
+    }
+
+    #[test]
+    fn plain_text_update_refuses_embeds_maps_and_other_roots() {
+        use yrs::Map;
+
+        let embed = Doc::new();
+        let text = embed.get_or_insert_text("content");
+        {
+            let mut txn = embed.transact_mut();
+            text.insert(&mut txn, 0, "ab");
+            text.insert_embed(&mut txn, 1, true);
+        }
+
+        let map = Doc::new();
+        let root = map.get_or_insert_map("m");
+        {
+            let mut txn = map.transact_mut();
+            root.insert(&mut txn, "key", "value");
+        }
+
+        let renamed = Doc::new();
+        let other = renamed.get_or_insert_text("notes");
+        {
+            let mut txn = renamed.transact_mut();
+            other.insert(&mut txn, 0, "hello");
+        }
+
+        for doc in [&embed, &map, &renamed] {
+            assert!(!is_plain_text_update(
+                &doc.transact()
+                    .encode_state_as_update_v1(&StateVector::default())
+            ));
+        }
+    }
+
+    #[test]
+    fn plain_text_update_refuses_truncated_and_garbage_bytes() {
+        use crate::io::SafeSliceExt;
+
+        let (_client, _text, updates) = client_updates(&[(0, "hello")]);
+        let update = updates.first().unwrap();
+        for len in 0..update.len() {
+            assert!(
+                !is_plain_text_update(update.get_slice(..len).unwrap()),
+                "{len}"
+            );
+        }
+
+        for garbage in [
+            b"not a yjs update".as_slice(),
+            &[0xff; 32],
+            &[0x01, 0x01, 0x01],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80],
+        ] {
+            assert!(!is_plain_text_update(garbage), "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn plain_text_update_refuses_deeply_nested_values_without_decoding() {
+        let mut update = vec![0x01, 0x01, 0x01, 0x00, 0x08, 0x01, 0x07];
+        update.extend_from_slice(b"content");
+        update.push(0x01);
+        for _ in 0..400_000 {
+            update.extend_from_slice(&[0x75, 0x01]);
+        }
+
+        assert!(!is_plain_text_update(&update));
     }
 }

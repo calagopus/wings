@@ -18,11 +18,50 @@ pub enum ScheduleResourceMetric {
     Disk,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+impl ScheduleResourceMetric {
+    /// Returns `None` for a percentage against an unlimited memory/disk limit.
+    pub async fn current_value(
+        self,
+        server: &crate::server::Server,
+        usage: &crate::server::resources::ResourceUsage,
+        percentage: bool,
+    ) -> Option<f64> {
+        let current = match self {
+            Self::Cpu => usage.cpu_absolute,
+            Self::Memory => usage.memory_bytes as f64,
+            Self::Disk => usage.disk_bytes as f64,
+        };
+        if !percentage {
+            return Some(current);
+        }
+
+        let limit = match self {
+            Self::Cpu => match server.configuration.read().await.build.cpu_limit {
+                limit if limit > 0 => limit as f64,
+                _ => {
+                    std::thread::available_parallelism().map_or(1, |threads| threads.get()) as f64
+                        * 100.0
+                }
+            },
+            Self::Memory => {
+                server.configuration.read().await.build.memory_limit.max(0) as f64 * 1024.0 * 1024.0
+            }
+            Self::Disk => server.filesystem.disk_limit().max(0) as f64,
+        };
+
+        (limit > 0.0).then(|| current / limit * 100.0)
+    }
+}
+
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ScheduleTrigger {
     Cron {
         schedule: Box<croner::Cron>,
+        #[serde(default = "default_week_interval")]
+        week_interval: u32,
+        #[serde(default)]
+        week_anchor: Option<chrono::NaiveDate>,
     },
     PowerAction {
         action: crate::models::ServerPowerAction,
@@ -45,6 +84,8 @@ pub enum ScheduleTrigger {
         comparator: conditions::ScheduleConditionComparator,
         value: f64,
         #[serde(default)]
+        percentage: bool,
+        #[serde(default)]
         for_seconds: u64,
     },
     ConsoleLine {
@@ -56,67 +97,45 @@ pub enum ScheduleTrigger {
     Crash,
 }
 
-impl PartialEq for ScheduleTrigger {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (ScheduleTrigger::Cron { schedule: s1 }, ScheduleTrigger::Cron { schedule: s2 }) => {
-                s1 == s2
-            }
-            (
-                ScheduleTrigger::PowerAction { action: a1 },
-                ScheduleTrigger::PowerAction { action: a2 },
-            ) => a1 == a2,
-            (
-                ScheduleTrigger::ServerState { state: s1 },
-                ScheduleTrigger::ServerState { state: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::BackupStatus { status: s1 },
-                ScheduleTrigger::BackupStatus { status: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::DatabaseBackupStatus { status: s1 },
-                ScheduleTrigger::DatabaseBackupStatus { status: s2 },
-            ) => s1 == s2,
-            (
-                ScheduleTrigger::ScheduleCompletion {
-                    schedule: s1,
-                    successful: su1,
-                },
-                ScheduleTrigger::ScheduleCompletion {
-                    schedule: s2,
-                    successful: su2,
-                },
-            ) => s1 == s2 && su1 == su2,
-            (
-                ScheduleTrigger::ResourceUsage {
-                    metric: m1,
-                    comparator: c1,
-                    value: v1,
-                    for_seconds: f1,
-                },
-                ScheduleTrigger::ResourceUsage {
-                    metric: m2,
-                    comparator: c2,
-                    value: v2,
-                    for_seconds: f2,
-                },
-            ) => m1 == m2 && c1 == c2 && v1 == v2 && f1 == f2,
-            (
-                ScheduleTrigger::ConsoleLine {
-                    contains: c1,
-                    case_insensitive: ci1,
-                    output_into: o1,
-                },
-                ScheduleTrigger::ConsoleLine {
-                    contains: c2,
-                    case_insensitive: ci2,
-                    output_into: o2,
-                },
-            ) => c1 == c2 && ci1 == ci2 && o1 == o2,
-            (ScheduleTrigger::Crash, ScheduleTrigger::Crash) => true,
-            _ => false,
+fn default_week_interval() -> u32 {
+    1
+}
+
+pub fn next_cron_occurrence<Tz: chrono::TimeZone>(
+    schedule: &croner::Cron,
+    week_interval: u32,
+    week_anchor: Option<chrono::NaiveDate>,
+    after: chrono::DateTime<Tz>,
+) -> Option<chrono::DateTime<Tz>> {
+    let mut candidate = schedule.find_next_occurrence(&after, false).ok()?;
+    if week_interval <= 1 {
+        return Some(candidate);
+    }
+
+    let interval = i64::from(week_interval);
+    let anchor = match week_anchor {
+        Some(anchor) => anchor,
+        None => chrono::NaiveDate::from_ymd_opt(1970, 1, 5)?,
+    };
+
+    loop {
+        let week = (candidate.date_naive() - anchor).num_days().div_euclid(7);
+        let phase = week.rem_euclid(interval);
+        if phase == 0 {
+            return Some(candidate);
         }
+
+        let window_start = anchor.checked_add_signed(chrono::TimeDelta::try_weeks(
+            week.checked_add(interval - phase)?,
+        )?)?;
+        let timezone = candidate.timezone();
+        let window_start = (0..24).find_map(|hour| {
+            timezone
+                .from_local_datetime(&window_start.and_hms_opt(hour, 0, 0)?)
+                .earliest()
+        })?;
+
+        candidate = schedule.find_next_occurrence(&window_start, true).ok()?;
     }
 }
 
@@ -158,6 +177,25 @@ impl ScheduleExecutionContext {
                 self.variables.get(&variable.variable)
             }
         }
+    }
+
+    pub fn resolve_required<'a>(
+        &'a self,
+        parameter: &'a actions::ScheduleDynamicParameter,
+        name: &str,
+    ) -> Result<&'a compact_str::CompactString, Cow<'static, str>> {
+        self.resolve_parameter(parameter)
+            .ok_or_else(|| format!("unable to resolve parameter `{name}` into a string.").into())
+    }
+
+    pub fn resolve_optional<'a>(
+        &'a self,
+        parameter: Option<&'a actions::ScheduleDynamicParameter>,
+        name: &str,
+    ) -> Result<Option<&'a compact_str::CompactString>, Cow<'static, str>> {
+        parameter
+            .map(|parameter| self.resolve_required(parameter, name))
+            .transpose()
     }
 
     pub fn get_variable_by_str(&self, variable: &str) -> Option<&compact_str::CompactString> {
@@ -580,11 +618,15 @@ impl Schedule {
                 status_lock.step = None;
                 drop(status_lock);
 
+                let timestamp = chrono::Utc::now();
+
                 server
                     .websocket
                     .send(
                         WebsocketMessage::builder(WebsocketEvent::ServerScheduleCompleted)
                             .arg(uuid.to_compact_string())
+                            .arg(successful.to_compact_string())
+                            .arg(timestamp.to_rfc3339())
                             .build(),
                     )
                     .ok();
@@ -593,8 +635,9 @@ impl Schedule {
                     uuid,
                     successful,
                     errors,
-                    timestamp: chrono::Utc::now(),
+                    timestamp,
                 });
+                server.schedules.notify_completed();
 
                 server
                     .schedules
@@ -629,7 +672,11 @@ impl Schedule {
 
         for trigger in raw_triggers {
             match trigger {
-                ScheduleTrigger::Cron { schedule } => {
+                ScheduleTrigger::Cron {
+                    schedule,
+                    week_interval,
+                    week_anchor,
+                } => {
                     tasks.push(tokio::task::spawn({
                         let executor_notifier = Arc::clone(&executor_notifier);
                         let server = server.clone();
@@ -653,8 +700,12 @@ impl Schedule {
                                 drop(timezone_lock);
 
                                 let now_datetime = chrono::Utc::now().with_timezone(&timezone);
-                                let target_datetime = match schedule.iter_after(now_datetime).next()
-                                {
+                                let target_datetime = match next_cron_occurrence(
+                                    &schedule,
+                                    week_interval,
+                                    week_anchor,
+                                    now_datetime,
+                                ) {
                                     Some(dt) => dt,
                                     None => break,
                                 };
@@ -680,6 +731,7 @@ impl Schedule {
                     metric,
                     comparator,
                     value,
+                    percentage,
                     for_seconds,
                 } => {
                     tasks.push(tokio::task::spawn({
@@ -694,19 +746,20 @@ impl Schedule {
 
                             loop {
                                 let usage = *usage_rx.borrow_and_update();
-
                                 let evaluable = !matches!(
                                     metric,
                                     ScheduleResourceMetric::Cpu | ScheduleResourceMetric::Memory
                                 ) || usage.state
                                     == crate::server::state::ServerState::Running;
-                                let current = match metric {
-                                    ScheduleResourceMetric::Cpu => usage.cpu_absolute,
-                                    ScheduleResourceMetric::Memory => usage.memory_bytes as f64,
-                                    ScheduleResourceMetric::Disk => usage.disk_bytes as f64,
+                                let current = if evaluable {
+                                    metric.current_value(&server, &usage, percentage).await
+                                } else {
+                                    None
                                 };
 
-                                if evaluable && comparator.compare_f64(current, value) {
+                                if current
+                                    .is_some_and(|current| comparator.compare_f64(current, value))
+                                {
                                     let since =
                                         *met_since.get_or_insert_with(tokio::time::Instant::now);
 
@@ -815,6 +868,8 @@ impl Schedule {
                                         }
                                     }
                                 }
+
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             }
                         }
                     }));
@@ -947,5 +1002,183 @@ mod tests {
         }
 
         assert!(validate_action_structure(&steps).is_err());
+    }
+
+    fn cron(pattern: &str) -> croner::Cron {
+        pattern.parse().unwrap()
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, y, m, d, h, min, 0).unwrap()
+    }
+
+    // next_cron_occurrence
+    #[test]
+    fn interval_zero_and_one_behave_like_plain_cron() {
+        let mondays = cron("0 9 * * 1");
+        let after = utc(2025, 1, 6, 10, 0);
+
+        for interval in [0, 1] {
+            for anchor in [None, Some(date(2025, 1, 13)), Some(date(2001, 4, 3))] {
+                assert_eq!(
+                    next_cron_occurrence(&mondays, interval, anchor, after),
+                    Some(utc(2025, 1, 13, 9, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_second_week_skips_the_inactive_week() {
+        let mondays = cron("0 9 * * 1");
+        let anchor = Some(date(2025, 1, 6));
+
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, utc(2025, 1, 6, 8, 0)),
+            Some(utc(2025, 1, 6, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, utc(2025, 1, 6, 10, 0)),
+            Some(utc(2025, 1, 20, 9, 0))
+        );
+    }
+
+    #[test]
+    fn every_third_week_lands_in_the_third_week() {
+        let mondays = cron("0 9 * * 1");
+        let anchor = Some(date(2025, 1, 6));
+
+        assert_eq!(
+            next_cron_occurrence(&mondays, 3, anchor, utc(2025, 1, 7, 0, 0)),
+            Some(utc(2025, 1, 27, 9, 0))
+        );
+    }
+
+    #[test]
+    fn occurrence_exactly_at_after_is_not_returned() {
+        let mondays = cron("0 9 * * 1");
+        let anchor = Some(date(2025, 1, 6));
+
+        assert_eq!(
+            next_cron_occurrence(&mondays, 1, anchor, utc(2025, 1, 6, 9, 0)),
+            Some(utc(2025, 1, 13, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, utc(2025, 1, 20, 9, 0)),
+            Some(utc(2025, 2, 3, 9, 0))
+        );
+    }
+
+    #[test]
+    fn skipping_lands_on_an_occurrence_at_window_start() {
+        let midnight = cron("0 0 * * *");
+        let anchor = Some(date(2025, 1, 6));
+
+        assert_eq!(
+            next_cron_occurrence(&midnight, 2, anchor, utc(2025, 1, 12, 12, 0)),
+            Some(utc(2025, 1, 20, 0, 0))
+        );
+    }
+
+    #[test]
+    fn dates_before_the_anchor_follow_the_same_period() {
+        let mondays = cron("0 9 * * 1");
+        let sundays = cron("0 9 * * 0");
+        let anchor = Some(date(2025, 1, 6));
+
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, utc(2024, 12, 1, 0, 0)),
+            Some(utc(2024, 12, 9, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&sundays, 2, anchor, utc(2025, 1, 1, 0, 0)),
+            Some(utc(2025, 1, 12, 9, 0))
+        );
+    }
+
+    #[test]
+    fn windows_start_on_the_anchor_weekday() {
+        let weekends = cron("0 9 * * 0,6");
+        let anchor = Some(date(2025, 1, 5));
+
+        assert_eq!(
+            next_cron_occurrence(&weekends, 2, anchor, utc(2025, 1, 4, 12, 0)),
+            Some(utc(2025, 1, 5, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&weekends, 2, anchor, utc(2025, 1, 5, 9, 0)),
+            Some(utc(2025, 1, 11, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&weekends, 2, anchor, utc(2025, 1, 11, 9, 0)),
+            Some(utc(2025, 1, 19, 9, 0))
+        );
+    }
+
+    #[test]
+    fn missing_anchor_aligns_to_monday_1970_01_05() {
+        let sun_mon = cron("0 9 * * 0,1");
+
+        assert_eq!(
+            next_cron_occurrence(&sun_mon, 2, None, utc(2025, 1, 6, 10, 0)),
+            Some(utc(2025, 1, 12, 9, 0))
+        );
+        assert_eq!(
+            next_cron_occurrence(&sun_mon, 2, None, utc(2025, 1, 12, 10, 0)),
+            Some(utc(2025, 1, 20, 9, 0))
+        );
+    }
+
+    #[test]
+    fn active_week_is_judged_by_local_date() {
+        let tokyo = chrono_tz::Asia::Tokyo;
+        let mondays = cron("0 7 * * 1");
+        let anchor = Some(date(2025, 1, 6));
+        let local = |d, h| chrono::TimeZone::with_ymd_and_hms(&tokyo, 2025, 1, d, h, 0, 0).unwrap();
+
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, local(5, 12)),
+            Some(local(6, 7))
+        );
+        assert_eq!(
+            next_cron_occurrence(&mondays, 2, anchor, local(6, 8)),
+            Some(local(20, 7))
+        );
+    }
+
+    #[test]
+    fn window_starting_in_a_midnight_dst_gap_starts_at_first_existing_hour() {
+        let santiago = chrono_tz::America::Santiago;
+        let hourly = cron("0 * * * *");
+        let local =
+            |m, d, h| chrono::TimeZone::with_ymd_and_hms(&santiago, 2025, m, d, h, 0, 0).unwrap();
+
+        assert_eq!(
+            next_cron_occurrence(&hourly, 2, Some(date(2025, 9, 7)), local(8, 31, 12)),
+            Some(local(9, 7, 1))
+        );
+    }
+
+    // ScheduleTrigger
+    #[test]
+    fn cron_trigger_defaults_to_every_week_without_anchor() {
+        let trigger: ScheduleTrigger =
+            serde_json::from_str(r#"{"type":"cron","schedule":"0 0 0 * * *"}"#).unwrap();
+
+        match trigger {
+            ScheduleTrigger::Cron {
+                week_interval,
+                week_anchor,
+                ..
+            } => {
+                assert_eq!(week_interval, 1);
+                assert_eq!(week_anchor, None);
+            }
+            _ => panic!("expected cron trigger"),
+        }
     }
 }

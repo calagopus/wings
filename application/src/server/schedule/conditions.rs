@@ -49,6 +49,8 @@ pub enum ScheduleCondition {
         metric: super::ScheduleResourceMetric,
         comparator: ScheduleConditionComparator,
         value: f64,
+        #[serde(default)]
+        percentage: bool,
     },
     FileExists {
         file: compact_str::CompactString,
@@ -116,16 +118,11 @@ impl ScheduleCondition {
                     metric,
                     comparator,
                     value,
-                } => {
-                    let resource_usage = server.resource_usage();
-                    let current = match metric {
-                        super::ScheduleResourceMetric::Cpu => resource_usage.cpu_absolute,
-                        super::ScheduleResourceMetric::Memory => resource_usage.memory_bytes as f64,
-                        super::ScheduleResourceMetric::Disk => resource_usage.disk_bytes as f64,
-                    };
-
-                    comparator.compare_f64(current, *value)
-                }
+                    percentage,
+                } => metric
+                    .current_value(server, &server.resource_usage(), *percentage)
+                    .await
+                    .is_some_and(|current| comparator.compare_f64(current, *value)),
                 ScheduleCondition::FileExists { file } => {
                     server.filesystem.async_symlink_metadata(file).await.is_ok()
                 }

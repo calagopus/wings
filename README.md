@@ -146,6 +146,23 @@ system:
     per_server_disk_budget: 209715200
     maintenance_interval: 3600
 
+  crash_history:
+    # whether to keep the last console output, exit code and oom state of every detected crash
+    enabled: true
+    # how many console lines to keep per crash
+    lines: 2000
+    # max uncompressed bytes of console output per crash, older lines are cut first
+    record_size_cap: 524288
+    zstd_level: 3
+    # per-server retention, 0 disables the respective limit
+    max_records: 10
+    # in seconds
+    max_age: 2592000
+    # compressed bytes
+    per_server_disk_budget: 2097152
+    # seconds to wait for the console output before storing the crash without it
+    capture_timeout: 5
+
   backups:
     # what compression level to use? best_speed, good_speed, good_compression, best_compression (higher compression = more CPU usage, better compression)
     compression_level: best_speed
@@ -183,6 +200,8 @@ system:
     ddup_bak:
       # how many threads to use when creating a ddup-bak backup
       create_threads: 4
+      # how many threads to use when restoring a ddup-bak backup
+      restore_threads: 4
       # the compression format to use for each ddup-bak chunk
       # none, deflate, gzip, brotli, zstd
       compression_format: zstd
@@ -197,6 +216,16 @@ system:
       retry_lock_seconds: 60
       # the restic cli environment for each command (useful for s3 credentials, etc, can be overriden by panel)
       environment: {}
+
+    # settings for the kopia backup driver
+    kopia:
+      # how many files kopia uploads in parallel when creating a backup (kopia --parallel)
+      # 0 uses kopia's default (cpu count), higher values are capped at the cpu count
+      create_threads: 0
+      # how many files kopia restores in parallel (kopia --parallel)
+      restore_threads: 8
+      # how often a kopia snapshot or policy change is retried after a transient error
+      retry_limit: 3
 
     # settings for the btrfs backup driver
     btrfs:

@@ -1,4 +1,4 @@
-use super::{WebsocketEvent, WebsocketMessage};
+use super::{TransmissionMode, WebsocketEvent, WebsocketMessage};
 use crate::server::{
     PowerActionError,
     activity::{Activity, ActivityEvent},
@@ -31,21 +31,30 @@ pub async fn handle_message(
                         return Ok(());
                     };
 
-                    match mode_str {
-                        "binary" => {
-                            websocket_handler.set_binary_mode(true);
-                        }
-                        "text" => {
-                            websocket_handler.set_binary_mode(false);
-                        }
+                    let mode = match mode_str {
+                        "text" => TransmissionMode::Text,
+                        "binary" => TransmissionMode::Binary,
+                        "msgpack" => TransmissionMode::Msgpack,
                         _ => {
                             tracing::debug!(
                                 server = %server.uuid,
                                 "received unknown transmission mode: {}",
                                 mode_str
                             );
+
+                            return Ok(());
                         }
-                    }
+                    };
+
+                    websocket_handler.set_transmission_mode(mode);
+                    websocket_handler
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::SocketConfigured)
+                                .arg(property_str)
+                                .arg(mode_str)
+                                .build(),
+                        )
+                        .await;
                 }
                 _ => {
                     tracing::debug!(
@@ -85,29 +94,29 @@ pub async fn handle_message(
             if server.state.get_state() != crate::server::state::ServerState::Offline
                 || state.config.load().api.send_offline_server_logs
             {
-                let socket_jwt = websocket_handler.get_jwt().await?;
-
-                if !socket_jwt
-                    .permissions
+                if !websocket_handler
                     .has_calagopus_permission_or(Permission::ControlReadConsole, true)
+                    .await?
                 {
                     return Ok(());
                 }
-                drop(socket_jwt);
 
                 let mut log_stream = server
                     .logs_lines(Some(state.config.load().system.websocket_log_count))
                     .await;
 
+                let mut lines = Vec::new();
                 while let Some(Ok(line)) = log_stream.next().await {
-                    websocket_handler
-                        .send_message(
-                            WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
-                                .arg(line.trim())
-                                .build(),
-                        )
-                        .await;
+                    lines.push(line);
                 }
+
+                websocket_handler
+                    .send_messages(lines.into_iter().map(|line| {
+                        WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
+                            .arg(line.trim())
+                            .build()
+                    }))
+                    .await;
             }
         }
         WebsocketEvent::SetState => {
@@ -116,22 +125,18 @@ pub async fn handle_message(
             };
             let power_action = crate::models::ServerPowerAction::from_str(action)?;
 
-            let socket_jwt = websocket_handler.get_jwt().await?;
-
-            if !socket_jwt
-                .permissions
+            if !websocket_handler
                 .has_permission(power_action.required_permission())
+                .await?
             {
                 tracing::debug!(
                     server = %server.uuid,
-                    "jwt does not have permission to {} server: {:?}",
-                    power_action.to_str(),
-                    socket_jwt.permissions
+                    "jwt does not have permission to {} server",
+                    power_action.to_str()
                 );
 
                 return Ok(());
             }
-            drop(socket_jwt);
 
             match server.checked_power_action(power_action).await {
                 Ok(()) => {
@@ -147,27 +152,32 @@ pub async fn handle_message(
                 Err(PowerActionError::User(message)) => {
                     websocket_handler.send_error(message).await;
                 }
+                Err(PowerActionError::Reported(message)) => {
+                    if !websocket_handler
+                        .has_calagopus_permission_or(Permission::ControlReadConsole, true)
+                        .await
+                        .is_ok_and(|can_read| can_read)
+                    {
+                        websocket_handler.send_error(message).await;
+                    }
+                }
                 Err(PowerActionError::Internal(err)) => {
                     websocket_handler.send_admin_error(err).await;
                 }
             }
         }
         WebsocketEvent::SendCommand => {
-            let socket_jwt = websocket_handler.get_jwt().await?;
-
-            if !socket_jwt
-                .permissions
+            if !websocket_handler
                 .has_permission(Permission::ControlConsole)
+                .await?
             {
                 tracing::debug!(
                     server = %server.uuid,
-                    "jwt does not have permission to send command to server: {:?}",
-                    socket_jwt.permissions
+                    "jwt does not have permission to send command to server"
                 );
 
                 return Ok(());
             }
-            drop(socket_jwt);
 
             let Some(raw_command) = message.args.first() else {
                 return Ok(());
@@ -270,41 +280,50 @@ pub async fn handle_message(
                         .await
                 }
                 WebsocketEvent::FileCollabUpdate => {
-                    let (Some(finished), Some(chunk)) = (
-                        message.args.get(1).map(|s| s.as_str()),
-                        message.args.get(2).map(|s| s.as_str()),
-                    ) else {
+                    let (Some(finished), Some(chunk)) =
+                        (message.args.get(1).map(|s| s.as_str()), message.args.get(2))
+                    else {
                         return Ok(());
                     };
 
-                    server
-                        .collab
-                        .apply_update(
-                            server,
-                            websocket_handler.connection_id,
-                            user_uuid,
-                            &path,
-                            finished == "1",
-                            chunk,
-                            message.args.get(3).map(|s| s.as_str()),
-                        )
-                        .await
+                    match websocket_handler.binary_arg(chunk) {
+                        Some(chunk) => {
+                            server
+                                .collab
+                                .apply_update(
+                                    server,
+                                    websocket_handler.connection_id,
+                                    user_uuid,
+                                    &path,
+                                    finished == "1",
+                                    chunk,
+                                    message.args.get(3).map(|s| s.as_str()),
+                                )
+                                .await
+                        }
+                        None => Err(CollabError::User("invalid update encoding")),
+                    }
                 }
                 WebsocketEvent::FileCollabAwareness => {
-                    let Some(payload) = message.args.get(1).map(|s| s.as_str()) else {
+                    let Some(payload) = message.args.get(1) else {
                         return Ok(());
                     };
 
-                    server
-                        .collab
-                        .relay_awareness(
-                            server,
-                            websocket_handler.connection_id,
-                            user_uuid,
-                            &path,
-                            payload,
-                        )
-                        .await
+                    match websocket_handler.binary_arg(payload) {
+                        Some(payload) => {
+                            server
+                                .collab
+                                .relay_awareness(
+                                    server,
+                                    websocket_handler.connection_id,
+                                    user_uuid,
+                                    &path,
+                                    &payload,
+                                )
+                                .await
+                        }
+                        None => Err(CollabError::User("invalid awareness encoding")),
+                    }
                 }
                 WebsocketEvent::FileCollabSave => {
                     let force = message.args.get(1).map(|s| s.as_str()) == Some("1");

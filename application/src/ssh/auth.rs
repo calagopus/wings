@@ -1,14 +1,14 @@
 use crate::{
-    remote::AuthenticationType,
+    remote::{AuthenticationType, SftpAuth},
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        permissions::Permission,
+        permissions::{FetchVerdict, Permission, now_millis},
     },
 };
 use russh::{
     Channel, ChannelId, Disconnect, MethodSet, Pty,
-    server::{Auth, Msg, Session},
+    server::{Auth, Msg, Session, VerifiedPublicKey},
 };
 use serde_json::json;
 use std::{
@@ -97,7 +97,13 @@ impl SshSession {
             .check_attempt(self.user_ip, authentication_type)
             .await?;
 
-        let (user, server, permissions, ignored_files) = match self
+        let SftpAuth {
+            user,
+            server,
+            permissions,
+            ignored_files,
+            as_of,
+        } = match self
             .state
             .config
             .client
@@ -133,6 +139,16 @@ impl SshSession {
             return Ok(self.reject());
         }
 
+        if server.user_permissions.set_fetched_permissions(
+            user,
+            permissions,
+            Some(&ignored_files),
+            as_of.unwrap_or_else(now_millis),
+        ) == FetchVerdict::Outdated
+        {
+            return Ok(self.reject());
+        }
+
         self.limiter.increment_sessions(user)?;
         self.user_uuid = Some(user);
 
@@ -143,9 +159,6 @@ impl SshSession {
             "user authenticated"
         );
 
-        server
-            .user_permissions
-            .set_fetched_permissions(user, permissions, Some(&ignored_files));
         if self.state.config.load().system.sftp.activity.log_logins {
             server.activity.log_activity(Activity {
                 event: ActivityEvent::SftpLogin,
@@ -183,12 +196,12 @@ impl russh::server::Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         username: &str,
-        public_key: &russh::keys::ssh_key::PublicKey,
+        key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.authenticate(
             AuthenticationType::PublicKey,
             username,
-            &public_key.to_openssh()?,
+            &key.public_key.to_openssh()?,
         )
         .await
     }
@@ -370,6 +383,7 @@ impl russh::server::Handler for SshSession {
 
         session.channel_success(channel_id)?;
         let exec = super::exec::ExecSession {
+            state: Arc::clone(&self.state),
             server,
 
             user_ip: self.user_ip,

@@ -4,8 +4,8 @@ use crate::{
         filesystem::{
             ignore_list::IgnoreList,
             virtualfs::{
-                AsyncDirectoryStreamWalkFn, IgnoreVerdict, IsIgnoredFn, VirtualReadableFilesystem,
-                VirtualWritableFilesystem,
+                AsyncDirectoryStreamWalkFn, AsyncDirectoryWalkFn, IgnoreVerdict, IsIgnoredFn,
+                VirtualReadableFilesystem, VirtualWritableFilesystem,
             },
         },
         resources::ResourceUsageWatchExt,
@@ -35,8 +35,10 @@ pub mod inotify;
 pub mod limiter;
 pub mod listing;
 pub mod operations;
+pub mod patch;
 pub mod pull;
 pub mod sqlite;
+pub mod trash;
 pub mod uploads;
 pub mod usage;
 pub mod virtualfs;
@@ -148,6 +150,27 @@ impl RequestIgnored {
                 .await
     }
 
+    /// Whether moving or removing the directory at `directory` would carry along an
+    /// entry that is hidden at its current location or would be at any of `roots`,
+    /// the places its contents are judged at. Point checks on the directory itself
+    /// cannot see a pattern that names something deeper inside it.
+    pub async fn contains_ignored(
+        &self,
+        server: &crate::server::Server,
+        file_type: cap::FileType,
+        directory: &Path,
+        roots: &[&Path],
+    ) -> bool {
+        if !file_type.is_dir() || !self.applies(server) {
+            return false;
+        }
+
+        server
+            .filesystem
+            .async_contains_ignored(directory, roots, self.0.as_ref())
+            .await
+    }
+
     fn applies(&self, server: &crate::server::Server) -> bool {
         self.0.is_some() || !server.filesystem.disk_ignored.load().is_empty()
     }
@@ -179,6 +202,47 @@ impl RequestIgnored {
         self.0
             .as_ref()
             .map(|matcher| Filesystem::subuser_deny_filter(server, matcher.clone()))
+    }
+
+    /// A filter judging each entry by its own path placed under `root`, without
+    /// resolving links against the live filesystem, for filesystems whose entries
+    /// stand for server paths: a backup mirrors the server root, a mount sits at its
+    /// target.
+    fn lexical_filter(&self, server: &crate::server::Server, root: &Path) -> IsIgnoredFn {
+        let server = server.clone();
+        let ignored = self.clone();
+        let root = root.to_path_buf();
+
+        IsIgnoredFn::from(move |file_type, path: PathBuf| {
+            let mut match_path = root.clone();
+            match_path.extend(
+                path.components()
+                    .filter(|component| matches!(component, std::path::Component::Normal(_))),
+            );
+
+            ignored.verdict_as(&server, file_type, &match_path, path)
+        })
+    }
+
+    /// [`IgnoreList::verdict_as`] over the server's deny-list and this request's,
+    /// for filters that judge an entry by a path other than the one it sits at.
+    pub fn verdict_as(
+        &self,
+        server: &crate::server::Server,
+        file_type: cap::FileType,
+        match_path: &Path,
+        path: PathBuf,
+    ) -> IgnoreVerdict {
+        let verdict = server
+            .filesystem
+            .disk_ignored
+            .load()
+            .verdict_as(file_type, match_path, path);
+
+        match &self.0 {
+            Some(matcher) => verdict.then(|path| matcher.verdict_as(file_type, match_path, path)),
+            None => verdict,
+        }
     }
 }
 
@@ -242,6 +306,20 @@ pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     }
 }
 
+#[cfg(target_os = "linux")]
+const ZFS_SUPER_MAGIC: u64 = 0x2fc12fc1;
+
+pub const VIRTUAL_PATH_MESSAGE: &str = "path is a mount point or virtual directory";
+pub const IGNORED_CONTENTS_MESSAGE: &str =
+    "a directory contains files you cannot access, so it was left in place";
+
+struct MountMatch {
+    inner_path: PathBuf,
+    source_path: PathBuf,
+    read_only: bool,
+    target: PathBuf,
+}
+
 pub struct Filesystem {
     uuid: uuid::Uuid,
     app_state: crate::routes::State,
@@ -260,6 +338,7 @@ pub struct Filesystem {
     use_server_notifier: Arc<AtomicBool>,
 
     resource_usage: tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
+    limiter_usage_known: Arc<AtomicBool>,
     disk_limit: AtomicI64,
     disk_usage_delta_cached: Arc<AtomicI64>,
     disk_usage_cached_logical: Arc<AtomicU64>,
@@ -268,10 +347,14 @@ pub struct Filesystem {
     pub last_disk_check: Arc<AtomicU64>,
     pub disk_check_completed: Arc<tokio::sync::Notify>,
     disk_ignored: arc_swap::ArcSwap<IgnoreList>,
+    mount_gateways: arc_swap::ArcSwap<Vec<PathBuf>>,
+    zfs_dataset_root: AtomicBool,
 
-    pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
+    pub archive_fs_cache:
+        moka::future::Cache<(PathBuf, MimeCacheKey), Arc<dyn VirtualReadableFilesystem>>,
     pub operations: operations::OperationManager,
     pub uploads: uploads::UploadManager,
+    pub trash: trash::TrashManager,
 }
 
 impl Filesystem {
@@ -292,8 +375,7 @@ impl Filesystem {
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
         let disk_usage_cached_logical = Arc::new(AtomicU64::new(0));
         let disk_usage_cached_physical = Arc::new(AtomicU64::new(0));
-        let disk_ignored =
-            IgnoreList::from_lines(deny_list.iter()).unwrap_or_else(|_| IgnoreList::empty());
+        let disk_ignored = Self::build_deny_list(deny_list).unwrap_or_else(|_| IgnoreList::empty());
 
         let cap_filesystem = cap::CapFilesystem::new_uninitialized(&base_path);
         let server_notifier = inotify::InotifyServerNotifier::new(
@@ -307,6 +389,7 @@ impl Filesystem {
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
         let disk_check_completed = Arc::new(tokio::sync::Notify::new());
         let last_disk_check = Arc::new(AtomicU64::new(0));
+        let limiter_usage_known = Arc::new(AtomicBool::new(false));
 
         Self {
             uuid,
@@ -328,6 +411,7 @@ impl Filesystem {
                 use_server_notifier: Arc::clone(&use_server_notifier),
                 last_disk_check: Arc::clone(&last_disk_check),
                 resource_usage: resource_usage.clone(),
+                limiter_usage_known: Arc::clone(&limiter_usage_known),
             })),
             config: Arc::clone(&config),
 
@@ -337,7 +421,9 @@ impl Filesystem {
             server_notifier,
             use_server_notifier,
 
+            trash: trash::TrashManager::new(resource_usage.clone(), Arc::clone(&disk_usage)),
             resource_usage,
+            limiter_usage_known,
             disk_limit: AtomicI64::new(disk_limit as i64),
             disk_usage_delta_cached: Arc::new(AtomicI64::new(0)),
             disk_usage_cached_logical,
@@ -346,12 +432,40 @@ impl Filesystem {
             last_disk_check,
             disk_check_completed,
             disk_ignored: arc_swap::ArcSwap::from_pointee(disk_ignored),
+            mount_gateways: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            zfs_dataset_root: AtomicBool::new(false),
 
             archive_fs_cache: moka::future::CacheBuilder::new(8)
                 .time_to_idle(std::time::Duration::from_mins(1))
                 .build(),
             operations: operations::OperationManager::new(sender.clone(), Arc::clone(&config)),
             uploads: uploads::UploadManager::new(sender),
+        }
+    }
+
+    /// The egg deny-list with the trash directory appended last, so no egg rule can
+    /// re-include it.
+    fn build_deny_list(deny_list: &[impl AsRef<str>]) -> Result<IgnoreList, ignore::Error> {
+        let trash_line = trash::ignore_line();
+
+        IgnoreList::from_lines(
+            deny_list
+                .iter()
+                .map(AsRef::as_ref)
+                .chain([trash_line.as_str()]),
+        )
+    }
+
+    pub async fn ensure_trash_directory(&self) {
+        if let Err(err) = self
+            .async_create_chowned_dir_all(trash::TRASH_DIRECTORY, None)
+            .await
+        {
+            tracing::warn!(
+                path = %self.base_path.display(),
+                "failed to create trash directory: {}",
+                err
+            );
         }
     }
 
@@ -376,8 +490,111 @@ impl Filesystem {
         self.use_server_notifier.load(Ordering::Relaxed) && self.server_notifier.is_trusted()
     }
 
+    /// Remembers the container-relative mount targets so the mount points and the
+    /// virtual directories leading to them cannot be replaced or removed.
+    pub fn update_mounts(&self, mounts: &[crate::server::configuration::Mount]) {
+        let gateways = mounts
+            .iter()
+            .filter_map(|mount| mount.container_relative_target())
+            .map(|target| cap::CapFilesystem::resolve_path(Path::new(target)))
+            .collect();
+
+        self.mount_gateways.store(Arc::new(gateways));
+    }
+
+    /// A mount point itself, or a directory that only exists to lead to one.
+    pub fn is_mount_gateway(&self, path: &Path) -> bool {
+        let gateways = self.mount_gateways.load();
+        if gateways.is_empty() {
+            return false;
+        }
+
+        let path = self.relative_path_cow(path);
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
+        gateways.iter().any(|gateway| gateway.starts_with(&*path))
+    }
+
+    fn is_backups_virtual(&self, path: &Path) -> bool {
+        let config = self.config.load();
+        if !config.system.backups.mounting.enabled {
+            return false;
+        }
+
+        let path = self.relative_path_cow(path);
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
+        path.starts_with(&config.system.backups.mounting.path)
+    }
+
+    /// Whether writing an entry of `file_type` at `path` would clobber a virtual
+    /// entry: anything under the backup browsing directory, or a non-directory where
+    /// a mount point or one of its parents belongs. Directories stay allowed there,
+    /// which is what the container runtime creates itself.
+    pub fn is_virtual_write_target(&self, path: &Path, file_type: cap::FileType) -> bool {
+        self.is_backups_virtual(path)
+            || self.is_zfs_control_path(path)
+            || (!file_type.is_dir() && self.is_mount_gateway(path))
+    }
+
+    /// Whether `path` lies in the control directory a ZFS dataset root exposes its
+    /// snapshots under, which hold copies no deny-list or backup mount check sees.
+    fn is_zfs_control_path(&self, path: &Path) -> bool {
+        self.zfs_dataset_root.load(Ordering::Relaxed)
+            && self
+                .relative_path_cow(path)
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == ".zfs")
+    }
+
+    /// Whether a symlink still has to be resolved to tell if it leads somewhere
+    /// virtual, when no deny-list would resolve it anyway.
+    fn resolves_virtual_links(&self, file_type: cap::FileType) -> bool {
+        file_type.is_symlink() && self.zfs_dataset_root.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`Self::is_ignored`] can return true for any path at all.
+    pub fn may_ignore(&self) -> bool {
+        self.config.load().system.backups.mounting.enabled
+            || self.zfs_dataset_root.load(Ordering::Relaxed)
+            || !self.mount_gateways.load().is_empty()
+            || !self.disk_ignored.load().is_empty()
+    }
+
+    /// Whether `path` may not be removed, renamed or replaced at all, also when it is
+    /// a directory. Resolves the parent chain so a symlink cannot reach around it.
+    pub async fn async_is_protected_path(&self, path: &Path) -> bool {
+        if self.is_backups_virtual(path)
+            || self.is_zfs_control_path(path)
+            || self.is_mount_gateway(path)
+        {
+            return true;
+        }
+
+        if self.zfs_dataset_root.load(Ordering::Relaxed)
+            && self.is_zfs_control_path(&self.diff_key(path).await)
+        {
+            return true;
+        }
+
+        if self.mount_gateways.load().is_empty() {
+            return false;
+        }
+
+        self.is_mount_gateway(&self.diff_key(path).await)
+    }
+
+    fn virtual_path_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, VIRTUAL_PATH_MESSAGE)
+    }
+
     pub async fn update_ignored(&self, deny_list: &[impl AsRef<str>]) {
-        if let Ok(disk_ignored) = IgnoreList::from_lines(deny_list.iter()) {
+        if let Ok(disk_ignored) = Self::build_deny_list(deny_list) {
             self.disk_ignored.store(Arc::new(disk_ignored));
         }
     }
@@ -410,6 +627,13 @@ impl Filesystem {
 
         IsIgnoredFn::new(
             move |file_type, path: PathBuf| {
+                if sync_server
+                    .filesystem
+                    .is_virtual_write_target(&path, file_type)
+                {
+                    return IgnoreVerdict::Skip;
+                }
+
                 let matcher = sync_server.filesystem.disk_ignored.load();
                 if matcher.is_empty() {
                     return IgnoreVerdict::Keep(path);
@@ -423,6 +647,10 @@ impl Filesystem {
                 let server = async_server.clone();
 
                 async move {
+                    if server.filesystem.is_virtual_write_target(&path, file_type) {
+                        return IgnoreVerdict::Skip;
+                    }
+
                     let matcher = server.filesystem.disk_ignored.load();
                     if matcher.is_empty() {
                         return IgnoreVerdict::Keep(path);
@@ -474,37 +702,136 @@ impl Filesystem {
     }
 
     pub fn is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
+        if self.is_virtual_write_target(path, file_type) {
+            return true;
+        }
+
         let disk_ignored = self.disk_ignored.load();
-        if disk_ignored.is_empty() {
+        if disk_ignored.is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
-        disk_ignored.is_ignored(&self.ignore_path(path, file_type), file_type)
+        let path = self.ignore_path(path, file_type);
+
+        self.is_zfs_control_path(&path) || disk_ignored.is_ignored(&path, file_type)
     }
 
     pub async fn async_is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
-        if self.disk_ignored.load().is_empty() {
+        if self.is_virtual_write_target(path, file_type) {
+            return true;
+        }
+
+        if self.disk_ignored.load().is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
         let path = self.async_ignore_path(path, file_type).await;
 
-        self.disk_ignored.load().is_ignored(&path, file_type)
+        self.is_zfs_control_path(&path) || self.disk_ignored.load().is_ignored(&path, file_type)
     }
 
     /// Like [`Self::async_is_ignored`], but false for a directory the denylist only
     /// excludes while re-including something beneath it, so that a re-included
     /// entry can still be created or reached through it.
     pub async fn async_is_ignored_subtree(&self, path: &Path, file_type: cap::FileType) -> bool {
-        if self.disk_ignored.load().is_empty() {
+        if self.is_virtual_write_target(path, file_type) {
+            return true;
+        }
+
+        if self.disk_ignored.load().is_empty() && !self.resolves_virtual_links(file_type) {
             return false;
         }
 
         let path = self.async_ignore_path(path, file_type).await;
 
-        self.disk_ignored
-            .load()
-            .is_ignored_subtree(&path, file_type)
+        self.is_zfs_control_path(&path)
+            || self
+                .disk_ignored
+                .load()
+                .is_ignored_subtree(&path, file_type)
+    }
+
+    /// Walks the real directory `directory` and reports whether any entry beneath it,
+    /// re-rooted onto any of `roots` (each also taken with its parents resolved), is
+    /// excluded by the deny-list or `list`. Entries are judged by their own path, not
+    /// what they link to, since the caller acts on the links themselves. Anything that
+    /// cannot be read counts as hidden.
+    pub async fn async_contains_ignored(
+        &self,
+        directory: &Path,
+        roots: &[&Path],
+        list: Option<&IgnoreList>,
+    ) -> bool {
+        let denylist = self.disk_ignored.load_full();
+        if denylist.is_empty() && list.is_none() {
+            return false;
+        }
+
+        let mut match_roots = Vec::with_capacity(roots.len() * 2);
+        for root in roots {
+            for root in [
+                self.relative_path(root),
+                self.async_canonicalize_parent(root).await,
+            ] {
+                if !match_roots.contains(&root) {
+                    match_roots.push(root);
+                }
+            }
+        }
+
+        let directory = self.relative_path(directory);
+        let cap_filesystem = self.cap_filesystem.clone();
+        let list = list.cloned();
+
+        tokio::task::spawn_blocking(move || {
+            Self::contains_ignored_impl(
+                &cap_filesystem,
+                &directory,
+                &match_roots,
+                &denylist,
+                list.as_ref(),
+            )
+        })
+        .await
+        .unwrap_or(true)
+    }
+
+    fn contains_ignored_impl(
+        cap_filesystem: &cap::CapFilesystem,
+        directory: &Path,
+        roots: &[PathBuf],
+        denylist: &IgnoreList,
+        list: Option<&IgnoreList>,
+    ) -> bool {
+        let Ok(mut walk) = cap_filesystem.walk_dir(directory) else {
+            return true;
+        };
+
+        while let Some(entry) = walk.next_entry() {
+            let Ok(entry) = entry else {
+                return true;
+            };
+
+            let file_type = entry.file_type();
+            if matches!(file_type, cap::FileType::Unknown) {
+                return true;
+            }
+
+            let Ok(inner) = entry.path.strip_prefix(directory) else {
+                return true;
+            };
+
+            for root in roots {
+                let path = root.join(inner);
+                if denylist.is_ignored(&path, file_type)
+                    || list.is_some_and(|list| list.is_ignored(&path, file_type))
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn ignore_path<'a>(&self, path: &'a Path, file_type: cap::FileType) -> Cow<'a, Path> {
@@ -608,11 +935,6 @@ impl Filesystem {
         self.disk_limit.load(Ordering::Relaxed)
     }
 
-    #[inline]
-    pub async fn is_full(&self) -> bool {
-        self.disk_limit() != 0 && self.limiter_usage().await >= self.disk_limit() as u64
-    }
-
     /// Checks whether `delta` additional bytes would still fit within the disk limit,
     /// without reserving them. Writers that go through [`file::ServerFile`] account for
     /// their own bytes, so callers that only want to fail early must not allocate here.
@@ -661,6 +983,15 @@ impl Filesystem {
     ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
         let path = self.relative_path(path);
 
+        if let Ok(trash_path) = path.strip_prefix(trash::TRASH_DIRECTORY)
+            && let Some(resolved) = self
+                .trash
+                .resolve_virtual(server, trash_path, ignored)
+                .await
+        {
+            return resolved;
+        }
+
         'backupfs: {
             if !self.config.load().system.backups.mounting.enabled {
                 break 'backupfs;
@@ -684,8 +1015,13 @@ impl Filesystem {
                 None => break 'backupfs,
             };
 
-            if !server.configuration.read().await.backups.contains(&uuid) {
-                break 'backupfs;
+            {
+                let configuration = server.configuration.read().await;
+                if !configuration.backups.contains(&uuid)
+                    || configuration.database_backups.contains(&uuid)
+                {
+                    break 'backupfs;
+                }
             }
 
             match self.app_state.backup_manager.browse(server, uuid).await {
@@ -695,7 +1031,25 @@ impl Filesystem {
                         Err(_) => PathBuf::new(),
                     };
 
-                    return (path, backup);
+                    if !ignored.applies(server) {
+                        return (path, backup);
+                    }
+
+                    let is_ignored = ignored.lexical_filter(server, Path::new(""));
+                    if let Some(filesystem) = backup.as_virtual_cap() {
+                        let mut filesystem = filesystem.clone();
+                        filesystem.check_links = true;
+
+                        return (path, Arc::new(filesystem.with_is_ignored(is_ignored)));
+                    }
+
+                    return (
+                        path,
+                        Arc::new(virtualfs::filtered::VirtualFilteredFilesystem {
+                            inner: backup,
+                            is_ignored,
+                        }),
+                    );
                 }
                 Ok(None) => break 'backupfs,
                 Err(err) => {
@@ -741,25 +1095,23 @@ impl Filesystem {
             };
             let archive_path = self.diff_key(&archive_path).await;
 
-            if self
-                .async_metadata(&archive_path)
-                .await
-                .ok()
-                .is_none_or(|m| !m.is_file())
-            {
-                break 'archivefs;
-            }
+            let archive_key = match self.async_metadata(&archive_path).await {
+                Ok(metadata) if metadata.is_file() => MimeCacheKey::from(&metadata),
+                _ => break 'archivefs,
+            };
+            let cache_key = (archive_path, archive_key);
 
-            if let Some(archive_fs) = self.archive_fs_cache.get(&archive_path).await {
+            if let Some(archive_fs) = self.archive_fs_cache.get(&cache_key).await {
                 return (inner_path.to_path_buf(), archive_fs);
             }
+            let archive_path = &cache_key.0;
 
             let archive_fs: Arc<dyn VirtualReadableFilesystem> =
                 match archive_path.extension().and_then(|ext| ext.to_str()) {
                     Some("zip") => {
                         match virtualfs::archive::zip::VirtualZipArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -777,7 +1129,7 @@ impl Filesystem {
                     Some("7z") => {
                         match virtualfs::archive::seven_zip::VirtualSevenZipArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -795,7 +1147,7 @@ impl Filesystem {
                     Some("ddup") => {
                         match virtualfs::archive::ddup_bak::VirtualDdupBakArchive::open(
                             server.clone(),
-                            &archive_path,
+                            archive_path,
                         )
                         .await
                         {
@@ -814,58 +1166,42 @@ impl Filesystem {
                 };
 
             self.archive_fs_cache
-                .insert(archive_path, archive_fs.clone())
+                .insert(cache_key, archive_fs.clone())
                 .await;
 
             return (inner_path.to_path_buf(), archive_fs);
         }
 
-        let (mount_match, mount_infos) = {
+        let (mount_match, mounts, mut allowed) = {
             let server_config = server.configuration.read().await;
-            let allowed = if server_config.mounts.is_empty() {
-                crate::server::configuration::AllowedMounts::default()
+            if server_config.mounts.is_empty() {
+                (None, Vec::new(), None)
             } else {
-                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
-            };
+                let mounts = server_config.mounts.clone();
+                let config = Arc::clone(&server.app_state.config);
+                let path = path.clone();
 
-            let mut match_result = None;
-            let mut infos = Vec::new();
+                tokio::task::spawn_blocking(move || {
+                    let mut allowed = None;
+                    let mount_match = Self::match_mount(&config, &mounts, &path, &mut allowed);
 
-            for mount in &server_config.mounts {
-                let Some(relative_target) = mount.target.strip_prefix("/home/container/") else {
-                    continue;
-                };
-                if relative_target.is_empty() {
-                    continue;
-                }
-                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
-                    continue;
-                };
-
-                infos.push(virtualfs::mount::MountInfo {
-                    relative_target: PathBuf::from(relative_target),
-                });
-
-                if match_result.is_none() {
-                    let relative_target_path = Path::new(relative_target);
-                    if path.starts_with(relative_target_path)
-                        && let Ok(inner_path) = path.strip_prefix(relative_target_path)
-                    {
-                        match_result =
-                            Some((inner_path.to_path_buf(), source_path, mount.read_only));
-                    }
-                }
+                    (mount_match, mounts, allowed)
+                })
+                .await
+                .unwrap_or_default()
             }
-
-            (match_result, infos)
         };
 
-        if let Some((inner_path, source_path, read_only)) = mount_match {
+        if let Some(MountMatch {
+            inner_path,
+            source_path,
+            read_only,
+            target,
+        }) = mount_match
+        {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
-                    let mut fs = cap_fs.get_virtual(server.clone());
-                    fs.is_primary_server_fs = false;
-                    fs.is_writable = !read_only;
+                    let fs = Self::mount_virtual_fs(server, cap_fs, read_only, &target, ignored);
 
                     return (inner_path, Arc::new(fs));
                 }
@@ -878,6 +1214,16 @@ impl Filesystem {
                 }
             }
         }
+
+        let mount_infos = if mounts.is_empty() {
+            Vec::new()
+        } else {
+            let config = Arc::clone(&server.app_state.config);
+
+            tokio::task::spawn_blocking(move || Self::mount_infos(&config, &mounts, &mut allowed))
+                .await
+                .unwrap_or_default()
+        };
 
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
@@ -896,6 +1242,95 @@ impl Filesystem {
         )
     }
 
+    /// The deepest mount holding `path` whose source resolves inside `allowed_mounts`, the
+    /// first in config order on equal depth. `allowed` is loaded on first use. Blocking.
+    fn match_mount(
+        config: &crate::config::Config,
+        mounts: &[crate::server::configuration::Mount],
+        path: &Path,
+        allowed: &mut Option<crate::server::configuration::AllowedMounts>,
+    ) -> Option<MountMatch> {
+        let mut candidates: Vec<(usize, &crate::server::configuration::Mount, &Path)> = mounts
+            .iter()
+            .filter_map(|mount| {
+                let target = Path::new(mount.container_relative_target()?);
+
+                path.starts_with(target)
+                    .then(|| (target.components().count(), mount, target))
+            })
+            .collect();
+        candidates.sort_by_key(|(depth, _, _)| std::cmp::Reverse(*depth));
+
+        for (_, mount, target) in candidates {
+            let allowed = allowed.get_or_insert_with(|| {
+                crate::server::configuration::AllowedMounts::load_blocking(config)
+            });
+            let Ok(source_path) = mount.resolve_allowed_source_blocking(allowed) else {
+                continue;
+            };
+            let Ok(inner_path) = path.strip_prefix(target) else {
+                continue;
+            };
+
+            return Some(MountMatch {
+                inner_path: inner_path.to_path_buf(),
+                source_path,
+                read_only: mount.read_only,
+                target: target.to_path_buf(),
+            });
+        }
+
+        None
+    }
+
+    /// Every mount with a target inside the container root whose source resolves. Blocking.
+    fn mount_infos(
+        config: &crate::config::Config,
+        mounts: &[crate::server::configuration::Mount],
+        allowed: &mut Option<crate::server::configuration::AllowedMounts>,
+    ) -> Vec<virtualfs::mount::MountInfo> {
+        let mut infos = Vec::new();
+
+        for mount in mounts {
+            let Some(relative_target) = mount.container_relative_target() else {
+                continue;
+            };
+            let allowed = allowed.get_or_insert_with(|| {
+                crate::server::configuration::AllowedMounts::load_blocking(config)
+            });
+            if mount.resolve_allowed_source_blocking(allowed).is_err() {
+                continue;
+            }
+
+            infos.push(virtualfs::mount::MountInfo {
+                relative_target: PathBuf::from(relative_target),
+            });
+        }
+
+        infos
+    }
+
+    /// A mount source as a filesystem whose entries are judged by the denylist and
+    /// `ignored` at the server path they appear under, `target` joined with their own.
+    fn mount_virtual_fs(
+        server: &crate::server::Server,
+        cap_fs: cap::CapFilesystem,
+        read_only: bool,
+        target: &Path,
+        ignored: &RequestIgnored,
+    ) -> virtualfs::cap::VirtualCapFilesystem {
+        let mut fs = cap_fs.get_virtual(server.clone());
+        fs.is_primary_server_fs = false;
+        fs.is_writable = !read_only;
+
+        if !ignored.applies(server) {
+            return fs;
+        }
+
+        fs.check_links = true;
+        fs.with_is_ignored(ignored.lexical_filter(server, target))
+    }
+
     pub async fn resolve_writable_fs(
         &self,
         server: &crate::server::Server,
@@ -911,49 +1346,38 @@ impl Filesystem {
         path: impl AsRef<Path>,
         ignored: &RequestIgnored,
     ) -> (PathBuf, Arc<dyn VirtualWritableFilesystem>) {
+        let request_ignored = ignored;
         let ignored = ignored.filter(server);
         let path = self.relative_path(path.as_ref());
 
         let mount_match = {
             let server_config = server.configuration.read().await;
-            let allowed = if server_config.mounts.is_empty() {
-                crate::server::configuration::AllowedMounts::default()
+            if server_config.mounts.is_empty() {
+                None
             } else {
-                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
-            };
+                let mounts = server_config.mounts.clone();
+                let config = Arc::clone(&server.app_state.config);
+                let path = path.clone();
 
-            let mut result: Option<(PathBuf, PathBuf, bool)> = None;
-            for mount in &server_config.mounts {
-                let Some(relative_target) = mount.target.strip_prefix("/home/container/") else {
-                    continue;
-                };
-                if relative_target.is_empty() {
-                    continue;
-                }
-
-                let relative_target_path = Path::new(relative_target);
-                if !path.starts_with(relative_target_path) {
-                    continue;
-                }
-
-                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
-                    continue;
-                };
-
-                if let Ok(inner_path) = path.strip_prefix(relative_target_path) {
-                    result = Some((inner_path.to_path_buf(), source_path, mount.read_only));
-                    break;
-                }
+                tokio::task::spawn_blocking(move || {
+                    Self::match_mount(&config, &mounts, &path, &mut None)
+                })
+                .await
+                .unwrap_or_default()
             }
-            result
         };
 
-        if let Some((inner_path, source_path, read_only)) = mount_match {
+        if let Some(MountMatch {
+            inner_path,
+            source_path,
+            read_only,
+            target,
+        }) = mount_match
+        {
             match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
-                    let mut fs = cap_fs.get_virtual(server.clone());
-                    fs.is_primary_server_fs = false;
-                    fs.is_writable = !read_only;
+                    let fs =
+                        Self::mount_virtual_fs(server, cap_fs, read_only, &target, request_ignored);
 
                     return (inner_path, Arc::new(fs));
                 }
@@ -972,7 +1396,7 @@ impl Filesystem {
                             fs = fs.with_is_ignored(ignored);
                         }
 
-                        return (inner_path, Arc::new(fs));
+                        return (path, Arc::new(fs));
                     }
                 }
             }
@@ -989,32 +1413,82 @@ impl Filesystem {
         (path, Arc::new(fs))
     }
 
+    /// The primary filesystem without ignore rules or disk quota, for restoring a
+    /// server's files exactly as they were sent.
+    pub fn transfer_writable_fs(
+        &self,
+        server: &crate::server::Server,
+    ) -> Arc<dyn virtualfs::VirtualWritableFilesystem> {
+        let mut fs = self.cap_filesystem.get_virtual(server.clone());
+        fs.is_primary_server_fs = true;
+        fs.is_writable = true;
+        // Transfers skip disk quota checks on Docker only; on Incus they stay subject to the limit.
+        fs.ignore_quota =
+            server.app_state.config.load().runtime.backend != crate::config::RuntimeBackend::Incus;
+
+        Arc::new(fs)
+    }
+
     pub async fn truncate_path(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
+
+        if self.async_is_protected_path(&path).await {
+            return Err(Self::virtual_path_error().into());
+        }
 
         let metadata = self.async_symlink_metadata(&path).await?;
 
         if metadata.is_dir() {
+            let key = self.diff_key(&path).await;
             let threads = self.config.load().api.file_delete_threads;
-            self.async_remove_dir_all(&path, threads).await?;
+            let result = self.async_remove_dir_all(&path, threads).await;
 
-            let mut disk_usage = self.disk_usage.write().await;
-            if let Some(removed) = disk_usage.remove_path(&path) {
-                drop(disk_usage);
-                self.try_update_atomics(
-                    usage::SpaceDelta::new(
-                        -(removed.space.get_logical() as i64),
-                        -(removed.space.get_physical() as i64),
-                    ),
-                    false,
-                );
+            let delta = if result.is_ok() || self.async_symlink_metadata(&key).await.is_err() {
+                self.disk_usage
+                    .write()
+                    .await
+                    .remove_path(&key)
+                    .map(|removed| {
+                        usage::SpaceDelta::new(
+                            -(removed.space.get_logical() as i64),
+                            -(removed.space.get_physical() as i64),
+                        )
+                    })
+            } else {
+                match disk_checker::rescan_tree(
+                    self.cap_filesystem.clone(),
+                    Arc::clone(&self.disk_usage),
+                    key,
+                )
+                .await
+                {
+                    Ok(delta) => Some(delta),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "failed to rescan partially removed directory: {}",
+                            err
+                        );
+                        None
+                    }
+                }
+            };
+
+            if let Some(delta) = delta {
+                self.try_update_atomics(delta, true);
             }
+            result?;
         } else {
-            let size = metadata.len() as i64;
+            let removed = disk_checker::space_delta(&metadata);
             self.async_remove_file(&path).await?;
 
             if let Some(parent) = path.parent() {
-                self.async_allocate_in_path(parent, -size, false).await;
+                self.async_allocate_in_path(
+                    parent,
+                    usage::SpaceDelta::new(-removed.logical, -removed.physical),
+                    false,
+                )
+                .await;
             }
         }
 
@@ -1031,6 +1505,10 @@ impl Filesystem {
                 std::io::ErrorKind::PermissionDenied,
                 "cannot remove the server root directory",
             ));
+        }
+
+        if self.async_is_protected_path(&path).await {
+            return Err(Self::virtual_path_error());
         }
 
         self.async_remove_dir(&path).await?;
@@ -1059,15 +1537,30 @@ impl Filesystem {
         let old_path = self.relative_path(old_path.as_ref());
         let new_path = self.relative_path(new_path.as_ref());
 
+        if self.async_is_protected_path(&old_path).await
+            || self.async_is_protected_path(&new_path).await
+        {
+            return Err(Self::virtual_path_error().into());
+        }
+
         if parents == RenameParents::Create
             && let Some(parent) = new_path.parent()
         {
-            self.async_create_dir_all(parent).await?;
+            self.async_create_chowned_dir_all(parent, None).await?;
         }
 
-        let old_metadata = self.async_metadata(&old_path).await?;
-        let new_metadata = self.async_metadata(&new_path).await.ok();
+        let old_metadata = self.async_symlink_metadata(&old_path).await?;
+        let new_metadata = self.async_symlink_metadata(&new_path).await.ok();
         let is_dir = old_metadata.is_dir();
+
+        #[cfg(unix)]
+        let same_file = new_metadata.as_ref().is_some_and(|new_metadata| {
+            use cap_std::fs::MetadataExt;
+
+            new_metadata.dev() == old_metadata.dev() && new_metadata.ino() == old_metadata.ino()
+        });
+        #[cfg(not(unix))]
+        let same_file = false;
 
         let old_parent = self
             .async_canonicalize(match old_path.parent() {
@@ -1084,6 +1577,10 @@ impl Filesystem {
             .await
             .unwrap_or_default();
 
+        let abs_old_path = old_parent.join(match old_path.file_name() {
+            Some(name) => name,
+            None => return Err(anyhow::anyhow!("failed to get old path file name")),
+        });
         let abs_new_path = new_parent.join(match new_path.file_name() {
             Some(name) => name,
             None => return Err(anyhow::anyhow!("failed to get new path file name")),
@@ -1092,10 +1589,14 @@ impl Filesystem {
         self.async_rename(&old_path, &self.cap_filesystem, &new_path)
             .await?;
 
+        if same_file {
+            return Ok(());
+        }
+
         if is_dir {
             let mut disk_usage = self.disk_usage.write().await;
 
-            let path = disk_usage.remove_path(&old_path);
+            let path = disk_usage.remove_path(&abs_old_path);
             if let Some(path) = path {
                 disk_usage.add_directory(
                     &abs_new_path
@@ -1106,19 +1607,26 @@ impl Filesystem {
                 );
             }
         } else {
-            let size = old_metadata.len() as i64;
+            let moved = disk_checker::space_delta(&old_metadata);
+            let added = match new_metadata {
+                Some(new_metadata) => {
+                    let replaced = disk_checker::space_delta(&new_metadata);
 
-            if let Some(new_metadata) = new_metadata {
-                let new_size = new_metadata.len() as i64;
-                let size_delta = new_size - size;
+                    usage::SpaceDelta::new(
+                        moved.logical - replaced.logical,
+                        moved.physical - replaced.physical,
+                    )
+                }
+                None => moved,
+            };
 
-                self.async_allocate_in_path(&old_parent, -size, true).await;
-                self.async_allocate_in_path(&new_parent, size_delta, true)
-                    .await;
-            } else {
-                self.async_allocate_in_path(&old_parent, -size, true).await;
-                self.async_allocate_in_path(&new_parent, size, true).await;
-            }
+            self.async_allocate_in_path(
+                &old_parent,
+                usage::SpaceDelta::new(-moved.logical, -moved.physical),
+                true,
+            )
+            .await;
+            self.async_allocate_in_path(&new_parent, added, true).await;
         }
 
         self.uploads.forget(&old_path, &self.cap_filesystem).await;
@@ -1139,12 +1647,11 @@ impl Filesystem {
     ) -> Result<(), anyhow::Error> {
         if metadata.file_type.is_file() {
             if filesystem.is_primary_server_fs() && destination_filesystem.is_primary_server_fs() {
-                server
-                    .filesystem
-                    .async_quota_copy(
+                destination_filesystem
+                    .async_quota_copy_from(
+                        filesystem.backing_server(),
                         &path,
                         &destination_path,
-                        server,
                         Some(metadata.permissions),
                         progress.clone_bytes().as_ref(),
                     )
@@ -1156,27 +1663,58 @@ impl Filesystem {
                 if let Some(parent) = destination_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    destination_filesystem.async_create_dir_all(&parent).await?;
+                    destination_filesystem
+                        .async_create_dir_all(&parent, None)
+                        .await?;
                 }
 
-                let mut writer = destination_filesystem
-                    .async_create_file_with_permissions(
-                        &destination_path,
-                        Some(metadata.permissions),
-                    )
-                    .await?;
+                if destination_filesystem.is_primary_server_fs() {
+                    let mut writer = destination_filesystem
+                        .async_create_file_with_permissions(
+                            &destination_path,
+                            Some(metadata.permissions),
+                        )
+                        .await?;
 
-                tokio::io::copy(&mut reader, &mut writer).await?;
-                writer.shutdown().await?;
+                    crate::io::async_copy(&mut reader, &mut writer).await?;
+                    writer.shutdown().await?;
+                } else {
+                    // Both sides may be the same file on one mount, which creating the
+                    // destination in place would truncate before it is read.
+                    let staging = destination_path
+                        .with_file_name(format!(".calagopus-copy-{}", uuid::Uuid::new_v4()));
+
+                    let result = async {
+                        let mut writer = destination_filesystem
+                            .async_create_file_with_permissions(
+                                &staging,
+                                Some(metadata.permissions),
+                            )
+                            .await?;
+
+                        crate::io::async_copy(&mut reader, &mut writer).await?;
+                        writer.shutdown().await?;
+
+                        destination_filesystem
+                            .async_rename(&staging, &destination_path, cap::FileType::File)
+                            .await
+                    }
+                    .await;
+
+                    if result.is_err() {
+                        destination_filesystem
+                            .async_remove_file(&staging)
+                            .await
+                            .ok();
+                    }
+                    result?;
+                }
             }
 
             progress.increment_files();
         } else {
             destination_filesystem
-                .async_create_dir_all(&destination_path)
-                .await?;
-            destination_filesystem
-                .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
+                .async_create_dir_all(&destination_path, Some(metadata.permissions))
                 .await?;
 
             let ignored = if filesystem.is_primary_server_fs() {
@@ -1184,108 +1722,133 @@ impl Filesystem {
             } else {
                 Default::default()
             };
-            let mut walker = filesystem.async_walk_dir_stream(&path, ignored).await?;
+            let threads = server.app_state.config.load().api.file_copy_threads;
+            let quota_copy = filesystem.is_primary_server_fs()
+                && destination_filesystem.is_primary_server_fs()
+                && filesystem.backing_server().uuid == destination_filesystem.backing_server().uuid;
 
-            walker
-                .run_multithreaded(
-                    server.app_state.config.load().api.file_copy_threads,
-                    AsyncDirectoryStreamWalkFn::from({
-                        let server = server.clone();
-                        let filesystem = filesystem.clone();
-                        let source_path = Arc::new(path);
-                        let destination_path = Arc::new(destination_path);
-                        let destination_filesystem = destination_filesystem.clone();
-                        let progress = progress.clone();
+            let copy_entry = {
+                let server = server.clone();
+                let filesystem = filesystem.clone();
+                let source_path = Arc::new(path.clone());
+                let destination_path = Arc::new(destination_path);
+                let destination_filesystem = destination_filesystem.clone();
+                let progress = progress.clone();
 
-                        move |entry: virtualfs::VirtualWalkEntry, stream| {
-                            let path = entry.path;
+                move |entry: virtualfs::VirtualWalkEntry,
+                      stream: Option<virtualfs::AsyncReadableFileStream>| {
+                    let path = entry.path;
 
-                            let server = server.clone();
-                            let filesystem = filesystem.clone();
-                            let source_path = Arc::clone(&source_path);
-                            let destination_path = Arc::clone(&destination_path);
-                            let destination_filesystem = destination_filesystem.clone();
-                            let progress = progress.clone();
+                    let server = server.clone();
+                    let filesystem = filesystem.clone();
+                    let source_path = Arc::clone(&source_path);
+                    let destination_path = Arc::clone(&destination_path);
+                    let destination_filesystem = destination_filesystem.clone();
+                    let progress = progress.clone();
 
-                            async move {
-                                let metadata =
-                                    match filesystem.async_symlink_metadata(&path).await {
-                                        Ok(metadata) => metadata,
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                path = %path.display(),
-                                                "skipping copy entry, failed to stat: {:?}",
-                                                err,
-                                            );
-                                            return Ok(());
-                                        }
-                                    };
+                    async move {
+                        let metadata = match filesystem.async_symlink_metadata(&path).await {
+                            Ok(metadata) => metadata,
+                            Err(err) => {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    "skipping copy entry, failed to stat: {:?}",
+                                    err,
+                                );
+                                return Ok(());
+                            }
+                        };
 
-                                let relative_path = match path.strip_prefix(&*source_path) {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        tracing::debug!(
-                                            path = %path.display(),
-                                            source = %source_path.display(),
-                                            "skipping copy entry, not under source path",
-                                        );
-                                        return Ok(());
-                                    }
-                                };
-                                let destination_path = destination_path.join(relative_path);
+                        let relative_path = match path.strip_prefix(&*source_path) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    source = %source_path.display(),
+                                    "skipping copy entry, not under source path",
+                                );
+                                return Ok(());
+                            }
+                        };
+                        let destination_path = destination_path.join(relative_path);
 
-                                if metadata.file_type.is_file() {
-                                    if let Some(parent) = destination_path.parent() {
-                                        destination_filesystem.async_create_dir_all(&parent).await?;
-                                    }
+                        if metadata.file_type.is_file() {
+                            if let Some(parent) = destination_path.parent() {
+                                destination_filesystem
+                                    .async_create_dir_all(&parent, None)
+                                    .await?;
+                            }
 
-                                    if filesystem.is_primary_server_fs()
-                                        && destination_filesystem.is_primary_server_fs()
-                                        && filesystem.backing_server().uuid == destination_filesystem.backing_server().uuid
-                                    {
-                                        server
-                                            .filesystem
-                                            .async_quota_copy(
-                                                &path,
-                                                &destination_path,
-                                                &server,
-                                                Some(metadata.permissions),
-                                                progress.clone_bytes().as_ref(),
-                                            )
-                                            .await?;
-                                    } else {
-                                        let mut reader = progress.async_counting_reader(stream);
+                            if let Some(stream) = stream {
+                                let mut reader = progress.async_counting_reader(stream);
 
-                                        let mut writer = destination_filesystem
-                                            .async_create_file_with_permissions(&destination_path, Some(metadata.permissions))
-                                            .await?;
+                                let mut writer = destination_filesystem
+                                    .async_create_file_with_permissions(
+                                        &destination_path,
+                                        Some(metadata.permissions),
+                                    )
+                                    .await?;
 
-                                        tokio::io::copy(&mut reader, &mut writer).await?;
-                                        writer.shutdown().await?;
-                                    }
+                                crate::io::async_copy(&mut reader, &mut writer).await?;
+                                writer.shutdown().await?;
+                            } else {
+                                destination_filesystem
+                                    .async_quota_copy_from(
+                                        &server,
+                                        &path,
+                                        &destination_path,
+                                        Some(metadata.permissions),
+                                        progress.clone_bytes().as_ref(),
+                                    )
+                                    .await?;
+                            }
 
-                                    progress.increment_files();
-                                } else if metadata.file_type.is_dir() {
-                                    destination_filesystem.async_create_dir_all(&destination_path).await?;
-                                    destination_filesystem
-                                        .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
-                                        .await?;
+                            progress.increment_files();
+                        } else if metadata.file_type.is_dir() {
+                            destination_filesystem
+                                .async_create_dir_all(&destination_path, Some(metadata.permissions))
+                                .await?;
 
-                                    progress.increment_bytes(metadata.size);
-                                } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&path).await {
-                                    if let Err(err) = destination_filesystem.async_create_symlink(&target, &destination_path).await {
-                                        tracing::debug!(path = %destination_path.display(), "failed to create symlink from copy: {:?}", err);
-                                    } else {
-                                        progress.increment_files();
-                                    }
-                                }
-
-                                Ok(())
+                            progress.increment_bytes(metadata.size);
+                        } else if metadata.file_type.is_symlink()
+                            && let Ok(target) = filesystem.async_read_symlink(&path).await
+                        {
+                            if let Err(err) = destination_filesystem
+                                .async_create_symlink(&target, &destination_path)
+                                .await
+                            {
+                                tracing::debug!(path = %destination_path.display(), "failed to create symlink from copy: {:?}", err);
+                            } else {
+                                progress.increment_files();
                             }
                         }
-                    }),
-                )
-                .await?;
+
+                        Ok(())
+                    }
+                }
+            };
+
+            if quota_copy {
+                filesystem
+                    .async_walk_dir(&path, ignored)
+                    .await?
+                    .run_multithreaded(
+                        threads,
+                        AsyncDirectoryWalkFn::from(move |entry| copy_entry(entry, None)),
+                    )
+                    .await?;
+            } else {
+                filesystem
+                    .async_walk_dir_stream(&path, ignored)
+                    .await?
+                    .run_multithreaded(
+                        threads,
+                        AsyncDirectoryStreamWalkFn::from(move |entry, stream| {
+                            copy_entry(entry, Some(stream))
+                        }),
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -1351,8 +1914,17 @@ impl Filesystem {
 
         self.disk_usage_delta_cached
             .fetch_add(delta.physical, Ordering::Relaxed);
-        self.resource_usage
-            .publish_disk_usage(self.get_physical_cached_size());
+        if self
+            .config
+            .load()
+            .system
+            .disk_limiter_mode
+            .usage_is_scanned()
+            || !self.limiter_usage_known.load(Ordering::Relaxed)
+        {
+            self.resource_usage
+                .publish_disk_usage(self.get_physical_cached_size());
+        }
 
         true
     }
@@ -1365,15 +1937,18 @@ impl Filesystem {
     /// - `ignorant`: If `true`, ignores disk limit checks
     ///
     /// Returns `true` if allocation was successful, `false` if it would exceed disk limit
-    pub async fn async_allocate_in_path(&self, path: &Path, delta: i64, ignorant: bool) -> bool {
+    pub async fn async_allocate_in_path(
+        &self,
+        path: &Path,
+        delta: impl Into<usage::SpaceDelta>,
+        ignorant: bool,
+    ) -> bool {
+        let delta: usage::SpaceDelta = delta.into();
         if !self.try_update_atomics(delta, ignorant) {
             return false;
         }
 
-        self.disk_usage
-            .write()
-            .await
-            .update_size(path, delta.into());
+        self.disk_usage.write().await.update_size(path, delta);
 
         true
     }
@@ -1455,6 +2030,8 @@ impl Filesystem {
         self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
         self.resource_usage.publish_disk_usage(0);
 
+        self.trash.clear().await;
+
         let threads = self.config.load().api.file_delete_threads;
         self.async_remove_dir_all(Path::new(""), threads).await
     }
@@ -1483,17 +2060,26 @@ impl Filesystem {
         &self,
         result: Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
+        Self::absorb_chown_refusal_impl(&self.config, &self.chown_refused, self.uuid, result)
+    }
+
+    fn absorb_chown_refusal_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        result: Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
         let Err(err) = result else {
             return Ok(());
         };
 
-        if !self.config.load().system.user.rootless.enabled {
+        if !config.load().system.user.rootless.enabled {
             return Err(err);
         }
 
-        if !self.chown_refused.swap(true, Ordering::Relaxed) {
+        if !chown_refused.swap(true, Ordering::Relaxed) {
             tracing::debug!(
-                server = %self.uuid,
+                server = %uuid,
                 "chown refused under a rootless engine, leaving ownership as written: {}",
                 err
             );
@@ -1508,6 +2094,22 @@ impl Filesystem {
         }
 
         self.absorb_chown_refusal(Self::chown_impl(&self.config, &self.cap_filesystem, path))
+    }
+
+    /// Whether `metadata` already carries the configured owner, so a chown would be a no-op.
+    pub fn is_owned(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let cfg = self.config.load();
+            metadata.uid() == cfg.system.user.uid && metadata.gid() == cfg.system.user.gid
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            true
+        }
     }
 
     pub fn chown_file(&self, file: &std::fs::File) -> Result<(), std::io::Error> {
@@ -1628,29 +2230,111 @@ impl Filesystem {
         }
     }
 
-    pub fn create_chowned_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    pub fn create_chowned_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
         if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.set_permissions(&path, permissions)?;
+            }
+
             return Ok(());
         }
 
-        match self.create_dir(&path) {
-            Ok(_) => {
-                self.chown_path(&path)?;
+        Self::create_chowned_dir_all_impl(
+            &self.config,
+            &self.chown_refused,
+            self.uuid,
+            &self.cap_filesystem,
+            &path,
+            permissions,
+        )
+    }
+
+    /// `permissions` only apply to the leaf directory, and are also applied when it already exists.
+    pub async fn async_create_chowned_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.as_os_str().is_empty() {
+            if let Some(permissions) = permissions {
+                self.async_set_permissions(&path, permissions).await?;
+            }
+
+            return Ok(());
+        }
+
+        let config = self.config.clone();
+        let chown_refused = Arc::clone(&self.chown_refused);
+        let uuid = self.uuid;
+        let cap_filesystem = self.cap_filesystem.clone();
+
+        tokio::task::spawn_blocking(move || {
+            Self::create_chowned_dir_all_impl(
+                &config,
+                &chown_refused,
+                uuid,
+                &cap_filesystem,
+                &path,
+                permissions,
+            )
+        })
+        .await?
+    }
+
+    fn create_chowned_dir_all_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<(), std::io::Error> {
+        match Self::create_chowned_dir(
+            config,
+            chown_refused,
+            uuid,
+            cap_filesystem,
+            path,
+            permissions,
+        ) {
+            Ok(chowned) => return chowned,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(permissions) = permissions {
+                    cap_filesystem.set_permissions(path, permissions)?;
+                }
+
                 return Ok(());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
             Err(_) => {}
         }
 
         let mut progress = PathBuf::new();
-        for component in path.components() {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
             progress.push(component);
+            let permissions = permissions.filter(|_| components.peek().is_none());
 
-            match self.create_dir(&progress) {
-                Ok(_) => self.chown_path(&progress)?,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            match Self::create_chowned_dir(
+                config,
+                chown_refused,
+                uuid,
+                cap_filesystem,
+                &progress,
+                permissions,
+            ) {
+                Ok(chowned) => chowned?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(permissions) = permissions {
+                        cap_filesystem.set_permissions(&progress, permissions)?;
+                    }
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -1658,43 +2342,159 @@ impl Filesystem {
         Ok(())
     }
 
-    pub async fn async_create_chowned_dir_all(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<(), std::io::Error> {
-        let path = self.relative_path(path.as_ref());
-        if path.as_os_str().is_empty() {
-            return Ok(());
+    /// Creates a single directory and chowns it through the same parent directory fd.
+    /// The outer error is the creation's, the inner one the chown's.
+    fn create_chowned_dir(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        path: &Path,
+        permissions: Option<PortablePermissions>,
+    ) -> Result<Result<(), std::io::Error>, std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            cap_filesystem.create_dir_then(path, permissions, |fd, name| {
+                Self::chown_at(config, chown_refused, uuid, fd, name)
+            })
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (config, chown_refused, uuid);
+            cap_filesystem.create_dir(path, permissions).map(Ok)
+        }
+    }
 
-        let config = self.config.clone();
-        let cap_filesystem = self.cap_filesystem.clone();
-
-        tokio::task::spawn_blocking(move || {
-            match cap_filesystem.create_dir(&path) {
-                Ok(_) => {
-                    Self::chown_impl(&config, &cap_filesystem, &path)?;
-                    return Ok(());
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
-                Err(_) => {}
-            }
-
-            let mut progress = PathBuf::new();
-            for component in path.components() {
-                progress.push(component);
-
-                match cap_filesystem.create_dir(&progress) {
-                    Ok(_) => Self::chown_impl(&config, &cap_filesystem, &progress)?,
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(err) => return Err(err),
-                }
+    /// Creates a symlink like [`cap::CapFilesystem::symlink`], then chowns it and sets
+    /// its modification time through the same parent directory fd.
+    pub fn create_chowned_symlink(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::create_chowned_symlink_impl(
+                &self.config,
+                &self.chown_refused,
+                self.uuid,
+                &self.cap_filesystem,
+                target.as_ref(),
+                link.as_ref(),
+                false,
+                modified,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.cap_filesystem.symlink(&target, &link)?;
+            self.chown_path(&link)?;
+            if let Some(modified) = modified {
+                self.cap_filesystem.set_times(&link, modified, None)?;
             }
 
             Ok(())
-        })
-        .await?
+        }
+    }
+
+    /// Like [`Self::create_chowned_symlink`], writing `target` verbatim when `verbatim` is set
+    /// (see [`cap::CapFilesystem::async_symlink_contents`]).
+    pub async fn async_create_chowned_symlink(
+        &self,
+        target: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+        verbatim: bool,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let config = self.config.clone();
+            let chown_refused = Arc::clone(&self.chown_refused);
+            let uuid = self.uuid;
+            let cap_filesystem = self.cap_filesystem.clone();
+            let target = target.as_ref().to_path_buf();
+            let link = link.as_ref().to_path_buf();
+
+            tokio::task::spawn_blocking(move || {
+                Self::create_chowned_symlink_impl(
+                    &config,
+                    &chown_refused,
+                    uuid,
+                    &cap_filesystem,
+                    &target,
+                    &link,
+                    verbatim,
+                    None,
+                )
+            })
+            .await?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if verbatim {
+                self.cap_filesystem
+                    .async_symlink_contents(&target, &link)
+                    .await?;
+            } else {
+                self.cap_filesystem.async_symlink(&target, &link).await?;
+            }
+
+            self.async_chown_path(&link).await
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn create_chowned_symlink_impl(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        cap_filesystem: &cap::CapFilesystem,
+        target: &Path,
+        link: &Path,
+        verbatim: bool,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<(), std::io::Error> {
+        cap_filesystem.create_symlink_then(target, link, verbatim, |fd, name| {
+            Self::chown_at(config, chown_refused, uuid, fd, name)?;
+            if let Some(modified) = modified {
+                cap::CapFilesystem::set_times_at(fd, name, modified, None)?;
+            }
+
+            Ok(())
+        })?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chown_at(
+        config: &crate::config::Config,
+        chown_refused: &AtomicBool,
+        uuid: uuid::Uuid,
+        fd: std::os::fd::BorrowedFd<'_>,
+        name: &Path,
+    ) -> Result<(), std::io::Error> {
+        if chown_refused.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let cfg = config.load();
+        let owner_uid = rustix::fs::Uid::from_raw_unchecked(cfg.system.user.uid);
+        let owner_gid = rustix::fs::Gid::from_raw_unchecked(cfg.system.user.gid);
+        drop(cfg);
+
+        Self::absorb_chown_refusal_impl(
+            config,
+            chown_refused,
+            uuid,
+            rustix::fs::chownat(
+                fd,
+                name,
+                Some(owner_uid),
+                Some(owner_gid),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(Into::into),
+        )
     }
 
     pub async fn setup(&self) {
@@ -1768,7 +2568,15 @@ impl Filesystem {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        self.zfs_dataset_root.store(
+            rustix::fs::fstatfs(&dir).is_ok_and(|stat| stat.f_type as u64 == ZFS_SUPER_MAGIC),
+            Ordering::Relaxed,
+        );
         self.cap_filesystem.inner.store(Some(Arc::new(dir)));
+
+        self.ensure_trash_directory().await;
+        self.trash.load(&self.cap_filesystem).await;
 
         if self.app_state.config.load().system.disk_check_use_inotify {
             tokio::spawn({
@@ -1798,8 +2606,9 @@ impl Filesystem {
         }
     }
 
-    pub async fn destroy(&self) {
+    pub async fn destroy(&self) -> Result<(), std::io::Error> {
         self.disk_checker.abort();
+        self.trash.abort_purge_task();
         self.app_state
             .inotify_manager
             .unregister_server(self.uuid)
@@ -1813,14 +2622,10 @@ impl Filesystem {
             );
             self.close();
 
-            if let Err(err) = self.get_disk_limiter().destroy().await {
-                tracing::error!(
-                    path = %self.base_path.display(),
-                    "failed to delete server base directory for: {}",
-                    err
-                );
-            }
+            self.get_disk_limiter().destroy().await?;
         }
+
+        Ok(())
     }
 
     pub async fn directory_entry_space(
@@ -2081,10 +2886,7 @@ impl Filesystem {
         metadata: Metadata,
     ) -> PreparedDirectoryEntry {
         let symlink_destination = if metadata.is_symlink() {
-            match filesystem.async_read_link(&path).await {
-                Ok(link) => filesystem.async_canonicalize(link).await.ok(),
-                Err(_) => None,
-            }
+            filesystem.async_canonicalize(&path).await.ok()
         } else {
             None
         };
@@ -2115,10 +2917,7 @@ impl Filesystem {
         metadata: Metadata,
     ) -> PreparedDirectoryEntry {
         let symlink_destination = if metadata.is_symlink() {
-            match filesystem.read_link(&path) {
-                Ok(link) => filesystem.canonicalize(link).ok(),
-                Err(_) => None,
-            }
+            filesystem.canonicalize(&path).ok()
         } else {
             None
         };
@@ -2257,15 +3056,6 @@ impl Filesystem {
 pub struct DirectoryEntryOptions {
     pub directory_size: bool,
     pub r#virtual: bool,
-}
-
-impl DirectoryEntryOptions {
-    pub fn server_fs(is_primary_server_fs: bool) -> Self {
-        Self {
-            directory_size: is_primary_server_fs,
-            r#virtual: !is_primary_server_fs,
-        }
-    }
 }
 
 pub struct PreparedDirectoryEntry {
@@ -2439,6 +3229,197 @@ mod tests {
         opened?;
         assert_eq!(opens.load(Ordering::Relaxed), 1);
         Ok(())
+    }
+
+    fn mount(target: &str) -> crate::server::configuration::Mount {
+        crate::server::configuration::Mount {
+            default: false,
+            target: target.into(),
+            source: "/mnt/allowed/source".into(),
+            read_only: false,
+        }
+    }
+
+    // Filesystem
+    #[test]
+    fn mount_points_and_virtual_parents_cannot_be_removed_or_renamed() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join("mods")).unwrap();
+            std::fs::write(root.join("mods/a.jar"), b"x").unwrap();
+            std::fs::write(root.join("x.txt"), b"x").unwrap();
+
+            server.filesystem.update_mounts(&[
+                mount("/home/container/mods"),
+                mount("/home/container/plugins/data"),
+            ]);
+
+            for path in ["mods", "plugins", "plugins/data"] {
+                assert!(
+                    server.filesystem.is_mount_gateway(Path::new(path)),
+                    "{path}"
+                );
+                assert!(
+                    server
+                        .filesystem
+                        .async_is_protected_path(Path::new(path))
+                        .await,
+                    "{path}"
+                );
+                assert!(
+                    server
+                        .filesystem
+                        .is_ignored(Path::new(path), FileType::File),
+                    "{path}"
+                );
+                assert!(
+                    !server.filesystem.is_ignored(Path::new(path), FileType::Dir),
+                    "{path}"
+                );
+            }
+            assert!(!server.filesystem.is_mount_gateway(Path::new("mods/a.jar")));
+            assert!(!server.filesystem.is_mount_gateway(Path::new("")));
+
+            assert!(server.filesystem.truncate_path("mods").await.is_err());
+            assert!(server.filesystem.remove_empty_dir("plugins").await.is_err());
+            assert!(
+                server
+                    .filesystem
+                    .rename_path("mods", "mods2", RenameParents::Require)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                server
+                    .filesystem
+                    .rename_path("x.txt", "plugins", RenameParents::Require)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                server
+                    .filesystem
+                    .trash
+                    .trash(&server, Path::new("mods"), trash::TrashSource::Api)
+                    .await
+                    .is_err()
+            );
+            assert!(root.join("mods/a.jar").is_file());
+            assert!(root.join("x.txt").is_file());
+
+            assert!(server.filesystem.truncate_path("mods/a.jar").await.is_ok());
+
+            server.filesystem.update_mounts(&[]);
+            assert!(!server.filesystem.is_mount_gateway(Path::new("mods")));
+            assert!(server.filesystem.truncate_path("mods").await.is_ok());
+        });
+    }
+
+    #[test]
+    fn backup_browsing_directory_is_never_a_write_target() {
+        crate::server::Server::with_mock(|server| async move {
+            assert!(
+                server
+                    .filesystem
+                    .is_ignored(Path::new(".backups"), FileType::Dir)
+            );
+            assert!(
+                server
+                    .filesystem
+                    .is_ignored(Path::new(".backups/abc/world"), FileType::File)
+            );
+            assert!(
+                server
+                    .filesystem
+                    .async_is_protected_path(Path::new(".backups/abc"))
+                    .await
+            );
+            assert!(
+                server
+                    .filesystem
+                    .rename_path("missing", ".backups/x", RenameParents::Create)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn zfs_control_dir_is_hidden_and_protected_on_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let filesystem = &server.filesystem;
+            filesystem.zfs_dataset_root.store(true, Ordering::Relaxed);
+
+            for (path, expected) in [
+                (".zfs", true),
+                (".zfs/snapshot/backup-x/file", true),
+                ("/.zfs/snapshot", true),
+                ("./.zfs", true),
+                ("sub/.zfs", false),
+                (".zfsx", false),
+            ] {
+                let path = Path::new(path);
+                for file_type in [FileType::Dir, FileType::File] {
+                    assert_eq!(
+                        filesystem.is_virtual_write_target(path, file_type),
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                    assert_eq!(
+                        filesystem.is_ignored(path, file_type),
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                    assert_eq!(
+                        filesystem.async_is_ignored(path, file_type).await,
+                        expected,
+                        "{path:?} {file_type:?}"
+                    );
+                }
+                assert_eq!(
+                    filesystem.async_is_protected_path(path).await,
+                    expected,
+                    "{path:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn zfs_control_dir_is_ordinary_off_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let filesystem = &server.filesystem;
+            let path = Path::new(".zfs");
+
+            for file_type in [FileType::Dir, FileType::File] {
+                assert!(!filesystem.is_virtual_write_target(path, file_type));
+                assert!(!filesystem.is_ignored(path, file_type));
+                assert!(!filesystem.async_is_ignored(path, file_type).await);
+            }
+            assert!(!filesystem.async_is_protected_path(path).await);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_into_zfs_control_dir_is_ignored_on_a_dataset_root() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join(".zfs/snapshot")).unwrap();
+            std::os::unix::fs::symlink(".zfs/snapshot", root.join("link")).unwrap();
+            server.filesystem.update_ignored(&[] as &[&str]).await;
+            server
+                .filesystem
+                .zfs_dataset_root
+                .store(true, Ordering::Relaxed);
+
+            assert!(
+                server
+                    .filesystem
+                    .async_is_ignored(Path::new("link"), FileType::Symlink)
+                    .await
+            );
+        });
     }
 
     #[test]
@@ -2712,5 +3693,593 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    // Filesystem::create_chowned_dir_all
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn create_chowned_dir_all_chowns_created_components_and_applies_mode_to_leaf()
+    -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        tokio_test::block_on(async {
+            let (_temp, server) = crate::server::Server::mock_in_tempdir().await;
+            {
+                let user = &mut server
+                    .app_state
+                    .config
+                    .mutate_in_place_for_testing()
+                    .system
+                    .user;
+                user.uid = 4242;
+                user.gid = 4243;
+            }
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir(root.join("existing"))?;
+            std::fs::create_dir(root.join("reference"))?;
+            let existing_owner = std::fs::metadata(root.join("existing"))?.uid();
+            let meta = |path: &str| std::fs::metadata(root.join(path));
+            let mode = |path: &str| -> Result<u32, std::io::Error> {
+                Ok(meta(path)?.permissions().mode() & 0o777)
+            };
+            let default_mode = mode("reference")?;
+            let leaf_mode = if default_mode == 0o777 { 0o775 } else { 0o777 };
+
+            server.filesystem.create_chowned_dir_all(
+                "existing/b/c",
+                Some(PortablePermissions::from_mode_dir(leaf_mode)),
+            )?;
+            server
+                .filesystem
+                .async_create_chowned_dir_all("x/y", None)
+                .await?;
+
+            for path in ["existing/b", "existing/b/c", "x", "x/y"] {
+                let metadata = meta(path)?;
+                assert_eq!((metadata.uid(), metadata.gid()), (4242, 4243), "{path}");
+            }
+            assert_eq!(meta("existing")?.uid(), existing_owner);
+            assert_eq!(mode("existing/b/c")?, leaf_mode);
+            assert_eq!(mode("existing/b")?, default_mode);
+
+            server
+                .filesystem
+                .async_create_chowned_dir_all(
+                    "existing/b/c",
+                    Some(PortablePermissions::from_mode_dir(0o700)),
+                )
+                .await?;
+            assert_eq!(mode("existing/b/c")?, 0o700);
+
+            Ok(())
+        })
+    }
+
+    fn write_vault(root: &Path, directory: &str) {
+        std::fs::create_dir_all(root.join(directory).join("Vault")).unwrap();
+        std::fs::write(root.join(directory).join("Vault/config.yml"), b"secret").unwrap();
+        std::fs::write(root.join(directory).join("Vault/other.yml"), b"public").unwrap();
+    }
+
+    // RequestIgnored::contains_ignored
+    #[test]
+    fn contains_ignored_sees_a_pattern_naming_a_deeper_entry() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            write_vault(&root, "mods");
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+
+            let plugins = Path::new("plugins");
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+
+            let mods = Path::new("mods");
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, mods, &[mods])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_judges_contents_at_the_destination() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "p2");
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let p2 = Path::new("p2");
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, p2, &[p2, Path::new("other")])
+                    .await
+            );
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, p2, &[p2, Path::new("plugins")])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_resolves_a_symlinked_destination_parent() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join("plugins")).unwrap();
+            std::os::unix::fs::symlink("plugins", root.join("alias")).unwrap();
+            std::fs::create_dir_all(root.join("staging")).unwrap();
+            std::fs::write(root.join("staging/config.yml"), b"secret").unwrap();
+            let ignored = RequestIgnored::compile(&["plugins/Vault/config.yml"]).unwrap();
+            let staging = Path::new("staging");
+
+            assert!(
+                ignored
+                    .contains_ignored(
+                        &server,
+                        FileType::Dir,
+                        staging,
+                        &[staging, Path::new("alias/Vault")]
+                    )
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_applies_the_denylist_without_a_request_list() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            let plugins = Path::new("plugins");
+            let ignored = RequestIgnored::default();
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+
+            server
+                .filesystem
+                .update_ignored(&["plugins/Vault/config.yml"])
+                .await;
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, plugins, &[plugins])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_matches_unanchored_patterns_deep_in_the_tree() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            std::fs::create_dir_all(root.join("cfg/a/b")).unwrap();
+            std::fs::write(root.join("cfg/a/b/secret.key"), b"key").unwrap();
+            std::fs::write(root.join("cfg/a/b/public.txt"), b"txt").unwrap();
+            let cfg = Path::new("cfg");
+
+            let ignored = RequestIgnored::compile(&["*.key"]).unwrap();
+            assert!(
+                ignored
+                    .contains_ignored(&server, FileType::Dir, cfg, &[cfg])
+                    .await
+            );
+
+            let ignored = RequestIgnored::compile(&["*.pem"]).unwrap();
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::Dir, cfg, &[cfg])
+                    .await
+            );
+        });
+    }
+
+    #[test]
+    fn contains_ignored_is_false_for_files() {
+        crate::server::Server::with_mock(|server| async move {
+            let root = server.filesystem.base_path.to_path_buf();
+            write_vault(&root, "plugins");
+            let ignored = RequestIgnored::compile(&["*.yml"]).unwrap();
+            let file = Path::new("plugins/Vault/other.yml");
+
+            assert!(
+                !ignored
+                    .contains_ignored(&server, FileType::File, file, &[file])
+                    .await
+            );
+        });
+    }
+
+    async fn mount_mods(server: &crate::server::Server) -> tempfile::TempDir {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("sub")).unwrap();
+        std::fs::write(source.path().join("sub/secret.key"), b"key").unwrap();
+        std::fs::write(source.path().join("secret.jar"), b"secret").unwrap();
+        std::fs::write(source.path().join("ok.jar"), b"ok").unwrap();
+
+        let source_path: compact_str::CompactString = source.path().to_string_lossy().into();
+        server
+            .app_state
+            .config
+            .mutate_in_place_for_testing()
+            .allowed_mounts = vec![source_path.clone()];
+        let mount = crate::server::configuration::Mount {
+            default: false,
+            target: "/home/container/mods".into(),
+            source: source_path,
+            read_only: false,
+        };
+        server
+            .configuration
+            .write()
+            .await
+            .mounts
+            .push(mount.clone());
+        server.filesystem.update_mounts(&[mount]);
+
+        source
+    }
+
+    async fn readable_in_mount(
+        server: &crate::server::Server,
+        path: &str,
+        ignored: &RequestIgnored,
+    ) -> (PathBuf, Arc<dyn VirtualReadableFilesystem>) {
+        let (path, filesystem) = server
+            .filesystem
+            .resolve_readable_fs_ignoring(server, Path::new(path), ignored)
+            .await;
+        assert!(!filesystem.is_primary_server_fs());
+
+        (path, filesystem)
+    }
+
+    async fn mount_root_names(
+        server: &crate::server::Server,
+        ignored: &RequestIgnored,
+    ) -> Vec<String> {
+        let (root, filesystem) = readable_in_mount(server, "mods", ignored).await;
+        let listing = filesystem
+            .async_read_dir(
+                &root,
+                None,
+                1,
+                IsIgnoredFn::default(),
+                crate::models::DirectorySortingMode::NameAsc,
+            )
+            .await
+            .unwrap();
+
+        listing
+            .entries
+            .into_iter()
+            .map(|entry| entry.name.to_string())
+            .collect()
+    }
+
+    async fn readable_contents(
+        server: &crate::server::Server,
+        path: &str,
+        ignored: &RequestIgnored,
+    ) -> Option<Vec<u8>> {
+        let (path, filesystem) = readable_in_mount(server, path, ignored).await;
+        filesystem.async_metadata(&path).await.ok()?;
+        let mut read = filesystem.async_read_file(&path, None).await.ok()?;
+        let mut contents = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut read.reader, &mut contents)
+            .await
+            .ok()?;
+
+        Some(contents)
+    }
+
+    // Filesystem::resolve_readable_fs_ignoring
+    #[test]
+    fn resolve_readable_fs_ignoring_hides_request_ignored_entries_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods/secret.jar"]).unwrap();
+
+            let names = mount_root_names(&server, &ignored).await;
+            assert!(!names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert!(names.contains(&"ok.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &ignored).await,
+                None
+            );
+            assert_eq!(
+                readable_contents(&server, "mods/ok.jar", &ignored)
+                    .await
+                    .as_deref(),
+                Some(&b"ok"[..])
+            );
+
+            let unfiltered = RequestIgnored::default();
+            let names = mount_root_names(&server, &unfiltered).await;
+            assert!(names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &unfiltered)
+                    .await
+                    .as_deref(),
+                Some(&b"secret"[..])
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_readable_fs_ignoring_applies_the_denylist_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            server.filesystem.update_ignored(&["mods/secret.jar"]).await;
+            let ignored = RequestIgnored::default();
+
+            let names = mount_root_names(&server, &ignored).await;
+            assert!(!names.contains(&"secret.jar".to_string()), "{names:?}");
+            assert!(names.contains(&"ok.jar".to_string()), "{names:?}");
+            assert_eq!(
+                readable_contents(&server, "mods/secret.jar", &ignored).await,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_readable_fs_ignoring_hides_a_mount_named_by_the_list() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods"]).unwrap();
+
+            for path in ["mods/ok.jar", "mods/sub/secret.key"] {
+                let (path, filesystem) = server
+                    .filesystem
+                    .resolve_readable_fs_ignoring(&server, Path::new(path), &ignored)
+                    .await;
+                assert!(
+                    filesystem.async_read_file(&path, None).await.is_err(),
+                    "{}",
+                    path.display()
+                );
+            }
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/ok.jar", &ignored)
+                .await;
+            assert!(filesystem.async_create_file(&path).await.is_err());
+        });
+    }
+
+    // Filesystem::resolve_writable_fs_ignoring
+    #[test]
+    fn resolve_writable_fs_ignoring_refuses_ignored_entries_inside_a_mount() {
+        crate::server::Server::with_mock(|server| async move {
+            let source = mount_mods(&server).await;
+            let ignored = RequestIgnored::compile(&["mods/secret.jar"]).unwrap();
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/secret.jar", &ignored)
+                .await;
+            assert!(!filesystem.is_primary_server_fs());
+            assert!(filesystem.async_create_file(&path).await.is_err());
+            assert!(filesystem.async_remove_file(&path).await.is_err());
+            assert_eq!(
+                std::fs::read(source.path().join("secret.jar")).unwrap(),
+                b"secret"
+            );
+
+            let (path, filesystem) = server
+                .filesystem
+                .resolve_writable_fs_ignoring(&server, "mods/ok.jar", &ignored)
+                .await;
+            assert!(filesystem.async_create_file(&path).await.is_ok());
+            assert!(filesystem.async_remove_file(&path).await.is_ok());
+            assert!(!source.path().join("ok.jar").exists());
+        });
+    }
+
+    // VirtualWritableFilesystem::async_holds_ignored
+    #[test]
+    fn async_holds_ignored_judges_mount_entries_at_their_server_path() {
+        crate::server::Server::with_mock(|server| async move {
+            let _source = mount_mods(&server).await;
+            let holds = |patterns: &'static [&'static str], roots: &'static [&'static str]| {
+                let server = server.clone();
+                async move {
+                    let ignored = if patterns.is_empty() {
+                        RequestIgnored::default()
+                    } else {
+                        RequestIgnored::compile(patterns).unwrap()
+                    };
+                    let (directory, filesystem) = server
+                        .filesystem
+                        .resolve_writable_fs_ignoring(&server, "mods/sub", &ignored)
+                        .await;
+                    assert!(!filesystem.is_primary_server_fs());
+                    let roots: Vec<&Path> = if roots.is_empty() {
+                        vec![directory.as_path()]
+                    } else {
+                        roots.iter().map(Path::new).collect()
+                    };
+
+                    filesystem.async_holds_ignored(&directory, &roots).await
+                }
+            };
+
+            assert!(holds(&["mods/sub/secret.key"], &[]).await);
+            assert!(holds(&["mods/dest/secret.key"], &["dest"]).await);
+            assert!(!holds(&["mods/other/secret.key"], &["dest"]).await);
+            assert!(!holds(&[], &["dest"]).await);
+        });
+    }
+
+    fn allow_sources(server: &crate::server::Server) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        std::fs::create_dir_all(root.path().join("b")).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        server
+            .app_state
+            .config
+            .mutate_in_place_for_testing()
+            .allowed_mounts = vec![canonical.to_string_lossy().into()];
+
+        (root, canonical.join("a"), canonical.join("b"))
+    }
+
+    fn sourced_mount(
+        target: &str,
+        source: &Path,
+        read_only: bool,
+    ) -> crate::server::configuration::Mount {
+        crate::server::configuration::Mount {
+            default: false,
+            target: target.into(),
+            source: source.to_string_lossy().into(),
+            read_only,
+        }
+    }
+
+    // Filesystem::match_mount
+    #[test]
+    fn match_mount_prefers_deepest_regardless_of_order() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let shallow = sourced_mount("/home/container/mods", &a, false);
+            let deep = sourced_mount("/home/container/mods/deep", &b, false);
+
+            for mounts in [
+                [shallow.clone(), deep.clone()],
+                [deep.clone(), shallow.clone()],
+            ] {
+                let found = Filesystem::match_mount(
+                    &server.app_state.config,
+                    &mounts,
+                    Path::new("mods/deep/x.jar"),
+                    &mut None,
+                )
+                .unwrap();
+                assert_eq!(found.target, Path::new("mods/deep"));
+                assert_eq!(found.inner_path, Path::new("x.jar"));
+                assert_eq!(found.source_path, b);
+            }
+        });
+    }
+
+    #[test]
+    fn match_mount_takes_first_in_config_order_on_equal_depth() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let mounts = [
+                sourced_mount("/home/container/mods", &b, false),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods/x.jar"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.source_path, b);
+        });
+    }
+
+    #[test]
+    fn match_mount_falls_back_when_deeper_source_is_unresolvable() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [
+                mount("/home/container/mods/deep"),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods/deep/x.jar"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.target, Path::new("mods"));
+            assert_eq!(found.inner_path, Path::new("deep/x.jar"));
+            assert_eq!(found.source_path, a);
+        });
+    }
+
+    #[test]
+    fn match_mount_outside_mounts_is_none_and_skips_loading_allowed() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [sourced_mount("/home/container/mods", &a, false)];
+
+            let mut allowed = None;
+            for path in ["plugins/x.jar", "modsX/a", ""] {
+                assert!(
+                    Filesystem::match_mount(
+                        &server.app_state.config,
+                        &mounts,
+                        Path::new(path),
+                        &mut allowed,
+                    )
+                    .is_none(),
+                    "{path}"
+                );
+            }
+            assert!(allowed.is_none());
+        });
+    }
+
+    #[test]
+    fn match_mount_on_target_itself_has_empty_inner_path_and_keeps_read_only() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, _b) = allow_sources(&server);
+            let mounts = [sourced_mount("/home/container/mods", &a, true)];
+
+            let found = Filesystem::match_mount(
+                &server.app_state.config,
+                &mounts,
+                Path::new("mods"),
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!(found.inner_path, Path::new(""));
+            assert_eq!(found.target, Path::new("mods"));
+            assert!(found.read_only);
+        });
+    }
+
+    // Filesystem::mount_infos
+    #[test]
+    fn mount_infos_keeps_config_order_and_omits_invalid_mounts() {
+        crate::server::Server::with_mock(|server| async move {
+            let (_root, a, b) = allow_sources(&server);
+            let mounts = [
+                sourced_mount("/home/container/plugins", &b, false),
+                mount("/home/container/unresolvable"),
+                sourced_mount("/srv/outside", &a, false),
+                sourced_mount("/home/container", &a, false),
+                sourced_mount("/home/containerX/mods", &a, false),
+                sourced_mount("/home/container/mods", &a, false),
+            ];
+
+            let targets: Vec<PathBuf> =
+                Filesystem::mount_infos(&server.app_state.config, &mounts, &mut None)
+                    .into_iter()
+                    .map(|info| info.relative_target)
+                    .collect();
+            assert_eq!(targets, [PathBuf::from("plugins"), PathBuf::from("mods")]);
+        });
     }
 }

@@ -72,7 +72,7 @@ mod post {
                 .ok();
         }
 
-        filesystem.async_create_dir_all(&destination).await?;
+        filesystem.async_create_dir_all(&destination, None).await?;
 
         ApiResponse::new_serialized(Response {}).ok()
     }

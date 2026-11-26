@@ -6,6 +6,7 @@ use std::{
 };
 use utoipa::ToSchema;
 
+pub mod controller;
 pub mod iptables;
 pub mod nftables;
 pub mod noop;
@@ -309,6 +310,16 @@ pub async fn create(
     let backend = config.load().docker.firewall.backend;
     let limits = sets::SourceFileLimits::from_config(config);
 
+    if let Err(err) = runner::DockerHelper::remove_stale(
+        docker,
+        &runner::FIREWALL_HELPER,
+        own_container.map(|(id, _)| id.as_str()),
+    )
+    .await
+    {
+        tracing::warn!("failed to remove stale firewall helper containers: {err:#}");
+    }
+
     if backend == FirewallBackendKind::Disabled {
         return Arc::new(noop::NoopFirewall::new(false));
     }
@@ -478,7 +489,7 @@ async fn container_helper(
     docker: &Arc<bollard::Docker>,
     own_container: Option<&(String, bollard::models::ContainerInspectResponse)>,
 ) -> Result<CommandRunner, anyhow::Error> {
-    let Some((_, inspect)) = own_container else {
+    let Some((own_id, inspect)) = own_container else {
         return Err(anyhow::anyhow!(
             "the container firewall backend needs wings to run as a container of the connected container engine"
         ));
@@ -493,8 +504,13 @@ async fn container_helper(
         .and_then(|config| config.image.clone())
         .unwrap_or_else(|| image.clone());
 
-    let helper =
-        runner::DockerHelper::new(Arc::clone(docker), image, config.load().app_name.clone());
+    let helper = runner::DockerHelper::new(
+        Arc::clone(docker),
+        &runner::FIREWALL_HELPER,
+        own_id,
+        image,
+        config.load().app_name.clone(),
+    );
     helper.ensure().await?;
 
     let runner = CommandRunner::Docker(helper);

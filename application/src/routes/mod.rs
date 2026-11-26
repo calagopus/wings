@@ -5,13 +5,18 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub mod api;
 mod download;
-mod token;
+pub mod token;
 mod upload;
 
 #[derive(Debug, ToSchema, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum AppContainerType {
     Official,
+    #[serde(rename = "official_aio")]
+    OfficialAIO,
+    OfficialHeavy,
+    #[serde(rename = "official_heavy_aio")]
+    OfficialHeavyAIO,
     Unknown,
     None,
 }
@@ -294,6 +299,8 @@ pub struct AppState {
     pub executor: Arc<dyn crate::server::executor::ServerExecutor>,
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub server_manager: Arc<crate::server::manager::ServerManager>,
+    pub resource_history: Arc<crate::server::resource_history::ResourceHistory>,
+    pub crash_history: Arc<crate::server::crash_history::CrashHistory>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub websocket_limiter: Arc<crate::server::websocket::limiter::WebsocketLimiter>,
@@ -316,6 +323,12 @@ impl AppState {
             executor: Arc::new(crate::server::executor::noop::NoopExecutor),
             stats_manager: Arc::new(crate::stats::StatsManager::default()),
             server_manager: Arc::new(crate::server::manager::ServerManager::new(&[])),
+            resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
+                &Arc::new(crate::config::Config::mock()),
+            )),
+            crash_history: Arc::new(crate::server::crash_history::CrashHistory::new(&Arc::new(
+                crate::config::Config::mock(),
+            ))),
             backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
             inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
             websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
@@ -340,6 +353,20 @@ impl<'a> ApiError<'a> {
     pub fn new(error: &'a str) -> Self {
         Self { error }
     }
+}
+
+pub async fn await_operation<T>(
+    task: tokio::task::JoinHandle<Option<Result<T, anyhow::Error>>>,
+    aborted: &'static str,
+    failed: &'static str,
+    log: impl FnOnce(&dyn std::fmt::Debug),
+) -> Result<T, crate::response::ApiResponse> {
+    crate::server::filesystem::operations::await_operation(task, aborted, failed, log)
+        .await
+        .map_err(|err| {
+            crate::response::ApiResponse::error(&err)
+                .with_status(axum::http::StatusCode::EXPECTATION_FAILED)
+        })
 }
 
 pub type State = Arc<AppState>;

@@ -12,6 +12,10 @@ pub enum PbsError {
     NotFound {
         datastore: CompactString,
     },
+    SnapshotNotFound {
+        backup_id: CompactString,
+        backup_time: i64,
+    },
     FingerprintMismatch {
         expected: CompactString,
         actual: CompactString,
@@ -39,6 +43,13 @@ impl std::fmt::Display for PbsError {
             PbsError::NotFound { datastore } => write!(
                 f,
                 "PBS datastore or namespace not found (HTTP 404) for datastore '{datastore}'"
+            ),
+            PbsError::SnapshotNotFound {
+                backup_id,
+                backup_time,
+            } => write!(
+                f,
+                "PBS snapshot '{backup_id}' at backup-time {backup_time} does not exist"
             ),
             PbsError::FingerprintMismatch { expected, actual } => write!(
                 f,

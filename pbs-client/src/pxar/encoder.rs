@@ -19,6 +19,7 @@ pub struct Encoder<W: Write> {
     pos: u64,
     stack: Vec<DirState>,
     finished: bool,
+    copy_buf: Vec<u8>,
 }
 
 impl<W: Write> Encoder<W> {
@@ -34,6 +35,7 @@ impl<W: Write> Encoder<W> {
             pos: 0,
             stack: Vec::new(),
             finished: false,
+            copy_buf: Vec::new(),
         };
 
         this.encode_metadata(root_metadata)?;
@@ -185,10 +187,14 @@ impl<W: Write> Encoder<W> {
     }
 
     fn copy_exact(&mut self, content: &mut dyn Read, mut size: u64) -> std::io::Result<()> {
-        let mut buf = vec![0; COPY_BUF_SIZE];
+        if self.copy_buf.is_empty() {
+            self.copy_buf.resize(COPY_BUF_SIZE, 0);
+        }
+
         while size > 0 {
-            let want = size.min(buf.len() as u64) as usize;
-            let slice = buf
+            let want = size.min(self.copy_buf.len() as u64) as usize;
+            let slice = self
+                .copy_buf
                 .get_mut(..want)
                 .ok_or_else(|| std::io::Error::other("pxar: copy buffer too small"))?;
             let got = content.read(slice)?;
@@ -200,7 +206,8 @@ impl<W: Write> Encoder<W> {
             let written = slice
                 .get(..got)
                 .ok_or_else(|| std::io::Error::other("pxar: short read past buffer"))?;
-            self.write_all(written)?;
+            self.out.write_all(written)?;
+            self.pos += got as u64;
             size -= got as u64;
         }
         Ok(())

@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::Next,
     response::IntoResponse,
+    serve::ListenerExt,
 };
 use colored::Colorize;
 use russh::server::Server;
@@ -43,6 +44,7 @@ mod threading;
 mod tls;
 #[cfg(unix)]
 mod tundra;
+mod upgrade;
 mod utils;
 
 use payload::Payload;
@@ -429,6 +431,39 @@ async fn main_rt() {
     };
     tracing::info!("config loaded from {}", config_path);
 
+    #[cfg(target_os = "linux")]
+    {
+        let user = {
+            let config = config.load();
+
+            crate::server::filesystem::sqlite::sandbox::SandboxUser {
+                uid: config.system.user.uid,
+                gid: config.system.user.gid,
+            }
+        };
+        let data_directory = config.resolve_as_path(|cfg| &cfg.system.data_directory);
+
+        match crate::server::filesystem::sqlite::helper::probe(&data_directory, user).await {
+            Ok(report) => {
+                tracing::info!(
+                    "sqlite queries run in a helper process sandboxed by: {}",
+                    report.applied.join(", ")
+                );
+                for (layer, reason) in &report.skipped {
+                    tracing::debug!("sqlite query sandbox layer {layer} skipped: {reason}");
+                }
+                if !report.confined() {
+                    tracing::warn!(
+                        "sqlite queries cannot be confined to their database directory on this host, neither chroot nor landlock is available"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                "failed to probe the sqlite query sandbox, sqlite queries will fail: {err:#}"
+            ),
+        }
+    }
+
     crate::spawn_handled(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -512,9 +547,7 @@ async fn main_rt() {
     tracing::info!("cleaning up stale temporary files from previous runs");
     config.cleanup_tmp_directory().await;
 
-    if config.load().system.disk_limiter_mode
-        == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
-    {
+    if config.load().system.disk_limiter_mode.is_btrfs_subvolume() {
         tracing::info!("cleaning up stale btrfs send snapshots from previous runs");
         crate::server::backup::adapters::btrfs::BtrfsBackup::cleanup_stale_btrfs_send_snapshots(
             &config,
@@ -560,6 +593,9 @@ async fn main_rt() {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
             Ok("official") => crate::routes::AppContainerType::Official,
+            Ok("official-aio") => crate::routes::AppContainerType::OfficialAIO,
+            Ok("official-heavy") => crate::routes::AppContainerType::OfficialHeavy,
+            Ok("official-heavy-aio") => crate::routes::AppContainerType::OfficialHeavyAIO,
             Ok(_) => crate::routes::AppContainerType::Unknown,
             Err(_) => crate::routes::AppContainerType::None,
         },
@@ -569,6 +605,10 @@ async fn main_rt() {
         executor,
         stats_manager: Arc::new(crate::stats::StatsManager::default()),
         server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
+        resource_history: Arc::new(crate::server::resource_history::ResourceHistory::new(
+            &config,
+        )),
+        crash_history: Arc::new(crate::server::crash_history::CrashHistory::new(&config)),
         backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
         websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
@@ -590,6 +630,9 @@ async fn main_rt() {
             state.server_manager.boot(&state, servers).await;
         }
     });
+
+    tokio::spawn(Arc::clone(&state.resource_history).run(Arc::clone(&state.server_manager)));
+    tokio::spawn(Arc::clone(&state.crash_history).run(Arc::clone(&state.server_manager)));
 
     #[cfg(unix)]
     if state.tundra.is_some() {
@@ -781,6 +824,17 @@ async fn main_rt() {
                     channel_buffer_size: 1024,
                     event_buffer_size: 1024,
                     keys: vec![key],
+                    nodelay: true,
+                    preferred: russh::Preferred {
+                        cipher: std::borrow::Cow::Borrowed(&[
+                            russh::cipher::AES_256_GCM,
+                            russh::cipher::AES_128_GCM,
+                            russh::cipher::AES_256_CTR,
+                            russh::cipher::AES_192_CTR,
+                            russh::cipher::AES_128_CTR,
+                        ]),
+                        ..russh::Preferred::DEFAULT
+                    },
                     ..Default::default()
                 };
 
@@ -931,12 +985,15 @@ async fn main_rt() {
                         }
                         Err(err) => exit_error!("failed to start https server: {:?}", err),
                     },
-                    None => match axum_server::tls_rustls::from_tcp_rustls(listener, rustls_config)
-                    {
+                    None => match axum_server::from_tcp(listener) {
                         Ok(mut server) => {
                             server.http_builder().http2().adaptive_window(true);
 
                             server
+                                .acceptor(
+                                    axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+                                        .acceptor(axum_server::accept::NoDelayAcceptor::new()),
+                                )
                                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                                 .await
                         }
@@ -947,10 +1004,14 @@ async fn main_rt() {
 
             #[cfg(not(target_os = "linux"))]
             let result = {
-                let mut server = axum_server::bind_rustls(address, rustls_config);
+                let mut server = axum_server::bind(address);
                 server.http_builder().http2().adaptive_window(true);
 
                 server
+                    .acceptor(
+                        axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+                            .acceptor(axum_server::accept::NoDelayAcceptor::new()),
+                    )
                     .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
             };
@@ -981,7 +1042,9 @@ async fn main_rt() {
             crate::net::apply_socket_congestion_control(&listener, &config);
 
             match axum::serve(
-                listener,
+                listener.tap_io(|tcp| {
+                    tcp.set_nodelay(true).ok();
+                }),
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -1046,6 +1109,27 @@ fn main() {
         }
         return;
     }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(server::bandwidth::HELPER_ARG.as_ref()) {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        std::process::exit(server::bandwidth::helper_main(&args));
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(server::bandwidth::CONTAINER_ARG.as_ref()) {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        std::process::exit(server::bandwidth::container_main(&args));
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(server::filesystem::sqlite::HELPER_ARG.as_ref())
+    {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        std::process::exit(server::filesystem::sqlite::helper_main(&args));
+    }
+
+    #[cfg(windows)]
+    upgrade::wait_for_previous_process();
+
     let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     tokio::runtime::Builder::new_multi_thread()

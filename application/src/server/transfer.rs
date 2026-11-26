@@ -4,7 +4,7 @@ use crate::{
         compression::{CompressionLevel, CompressionType},
         counting_reader::AsyncCountingReader,
     },
-    server::filesystem::archive::StreamableArchiveFormat,
+    server::filesystem::archive::{ArchiveType, StreamableArchiveFormat},
 };
 use futures::FutureExt;
 use human_bytes::human_bytes;
@@ -13,7 +13,6 @@ use sha2::Digest;
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -100,6 +99,15 @@ impl TransferArchiveFormat {
                 | TransferArchiveFormat::TarLz4
                 | TransferArchiveFormat::TarZstd
         )
+    }
+
+    #[inline]
+    pub const fn archive_type(self) -> ArchiveType {
+        if self.is_itaf() {
+            ArchiveType::Itaf
+        } else {
+            ArchiveType::Tar
+        }
     }
 
     #[inline]
@@ -271,7 +279,7 @@ impl OutgoingServerTransfer {
             .http1_only();
 
         if let Some(proxy) = proxy {
-            match reqwest::Proxy::all(proxy.url()) {
+            match reqwest::Proxy::https(proxy.url()) {
                 Ok(proxy) => builder = builder.proxy(proxy),
                 Err(err) => {
                     tracing::debug!("failed to construct transfer proxy definition: {}", err);
@@ -333,7 +341,7 @@ impl OutgoingServerTransfer {
         let old_task = self.task.replace(tokio::spawn(async move {
             if server.state.get_state() != super::state::ServerState::Offline
                 && let Err(err) = server
-                    .stop_with_kill_timeout(std::time::Duration::from_secs(15), true)
+                    .stop_with_kill_timeout(None, std::time::Duration::from_secs(15), true)
                     .await
             {
                 tracing::error!(
@@ -365,7 +373,7 @@ impl OutgoingServerTransfer {
             let (reader, mut writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
             fn get_tar_archive_task(
-                files_receiver: async_channel::Receiver<PathBuf>,
+                files_receiver: async_channel::Receiver<crate::server::filesystem::cap::WalkEntry>,
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
@@ -376,7 +384,6 @@ impl OutgoingServerTransfer {
                     let writer = crate::server::filesystem::archive::create::create_tar_distributed(
                         server.filesystem.clone(),
                         writer,
-                        Path::new(""),
                         files_receiver,
                         crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_archived, files_archived),
                         options,
@@ -390,7 +397,7 @@ impl OutgoingServerTransfer {
             }
 
             fn get_itaf_archive_task(
-                files_receiver: async_channel::Receiver<PathBuf>,
+                files_receiver: async_channel::Receiver<crate::server::filesystem::cap::WalkEntry>,
                 bytes_archived: Arc<AtomicU64>,
                 files_archived: Arc<AtomicU64>,
                 server: super::Server,
@@ -401,7 +408,6 @@ impl OutgoingServerTransfer {
                     let writer = crate::server::filesystem::archive::create::create_itaf_distributed(
                         server.filesystem.clone(),
                         writer,
-                        Path::new(""),
                         files_receiver,
                         crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_archived, files_archived),
                         options,
@@ -479,8 +485,16 @@ impl OutgoingServerTransfer {
 
                 async move {
                     let mut walker = server.filesystem.async_walk_dir("").await?;
-                    while let Some(Ok(entry)) = walker.next_entry().await {
-                        files_sender.send(entry.path).await?;
+                    while let Some(entry) = walker.next_entry().await {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(err) => {
+                                tracing::warn!(server = %server.uuid, "failed to read directory entry while transferring server: {err:#}");
+                                continue;
+                            }
+                        };
+
+                        files_sender.send(entry).await?;
                     }
 
                     Ok::<_, anyhow::Error>(())
@@ -558,7 +572,76 @@ impl OutgoingServerTransfer {
                 }
             }
 
+            match server
+                .app_state
+                .resource_history
+                .export(server.uuid)
+                .await
+            {
+                Ok(Some(history)) => {
+                    bytes_total.fetch_add(history.metadata().await.map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
+
+                    form = form.part(
+                        "resource-history",
+                        reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                AsyncCountingReader::new_with_bytes_read(
+                                    history,
+                                    Arc::clone(&bytes_archived),
+                                ),
+                                crate::TRANSFER_BUFFER_SIZE,
+                            ),
+                        ))
+                        .file_name("resource_history.db")
+                        .mime_str("application/octet-stream")
+                        .expect("failed to set mime type for resource history"),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to export resource history for transfer: {err:#}"
+                    );
+                }
+            }
+
+            match server
+                .app_state
+                .crash_history
+                .export(server.uuid)
+                .await
+            {
+                Ok(Some(history)) => {
+                    bytes_total.fetch_add(history.metadata().await.map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
+
+                    form = form.part(
+                        "crash-history",
+                        reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                AsyncCountingReader::new_with_bytes_read(
+                                    history,
+                                    Arc::clone(&bytes_archived),
+                                ),
+                                crate::TRANSFER_BUFFER_SIZE,
+                            ),
+                        ))
+                        .file_name("crash_history.db")
+                        .mime_str("application/octet-stream")
+                        .expect("failed to set mime type for crash history"),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to export crash history for transfer: {err:#}"
+                    );
+                }
+            }
+
             let proxy = match reqwest::Url::parse(&url) {
+                Ok(parsed) if parsed.scheme() != "https" => None,
                 Ok(parsed) => match (parsed.host_str(), parsed.port_or_known_default()) {
                     (Some(host), Some(port)) => {
                         crate::net::CongestionControlProxy::start(

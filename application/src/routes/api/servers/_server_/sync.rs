@@ -53,7 +53,7 @@ mod post {
             if suspended && server.state.get_state() != ServerState::Offline {
                 tokio::spawn(async move {
                     if let Err(err) = server
-                        .stop_with_kill_timeout(std::time::Duration::from_secs(30), true)
+                        .stop_with_kill_timeout(None, std::time::Duration::from_secs(30), true)
                         .await
                     {
                         tracing::error!(%err, "failed to stop server after being suspended");
@@ -74,7 +74,7 @@ mod post {
             if suspended && server.state.get_state() != ServerState::Offline {
                 tokio::spawn(async move {
                     if let Err(err) = server
-                        .stop_with_kill_timeout(std::time::Duration::from_secs(30), true)
+                        .stop_with_kill_timeout(None, std::time::Duration::from_secs(30), true)
                         .await
                     {
                         tracing::error!(%err, "failed to stop server after being suspended");

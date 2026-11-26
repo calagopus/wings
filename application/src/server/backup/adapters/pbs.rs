@@ -1,3 +1,4 @@
+use super::tree::{FileMeta, TreeEntry, TreeNode, TreeWalk};
 use crate::{
     io::{
         SafeSliceExt,
@@ -9,11 +10,10 @@ use crate::{
     models::{DirectoryEntry, DirectorySortingMode},
     remote::backups::{PbsBackupConfiguration, PbsRepositoryConfiguration, RawServerBackup},
     response::ApiResponse,
-    routes::MimeCacheValue,
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpSource,
         },
         filesystem::{
             archive::{Archive, StreamableArchiveFormat, create::CreatePxarOptions},
@@ -26,14 +26,14 @@ use crate::{
             },
         },
     },
-    utils::{CmpExt, PortablePermissions, detect_mime_type},
+    utils::{CmpExt, PortablePermissions},
 };
-use chrono::{Datelike, Timelike};
 use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata as ItafMetadata};
 use pbs_client::{
     accessor::{ArchiveEntry, ArchiveEntryKind, PbsArchive},
     config::PbsConfig,
+    error::PbsError,
     manifest::{BackupManifest, MANIFEST_BLOB_NAME},
     pxar::{
         EntryKind,
@@ -47,15 +47,34 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
-const MAX_TREE_DEPTH: usize = 1024;
 const DUMP_ARCHIVE_NAME: &str = "dump.didx";
+
+type GroupLockKey = (
+    compact_str::CompactString,
+    compact_str::CompactString,
+    Option<compact_str::CompactString>,
+    compact_str::CompactString,
+);
+static GROUP_LOCKS: LazyLock<crate::utils::KeyedLocks<GroupLockKey>> =
+    LazyLock::new(crate::utils::KeyedLocks::new);
+
+fn group_lock(config: &PbsConfig, backup_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let key = (
+        config.base_url().into(),
+        config.datastore.clone(),
+        config.namespace.clone().filter(|ns| !ns.is_empty()),
+        backup_id.into(),
+    );
+
+    GROUP_LOCKS.get(key)
+}
 
 pub struct PbsBackup {
     uuid: uuid::Uuid,
@@ -80,20 +99,16 @@ fn build_config(remote: PbsBackupConfiguration) -> PbsConfig {
 
 #[async_trait::async_trait]
 impl BackupFindExt for PbsBackup {
-    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
-        match state.config.client.backup_pbs_configuration(uuid).await {
-            Ok(remote) => Ok(remote.group_id().is_some()),
-            Err(_) => Ok(false),
-        }
-    }
-
     async fn find(
         state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
         let remote = match state.config.client.backup_pbs_configuration(uuid).await {
             Ok(remote) => remote,
-            Err(_) => return Ok(None),
+            Err(err) if super::is_configuration_missing(&err) => return Ok(None),
+            Err(err) => {
+                return Err(err.context("failed to get proxmox backup server backup configuration"));
+            }
         };
 
         let Some(group_id) = remote.group_id() else {
@@ -138,7 +153,10 @@ impl BackupCreateExt for PbsBackup {
 
         let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
 
-        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::BUFFER_SIZE);
+        let group_lock = group_lock(&config, &backup_id);
+        let _group_guard = group_lock.lock().await;
+
+        let (archive_reader, archive_writer) = crate::io::pipe::pipe(crate::TRANSFER_BUFFER_SIZE);
 
         let total_task = {
             let filesystem = server.filesystem.clone();
@@ -174,16 +192,19 @@ impl BackupCreateExt for PbsBackup {
 
             async move {
                 let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-                let writer = LimitedWriter::new_with_bytes_per_second(
-                    archive_writer.into_sync(),
-                    server
-                        .app_state
-                        .config
-                        .load()
-                        .system
-                        .backups
-                        .write_limit
-                        .as_bytes(),
+                let writer = std::io::BufWriter::with_capacity(
+                    crate::BUFFER_SIZE,
+                    LimitedWriter::new_with_bytes_per_second(
+                        archive_writer.into_sync(),
+                        server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .write_limit
+                            .as_bytes(),
+                    ),
                 );
 
                 let (writer, catalog) = crate::server::filesystem::archive::create::create_pxar(
@@ -199,7 +220,13 @@ impl BackupCreateExt for PbsBackup {
                 )
                 .await?;
 
-                writer.into_inner().into_inner().shutdown().await?;
+                writer
+                    .into_inner()
+                    .map_err(std::io::IntoInnerError::into_error)?
+                    .into_inner()
+                    .into_inner()
+                    .shutdown()
+                    .await?;
 
                 let _ = catalog_tx.send(catalog);
 
@@ -307,7 +334,8 @@ impl BackupStreamCreateExt for PbsBackup {
         state: &crate::routes::State,
         uuid: uuid::Uuid,
         extension: &str,
-        reader: DumpReader,
+        _compression: crate::io::compression::CompressionType,
+        source: DumpSource,
     ) -> Result<RawServerBackup, anyhow::Error> {
         let remote = state.config.client.backup_pbs_configuration(uuid).await?;
         let Some(group_id) = remote.group_id() else {
@@ -323,13 +351,16 @@ impl BackupStreamCreateExt for PbsBackup {
         let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
         let compression_threads = state.config.load().system.backups.pbs.create_threads;
 
+        let group_lock = group_lock(&config, &backup_id);
+        let _group_guard = group_lock.lock().await;
+
         let mut writer = PbsBackupWriter::connect(&config, &backup_id, backup_time).await?;
 
         let result = async {
             let archive = writer
                 .upload_archive_named(
                     DUMP_ARCHIVE_NAME,
-                    reader,
+                    source.await?,
                     Default::default(),
                     compression_threads,
                 )
@@ -501,7 +532,7 @@ impl BackupExt for PbsBackup {
                         };
                         let stat = entry.metadata().stat;
 
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -509,14 +540,8 @@ impl BackupExt for PbsBackup {
                                 .unix_permissions((stat.mode & 0o7777) as u32)
                                 .large_file(true);
                         if let Some(mtime) = chrono::DateTime::from_timestamp(stat.mtime.secs, 0)
-                            && let Ok(mtime) = zip::DateTime::from_date_and_time(
-                                mtime.year() as u16,
-                                mtime.month() as u8,
-                                mtime.day() as u8,
-                                mtime.hour() as u8,
-                                mtime.minute() as u8,
-                                mtime.second() as u8,
-                            )
+                            && let Some(mtime) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
                             options = options.last_modified_time(mtime);
                         }
@@ -817,13 +842,9 @@ impl BackupExt for PbsBackup {
                     EntryKind::Directory => {
                         server
                             .filesystem
-                            .async_create_chowned_dir_all(path.as_path())
-                            .await?;
-                        server
-                            .filesystem
-                            .async_set_permissions(
+                            .async_create_chowned_dir_all(
                                 path.as_path(),
-                                PortablePermissions::from_mode_dir(mode),
+                                Some(PortablePermissions::from_mode_dir(mode)),
                             )
                             .await?;
 
@@ -832,17 +853,14 @@ impl BackupExt for PbsBackup {
                         }
                     }
                     EntryKind::File { .. } => {
-                        server.log_daemon(compact_str::format_compact!(
-                            "(restoring): {}",
-                            path.display()
-                        ));
+                        super::log_restoring(server, &path);
 
                         if let Some(parent) = path.parent()
                             && last_parent.as_deref() != Some(parent)
                         {
                             server
                                 .filesystem
-                                .async_create_chowned_dir_all(parent)
+                                .async_create_chowned_dir_all(parent, None)
                                 .await?;
                             last_parent = Some(parent.to_path_buf());
                         }
@@ -856,7 +874,7 @@ impl BackupExt for PbsBackup {
                         .await?;
 
                         if let Some(mut contents) = decoder.contents()? {
-                            tokio::io::copy(&mut contents, &mut writer).await?;
+                            crate::io::async_copy(&mut contents, &mut writer).await?;
                         }
                         writer.flush().await?;
 
@@ -865,15 +883,14 @@ impl BackupExt for PbsBackup {
                     EntryKind::Symlink(target) => {
                         if let Err(err) = server
                             .filesystem
-                            .async_symlink(target.as_os_str(), path.as_path())
+                            .async_symlink_with_modified(
+                                target.as_os_str(),
+                                path.as_path(),
+                                Some(mtime),
+                            )
                             .await
                         {
                             tracing::debug!(path = %path.display(), "failed to create symlink from PBS backup: {:?}", err);
-                        } else {
-                            server
-                                .filesystem
-                                .async_set_times(path.as_path(), mtime, None)
-                                .await?;
                         }
 
                         progress.increment_files();
@@ -881,12 +898,17 @@ impl BackupExt for PbsBackup {
                 }
             }
 
-            for (destination_path, modified_time) in directory_entries {
-                server
-                    .filesystem
-                    .async_set_times(&destination_path, modified_time, None)
-                    .await?;
-            }
+            let server = server.clone();
+            tokio::task::spawn_blocking(move || {
+                for (destination_path, modified_time) in directory_entries {
+                    server
+                        .filesystem
+                        .set_times(&destination_path, modified_time, None)?;
+                }
+
+                Ok::<(), std::io::Error>(())
+            })
+            .await??;
 
             Ok(())
         };
@@ -911,16 +933,25 @@ impl BackupExt for PbsBackup {
             .invalidate_cached_browse(self.uuid)
             .await;
 
+        let group_lock = group_lock(&self.config, &self.backup_id);
+        let _group_guard = group_lock.lock().await;
+
         let client = PbsClient::new(self.config.clone())?;
-        client
+        match client
             .delete_snapshot(
                 pbs_client::naming::BACKUP_TYPE,
                 &self.backup_id,
                 self.backup_time,
             )
-            .await?;
-
-        Ok(())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err @ PbsError::SnapshotNotFound { .. }) => {
+                tracing::debug!(backup = %self.uuid, "{err}, treating as deleted");
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn browse(
@@ -938,153 +969,46 @@ impl BackupExt for PbsBackup {
         Ok(Arc::new(PbsVirtualFilesystem {
             server: server.clone(),
             archive,
-            tree: Arc::new(PbsTreeNode::build(entries)),
+            tree: Arc::new(build_tree(entries)),
         }))
     }
 }
 
-struct PbsFileMeta {
-    file_type: FileType,
-    mode: u32,
-    size: u64,
-    mtime: chrono::DateTime<chrono::Utc>,
-    symlink: Option<PathBuf>,
-}
+type PbsTreeNode = TreeNode<Option<PathBuf>>;
+type PbsFileMeta = FileMeta<Option<PathBuf>>;
 
-#[derive(Default)]
-struct PbsTreeNode {
-    size: u64,
-    mtime: chrono::DateTime<chrono::Utc>,
-    mode: u32,
-    has_explicit_entry: bool,
-    dirs: Vec<(compact_str::CompactString, PbsTreeNode)>,
-    files: Vec<(compact_str::CompactString, PbsFileMeta)>,
-}
+fn build_tree(entries: Vec<ArchiveEntry>) -> PbsTreeNode {
+    let mut root = TreeNode::default();
 
-// drops the tree iteratively, recursive dropping would overflow the stack on deeply nested trees
-impl Drop for PbsTreeNode {
-    fn drop(&mut self) {
-        while let Some((_, mut node)) = self.dirs.pop() {
-            self.dirs.append(&mut node.dirs);
-        }
-    }
-}
-
-impl PbsTreeNode {
-    fn build(entries: Vec<ArchiveEntry>) -> Self {
-        let mut root = PbsTreeNode::default();
-        for entry in entries {
-            root.insert(entry);
-        }
-        root.sort_files();
-        root.aggregate_sizes();
-        root
-    }
-
-    fn insert(&mut self, entry: ArchiveEntry) {
+    for entry in entries {
         let components: Vec<&str> = entry
             .path
             .components()
             .filter_map(|c| c.as_os_str().to_str())
             .collect();
-        if components.is_empty() || components.len() > MAX_TREE_DEPTH {
-            return;
-        }
-
         let mtime = chrono::DateTime::from_timestamp(entry.mtime, 0).unwrap_or_default();
 
-        match entry.kind {
-            ArchiveEntryKind::Directory => {
-                let node = self.upsert_dir_path(&components);
-                node.has_explicit_entry = true;
-                node.mtime = mtime;
-                node.mode = entry.mode;
-            }
-            ArchiveEntryKind::File | ArchiveEntryKind::Symlink => {
-                let (leaf, parents) = match components.split_last() {
-                    Some(value) => value,
-                    None => return,
-                };
+        let tree_entry = match entry.kind {
+            ArchiveEntryKind::Directory => TreeEntry::Dir {
+                mode: entry.mode,
+                mtime,
+            },
+            ArchiveEntryKind::File | ArchiveEntryKind::Symlink => TreeEntry::File(FileMeta {
+                file_type: match entry.kind {
+                    ArchiveEntryKind::Symlink => FileType::Symlink,
+                    _ => FileType::File,
+                },
+                mode: entry.mode,
+                size: entry.size,
+                mtime,
+                symlink: entry.symlink,
+            }),
+        };
 
-                let parent = self.upsert_dir_path(parents);
-                let meta = PbsFileMeta {
-                    file_type: match entry.kind {
-                        ArchiveEntryKind::Symlink => FileType::Symlink,
-                        _ => FileType::File,
-                    },
-                    mode: entry.mode,
-                    size: entry.size,
-                    mtime,
-                    symlink: entry.symlink,
-                };
-
-                parent.files.push((leaf.to_compact_string(), meta));
-            }
-        }
+        root.insert(&components, tree_entry);
     }
 
-    fn sort_files(&mut self) {
-        self.files.reverse();
-        self.files.sort_by(|(a, _), (b, _)| a.cmp(b));
-        self.files.dedup_by(|(a, _), (b, _)| a == b);
-        for (_, child) in self.dirs.iter_mut() {
-            child.sort_files();
-        }
-    }
-
-    fn upsert_dir_path(&mut self, components: &[&str]) -> &mut PbsTreeNode {
-        let mut current = self;
-        for name in components {
-            let idx = match current.dirs.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
-                Ok(idx) => idx,
-                Err(idx) => {
-                    current
-                        .dirs
-                        .insert(idx, (name.to_compact_string(), PbsTreeNode::default()));
-                    idx
-                }
-            };
-            // SAFETY: `idx` is a valid index into `current.dirs` by construction above.
-            current = unsafe { &mut current.dirs.get_unchecked_mut(idx).1 };
-        }
-        current
-    }
-
-    fn aggregate_sizes(&mut self) -> u64 {
-        let mut total: u64 = self.files.iter().map(|(_, m)| m.size).sum();
-        for (_, child) in self.dirs.iter_mut() {
-            total = total.saturating_add(child.aggregate_sizes());
-        }
-        self.size = total;
-        total
-    }
-
-    fn lookup_dir(&self, path: &Path) -> Option<&PbsTreeNode> {
-        if path == Path::new("") || path == Path::new("/") {
-            return Some(self);
-        }
-        let mut current = self;
-        for component in path.components() {
-            let name = component.as_os_str().to_str()?;
-            let idx = current
-                .dirs
-                .binary_search_by(|(n, _)| n.as_str().cmp(name))
-                .ok()?;
-            current = &current.dirs.get(idx)?.1;
-        }
-        Some(current)
-    }
-
-    fn lookup_file(&self, path: &Path) -> Option<&PbsFileMeta> {
-        let parent_path = path.parent()?;
-        let leaf = path.file_name()?.to_str()?;
-        let parent = self.lookup_dir(parent_path)?;
-        let idx = parent
-            .files
-            .binary_search_by(|(n, _)| n.as_str().cmp(leaf))
-            .ok()?;
-        Some(&parent.files.get(idx)?.1)
-    }
+    root.finish()
 }
 
 struct SubtreeEntry {
@@ -1136,66 +1060,6 @@ fn resolve_range(
 }
 
 impl PbsVirtualFilesystem {
-    fn directory_entry_from_dir_node(path: &Path, node: &PbsTreeNode) -> DirectoryEntry {
-        let mode = if node.mode != 0 { node.mode } else { 0o755 };
-
-        DirectoryEntry {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            mode: crate::server::filesystem::encode_mode(mode),
-            mode_bits: compact_str::format_compact!("{:o}", mode & 0o777),
-            size: node.size,
-            size_physical: node.size,
-            editable: false,
-            inner_editable: false,
-            directory: true,
-            file: false,
-            symlink: false,
-            r#virtual: true,
-            mime: MimeCacheValue::directory().mime,
-            modified: node.mtime,
-            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-        }
-    }
-
-    fn directory_entry_from_file_meta(
-        path: &Path,
-        meta: &PbsFileMeta,
-        buffer: Option<&[u8]>,
-    ) -> DirectoryEntry {
-        let detected_mime = if meta.file_type.is_symlink() {
-            MimeCacheValue::symlink()
-        } else if meta.file_type.is_file() && meta.size == 0 {
-            MimeCacheValue::text()
-        } else {
-            detect_mime_type(path, buffer)
-        };
-
-        DirectoryEntry {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-            mode: crate::server::filesystem::encode_mode(meta.mode),
-            mode_bits: compact_str::format_compact!("{:o}", meta.mode & 0o777),
-            size: meta.size,
-            size_physical: meta.size,
-            editable: meta.file_type.is_file() && detected_mime.valid_utf8,
-            inner_editable: meta.file_type.is_file() && detected_mime.valid_inner_utf8,
-            directory: false,
-            file: meta.file_type.is_file(),
-            symlink: meta.file_type.is_symlink(),
-            r#virtual: true,
-            mime: detected_mime.mime,
-            modified: meta.mtime,
-            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-        }
-    }
-
     fn collect_subtree(
         node: &PbsTreeNode,
         archive_dir: &Path,
@@ -1250,45 +1114,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<FileMetadata, anyhow::Error> {
-        let path = path.as_ref();
-
-        if path == Path::new("") || path == Path::new("/") {
-            return Ok(FileMetadata {
-                file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode_dir(0o755),
-                size: 0,
-                modified: None,
-                created: None,
-            });
-        }
-
-        if let Some(node) = self.tree.lookup_dir(path) {
-            let mode = if node.mode != 0 { node.mode } else { 0o755 };
-            return Ok(FileMetadata {
-                file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode_dir(mode),
-                size: 0,
-                modified: node
-                    .has_explicit_entry
-                    .then(|| mtime_to_system_time(node.mtime)),
-                created: None,
-            });
-        }
-
-        if let Some(meta) = self.tree.lookup_file(path) {
-            return Ok(FileMetadata {
-                file_type: meta.file_type,
-                permissions: PortablePermissions::from_mode_file(meta.mode),
-                size: meta.size,
-                modified: Some(mtime_to_system_time(meta.mtime)),
-                created: None,
-            });
-        }
-
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.metadata(path.as_ref())
     }
     async fn async_metadata(
         &self,
@@ -1314,17 +1140,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path = path.as_ref();
-        if let Some(node) = self.tree.lookup_dir(path) {
-            return Ok(Self::directory_entry_from_dir_node(path, node));
-        }
-        if let Some(meta) = self.tree.lookup_file(path) {
-            return Ok(Self::directory_entry_from_file_meta(path, meta, None));
-        }
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.lookup_entry(path.as_ref(), None)
     }
 
     fn directory_entry_buffer(
@@ -1332,21 +1148,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path = path.as_ref();
-        if let Some(node) = self.tree.lookup_dir(path) {
-            return Ok(Self::directory_entry_from_dir_node(path, node));
-        }
-        if let Some(meta) = self.tree.lookup_file(path) {
-            return Ok(Self::directory_entry_from_file_meta(
-                path,
-                meta,
-                Some(buffer),
-            ));
-        }
-        Err(anyhow::anyhow!(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found"
-        )))
+        self.tree.lookup_entry(path.as_ref(), Some(buffer))
     }
     async fn async_directory_entry_buffer(
         &self,
@@ -1453,15 +1255,11 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             match child {
                 Child::Dir(name, node) => {
                     let child_path = path.join(name.as_str());
-                    entries.push(Self::directory_entry_from_dir_node(&child_path, node));
+                    entries.push(node.to_directory_entry(&child_path));
                 }
                 Child::File(name, meta) => {
                     let child_path = path.join(name.as_str());
-                    entries.push(Self::directory_entry_from_file_meta(
-                        &child_path,
-                        meta,
-                        None,
-                    ));
+                    entries.push(meta.to_directory_entry(&child_path, None));
                 }
             }
         }
@@ -1477,93 +1275,18 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
-
-        if let Some(start) = self.tree.lookup_dir(path.as_ref()) {
-            fn walk(
-                node: &PbsTreeNode,
-                current_path: &Path,
-                is_ignored: &IsIgnoredFn,
-                out: &mut Vec<(FileType, PathBuf)>,
-            ) {
-                for (name, meta) in node.files.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
-                        out.push((meta.file_type, filtered));
-                    }
-                }
-                for (name, child) in node.dirs.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
-                        out.push((FileType::Dir, filtered));
-                    }
-                    walk(child, &child_path, is_ignored, out);
-                }
-            }
-
-            walk(start, path.as_ref(), &is_ignored, &mut flat);
-        }
-
-        struct TreeWalk {
-            items: std::vec::IntoIter<(FileType, PathBuf)>,
-        }
-
-        impl DirectoryWalk for TreeWalk {
-            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.items.next().map(Ok)
-            }
-        }
-
-        Ok(Box::new(TreeWalk {
-            items: flat.into_iter(),
-        }))
+        Ok(Box::new(TreeWalk::new(
+            self.tree.walk(path.as_ref(), &is_ignored),
+        )))
     }
     async fn async_walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
-
-        if let Some(start) = self.tree.lookup_dir(path.as_ref()) {
-            fn walk(
-                node: &PbsTreeNode,
-                current_path: &Path,
-                is_ignored: &IsIgnoredFn,
-                out: &mut Vec<(FileType, PathBuf)>,
-            ) {
-                for (name, meta) in node.files.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
-                        out.push((meta.file_type, filtered));
-                    }
-                }
-                for (name, child) in node.dirs.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
-                        out.push((FileType::Dir, filtered));
-                    }
-                    walk(child, &child_path, is_ignored, out);
-                }
-            }
-
-            walk(start, path.as_ref(), &is_ignored, &mut flat);
-        }
-
-        struct TreeWalk {
-            items: std::vec::IntoIter<(FileType, PathBuf)>,
-        }
-
-        #[async_trait::async_trait]
-        impl AsyncDirectoryWalk for TreeWalk {
-            async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.items.next().map(Ok)
-            }
-        }
-
-        Ok(Box::new(TreeWalk {
-            items: flat.into_iter(),
-        }))
+        Ok(Box::new(TreeWalk::new(
+            self.tree.walk(path.as_ref(), &is_ignored),
+        )))
     }
 
     async fn async_walk_dir_stream<'a>(
@@ -1593,31 +1316,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             }
         }
 
-        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
-        if let Some(start) = self.tree.lookup_dir(path.as_ref()) {
-            fn walk(
-                node: &PbsTreeNode,
-                current_path: &Path,
-                is_ignored: &IsIgnoredFn,
-                out: &mut Vec<(FileType, PathBuf)>,
-            ) {
-                for (name, meta) in node.files.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path).keep() {
-                        out.push((meta.file_type, filtered));
-                    }
-                }
-                for (name, child) in node.dirs.iter() {
-                    let child_path = current_path.join(name.as_str());
-                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()).keep() {
-                        out.push((FileType::Dir, filtered));
-                    }
-                    walk(child, &child_path, is_ignored, out);
-                }
-            }
-
-            walk(start, path.as_ref(), &is_ignored, &mut flat);
-        }
+        let flat = self.tree.walk(path.as_ref(), &is_ignored);
 
         let entry_wanted_notifier = Arc::new(tokio::sync::Notify::new());
         let (entry_channel_tx, entry_channel_rx) = tokio::sync::mpsc::channel(1);
@@ -1784,7 +1483,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
 
                     for entry in entries {
                         let name = entry.relative.to_string_lossy();
-                        let mut options: zip::write::FileOptions<'_, ()> =
+                        let mut options: zip::write::FileOptions<'_, '_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
@@ -1794,14 +1493,8 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
 
                         if let Some(mtime) =
                             chrono::DateTime::from_timestamp(entry.mtime.timestamp(), 0)
-                            && let Ok(dt) = zip::DateTime::from_date_and_time(
-                                mtime.year() as u16,
-                                mtime.month() as u8,
-                                mtime.day() as u8,
-                                mtime.hour() as u8,
-                                mtime.minute() as u8,
-                                mtime.second() as u8,
-                            )
+                            && let Some(dt) =
+                                crate::server::filesystem::archive::zip_datetime(mtime)
                         {
                             options = options.last_modified_time(dt);
                         }

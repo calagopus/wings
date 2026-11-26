@@ -1,10 +1,25 @@
 use super::{Server, state::ServerState};
-use std::{collections::HashMap, sync::Arc};
-use tokio::{
-    fs::File,
-    io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{RwLock, Semaphore},
+use anyhow::Context;
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Write,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+use tokio::sync::{RwLock, Semaphore};
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), anyhow::Error> {
+    let parent = path.parent().context("state file has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path)?;
+
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 pub enum ServerCreation {
@@ -19,6 +34,7 @@ pub enum ServerCreation {
 
 pub struct ServerManager {
     servers: Arc<RwLock<Vec<Server>>>,
+    booted: AtomicBool,
 }
 
 impl ServerManager {
@@ -27,6 +43,7 @@ impl ServerManager {
 
         Self {
             servers: Arc::new(RwLock::new(servers)),
+            booted: AtomicBool::new(false),
         }
     }
 
@@ -188,99 +205,87 @@ impl ServerManager {
             servers.push(server);
         }
 
-        tokio::spawn({
-            let servers = Arc::clone(&self.servers);
-
-            async move {
-                let mut states_file = match File::create(&states_path).await {
-                    Ok(file) => file,
-                    Err(err) => {
-                        tracing::error!("failed to create states.json file: {:?}", err);
-                        return;
-                    }
-                };
-
-                let mut run_inner = async || -> Result<(), anyhow::Error> {
-                    let servers = servers.read().await;
-                    let states: HashMap<_, _> = servers
-                        .iter()
-                        .map(|s| (s.uuid, s.state.get_state()))
-                        .collect();
-
-                    states_file.set_len(0).await?;
-                    states_file.seek(std::io::SeekFrom::Start(0)).await?;
-                    states_file
-                        .write_all(serde_json::to_string(&states)?.as_bytes())
-                        .await?;
-                    states_file.flush().await?;
-                    states_file.sync_all().await?;
-
-                    Ok(())
-                };
-
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-                    match run_inner().await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::error!("failed to write states.json file: {:?}", err);
-                            continue;
-                        }
-                    }
-                }
-            }
-        });
+        self.booted.store(true, Ordering::SeqCst);
 
         tokio::spawn({
             let servers = Arc::clone(&self.servers);
 
             async move {
-                let mut installing_file = match File::create(&installing_path).await {
-                    Ok(file) => file,
-                    Err(err) => {
-                        tracing::error!("failed to create installing.json file: {:?}", err);
-                        return;
-                    }
-                };
-
-                let mut run_inner = async || -> Result<(), anyhow::Error> {
-                    let mut installing = HashMap::new();
-                    for server in servers.read().await.iter() {
-                        if let Some(installer) = server.installer.read().await.as_ref()
-                            && let Ok(installation_script) = installer.get_installation_script()
-                        {
-                            installing.insert(
-                                server.uuid,
-                                (installer.reinstall, (*installation_script).clone()),
-                            );
-                        }
-                    }
-
-                    installing_file.set_len(0).await?;
-                    installing_file.seek(std::io::SeekFrom::Start(0)).await?;
-                    installing_file
-                        .write_all(serde_json::to_string(&installing)?.as_bytes())
-                        .await?;
-                    installing_file.flush().await?;
-                    installing_file.sync_all().await?;
-
-                    Ok(())
-                };
+                let mut last_persisted = None;
 
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-                    match run_inner().await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::error!("failed to write installing.json file: {:?}", err);
-                            continue;
-                        }
+                    if let Err(err) =
+                        Self::persist_into(&servers, &root_directory, &mut last_persisted).await
+                    {
+                        tracing::error!("failed to persist server states: {:?}", err);
                     }
                 }
             }
         });
+    }
+
+    #[inline]
+    pub fn booted(&self) -> bool {
+        self.booted.load(Ordering::SeqCst)
+    }
+
+    pub async fn persist(&self, config: &crate::config::Config) -> Result<(), anyhow::Error> {
+        if !self.booted() {
+            return Err(anyhow::anyhow!("servers are still booting"));
+        }
+
+        let root_directory = config.resolve_as_path(|cfg| &cfg.system.root_directory);
+
+        Self::persist_into(&self.servers, &root_directory, &mut None).await
+    }
+
+    async fn persist_into(
+        servers: &RwLock<Vec<Server>>,
+        root_directory: &Path,
+        last_persisted: &mut Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), anyhow::Error> {
+        let servers = servers.read().await;
+
+        let states: BTreeMap<_, _> = servers
+            .iter()
+            .map(|s| (s.uuid, s.state.get_state()))
+            .collect();
+
+        let mut installing = BTreeMap::new();
+        for server in servers.iter() {
+            if let Some(installer) = server.installer.read().await.as_ref()
+                && let Ok(installation_script) = installer.get_installation_script()
+            {
+                installing.insert(
+                    server.uuid,
+                    (installer.reinstall, (*installation_script).clone()),
+                );
+            }
+        }
+        drop(servers);
+
+        let snapshot = (
+            serde_json::to_vec(&states)?,
+            serde_json::to_vec(&installing)?,
+        );
+        if last_persisted.as_ref() == Some(&snapshot) {
+            return Ok(());
+        }
+
+        let root_directory = root_directory.to_path_buf();
+
+        let snapshot = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+            write_atomic(&root_directory.join("states.json"), &snapshot.0)?;
+            write_atomic(&root_directory.join("installing.json"), &snapshot.1)?;
+
+            Ok(snapshot)
+        })
+        .await??;
+        *last_persisted = Some(snapshot);
+
+        Ok(())
     }
 
     #[inline]
@@ -362,5 +367,27 @@ impl ServerManager {
 
             tokio::spawn(async move { server.destroy().await });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // write_atomic
+    #[test]
+    fn write_atomic_replaces_content_without_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("states.json");
+        std::fs::write(&path, b"old content that is longer").unwrap();
+
+        write_atomic(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("states.json")]);
     }
 }

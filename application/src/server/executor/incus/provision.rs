@@ -311,7 +311,7 @@ impl IncusExecutor {
         server: &Server,
         script: &InstallationScript,
         installation: bool,
-    ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
+    ) -> anyhow::Result<(String, Arc<dyn ProcessHandle>, StatusReceiver)> {
         server.log_daemon_install("[Incus] Preparing server data permissions...".into());
         server
             .filesystem
@@ -392,6 +392,8 @@ impl IncusExecutor {
         );
         self.update_instance(&instance, etag.as_deref()).await?;
         tokio::fs::write(staging.join(filename), script.script.replace("\r\n", "\n")).await?;
-        process::Handle::connect(self.clone(), server, name, false, false).await
+        let (handle, status_rx) =
+            process::Handle::connect(self.clone(), server, name.clone(), false, false).await?;
+        Ok((name, handle, status_rx))
     }
 }

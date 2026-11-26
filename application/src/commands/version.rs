@@ -19,6 +19,12 @@ impl crate::commands::CliCommand<VersionArgs> for VersionCommand {
                     crate::full_version(),
                     crate::TARGET
                 );
+                println!(
+                    "upgrades from {} {} ({})",
+                    crate::upgrade::PROVIDER,
+                    crate::upgrade::REPOSITORY,
+                    crate::upgrade::API_URL
+                );
                 if !crate::bins::FUSEQUOTA_VERSION.is_empty() {
                     println!(
                         "github.com/calagopus/fusequota {} ({} compressed)",

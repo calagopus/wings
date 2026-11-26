@@ -1,3 +1,4 @@
+use super::{ReadSeek, SeekableSource};
 use crate::io::{SafeSliceExt, SafeSliceMutExt};
 use positioned_io::ReadAt;
 use std::{
@@ -12,6 +13,17 @@ const READAHEAD_SEQUENTIAL: usize = 256 * 1024;
 /// small entry so that a directory scan does not drag whole windows for a few bytes.
 const READAHEAD_RANDOM: usize = 16 * 1024;
 
+/// Serves positioned reads from a plain `Read + Seek` source by seeking under a lock.
+struct SeekReadAt(parking_lot::Mutex<Box<dyn ReadSeek>>);
+
+impl ReadAt for SeekReadAt {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut reader = self.0.lock();
+        reader.seek(SeekFrom::Start(pos))?;
+        reader.read(buf)
+    }
+}
+
 /// A simple file wrapper that allows multiple independent read cursors to exist on a single file. (Mainly for archives)
 ///
 /// Reads are served from a read-ahead window so that decoders which pull a few
@@ -23,7 +35,7 @@ const READAHEAD_RANDOM: usize = 16 * 1024;
 /// Cloning a `MultiReader` will create a new reader with its own independent cursor (same position as the original), allowing
 /// multiple parts of code to read from the same file without interfering with each other's read positions.
 pub struct MultiReader {
-    file: Arc<File>,
+    file: Arc<dyn ReadAt + Send + Sync>,
     file_size: u64,
     offset: u64,
     window: Vec<u8>,
@@ -35,14 +47,32 @@ impl MultiReader {
     pub fn new(file: Arc<File>) -> std::io::Result<Self> {
         let file_size = file.metadata()?.len();
 
-        Ok(MultiReader {
+        Ok(Self::with_size(file, file_size))
+    }
+
+    pub fn from_seekable(source: SeekableSource) -> std::io::Result<Self> {
+        match source {
+            SeekableSource::File(file) => Self::new(Arc::new(file)),
+            SeekableSource::Reader(mut reader) => {
+                let file_size = reader.seek(SeekFrom::End(0))?;
+
+                Ok(Self::with_size(
+                    Arc::new(SeekReadAt(parking_lot::Mutex::new(reader))),
+                    file_size,
+                ))
+            }
+        }
+    }
+
+    fn with_size(file: Arc<dyn ReadAt + Send + Sync>, file_size: u64) -> Self {
+        MultiReader {
             file,
             file_size,
             offset: 0,
             window: crate::io::mem_buffer(READAHEAD_SEQUENTIAL),
             window_start: 0,
             window_len: 0,
-        })
+        }
     }
 
     #[inline]
