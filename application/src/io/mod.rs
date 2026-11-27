@@ -21,6 +21,7 @@ pub mod replay_reader;
 pub mod shared_reader;
 pub mod tail;
 
+#[cfg(target_os = "linux")]
 const KERNEL_COPY_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Allocates a zero-filled buffer of `len` bytes.

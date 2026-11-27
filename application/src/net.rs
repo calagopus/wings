@@ -312,8 +312,10 @@ impl Drop for CongestionControlProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(target_os = "linux")]
     async fn echo_target() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -336,6 +338,7 @@ mod tests {
         (address, task)
     }
 
+    #[cfg(target_os = "linux")]
     fn proxy_test_config() -> Arc<crate::config::Config> {
         let config = Arc::new(crate::config::Config::mock());
         // cubic is compiled into every linux kernel, unlike bbr
@@ -349,6 +352,7 @@ mod tests {
 
     // CongestionControlProxy
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn congestion_control_proxy_tunnels_connect_requests() {
         tokio_test::block_on(async {
@@ -381,6 +385,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn congestion_control_proxy_forwards_plain_http_transparently() {
         tokio_test::block_on(async {

@@ -24,6 +24,18 @@ fn is_plain_absolute_path(path: &Path) -> bool {
         })
 }
 
+/// Like [`is_plain_absolute_path`] for a path inside the container, which is rooted at `/` no
+/// matter what the host considers absolute.
+fn is_plain_container_path(path: &Path) -> bool {
+    path.has_root()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
 fn parse_cpu_list(list: &str) -> Option<Vec<u64>> {
     let mut cpus = Vec::new();
 
@@ -292,7 +304,7 @@ fn resolve_allowed_path(
         return Err(anyhow::anyhow!("{name} is empty"));
     }
 
-    if !is_plain_absolute_path(Path::new(target)) {
+    if !is_plain_container_path(Path::new(target)) {
         return Err(anyhow::anyhow!(
             "target {target} is not an absolute, normalized path"
         ));
@@ -651,6 +663,7 @@ impl ServerConfiguration {
         )
     }
 
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
     async fn vmounts(&self, config: &crate::config::Config) -> Vec<Mount> {
         let mut mounts = Vec::new();
 

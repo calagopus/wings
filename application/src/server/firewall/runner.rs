@@ -84,6 +84,7 @@ impl CommandRunner {
     }
 }
 
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 enum StreamingProcess {
     Local {
         child: tokio::process::Child,

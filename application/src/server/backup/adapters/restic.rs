@@ -2736,6 +2736,7 @@ mod tests {
     }
 
     // ResticBackup::std_command
+    #[cfg(unix)]
     #[test]
     fn panel_environment_passes_only_backend_and_proxy_keys() {
         tokio_test::block_on(async {

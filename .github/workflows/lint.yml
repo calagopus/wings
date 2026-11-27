@@ -1,0 +1,49 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - x86_64-windows
+        include:
+          - build: x86_64-windows
+            os: ubuntu-24.04
+            target: x86_64-pc-windows-gnu
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          components: clippy
+          cache-key: lint-${{ matrix.target }}
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends mingw-w64 nasm
+
+          # unrar includes these in the casing the windows sdk ships them in
+          cd /usr/x86_64-w64-mingw32/include
+          sudo ln -s powrprof.h PowrProf.h
+          sudo ln -s wbemidl.h Wbemidl.h
+          sudo ln -s sddl.h Sddl.h
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --locked --target ${{ matrix.target }}

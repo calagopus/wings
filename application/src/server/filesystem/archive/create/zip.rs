@@ -160,7 +160,7 @@ impl Entry {
             .and_then(|mtime| crate::server::filesystem::archive::zip_datetime(mtime.into_std()));
 
         Some(Self {
-            name: relative.to_string_lossy().into_owned(),
+            name: super::entry_name(relative),
             path,
             kind,
             len: metadata.len(),

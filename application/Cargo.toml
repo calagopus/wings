@@ -8,7 +8,6 @@ edition = "2024"
 tempfile = "3.27.0"
 unrar = { package = "unrar-ng", git = "https://github.com/0x7d8/unrar.rs.git" }
 pbs-client = { path = "../pbs-client" }
-tundra-common = { git = "https://github.com/calagopus/tundra.git" }
 tracing = { version = "0.1.41", features = ["max_level_debug"] }
 tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 tracing-appender = "0.2.3"
@@ -59,7 +58,6 @@ dialoguer = { version = "0.12.0", default-features = false }
 sysinfo = { version = "0.40.0", default-features = false, features = ["disk", "network", "system", "user"] }
 crc32fast = { workspace = true }
 cap-std = "4.0.0"
-rustix = { version = "1.0.7", features = ["fs", "process", "net", "thread"] }
 cidr = { version = "0.3.1", features = ["serde"] }
 hickory-resolver = { workspace = true }
 constant_time_eq = "0.6.0"
@@ -102,11 +100,15 @@ toml_edit = "0.25.12"
 ini-roundtrip = "0.2.1"
 yrs = "0.28.0"
 croner = { version = "4.0.0", features = ["serde"] }
-rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 time = "0.3.55"
 semver = "1.0.28"
 diffy = "0.5.2"
 qbsdiff = "1.4.4"
+
+[target.'cfg(unix)'.dependencies]
+tundra-common = { git = "https://github.com/calagopus/tundra.git" }
+rustix = { version = "1.0.7", features = ["fs", "process", "net", "thread"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"

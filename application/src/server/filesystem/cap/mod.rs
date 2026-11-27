@@ -117,10 +117,10 @@ impl CapFilesystem {
     /// which is the case for every path the listing pipeline builds from a resolved root.
     #[inline]
     pub fn relative_path_cow<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
-        let path = path
-            .strip_prefix(&*self.base_path)
-            .or_else(|_| path.strip_prefix("/"))
-            .unwrap_or(path);
+        let path = match path.strip_prefix(&*self.base_path) {
+            Ok(path) => path,
+            Err(_) => Self::strip_root(path),
+        };
 
         if path
             .components()
@@ -128,7 +128,29 @@ impl CapFilesystem {
         {
             Cow::Borrowed(path)
         } else {
-            Cow::Owned(Self::resolve_path(path))
+            Cow::Owned(
+                Self::resolve_path(path)
+                    .components()
+                    .filter(|component| matches!(component, std::path::Component::Normal(_)))
+                    .collect(),
+            )
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[inline]
+    fn strip_root(path: &Path) -> &Path {
+        path.strip_prefix("/").unwrap_or(path)
+    }
+
+    /// Request paths are rooted at the server directory, where windows would read a leading
+    /// `//` as a UNC prefix.
+    #[cfg(windows)]
+    #[inline]
+    fn strip_root(path: &Path) -> &Path {
+        match path.to_str() {
+            Some(path) => Path::new(path.trim_start_matches(['/', '\\'])),
+            None => path,
         }
     }
 
@@ -2753,6 +2775,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn canonicalize_parent_resolves_symlinked_directories_but_not_the_leaf() {
         tokio_test::block_on(async {
@@ -2851,6 +2874,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_dir_all_unlinks_symlinks_without_following_them() {
         let (dir, filesystem) = temp_filesystem();
@@ -3130,6 +3154,7 @@ mod tests {
         assert!(listing.symlink_metadata("missing").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn listing_dir_keeps_resolving_after_the_directory_is_renamed() {
         use std::io::Read;

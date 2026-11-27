@@ -858,6 +858,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ignores_a_symlinked_file() {
         tokio_test::block_on(async {

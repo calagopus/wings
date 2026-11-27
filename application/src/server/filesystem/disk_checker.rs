@@ -4,8 +4,9 @@ use super::{
     usage::{DiskUsage, SpaceDelta, UsedSpace},
 };
 use crate::{server::resources::ResourceUsageWatchExt, utils::PortableSizeExt};
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,

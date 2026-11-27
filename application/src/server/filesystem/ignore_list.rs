@@ -72,6 +72,8 @@ impl IgnoreList {
         }
 
         let path = path.to_string_lossy();
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
         let path = path.trim_start_matches("./").trim_start_matches('/');
 
         self.descend.iter().any(|rule| rule.covers(path))
@@ -915,7 +917,7 @@ mod tests {
             let mut frontier: Vec<String> = ignore
                 .exclusion_frontier(&filesystem)?
                 .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .collect();
             frontier.sort();
 

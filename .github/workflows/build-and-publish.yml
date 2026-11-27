@@ -57,6 +57,7 @@ jobs:
           - aarch64-linux
           - riscv64-linux
           - ppc64le-linux
+          - x86_64-windows
         include:
           - build: x86_64-linux
             os: ubuntu-24.04
@@ -78,6 +79,11 @@ jobs:
             target: powerpc64le-unknown-linux-gnu
             jemalloc_lg_page: 16
             link_flags: -C relocation-model=static
+          - build: x86_64-windows
+            os: ubuntu-24.04
+            target: x86_64-pc-windows-gnu
+            ext: .exe
+            mingw: true
 
     steps:
       - name: Checkout sources
@@ -91,11 +97,25 @@ jobs:
           cache-key: ${{ matrix.target }}
 
       - name: Install cross
+        if: ${{ !matrix.mingw }}
         run: cargo install cross --git https://github.com/cross-rs/cross --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 --locked
         env:
           CARGO_BUILD_WARNINGS: allow
 
+      - name: Install mingw-w64
+        if: ${{ matrix.mingw }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends mingw-w64 nasm
+
+          # unrar includes these in the casing the windows sdk ships them in
+          cd /usr/x86_64-w64-mingw32/include
+          sudo ln -s powrprof.h PowrProf.h
+          sudo ln -s wbemidl.h Wbemidl.h
+          sudo ln -s sddl.h Sddl.h
+
       - name: Download fusequota
+        if: ${{ !matrix.mingw }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -106,6 +126,7 @@ jobs:
           echo "FUSEQUOTA_BINARY_PATH=$GITHUB_WORKSPACE/.fusequota/fusequota" >> "$GITHUB_ENV"
 
       - name: Run cargo test
+        if: ${{ !matrix.mingw }}
         run: cross test --release --target ${{ matrix.target }}
         env:
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
@@ -113,20 +134,26 @@ jobs:
       - name: Build release binary
         run: |
           RUSTFLAGS="-C target-feature=+crt-static ${{ matrix.link_flags }}" \
-          cross build --release --target ${{ matrix.target }}
+          ${{ matrix.mingw && 'cargo' || 'cross' }} build --release --target ${{ matrix.target }}
         env:
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
+
+      - name: Check for mingw runtime dependencies
+        if: ${{ matrix.mingw }}
+        run: |
+          ! x86_64-w64-mingw32-objdump -p "target/${{ matrix.target }}/release/$BIN_NAME${{ matrix.ext }}" \
+            | grep -iE 'DLL Name: lib(winpthread|gcc|stdc)'
 
       - name: Prepare binary with platform name
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/$BIN_NAME-${{ matrix.build }}"
+          cp "target/${{ matrix.target }}/release/$BIN_NAME${{ matrix.ext }}" "dist/$BIN_NAME-${{ matrix.build }}${{ matrix.ext }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.PROJECT_NAME }}-${{ matrix.build }}
-          path: dist/${{ env.BIN_NAME }}-${{ matrix.build }}
+          path: dist/${{ env.BIN_NAME }}-${{ matrix.build }}${{ matrix.ext }}
 
   create-multiarch-image:
     name: Create multi-arch Docker image
@@ -151,7 +178,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: ${{ env.PROJECT_NAME }}-*
+          pattern: ${{ env.PROJECT_NAME }}-*-linux
           path: dist
 
       - name: Install Cosign

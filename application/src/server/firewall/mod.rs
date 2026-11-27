@@ -912,6 +912,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn expand_rules_emits_set_rules_per_family_for_a_source_file() {
         let server = uuid::Uuid::new_v4();

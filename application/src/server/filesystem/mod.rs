@@ -914,6 +914,7 @@ impl Filesystem {
     /// It may differ from the base_path for some disk limiters.
     ///
     /// DO NOT CALL THIS FUNCTION UNLESS YOU KNOW WHAT YOU ARE DOING
+    #[cfg(unix)]
     pub async fn set_base_fs_mount_path(&self, path: PathBuf) -> Result<(), std::io::Error> {
         let mut base_fs_path = self.base_fs_mount_path.write().await;
         if *base_fs_path == path {
@@ -2034,6 +2035,7 @@ impl Filesystem {
         self.async_remove_dir_all(Path::new(""), threads).await
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     fn chown_impl(
         config: &crate::config::Config,
         cap_filesystem: &cap::CapFilesystem,
@@ -2132,6 +2134,7 @@ impl Filesystem {
             Ok(())
         }
     }
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub async fn async_chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         if self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
@@ -3472,12 +3475,14 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     struct CopyFixture {
         server: crate::server::Server,
         root: PathBuf,
         _temp: tempfile::TempDir,
     }
 
+    #[cfg(unix)]
     impl CopyFixture {
         async fn new() -> Result<Self, anyhow::Error> {
             let (temp, server) = crate::server::Server::mock_in_tempdir().await;
@@ -3546,6 +3551,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn assert_copied_file(
         path: &Path,
         contents: &[u8],
@@ -3577,6 +3583,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn copy_path_applies_mode_and_owner_on_the_open_file() -> Result<(), anyhow::Error> {
@@ -3615,6 +3622,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_path_across_filesystems_applies_mode_on_the_open_file() -> Result<(), anyhow::Error> {
         tokio_test::block_on(async {
@@ -3647,6 +3655,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "timing and syscall probe for copy_path, run with --ignored under strace"]
     fn copy_path_many_files_probe() -> Result<(), anyhow::Error> {
@@ -3807,6 +3816,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn contains_ignored_resolves_a_symlinked_destination_parent() {
         crate::server::Server::with_mock(|server| async move {

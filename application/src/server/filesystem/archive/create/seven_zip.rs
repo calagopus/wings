@@ -79,7 +79,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                     let reader = FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                     let mut entry =
-                        sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
+                        sevenz_rust2::ArchiveEntry::new_file(&super::entry_name(relative));
                     if let Some(mtime) = mtime {
                         entry.has_last_modified_date = true;
                         entry.last_modified_date = mtime;
@@ -98,7 +98,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                     let target = link_target.to_string_lossy();
 
                     let mut entry =
-                        sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
+                        sevenz_rust2::ArchiveEntry::new_file(&super::entry_name(relative));
                     if let Some(mtime) = mtime {
                         entry.has_last_modified_date = true;
                         entry.last_modified_date = mtime;
@@ -122,7 +122,7 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
 
         for (source_path, mtime, ctime, mode) in directory_entries {
             let mut entry =
-                sevenz_rust2::ArchiveEntry::new_directory(&source_path.to_string_lossy());
+                sevenz_rust2::ArchiveEntry::new_directory(&super::entry_name(&source_path));
             if let Some(mtime) = mtime {
                 entry.has_last_modified_date = true;
                 entry.last_modified_date = mtime;
@@ -143,4 +143,68 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
         Ok(inner)
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::filesystem::cap::CapFilesystem;
+    use std::{collections::BTreeSet, io::Cursor};
+
+    // create_7z
+    #[test]
+    fn entry_names_use_forward_slashes_for_files_and_directories() -> Result<(), anyhow::Error> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("tree").join("plugins").join("nested"))?;
+        std::fs::write(
+            root.join("tree")
+                .join("plugins")
+                .join("nested")
+                .join("config.yml"),
+            b"key: value\n",
+        )?;
+        std::fs::write(root.join("tree").join("top.txt"), b"top")?;
+
+        let bytes = tokio_test::block_on(async {
+            let filesystem = CapFilesystem::new(root).await?;
+            let archive = create_7z(
+                filesystem,
+                Cursor::new(Vec::new()),
+                Path::new(""),
+                vec!["tree"],
+                ArchiveProgress::default(),
+                IsIgnoredFn::default(),
+                Create7zOptions {
+                    compression_level: CompressionLevel::BestSpeed,
+                    threads: 1,
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(archive.into_inner())
+        })?;
+
+        let archive =
+            sevenz_rust2::Archive::read(&mut Cursor::new(bytes), &sevenz_rust2::Password::empty())?;
+        let names: Vec<String> = archive.files.iter().map(|f| f.name().to_string()).collect();
+
+        assert!(names.iter().all(|name| !name.contains('\\')), "{names:?}");
+
+        let actual: BTreeSet<&str> = names
+            .iter()
+            .map(|name| name.trim_end_matches('/'))
+            .collect();
+        let expected: BTreeSet<&str> = [
+            "tree",
+            "tree/plugins",
+            "tree/plugins/nested",
+            "tree/plugins/nested/config.yml",
+            "tree/top.txt",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
 }

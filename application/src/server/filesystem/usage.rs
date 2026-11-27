@@ -91,6 +91,7 @@ impl SpaceDelta {
         Self { logical, physical }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[inline]
     pub fn only_logical(logical: i64) -> Self {
         Self {

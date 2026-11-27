@@ -2112,6 +2112,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn resolve_inner_does_not_follow_symlinks_out_of_the_payload() {
@@ -2140,6 +2141,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn resolve_inner_does_not_follow_symlinks_to_ignored_files() {

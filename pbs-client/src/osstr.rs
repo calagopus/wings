@@ -11,7 +11,9 @@ pub fn os_str_from_bytes(bytes: &[u8]) -> &OsStr {
     let valid = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         // SAFETY: `valid_up_to()` is the length of a valid UTF-8 prefix.
-        Err(e) => unsafe { std::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) },
+        Err(e) => unsafe {
+            std::str::from_utf8_unchecked(bytes.get(..e.valid_up_to()).unwrap_or(&[]))
+        },
     };
     OsStr::new(valid)
 }

@@ -5688,7 +5688,7 @@ dependencies = [
 [[package]]
 name = "unrar-ng"
 version = "0.7.7"
-source = "git+https://github.com/0x7d8/unrar.rs.git#1a57ca302207b12c7cb1b12dbedf5d7b1eeadce2"
+source = "git+https://github.com/0x7d8/unrar.rs.git#44771959744324b87fda30e95df93301a03f9b11"
 dependencies = [
  "bitflags",
  "regex",
@@ -5699,7 +5699,7 @@ dependencies = [
 [[package]]
 name = "unrar-ng-sys"
 version = "0.7.7"
-source = "git+https://github.com/0x7d8/unrar.rs.git#1a57ca302207b12c7cb1b12dbedf5d7b1eeadce2"
+source = "git+https://github.com/0x7d8/unrar.rs.git#44771959744324b87fda30e95df93301a03f9b11"
 dependencies = [
  "cc",
  "libc",

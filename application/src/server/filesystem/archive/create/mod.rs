@@ -100,6 +100,16 @@ pub async fn create_archive<W: Write + Seek + Send + 'static>(
     }
 }
 
+/// Zip and 7z entry names are separated by forward slashes on every platform.
+fn entry_name(path: &Path) -> String {
+    let name = path.to_string_lossy();
+
+    #[cfg(windows)]
+    return name.replace('\\', "/");
+    #[cfg(not(windows))]
+    name.into_owned()
+}
+
 fn walk_sources(
     filesystem: &CapFilesystem,
     base: &Path,

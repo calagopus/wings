@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+#[cfg(target_os = "linux")]
 pub const MINIMUM_RATE: u64 = 8;
+#[cfg(target_os = "linux")]
 pub const MAXIMUM_RATE: u64 = 100_000_000_000;
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]

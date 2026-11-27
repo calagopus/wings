@@ -27,6 +27,7 @@ const QUERY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const QUERY_MAX_VALUE_BYTES: usize = 256 * 1024;
 const QUERY_SQLITE_LENGTH_LIMIT: i32 = 32 * 1024 * 1024;
 /// Room for a few values of [`QUERY_SQLITE_LENGTH_LIMIT`] plus working memory.
+#[cfg(target_os = "linux")]
 pub const QUERY_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 pub const QUERY_DEADLINE: Duration = Duration::from_secs(15);
 pub const QUERY_BUSY_TIMEOUT: Duration = Duration::from_millis(3000);

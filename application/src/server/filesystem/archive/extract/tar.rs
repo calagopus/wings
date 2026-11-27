@@ -441,6 +441,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn file_modes_and_mtimes_are_preserved() -> Result<(), anyhow::Error> {
@@ -473,6 +474,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn file_modes_ignore_the_umask() -> Result<(), anyhow::Error> {
@@ -504,6 +506,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
     fn extracting_over_an_existing_file_replaces_content_and_mode() -> Result<(), anyhow::Error> {

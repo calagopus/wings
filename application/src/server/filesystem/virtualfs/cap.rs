@@ -525,7 +525,7 @@ impl VirtualCapFilesystem {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn prepare_statted_directory_entry(
         &self,
         statted: StattedDirectoryEntry,
@@ -576,7 +576,7 @@ impl VirtualCapFilesystem {
         prepared
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn prepare_directory_entry(
         &self,
         dir: &Arc<ListingDir>,
@@ -3128,6 +3128,7 @@ mod tests {
     }
 
     // VirtualCapFilesystem::async_read_file
+    #[cfg(unix)]
     #[test]
     fn reading_through_a_symlink_to_a_denied_file_is_refused() {
         with_one_blocking_worker(|| async {

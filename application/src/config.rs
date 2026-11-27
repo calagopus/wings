@@ -1297,6 +1297,8 @@ nestify::nest! {
             },
         },
         #[serde(default)]
+        pub executor: crate::server::executor::ExecutorKind,
+        #[serde(default)]
         #[schema(inline)]
         pub docker: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Docker {
             #[serde(default = "docker_socket")]

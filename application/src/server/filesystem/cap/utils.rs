@@ -214,6 +214,7 @@ pub fn name_and_type(entry: &cap_std::fs::DirEntry) -> (FileType, String) {
     )
 }
 
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 enum StatSource {
     Entry(cap_std::fs::DirEntry),
     Path(super::CapFilesystem),
@@ -593,6 +594,7 @@ impl WalkDir {
         None
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn run_multithreaded<
         F: Fn(WalkEntry) -> Result<(), anyhow::Error> + Send + Sync + 'static,
     >(

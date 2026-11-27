@@ -1,7 +1,4 @@
-use crate::{
-    io::{SafeSliceExt, line_buffer::LineBuffer},
-    server::resources::ResourceUsageWatchExt,
-};
+use crate::{io::SafeSliceExt, server::resources::ResourceUsageWatchExt};
 use bollard::errors::Error::DockerResponseServerError;
 use futures::StreamExt;
 use rand::distr::SampleString;
@@ -294,7 +291,7 @@ impl HostBinding {
     }
 }
 
-fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
+pub(super) fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
     for name in names.unwrap_or_default() {
         let name = name.trim_start_matches('/');
 
@@ -310,6 +307,27 @@ fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
     }
 
     None
+}
+
+pub(super) async fn container_name(
+    config: &crate::config::Config,
+    server: &super::super::Server,
+) -> String {
+    let cfg = server.configuration.read().await;
+
+    if config.load().docker.server_name_in_container_name {
+        let mut filtered = String::new();
+        for c in cfg.meta.name.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                filtered.push(c);
+            }
+        }
+        filtered.truncate(63 - 1 - 36);
+
+        format!("{}.{}", filtered, cfg.uuid)
+    } else {
+        cfg.uuid.to_string()
+    }
 }
 
 impl crate::server::configuration::ServerConfiguration {
@@ -567,6 +585,7 @@ impl crate::server::configuration::ServerConfiguration {
             }
         }
 
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let (mut mounts, binds) = split_binds(
             self.convert_mounts(config, filesystem, host_mounts).await,
             &config.load().docker.mount_options,
@@ -714,7 +733,10 @@ impl crate::server::configuration::ServerConfiguration {
         }
     }
 
-    fn installer_resources(&self, config: &crate::config::Config) -> bollard::models::Resources {
+    pub(super) fn installer_resources(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::Resources {
         let mut resources = self.convert_container_resources(config);
 
         let config = config.load();
@@ -1012,42 +1034,6 @@ impl DockerExecutor {
         ContainerFirewallState::endpoint_ips(inspect)
     }
 
-    pub async fn reconcile_firewall(
-        &self,
-        servers: &[crate::remote::servers::RawServer],
-    ) -> Result<(), anyhow::Error> {
-        let mut specs = Vec::with_capacity(servers.len());
-        for server in servers {
-            let mut spec = server.settings.convert_firewall_spec(&self.app_config);
-
-            if spec.references_files() {
-                match crate::server::filesystem::cap::CapFilesystem::new(
-                    &self.app_config.data_path(spec.server),
-                )
-                .await
-                {
-                    Ok(filesystem) => {
-                        spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
-                            filesystem,
-                            notifier: None,
-                            server: None,
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            server = %spec.server,
-                            "failed to open the server directory for its firewall source files: {err}"
-                        );
-                    }
-                }
-            }
-
-            specs.push(spec);
-        }
-
-        self.firewall.reconcile(&specs).await
-    }
-
     fn firewall_file_access(
         server: &Arc<super::super::InnerServer>,
     ) -> crate::server::firewall::sets::FirewallFileAccess {
@@ -1184,24 +1170,6 @@ impl DockerExecutor {
     #[cfg(not(target_os = "linux"))]
     fn detect_host_gateway() -> Option<std::net::IpAddr> {
         None
-    }
-
-    async fn container_name(&self, server: &super::super::Server) -> String {
-        let cfg = server.configuration.read().await;
-
-        if self.app_config.load().docker.server_name_in_container_name {
-            let mut filtered = String::new();
-            for c in cfg.meta.name.chars() {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    filtered.push(c);
-                }
-            }
-            filtered.truncate(63 - 1 - 36);
-
-            format!("{}.{}", filtered, cfg.uuid)
-        } else {
-            cfg.uuid.to_string()
-        }
     }
 
     async fn image_exists(&self, image: &str) -> bool {
@@ -1605,77 +1573,15 @@ impl DockerProcessHandle {
         });
 
         // intentionally not aborted on drop so that it can finish writing any remaining logs to the channel
-        tokio::spawn({
-            let server = server.clone();
-            let app_config = Arc::clone(&app_config);
-
-            async move {
-                let mut line_buffer = LineBuffer::new();
-
-                let mut ratelimit_counter = 0;
-                let mut ratelimit_start = std::time::Instant::now();
-
-                let mut allow_ratelimit = || {
-                    ratelimit_counter += 1;
-
-                    let config = app_config.load();
-
-                    if config.throttles.enabled
-                        && config.throttles.line_reset_interval > 0
-                        && ratelimit_counter >= config.throttles.lines
-                    {
-                        if ratelimit_start.elapsed()
-                            < std::time::Duration::from_millis(config.throttles.line_reset_interval)
-                        {
-                            if ratelimit_counter == config.throttles.lines {
-                                tracing::debug!(
-                                    server = %server.uuid,
-                                    lines = config.throttles.lines,
-                                    reset_interval = config.throttles.line_reset_interval,
-                                    "ratelimit reached for server output"
-                                );
-
-                                server.log_daemon_with_prelude(
-                                    "Server is outputting console data too quickly -- throttling...",
-                                );
-                            }
-
-                            return false;
-                        } else {
-                            ratelimit_counter = 0;
-                            ratelimit_start = std::time::Instant::now();
-                        }
-                    }
-
-                    true
-                };
-
-                let mut emit = |slice: &[u8]| {
-                    let line = Arc::new(compact_str::CompactString::from_utf8_lossy(slice));
-
-                    if allow_ratelimit() {
-                        stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
-                    }
-                    stdout_tx.send(line).ok();
-                };
-
-                while let Some(Ok(data)) = attach.output.next().await {
-                    line_buffer.extend(&data.into_bytes());
-
-                    while let Some(line) = line_buffer.next_line() {
-                        emit(line);
-                    }
-
-                    line_buffer.compact();
-                }
-
-                if let Some(line) = line_buffer.flush() {
-                    emit(line);
-                }
-
-                tracing::debug!(server = %server.uuid, "stdout task ended");
-            }
-        });
+        tokio::spawn(super::pump_output(
+            Arc::clone(server),
+            Arc::clone(&app_config),
+            attach
+                .output
+                .map(|output| output.map(|output| output.into_bytes())),
+            stdout_ratelimited_tx,
+            stdout_tx,
+        ));
 
         let stats_docker = Arc::clone(&docker);
         let stats_id = container_id.clone();
@@ -3000,6 +2906,42 @@ impl super::ServerExecutor for DockerExecutor {
         Ok(())
     }
 
+    async fn reconcile_firewall(
+        &self,
+        servers: &[crate::remote::servers::RawServer],
+    ) -> Result<(), anyhow::Error> {
+        let mut specs = Vec::with_capacity(servers.len());
+        for server in servers {
+            let mut spec = server.settings.convert_firewall_spec(&self.app_config);
+
+            if spec.references_files() {
+                match crate::server::filesystem::cap::CapFilesystem::new(
+                    &self.app_config.data_path(spec.server),
+                )
+                .await
+                {
+                    Ok(filesystem) => {
+                        spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
+                            filesystem,
+                            notifier: None,
+                            server: None,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            server = %spec.server,
+                            "failed to open the server directory for its firewall source files: {err}"
+                        );
+                    }
+                }
+            }
+
+            specs.push(spec);
+        }
+
+        self.firewall.reconcile(&specs).await
+    }
+
     async fn setup_server_process(
         &self,
         server: &super::super::Server,
@@ -3008,7 +2950,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         self.pull_image(&image, server, false).await?;
 
-        let container_name = self.container_name(server).await;
+        let container_name = container_name(&self.app_config, server).await;
 
         server.filesystem.ensure_trash_directory().await;
 
@@ -3709,7 +3651,7 @@ impl super::ServerExecutor for DockerExecutor {
         for server in servers {
             let container = match running.remove(&server.uuid) {
                 Some(id) => id,
-                None => self.container_name(server).await,
+                None => container_name(&self.app_config, server).await,
             };
 
             refs.insert(server.uuid, container);

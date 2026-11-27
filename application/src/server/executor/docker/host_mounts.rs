@@ -63,6 +63,7 @@ impl HostMountTable {
         &self,
         cfg: &crate::config::InnerConfig,
     ) -> Result<(), anyhow::Error> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut directories = vec![
             (&cfg.system.data_directory, "system.data_directory"),
             (&cfg.system.tmp_directory, "system.tmp_directory"),

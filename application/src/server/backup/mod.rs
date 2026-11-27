@@ -408,6 +408,7 @@ pub trait BackupTestExt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -501,6 +502,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn stream(script: &str) -> Result<BackupStream, anyhow::Error> {
         let child = tokio::process::Command::new("sh")
             .arg("-c")
@@ -512,6 +514,7 @@ mod tests {
         BackupStream::from_process(child, None, "dump.sql".into())
     }
 
+    #[cfg(unix)]
     #[test]
     fn successful_process_reads_to_eof() -> Result<(), anyhow::Error> {
         tokio_test::block_on(async {
@@ -524,6 +527,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_process_reports_partial_dump() -> Result<(), anyhow::Error> {
         tokio_test::block_on(async {
@@ -537,6 +541,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn closed_stdout_waits_for_process_failure() -> Result<(), anyhow::Error> {
         tokio_test::block_on(async {

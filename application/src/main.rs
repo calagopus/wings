@@ -2,7 +2,7 @@ use crate::{response::ApiResponse, routes::GetState, server::executor::ServerExe
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Request},
+    extract::Request,
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::Next,
     response::IntoResponse,
@@ -528,55 +528,70 @@ async fn main_rt() {
         Ok::<_, anyhow::Error>(())
     });
 
-    tracing::info!("connecting to docker");
-    let (executor, docker) = {
-        let config_ref = config.load();
-        let docker = Arc::new(
-            match if config_ref.docker.socket.starts_with("http://")
-                || config_ref.docker.socket.starts_with("tcp://")
-            {
-                bollard::Docker::connect_with_http(
-                    &config_ref.docker.socket,
-                    120,
-                    bollard::API_DEFAULT_VERSION,
+    let executor_kind = config.load().executor;
+    let (executor, docker): (Arc<dyn ServerExecutor>, Option<Arc<bollard::Docker>>) =
+        match executor_kind {
+            crate::server::executor::ExecutorKind::Docker => {
+                tracing::info!("connecting to docker");
+                let config_ref = config.load();
+                let docker = Arc::new(
+                    match if config_ref.docker.socket.starts_with("http://")
+                        || config_ref.docker.socket.starts_with("tcp://")
+                    {
+                        bollard::Docker::connect_with_http(
+                            &config_ref.docker.socket,
+                            120,
+                            bollard::API_DEFAULT_VERSION,
+                        )
+                    } else {
+                        bollard::Docker::connect_with_local(
+                            &config_ref.docker.socket,
+                            120,
+                            bollard::API_DEFAULT_VERSION,
+                        )
+                    } {
+                        Ok(docker) => docker,
+                        Err(err) => exit_error!("failed to connect to docker: {:?}", err),
+                    },
+                );
+
+                drop(config_ref);
+
+                if let Err(err) = config.ensure_docker_network(&docker).await {
+                    exit_error!("failed to boot server executor: {:?}", err);
+                }
+
+                let own_container =
+                    crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
+                let firewall =
+                    crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
+                let bandwidth = Arc::new(
+                    crate::server::bandwidth::Bandwidth::create(
+                        &config,
+                        &docker,
+                        own_container.as_ref(),
+                    )
+                    .await,
+                );
+
+                (
+                    Arc::new(crate::server::executor::docker::DockerExecutor::new(
+                        Arc::clone(&docker),
+                        config.clone(),
+                        firewall,
+                        bandwidth,
+                    )),
+                    Some(docker),
                 )
-            } else {
-                bollard::Docker::connect_with_local(
-                    &config_ref.docker.socket,
-                    120,
-                    bollard::API_DEFAULT_VERSION,
-                )
-            } {
-                Ok(docker) => docker,
-                Err(err) => exit_error!("failed to connect to docker: {:?}", err),
-            },
-        );
-
-        drop(config_ref);
-
-        if let Err(err) = config.ensure_docker_network(&docker).await {
-            exit_error!("failed to boot server executor: {:?}", err);
-        }
-
-        let own_container =
-            crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
-        let firewall =
-            crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
-        let bandwidth = Arc::new(
-            crate::server::bandwidth::Bandwidth::create(&config, &docker, own_container.as_ref())
-                .await,
-        );
-
-        (
-            Arc::new(crate::server::executor::docker::DockerExecutor::new(
-                Arc::clone(&docker),
-                config.clone(),
-                firewall,
-                bandwidth,
-            )),
-            docker,
-        )
-    };
+            }
+            #[cfg(windows)]
+            crate::server::executor::ExecutorKind::Wslc => (
+                Arc::new(crate::server::executor::wslc::WslcExecutor::new(
+                    config.clone(),
+                )),
+                None,
+            ),
+        };
 
     tracing::info!("running server executor boot tasks");
     if let Err(err) = executor.boot().await {
@@ -622,8 +637,10 @@ async fn main_rt() {
     }
 
     #[cfg(unix)]
-    let tundra = if config.load().tundra.enabled {
-        match crate::tundra::TundraManager::create(&config, Arc::clone(&docker)) {
+    let tundra = if config.load().tundra.enabled
+        && let Some(docker) = &docker
+    {
+        match crate::tundra::TundraManager::create(&config, Arc::clone(docker)) {
             Ok(tundra) => Some(tundra),
             Err(err) => exit_error!("failed to set up the tundra control plane: {:?}", err),
         }
@@ -1112,10 +1129,11 @@ async fn main_rt() {
 
             let router = router.layer(axum::middleware::from_fn(
                 |mut req: Request, next: Next| async move {
-                    req.extensions_mut().insert(ConnectInfo(SocketAddr::from((
-                        std::net::IpAddr::from([127, 0, 0, 1]),
-                        0,
-                    ))));
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                            std::net::IpAddr::from([127, 0, 0, 1]),
+                            0,
+                        ))));
                     next.run(req).await
                 },
             ));
