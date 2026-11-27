@@ -52,10 +52,20 @@ mod post {
                 .ok();
         }
 
+        let Some(reservation) = state
+            .backup_manager
+            .reserve_create_database(&server, data.uuid)
+        else {
+            return ApiResponse::error("backup already exists")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        };
+
         tokio::spawn(async move {
             if let Err(err) = state
                 .backup_manager
-                .create_database(
+                .create_database_reserved(
+                    reservation,
                     data.adapter,
                     &server,
                     data.uuid,

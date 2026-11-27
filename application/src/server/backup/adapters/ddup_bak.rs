@@ -1,6 +1,7 @@
 use crate::{
     io::{
         SafeDigestExt,
+        abort::{AbortGuard, AbortReader},
         compression::{CompressionLevel, writer::CompressionWriter},
         fixed_reader::FixedReader,
     },
@@ -343,11 +344,13 @@ impl BackupCreateExt for DdupBakBackup {
     ) -> Result<RawServerBackup, anyhow::Error> {
         let repository = get_repository(&server.app_state.config).await?;
         let path = repository.archive_path(&uuid.to_string())?;
+        let (_guard, listener) = AbortGuard::new();
 
         let total_task = {
             let filesystem = server.filesystem.clone();
             let total = Arc::clone(&total);
             let ignore = ignore.clone();
+            let listener = listener.clone();
 
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -355,6 +358,10 @@ impl BackupCreateExt for DdupBakBackup {
                         .walk_dir(Path::new(""))?
                         .with_is_ignored(ignore.into());
                     while let Some(Ok(entry)) = walker.next_entry() {
+                        if listener.is_aborted() {
+                            break;
+                        }
+
                         let metadata = match entry.metadata() {
                             Ok(metadata) => metadata,
                             Err(_) => continue,
@@ -374,7 +381,7 @@ impl BackupCreateExt for DdupBakBackup {
             tokio::task::spawn_blocking(move || -> Result<(u64, u64), anyhow::Error> {
                 let base_path = server.filesystem.base_path.clone();
 
-                let archive = repository.create_archive(
+                let archive = repository.create_archive_with_abort(
                     &uuid.to_string(),
                     Some(
                         WalkBuilder::new(&server.filesystem.base_path)
@@ -432,6 +439,7 @@ impl BackupCreateExt for DdupBakBackup {
                             }
                         })
                     }),
+                    Some(Arc::new(move || listener.is_aborted())),
                     server
                         .app_state
                         .config
@@ -506,6 +514,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
         let staging_dir = Self::get_dump_staging_path(&state.config, uuid);
         tokio::fs::create_dir_all(&staging_dir).await?;
         let staged_file = staging_dir.join(format!("{uuid}.{extension}"));
+        let (_guard, listener) = AbortGuard::new();
 
         let result = async {
             let mut reader = source.await?;
@@ -526,7 +535,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
             let staging_dir = staging_dir.clone();
 
             tokio::task::spawn_blocking(move || -> Result<u64, anyhow::Error> {
-                let archive = repository.create_archive(
+                let archive = repository.create_archive_with_abort(
                     &uuid.to_string(),
                     Some(
                         WalkBuilder::new(&staging_dir)
@@ -556,6 +565,7 @@ impl BackupStreamCreateExt for DdupBakBackup {
                             ddup_bak::archive::CompressionFormat::Zstd
                         }
                     })),
+                    Some(Arc::new(move || listener.is_aborted())),
                     create_threads,
                 )?;
 
@@ -783,6 +793,7 @@ impl BackupExt for DdupBakBackup {
             .restore_threads;
 
         let server = server.clone();
+        let (_guard, listener) = AbortGuard::new();
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
             let mut total_size = 0;
 
@@ -820,7 +831,7 @@ impl BackupExt for DdupBakBackup {
                             }
                         };
 
-                        if error.stopped() {
+                        if error.stopped() || listener.is_aborted() {
                             break;
                         }
 
@@ -848,15 +859,18 @@ impl BackupExt for DdupBakBackup {
                                 let repository = &repository;
                                 let progress = progress.clone();
                                 let error = Arc::clone(&error);
+                                let listener = listener.clone();
                                 scope.spawn(move |_| {
                                     let _permit = permit;
-                                    if error.stopped() {
+                                    if error.stopped() || listener.is_aborted() {
                                         return;
                                     }
 
-                                    let mut run = || -> Result<(), anyhow::Error> {
-                                        let reader =
-                                            repository.entry_reader(Entry::File(file.clone()))?;
+                                    let run = || -> Result<(), anyhow::Error> {
+                                        let reader = AbortReader::new(
+                                            repository.entry_reader(Entry::File(file.clone()))?,
+                                            listener,
+                                        );
                                         let mut reader = progress.counting_reader(reader);
 
                                         crate::io::copy(&mut reader, &mut writer)?;
@@ -983,13 +997,22 @@ impl BackupCleanExt for DdupBakBackup {
         let repository = get_repository(&server.app_state.config).await?;
 
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-            repository.delete_archive(&uuid.to_string(), None)?;
-            repository.save()?;
+            match repository.delete_archive(&uuid.to_string(), None) {
+                Ok(()) => repository.save()?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
 
             Ok(())
         })
         .await??;
 
-        Ok(())
+        match tokio::fs::remove_dir_all(Self::get_dump_staging_path(&server.app_state.config, uuid))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }

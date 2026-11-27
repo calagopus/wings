@@ -83,6 +83,75 @@ async fn create_with_parent<T, Fut: Future<Output = Result<T, std::io::Error>>>(
     }
 }
 
+const INTERRUPT_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct InterruptOnDrop {
+    child: std::mem::ManuallyDrop<tokio::process::Child>,
+    hold: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl InterruptOnDrop {
+    fn new(child: tokio::process::Child, hold: impl std::any::Any + Send) -> Self {
+        Self {
+            child: std::mem::ManuallyDrop::new(child),
+            hold: Some(Box::new(hold)),
+        }
+    }
+}
+
+impl std::ops::Deref for InterruptOnDrop {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for InterruptOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: `child` is taken exactly once, here, and never touched afterwards.
+        let mut child = unsafe { std::mem::ManuallyDrop::take(&mut self.child) };
+        let hold = self.hold.take();
+
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Some(pid) = child
+            .id()
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+        {
+            rustix::process::kill_process(pid, rustix::process::Signal::INT).ok();
+        }
+        #[cfg(not(unix))]
+        child.start_kill().ok();
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            child.start_kill().ok();
+            return;
+        };
+
+        runtime.spawn(async move {
+            if tokio::time::timeout(INTERRUPT_GRACE_PERIOD, child.wait())
+                .await
+                .is_err()
+            {
+                child.start_kill().ok();
+                child.wait().await.ok();
+            }
+
+            drop(hold);
+        });
+    }
+}
+
 fn spawn_stderr_capture(
     stderr: tokio::process::ChildStderr,
     limit: usize,
@@ -467,6 +536,85 @@ mod tests {
             assert_eq!(attempts, 1);
             assert!(result.is_err_and(|err| err.to_string() == "create failed"));
             assert!(!server.filesystem.base_path.join("a").exists());
+        });
+    }
+
+    // InterruptOnDrop
+    #[cfg(unix)]
+    struct ExitProbe {
+        pid: rustix::process::Pid,
+        released: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ExitProbe {
+        fn drop(&mut self) {
+            if let Some(released) = self.released.take() {
+                released
+                    .send(rustix::process::test_kill_process(self.pid).is_err())
+                    .ok();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn exit_probe(
+        child: &tokio::process::Child,
+    ) -> (ExitProbe, tokio::sync::oneshot::Receiver<bool>) {
+        let (released, receiver) = tokio::sync::oneshot::channel();
+        let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        (
+            ExitProbe {
+                pid,
+                released: Some(released),
+            },
+            receiver,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_on_drop_interrupts_a_running_child_and_holds_until_it_exited() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let marker = temp.path().join("interrupted");
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"trap 'touch "$0"; exit 0' INT; echo ready; while :; do sleep 0.1; done"#)
+                .arg(&marker)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (probe, released) = exit_probe(&child);
+            let mut guard = InterruptOnDrop::new(child, probe);
+            let mut stdout = tokio::io::BufReader::new(guard.stdout.take().unwrap());
+            stdout.read_line(&mut String::new()).await.unwrap();
+
+            drop(guard);
+            let exited = tokio::time::timeout(std::time::Duration::from_secs(10), released)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(exited);
+            assert!(marker.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_on_drop_releases_hold_at_once_after_the_child_exited() {
+        tokio_test::block_on(async {
+            let child = tokio::process::Command::new("true").spawn().unwrap();
+            let (probe, released) = exit_probe(&child);
+            let mut guard = InterruptOnDrop::new(child, probe);
+            assert!(guard.wait().await.unwrap().success());
+
+            drop(guard);
+            let exited = tokio::time::timeout(std::time::Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(exited);
         });
     }
 }

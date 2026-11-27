@@ -535,11 +535,15 @@ impl BackupCreateExt for ResticBackup {
             )
         };
 
-        let repository_lock = Self::repository_lock(&configuration).await;
-        let repository_guard = repository_lock.read().await;
+        let repository_guard = Arc::new(
+            Self::repository_lock(&configuration)
+                .await
+                .read_owned()
+                .await,
+        );
         let mut retried = false;
         let (snapshot_id, total_bytes_processed, total_files_processed) = loop {
-            let mut child = Self::command(&server.app_state.config, &configuration)
+            let child = Self::command(&server.app_state.config, &configuration)
                 .arg("--json")
                 .arg("--retry-lock")
                 .arg(format!("{}s", configuration.retry_lock_seconds))
@@ -557,6 +561,7 @@ impl BackupCreateExt for ResticBackup {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()?;
+            let mut child = super::InterruptOnDrop::new(child, Arc::clone(&repository_guard));
 
             let stderr = child
                 .stderr
@@ -711,12 +716,16 @@ impl BackupStreamCreateExt for ResticBackup {
             )
         };
 
-        let repository_lock = Self::repository_lock(&configuration).await;
-        let repository_guard = repository_lock.read().await;
+        let repository_guard = Arc::new(
+            Self::repository_lock(&configuration)
+                .await
+                .read_owned()
+                .await,
+        );
         let mut reader = source.await?;
         let mut retried = false;
         let (snapshot_id, total_bytes_processed) = loop {
-            let mut child = Self::command(&state.config, &configuration)
+            let child = Self::command(&state.config, &configuration)
                 .arg("--json")
                 .arg("--retry-lock")
                 .arg(format!("{}s", configuration.retry_lock_seconds))
@@ -736,6 +745,7 @@ impl BackupStreamCreateExt for ResticBackup {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()?;
+            let mut child = super::InterruptOnDrop::new(child, Arc::clone(&repository_guard));
 
             let mut stdin = child
                 .stdin

@@ -90,6 +90,39 @@ impl PbsClient {
         Ok(())
     }
 
+    /// Backup ids of the `backup_type` snapshots taken at `backup_time` in the namespace.
+    pub async fn snapshot_ids_at(
+        &self,
+        backup_type: &str,
+        backup_time: i64,
+    ) -> Result<Vec<CompactString>, PbsError> {
+        let response = self
+            .client
+            .get(self.datastore_path("snapshots"))
+            .query(&self.ns_query())
+            .send()
+            .await
+            .map_err(|err| self.map_transport(err))?;
+        let response = self.check_status(response).await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| self.map_transport(err))?;
+
+        let data = super::h2::unwrap_data(&body)?;
+        Ok(data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|snapshot| {
+                snapshot.get("backup-type").and_then(|t| t.as_str()) == Some(backup_type)
+                    && snapshot.get("backup-time").and_then(|t| t.as_i64()) == Some(backup_time)
+            })
+            .filter_map(|snapshot| snapshot.get("backup-id").and_then(|id| id.as_str()))
+            .map(CompactString::from)
+            .collect())
+    }
+
     pub async fn check_access(&self) -> Result<(), PbsError> {
         let response = self
             .client

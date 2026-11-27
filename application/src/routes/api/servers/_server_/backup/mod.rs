@@ -2,6 +2,7 @@ use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod _backup_;
+mod restore;
 
 mod post {
     use crate::{
@@ -44,10 +45,20 @@ mod post {
                 .ok();
         }
 
+        let Some(reservation) =
+            state
+                .backup_manager
+                .reserve_create(&server, data.uuid, data.adapter)
+        else {
+            return ApiResponse::error("backup already exists")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        };
+
         tokio::spawn(async move {
             if let Err(err) = state
                 .backup_manager
-                .create(data.adapter, &server, data.uuid, data.ignore)
+                .create_reserved(reservation, data.adapter, &server, data.uuid, data.ignore)
                 .await
             {
                 tracing::error!(
@@ -69,6 +80,7 @@ mod post {
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .nest("/{backup}", _backup_::router(state))
+        .nest("/restore", restore::router(state))
         .routes(routes!(post::route))
         .with_state(state.clone())
 }

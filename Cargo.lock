@@ -1270,9 +1270,9 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "ddup-bak"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f43e60fd6ba5a91b736a8e9f360664922dbf4200961fe260ca535a78ae54f03"
+checksum = "435153705b16acc3fdafd74a4442f40b5786fa890fd04fe090b2bed59ed1cdb6"
 dependencies = [
  "blake2",
  "blake3",
@@ -1285,7 +1285,7 @@ dependencies = [
  "flate2",
  "ignore",
  "libc",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "positioned-io",
  "rayon",
  "same-file",

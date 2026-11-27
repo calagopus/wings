@@ -55,6 +55,8 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
 const DUMP_ARCHIVE_NAME: &str = "dump.didx";
+const CLEAN_ATTEMPTS: u32 = 5;
+const CLEAN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 type GroupLockKey = (
     compact_str::CompactString,
@@ -111,13 +113,15 @@ impl BackupFindExt for PbsBackup {
             }
         };
 
-        let Some(group_id) = remote.group_id() else {
-            return Ok(None);
-        };
         let backup_time = remote.backup_created.timestamp();
+        let group_id = remote.group_id();
 
         let config = build_config(remote);
-        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
+        let backup_id = match group_id {
+            Some(group_id) => pbs_client::naming::backup_id(config.id_prefix(), &group_id),
+            // the panel forgets the server once it is deleted or the backup detached
+            None => locate_backup_id(&config, uuid, backup_time).await?,
+        };
 
         Ok(Some(Backup::ProxmoxBackupServer(PbsBackup {
             uuid,
@@ -126,6 +130,45 @@ impl BackupFindExt for PbsBackup {
             backup_time,
         })))
     }
+}
+
+async fn locate_backup_id(
+    config: &PbsConfig,
+    uuid: uuid::Uuid,
+    backup_time: i64,
+) -> Result<compact_str::CompactString, anyhow::Error> {
+    let candidates = PbsClient::new(config.clone())?
+        .snapshot_ids_at(pbs_client::naming::BACKUP_TYPE, backup_time)
+        .await?;
+
+    for backup_id in candidates {
+        if !pbs_client::naming::is_calagopus_id(config.id_prefix(), &backup_id) {
+            continue;
+        }
+
+        let mut reader = PbsBackupReader::connect(config, &backup_id, backup_time).await?;
+        let meta_raw = reader.download_file(META_BLOB_NAME).await;
+        reader.close().await;
+
+        let Ok(meta) = meta_raw.and_then(|raw| pbs_client::datablob::decode_blob(&raw)) else {
+            continue;
+        };
+        let backup_uuid = serde_json::from_slice::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|meta| {
+                meta.get("backup_uuid")
+                    .and_then(|backup_uuid| backup_uuid.as_str())
+                    .and_then(|backup_uuid| uuid::Uuid::parse_str(backup_uuid).ok())
+            });
+
+        if backup_uuid == Some(uuid) {
+            return Ok(backup_id);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no proxmox backup server snapshot at backup-time {backup_time} holds backup {uuid}"
+    ))
 }
 
 #[async_trait::async_trait]
@@ -1728,10 +1771,46 @@ impl BackupTestExt for PbsBackup {
 
 #[async_trait::async_trait]
 impl BackupCleanExt for PbsBackup {
-    async fn clean(
-        _server: &crate::server::Server,
-        _uuid: uuid::Uuid,
-    ) -> Result<(), anyhow::Error> {
+    async fn clean(server: &crate::server::Server, uuid: uuid::Uuid) -> Result<(), anyhow::Error> {
+        let remote = server
+            .app_state
+            .config
+            .client
+            .backup_pbs_configuration(uuid)
+            .await?;
+        let backup_time = remote.backup_created.timestamp();
+        let Some(group_id) = remote.group_id() else {
+            return Ok(());
+        };
+        let config = build_config(remote);
+        let backup_id = pbs_client::naming::backup_id(config.id_prefix(), &group_id);
+
+        tokio::spawn(async move {
+            for attempt in 1..=CLEAN_ATTEMPTS {
+                let result = async {
+                    let group_lock = group_lock(&config, &backup_id);
+                    let _group_guard = group_lock.lock().await;
+
+                    PbsClient::new(config.clone())?
+                        .delete_snapshot(pbs_client::naming::BACKUP_TYPE, &backup_id, backup_time)
+                        .await
+                }
+                .await;
+
+                match result {
+                    Ok(()) | Err(PbsError::SnapshotNotFound { .. }) => return,
+                    Err(err) if attempt == CLEAN_ATTEMPTS => {
+                        tracing::warn!(
+                            backup = %uuid,
+                            "failed to remove unfinished PBS snapshot: {err}"
+                        );
+                        return;
+                    }
+                    Err(_) => tokio::time::sleep(CLEAN_RETRY_DELAY).await,
+                }
+            }
+        });
+
         Ok(())
     }
 }

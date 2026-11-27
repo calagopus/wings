@@ -654,7 +654,8 @@ impl BackupCreateExt for KopiaBackup {
 
         command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         let retry_limit = server
             .app_state
@@ -799,7 +800,8 @@ impl BackupStreamCreateExt for KopiaBackup {
                             ["--tags".to_string(), format!("{key}:{value}")]
                         }))
                         .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped());
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true);
 
                 let retry_limit = state.config.load().system.backups.kopia.retry_limit;
                 let mut attempt = 0;
@@ -1131,11 +1133,14 @@ impl BackupTestExt for KopiaBackup {
 
 #[async_trait::async_trait]
 impl BackupCleanExt for KopiaBackup {
-    async fn clean(
-        _server: &crate::server::Server,
-        _uuid: uuid::Uuid,
-    ) -> Result<(), anyhow::Error> {
-        Ok(())
+    async fn clean(server: &crate::server::Server, uuid: uuid::Uuid) -> Result<(), anyhow::Error> {
+        match tokio::fs::remove_dir_all(Self::get_dump_staging_path(&server.app_state.config, uuid))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

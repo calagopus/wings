@@ -24,6 +24,7 @@ mod post {
     #[utoipa::path(post, path = "/", responses(
         (status = ACCEPTED, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
     ), params(
         (
             "server" = uuid::Uuid,
@@ -61,10 +62,22 @@ mod post {
             }
         };
 
+        let Some(reservation) = state.backup_manager.reserve_restore(&server) else {
+            return ApiResponse::error("server is already restoring a backup")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        };
+
         tokio::spawn(async move {
             if let Err(err) = state
                 .backup_manager
-                .restore(&backup, &server, data.truncate_directory, data.download_url)
+                .restore_reserved(
+                    reservation,
+                    &backup,
+                    &server,
+                    data.truncate_directory,
+                    data.download_url,
+                )
                 .await
             {
                 tracing::error!(

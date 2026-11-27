@@ -4,9 +4,12 @@ use crate::{
 };
 use compact_str::ToCompactString;
 use futures::TryStreamExt;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 async fn is_database_dump(filesystem: &dyn VirtualReadableFilesystem, uuid: uuid::Uuid) -> bool {
@@ -38,6 +41,94 @@ pub struct BackupManager {
     cached_backup_adapters: moka::future::Cache<uuid::Uuid, BackupAdapter>,
     database_backup_restores: tokio::sync::broadcast::Sender<DatabaseBackupRestore>,
     active: AtomicUsize,
+    creating: InFlightRegistry,
+    restoring: InFlightRegistry,
+}
+
+pub enum BackupAbort {
+    Aborted,
+    NotRunning,
+    Unsupported,
+}
+
+struct InFlight {
+    server: uuid::Uuid,
+    abortable: bool,
+    abort: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+type InFlightRegistry = Arc<parking_lot::Mutex<HashMap<uuid::Uuid, InFlight>>>;
+
+struct InFlightGuard {
+    registry: InFlightRegistry,
+    key: uuid::Uuid,
+}
+
+pub struct BackupReservation {
+    _guard: InFlightGuard,
+    aborted: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl InFlightGuard {
+    fn register(
+        registry: &InFlightRegistry,
+        key: uuid::Uuid,
+        server: uuid::Uuid,
+        abortable: bool,
+    ) -> Option<(Self, tokio::sync::oneshot::Receiver<()>)> {
+        let mut registry_guard = registry.lock();
+        if registry_guard.contains_key(&key) {
+            return None;
+        }
+
+        let (abort, aborted) = tokio::sync::oneshot::channel();
+        registry_guard.insert(
+            key,
+            InFlight {
+                server,
+                abortable,
+                abort: Some(abort),
+            },
+        );
+
+        Some((
+            Self {
+                registry: Arc::clone(registry),
+                key,
+            },
+            aborted,
+        ))
+    }
+
+    fn abort(registry: &InFlightRegistry, key: uuid::Uuid, server: uuid::Uuid) -> BackupAbort {
+        let mut registry = registry.lock();
+        let Some(in_flight) = registry
+            .get_mut(&key)
+            .filter(|in_flight| in_flight.server == server)
+        else {
+            return BackupAbort::NotRunning;
+        };
+
+        if !in_flight.abortable {
+            return BackupAbort::Unsupported;
+        }
+
+        match in_flight.abort.take().map(|abort| abort.send(())) {
+            Some(Ok(())) => BackupAbort::Aborted,
+            _ => BackupAbort::NotRunning,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.registry.lock().remove(&self.key);
+    }
+}
+
+#[inline]
+fn is_create_abortable(adapter: BackupAdapter) -> bool {
+    !matches!(adapter, BackupAdapter::Btrfs | BackupAdapter::Zfs)
 }
 
 struct ActiveBackup<'a>(&'a AtomicUsize);
@@ -114,6 +205,8 @@ impl Default for BackupManager {
             cached_backup_adapters: moka::future::Cache::new(1024),
             cached_browse_backup_locks: crate::utils::KeyedLocks::new(),
             active: AtomicUsize::new(0),
+            creating: Default::default(),
+            restoring: Default::default(),
         }
     }
 }
@@ -147,12 +240,60 @@ impl BackupManager {
     }
 
     pub async fn fast_contains(&self, server: &crate::server::Server, uuid: uuid::Uuid) -> bool {
-        if self.cached_backups.contains_key(&uuid) {
+        if self.cached_backups.contains_key(&uuid) || self.creating.lock().contains_key(&uuid) {
             return true;
         }
 
         let configuration = server.configuration.read().await;
         configuration.backups.contains(&uuid) || configuration.database_backups.contains(&uuid)
+    }
+
+    pub fn abort_create(&self, server: uuid::Uuid, uuid: uuid::Uuid) -> BackupAbort {
+        InFlightGuard::abort(&self.creating, uuid, server)
+    }
+
+    pub fn abort_restore(&self, server: uuid::Uuid) -> BackupAbort {
+        InFlightGuard::abort(&self.restoring, server, server)
+    }
+
+    pub fn reserve_create(
+        &self,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        adapter: BackupAdapter,
+    ) -> Option<BackupReservation> {
+        InFlightGuard::register(
+            &self.creating,
+            uuid,
+            server.uuid,
+            is_create_abortable(adapter),
+        )
+        .map(|(guard, aborted)| BackupReservation {
+            _guard: guard,
+            aborted,
+        })
+    }
+
+    pub fn reserve_create_database(
+        &self,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+    ) -> Option<BackupReservation> {
+        InFlightGuard::register(&self.creating, uuid, server.uuid, true).map(|(guard, aborted)| {
+            BackupReservation {
+                _guard: guard,
+                aborted,
+            }
+        })
+    }
+
+    pub fn reserve_restore(&self, server: &crate::server::Server) -> Option<BackupReservation> {
+        InFlightGuard::register(&self.restoring, server.uuid, server.uuid, true).map(
+            |(guard, aborted)| BackupReservation {
+                _guard: guard,
+                aborted,
+            },
+        )
     }
 
     pub async fn create(
@@ -162,6 +303,26 @@ impl BackupManager {
         uuid: uuid::Uuid,
         ignore: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let Some(reservation) = self.reserve_create(server, uuid, adapter) else {
+            return Err(anyhow::anyhow!("backup {uuid} is already being created"));
+        };
+
+        self.create_reserved(reservation, adapter, server, uuid, ignore)
+            .await
+    }
+
+    pub async fn create_reserved(
+        &self,
+        reservation: BackupReservation,
+        adapter: BackupAdapter,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        ignore: compact_str::CompactString,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let BackupReservation {
+            _guard: _in_flight,
+            aborted,
+        } = reservation;
         let _active = ActiveBackup::new(&self.active);
 
         tracing::info!(
@@ -245,8 +406,8 @@ impl BackupManager {
             .execute_backup_status_trigger(crate::models::ServerBackupStatus::Starting)
             .await;
 
-        let backup = match adapter
-            .create(
+        let result = tokio::select! {
+            result = adapter.create(
                 server,
                 uuid,
                 crate::server::filesystem::archive::create::ArchiveProgress::new(
@@ -256,9 +417,11 @@ impl BackupManager {
                 Arc::clone(&total),
                 ignore,
                 ignore_raw,
-            )
-            .await
-        {
+            ) => result,
+            _ = aborted => Err(anyhow::anyhow!("backup was aborted")),
+        };
+
+        let backup = match result {
             Ok(backup) => {
                 progress_task.abort();
 
@@ -471,6 +634,34 @@ impl BackupManager {
         database_instance: uuid::Uuid,
         extension: &str,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        let Some(reservation) = self.reserve_create_database(server, uuid) else {
+            return Err(anyhow::anyhow!("backup {uuid} is already being created"));
+        };
+
+        self.create_database_reserved(
+            reservation,
+            adapter,
+            server,
+            uuid,
+            database_instance,
+            extension,
+        )
+        .await
+    }
+
+    pub async fn create_database_reserved(
+        &self,
+        reservation: BackupReservation,
+        adapter: BackupAdapter,
+        server: &crate::server::Server,
+        uuid: uuid::Uuid,
+        database_instance: uuid::Uuid,
+        extension: &str,
+    ) -> Result<RawServerBackup, anyhow::Error> {
+        let BackupReservation {
+            _guard: _in_flight,
+            aborted,
+        } = reservation;
         let _active = ActiveBackup::new(&self.active);
 
         tracing::info!(
@@ -505,7 +696,7 @@ impl BackupManager {
             .execute_database_backup_status_trigger(crate::models::ServerBackupStatus::Starting)
             .await;
 
-        let result = async {
+        let create = async {
             super::parse_dump_extension(extension)?;
 
             let source: super::DumpSource = Box::pin({
@@ -542,8 +733,12 @@ impl BackupManager {
             adapter
                 .create_from_stream(&server.app_state, uuid, extension, source)
                 .await
-        }
-        .await;
+        };
+
+        let result = tokio::select! {
+            result = create => result,
+            _ = aborted => Err(anyhow::anyhow!("backup was aborted")),
+        };
 
         progress_task.abort();
 
@@ -685,6 +880,33 @@ impl BackupManager {
         truncate_directory: bool,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
+        let Some(reservation) = self.reserve_restore(server) else {
+            return Err(anyhow::anyhow!("server is already restoring a backup"));
+        };
+
+        self.restore_reserved(
+            reservation,
+            backup,
+            server,
+            truncate_directory,
+            download_url,
+        )
+        .await
+    }
+
+    pub async fn restore_reserved(
+        &self,
+        reservation: BackupReservation,
+        backup: &super::Backup,
+        server: &crate::server::Server,
+        truncate_directory: bool,
+        download_url: Option<compact_str::CompactString>,
+    ) -> Result<(), anyhow::Error> {
+        let BackupReservation {
+            _guard: in_flight,
+            mut aborted,
+        } = reservation;
+
         if let Some(state) = server.locked_state() {
             return Err(anyhow::anyhow!(
                 "server is in a locked state ({state}), cannot restore backup"
@@ -723,6 +945,25 @@ impl BackupManager {
             adapter = ?backup.adapter(),
             "restoring backup",
         );
+
+        if aborted.try_recv().is_ok() {
+            server.set_restoring(false).await;
+            server
+                .app_state
+                .config
+                .client
+                .set_backup_restore_status(server.uuid, backup.uuid(), false)
+                .await?;
+            server.websocket.send(
+                crate::server::websocket::WebsocketMessage::builder(
+                    crate::server::websocket::WebsocketEvent::ServerBackupRestoreCompleted,
+                )
+                .arg("false")
+                .build(),
+            )?;
+
+            return Err(anyhow::anyhow!("backup restore was aborted"));
+        }
 
         if truncate_directory && let Err(err) = server.filesystem.truncate_root().await {
             server.set_restoring(false).await;
@@ -780,8 +1021,8 @@ impl BackupManager {
             .build(),
         )?;
 
-        match backup
-            .restore(
+        let result = tokio::select! {
+            result = backup.restore(
                 server,
                 crate::server::filesystem::archive::create::ArchiveProgress::new(
                     Arc::clone(&progress),
@@ -789,9 +1030,12 @@ impl BackupManager {
                 ),
                 Arc::clone(&total),
                 download_url,
-            )
-            .await
-        {
+            ) => result,
+            _ = aborted => Err(anyhow::anyhow!("backup restore was aborted")),
+        };
+        drop(in_flight);
+
+        match result {
             Ok(_) => {
                 progress_task.abort();
 
@@ -1133,5 +1377,111 @@ mod tests {
                 );
             }
         });
+    }
+
+    // InFlightGuard
+    #[test]
+    fn in_flight_abort_fires_once_and_only_for_its_own_operation() {
+        let manager = BackupManager::default();
+        let (server, backup, other) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+
+        let (_create, mut create_aborted) =
+            InFlightGuard::register(&manager.creating, backup, server, true).unwrap();
+        assert!(matches!(
+            manager.abort_create(other, backup),
+            BackupAbort::NotRunning
+        ));
+        assert!(matches!(
+            manager.abort_create(server, other),
+            BackupAbort::NotRunning
+        ));
+        assert!(matches!(
+            manager.abort_restore(server),
+            BackupAbort::NotRunning
+        ));
+        assert!(matches!(
+            create_aborted.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            manager.abort_create(server, backup),
+            BackupAbort::Aborted
+        ));
+        assert!(create_aborted.try_recv().is_ok());
+        assert!(matches!(
+            manager.abort_create(server, backup),
+            BackupAbort::NotRunning
+        ));
+
+        let (_restore, mut restore_aborted) =
+            InFlightGuard::register(&manager.restoring, server, server, true).unwrap();
+        assert!(matches!(
+            manager.abort_restore(other),
+            BackupAbort::NotRunning
+        ));
+        assert!(matches!(
+            manager.abort_restore(server),
+            BackupAbort::Aborted
+        ));
+        assert!(restore_aborted.try_recv().is_ok());
+    }
+
+    #[test]
+    fn in_flight_abort_of_a_non_abortable_operation_leaves_it_running() {
+        let manager = BackupManager::default();
+        let (server, backup) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        let (_guard, mut aborted) =
+            InFlightGuard::register(&manager.creating, backup, server, false).unwrap();
+        assert!(matches!(
+            manager.abort_create(server, backup),
+            BackupAbort::Unsupported
+        ));
+        assert!(matches!(
+            aborted.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn in_flight_abort_after_the_operation_finished_is_not_running() {
+        let manager = BackupManager::default();
+        let (server, backup) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        let (guard, aborted) =
+            InFlightGuard::register(&manager.creating, backup, server, true).unwrap();
+        drop(aborted);
+        assert!(matches!(
+            manager.abort_create(server, backup),
+            BackupAbort::NotRunning
+        ));
+        drop(guard);
+        assert!(matches!(
+            manager.abort_create(server, backup),
+            BackupAbort::NotRunning
+        ));
+    }
+
+    #[test]
+    fn in_flight_key_is_exclusive_until_its_guard_drops() {
+        let manager = BackupManager::default();
+        let server = uuid::Uuid::new_v4();
+
+        let (guard, _aborted) =
+            InFlightGuard::register(&manager.restoring, server, server, true).unwrap();
+        assert!(InFlightGuard::register(&manager.restoring, server, server, true).is_none());
+        drop(guard);
+
+        let (_guard, mut aborted) =
+            InFlightGuard::register(&manager.restoring, server, server, true).unwrap();
+        assert!(matches!(
+            manager.abort_restore(server),
+            BackupAbort::Aborted
+        ));
+        assert!(aborted.try_recv().is_ok());
     }
 }
