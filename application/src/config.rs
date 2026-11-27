@@ -1411,6 +1411,8 @@ nestify::nest! {
             #[serde(default = "docker_container_apply_seccomp")]
             pub container_apply_seccomp: bool,
             #[serde(default)]
+            pub container_no_new_privileges_whitelist: HashSet<uuid::Uuid>,
+            #[serde(default)]
             pub container_apparmor_profile: String,
             #[serde(default)]
             #[schema(inline)]

@@ -765,7 +765,14 @@ impl crate::server::configuration::ServerConfiguration {
     ) -> Result<Vec<String>, serde_json::Error> {
         let config = config.load();
 
-        let mut security_opt = vec!["no-new-privileges".to_string()];
+        let mut security_opt = Vec::new();
+        if !config
+            .docker
+            .container_no_new_privileges_whitelist
+            .contains(&self.uuid)
+        {
+            security_opt.push("no-new-privileges".to_string());
+        }
         if config.docker.container_apply_seccomp {
             security_opt.push(
                 crate::server::configuration::seccomp::Seccomp::default()
